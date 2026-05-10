@@ -1,14 +1,10 @@
-# PithTrain
+<h1 align="center">PithTrain</h1>
 
-**Efficient, Python-native MoE training in ~10K lines of code.**
+<p align="center"><strong>Compact and Agent-Native MoE Training System</strong></p>
 
-Existing MoE training frameworks force a trade-off: production systems offer full-featured, optimized training but carry 100K+ lines of code with heavy C++/CUDA dependencies; lightweight alternatives are easy to use but lack critical optimizations for MoE models.
+Production MoE training frameworks deliver peak throughput and broad model coverage, but evolving them for new architectures or system optimizations remains expensive. Meanwhile, the design patterns that make these stacks work for humans, such as plugin systems, registry-based indirection, and heavy compiled extensions, are harder for AI coding agents to navigate.
 
-PithTrain bridges this gap. It delivers production-grade performance — 4D parallelism, compute-communication overlap, FP8 training — in a codebase small enough to read end-to-end, with zero C++/CUDA build steps.
-
-### Designed for the Age of AI
-
-PithTrain is built to be understood — by humans and AI agents alike. At ~10K lines of Python, the entire codebase fits within the context window of modern AI coding tools. This means AI agents can read, reason about, and evolve the full system, not just isolated files.
+PithTrain is an MoE training framework designed agent-native from the start: ~10K lines of Python, no implicit indirection, with shipped agent skills for recurring tasks. It delivers production-grade performance, including 4D parallelism, compute-communication overlap, and FP8 training, in a codebase compact enough that an agent (or a human) can read it end-to-end.
 
 ## Installation
 
@@ -71,16 +67,16 @@ Convert a training checkpoint to standard Hugging Face format for evaluation or 
 
 PithTrain is structured in three layers:
 
-- **Upstream** — Training loop for pretraining, SFT, and more.
-- **Core** — The bulk of PithTrain, composed of five modules:
-  - *Model* — Protocol interface with implementations for Qwen and DeepSeek architectures.
+- **Application** — Training loop for pretraining, SFT, and more.
+- **Engine** — The bulk of PithTrain, composed of five modules:
+  - *Model* — Protocol interface with implementations for Qwen, DeepSeek, and GPT-OSS architectures.
   - *Building Blocks* — FP8 linear and quantization, ring attention, expert dispatch and deduplication, etc.
   - *Pipeline Engine* — DualPipeV scheduler with 5-stage overlapped forward-backward execution and P2P communication.
-  - *Distributed Training* — Expert, data, and context parallelism (PP x EP x FSDP x CP).
+  - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x FSDP x CP x EP).
   - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
-- **Operators** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton, TileLang).
+- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton).
 
-## Attribution
+## Acknowledgement
 
 PithTrain is developed by contributors from CMU. It is built on top of DeepSeek's [DualPipe](https://github.com/deepseek-ai/DualPipe), which provides the original pipeline parallelism schedule and examples. We thank the [CMU Foundation and Language Model (FLAME) Center](https://www.cmu.edu/flame/) for providing the compute resources to develop PithTrain. We also acknowledge the support of DGX B200 from NVIDIA.
 

@@ -5,8 +5,7 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "deep-gemm",
-    "flash-attn-4[cu13]>=4.0.0b7",
-    "tilelang",
+    "flash-attn-4[cu13]>=4.0.0b12",
     "torch>=2.10.0",
     "transformers",
     "wandb",
