@@ -406,7 +406,7 @@ class Qwen3MoeAttention(nn.Module):
                 query_states,
                 key_states,
                 value_states,
-                softmax_scale=self.scaling,
+                sm_scale=self.scaling,
                 cp_group=self.cp_group,
             )
 
@@ -673,6 +673,7 @@ class Qwen3MoeModel(nn.Module):
         self.num_stages = num_stages
         self.cp_group = cp_group
         self.cp_rank = cp_group.rank() if cp_group is not None else 0
+        self.cp_size = cp_group.size() if cp_group is not None else 1
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -765,12 +766,21 @@ class Qwen3MoeModel(nn.Module):
 
         bsz, seq_len, _ = hidden_states.shape
 
-        offset = self.cp_rank * seq_len
-        cos, sin = self.rotary_emb(hidden_states, seq_len=offset + seq_len)
-        position_embeddings = (
-            cos[offset : offset + seq_len].unsqueeze(0),
-            sin[offset : offset + seq_len].unsqueeze(0),
+        # Zigzag CP layout: the local seq_len tokens come from two non-contiguous
+        # global chunks. Build the global position IDs by concatenating the
+        # front block and the mirror back block, then gather cos/sin by position.
+        block = seq_len // 2
+        global_seq_len = seq_len * self.cp_size
+        front_start = self.cp_rank * block
+        back_start = (2 * self.cp_size - self.cp_rank - 1) * block
+        position_ids = torch.cat(
+            [
+                torch.arange(front_start, front_start + block, device=hidden_states.device),
+                torch.arange(back_start, back_start + block, device=hidden_states.device),
+            ]
         )
+        cos, sin = self.rotary_emb(hidden_states, seq_len=global_seq_len)
+        position_embeddings = (cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0))
 
         for layer_idx_str, layer in self.layers.items():
             layer._position_embeddings = position_embeddings

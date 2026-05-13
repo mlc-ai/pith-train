@@ -316,9 +316,12 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
     module_config.ep_size = ep_size
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)
-    assert cfg.sequence_length % cp_size == 0, (
-        f"sequence_length ({cfg.sequence_length}) must be divisible by context_parallel_size ({cp_size})"
-    )
+    if cfg.sequence_length % (2 * cp_size) != 0:
+        raise ValueError(
+            f"sequence_length ({cfg.sequence_length}) must be divisible by "
+            f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
+            f"splits the sequence into 2*cp_size equal chunks"
+        )
 
     hidden_size = module_config.hidden_size
 

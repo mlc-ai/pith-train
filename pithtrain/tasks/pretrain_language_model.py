@@ -90,27 +90,35 @@ def get_global_batch(
     local_batch_size = global_batch_size // (dp_size * ep_size)
     start0 = step * global_batch_size + (dp_rank * ep_size + ep_rank) * micro_batch_size
 
-    # Compute the CP sub-range so we only read the needed tokens from mmap.
+    # Zigzag context-parallel sharding. We split the global sequence into
+    # 2*cp_size equal chunks and assign rank r the pair (r, 2*cp_size-r-1).
+    # The local sequence is the concatenation of the "front" chunk and the
+    # mirror "back" chunk, balancing the causal workload across CP ranks
+    # (see pithtrain/operators/ring_attention.py for the matching attention
+    # implementation). For cp_size == 1 this reduces to a contiguous read.
     cp_size = ctx.distributed.cp_size
-    if cp_size > 1:
-        cp_rank = ctx.distributed.cp_rank
-        local_seq_len = sequence_length // cp_size
-        seq_offset = cp_rank * local_seq_len
-    else:
-        local_seq_len = sequence_length
-        seq_offset = 0
+    cp_rank = ctx.distributed.cp_rank
+    block = sequence_length // (2 * cp_size)
+    local_seq_len = 2 * block
+    front_offset = cp_rank * block
+    back_offset = (2 * cp_size - cp_rank - 1) * block
 
     # single allocation on host, then one HtoD transfer per tensor
     local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
     local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
 
-    # fill in one pass: k iterates over our rank-local batch rows
+    # fill in one pass: k iterates over our rank-local batch rows. Each sample
+    # is two memmap reads (front block + back block) followed by an in-place
+    # concat into the pre-allocated host buffer.
     for k in range(local_batch_size):
         acc, off = divmod(k, micro_batch_size)
         index = start0 + acc * effective_batch_size + off
-        # get_chunk reads smaller chunk of the sequence if cp_size > 1
-        tokens, labels = dataset.get_chunk(index, seq_offset, local_seq_len)
-        local_tokens[k], local_labels[k] = tokens, labels
+        tokens_a, labels_a = dataset.get_chunk(index, front_offset, block)
+        tokens_b, labels_b = dataset.get_chunk(index, back_offset, block)
+        local_tokens[k, :block] = tokens_a
+        local_tokens[k, block:] = tokens_b
+        local_labels[k, :block] = labels_a
+        local_labels[k, block:] = labels_b
 
     local_tokens = local_tokens.to(device, non_blocking=True)
     local_labels = local_labels.to(device, non_blocking=True)
