@@ -1,7 +1,9 @@
 """Benchmark forward and backward latency of ring attention."""
 
-import argparse
+import json
+import re
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -10,34 +12,47 @@ from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distri
 from pithtrain.operators.ring_attention import ring_attention_func
 
 
-def run(ctx: DistributedCtx, args: argparse.Namespace) -> None:
+def parse_scenario(scenario: str) -> tuple[dict, int, int]:
+    m = re.match(r"^(.+)-cp(\d+)-s(\d+)k$", scenario)
+    if not m:
+        raise ValueError(f"invalid scenario '{scenario}', expected <model>-cp<N>-s<N>k")
+    model = m.group(1)
+    with open(Path(f"examples/pretrain_language_model/{model}/config.json")) as f:
+        config = json.load(f)
+    return config, int(m.group(2)), int(m.group(3)) * 1024
+
+
+def run(ctx: DistributedCtx, scenario: str, config: dict, cp_size: int, S: int) -> None:
+    B = 1
+    WARMUP, NITERS = 25, 100
+    HQ, HK = config["num_attention_heads"], config["num_key_value_heads"]
+    D = config["head_dim"]
+
     cp_group = ctx.device_mesh.get_group("cp")
-    cp_size = cp_group.size()
     device = torch.cuda.current_device()
-    softmax_scale = args.D**-0.5
-    S_local = args.S // cp_size
+    softmax_scale = D**-0.5
+    S_local = S // cp_size
 
     torch.manual_seed(42)
     kwargs = dict(device=device, dtype=torch.bfloat16)
-    q = torch.randn(args.B, S_local, args.HQ, args.D, requires_grad=True, **kwargs)
-    k = torch.randn(args.B, S_local, args.HK, args.D, requires_grad=True, **kwargs)
-    v = torch.randn(args.B, S_local, args.HK, args.D, requires_grad=True, **kwargs)
-    grad_out = torch.randn(args.B, S_local, args.HQ, args.D, **kwargs)
+    q = torch.randn(B, S_local, HQ, D, requires_grad=True, **kwargs)
+    k = torch.randn(B, S_local, HK, D, requires_grad=True, **kwargs)
+    v = torch.randn(B, S_local, HK, D, requires_grad=True, **kwargs)
+    grad_out = torch.randn(B, S_local, HQ, D, **kwargs)
 
-    def once() -> None:
+    def run_once() -> None:
         q.grad, k.grad, v.grad = None, None, None
         out = ring_attention_func(q, k, v, softmax_scale, cp_group)
         out.backward(grad_out)
 
-    # Warmup
-    for _ in range(args.warmup):
-        once()
+    for _ in range(WARMUP):
+        run_once()
     torch.cuda.synchronize()
 
     # Timed forward/backward, separated by CUDA events.
     fwd_total_ms = 0.0
     bwd_total_ms = 0.0
-    for _ in range(args.niters):
+    for _ in range(NITERS):
         q.grad, k.grad, v.grad = None, None, None
         fwd_start = torch.cuda.Event(enable_timing=True)
         fwd_end = torch.cuda.Event(enable_timing=True)
@@ -51,43 +66,28 @@ def run(ctx: DistributedCtx, args: argparse.Namespace) -> None:
         fwd_total_ms += fwd_start.elapsed_time(fwd_end)
         bwd_total_ms += fwd_end.elapsed_time(bwd_end)
 
-    fwd_avg = fwd_total_ms / args.niters
-    bwd_avg = bwd_total_ms / args.niters
+    fwd_avg = fwd_total_ms / NITERS
+    bwd_avg = bwd_total_ms / NITERS
 
     if ctx.rank == 0:
-        print(f"B={args.B}, S={args.S}, HQ={args.HQ}, HK={args.HK}, D={args.D}, CP={args.cp_size}")
-        print(f"fwd: {fwd_avg:7.3f} ms")
-        print(f"bwd: {bwd_avg:7.3f} ms")
-        sys.stdout.flush()
+        print(f"{scenario} | fwd: {fwd_avg:7.3f} ms , bwd: {bwd_avg:7.3f} ms", flush=True)
+    torch.distributed.barrier()
 
-    # Profile capture: one iteration between cudaProfilerStart and cudaProfilerStop.
-    # nsys with --capture-range=cudaProfilerApi records only this region.
+    # Nsys profile capture with one iteration.
     torch.cuda.synchronize()
     torch.cuda.profiler.start()
-    once()
+    run_once()
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--B", type=int, required=True, help="Batch size")
-    p.add_argument("--S", type=int, required=True, help="Sequence length")
-    p.add_argument("--HQ", type=int, required=True, help="Number of query heads")
-    p.add_argument("--HK", type=int, required=True, help="Number of key/value heads")
-    p.add_argument("--D", type=int, required=True, help="Head dimension")
-    p.add_argument("--cp-size", type=int, required=True, help="Context parallel size")
-    p.add_argument("--warmup", type=int, default=25, help="Warmup iterations")
-    p.add_argument("--niters", type=int, default=100, help="Timed iterations")
-    args = p.parse_args()
+if __name__ == "__main__":
+    scenario = sys.argv[1]
+    config, cp_size, S = parse_scenario(scenario)
 
     cfg = DistributedCfg()
-    cfg.context_parallel_size = args.cp_size
+    cfg.context_parallel_size = cp_size
     parent_cfg = SimpleNamespace(distributed=cfg)
     parent_ctx = SimpleNamespace(distributed=DistributedCtx())
     with distributed_context(parent_cfg, parent_ctx) as ctx:
-        run(ctx, args)
-
-
-if __name__ == "__main__":
-    main()
+        run(ctx, scenario, config, cp_size, S)
