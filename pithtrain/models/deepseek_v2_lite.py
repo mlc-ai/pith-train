@@ -19,7 +19,7 @@ from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
-from pithtrain.operators.ring_attention.standard import ring_attention_func
+from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
