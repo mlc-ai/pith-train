@@ -16,65 +16,53 @@ from pithtrain.config import SlottedDefault
 
 @dataclass(init=False, slots=True)
 class DistributedCfg(SlottedDefault):
-    """Configuration for distributed runtime."""
+    """
+    Configuration for distributed runtime.
+
+    Parallelism degrees (PP, CP, EP), FSDP2 sharding strategy, and operation timeout. DP is
+    inferred from the world size.
+    """
 
     pipeline_parallel_size: int = 1
     """
-    Degree of pipeline parallelism.
+    Degree of pipeline parallelism (PP).
 
-    Pipeline Parallelism (PP) is a technique that assigns consecutive layers or segments of a neural network
-    to different GPUs. This division allows each GPU to process different stages of the network sequentially.
-
-    For example, if a model has 12 layers and the pipeline_parallel_size is set to 4, then each GPU will
-    handle 3 layers.
+    Partition the model layers across ranks; each rank holds a consecutive slice. Forward and
+    backward execution is scheduled by DualPipeV.
     """
 
     context_parallel_size: int = 1
     """
-    Degree of context parallelism.
+    Degree of context parallelism (CP).
 
-    Context Parallelism (CP) splits the sequence dimension across GPUs. Each GPU processes a chunk
-    of the full sequence. Ring attention is used to compute full causal attention across the
-    distributed sequence chunks, passing K/V around a ring of CP ranks.
+    Shard the sequence dimension across CP ranks. K/V exchange uses ring attention with a zigzag
+    token layout.
     """
 
     expert_parallel_size: int = 1
     """
-    Degree of expert parallelism.
+    Degree of expert parallelism (EP).
 
-    Expert Parallelism (EP) is a type of model parallelism that distributes experts of an MoE across GPUs.
-    Unlike other model-parallel techniques, EP is applied to only the expert layers thus does not impact
-    the parallel mapping of the rest of the layers.
-
-    For example, if the model has 8 experts, then setting expert_parallel_size to 4 results in each GPU
-    processing 2 experts. The number of experts should be divisible by the expert parallel size.
+    Distribute the MoE experts across ranks; non-expert layers are unaffected. Token routing uses
+    EP dispatch and combine kernels with token deduplication.
     """
 
-    timeout: timedelta = timedelta(seconds=180)
+    timeout: timedelta = timedelta(minutes=15)
     """
     Timeout for distributed operations.
 
-    Currently applied to NCCL collective operations and the watchdog heartbeat
-    (``torch.distributed.init_process_group`` timeout + ``TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC``).
-
-    Scale up for large multi-node or deep-pipeline runs where first-iteration
-    setup (NCCL channel build, FSDP all-gather, checkpoint load) can be slow.
-    Keep small for single-node runs to fail fast.
+    Applied to NCCL collectives and the watchdog heartbeat. Scale up for multi-node runs; keep
+    small to fail fast.
     """
 
     sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp"
     """
-    Sharding strategy for FSDP2.
+    FSDP2 sharding strategy.
 
-    - ``"fsdp"`` (default): Fully Sharded Data Parallel. Shards weights, gradients,
-      and optimizer states across the full data-parallel mesh (``dp x cp x ep``
-      for non-MoE parameters; ``dp x cp`` for MoE expert weights). Maximizes
-      memory savings.
-
-    - ``"hsdp"``: Hybrid Sharded Data Parallel. Shards within the inner mesh
-      dimension (``cp x ep`` for non-MoE; ``cp`` for MoE) and replicates across
-      the ``dp`` dimension. Lower memory savings than FSDP, but uses a smaller
-      FSDP group. Useful when the model fits comfortably in a single DP replica.
+    - "fsdp": shard parameters across the full FSDP mesh (dp x cp x ep for non-MoE; dp x cp
+      for MoE experts). Lowest memory.
+    - "hsdp": shard within the inner mesh (cp x ep for non-MoE; cp for MoE) and replicate
+      across dp. Pick when one DP replica fits the model.
     """
 
 
@@ -83,52 +71,58 @@ class DistributedCtx:
     """Context for distributed runtime."""
 
     rank: int
-    """Global rank of the current process."""
+    """Global rank of this process."""
 
     world_size: int
-    """Total number of workers in the distributed job."""
+    """Total number of processes."""
 
     local_rank: int
-    """Local rank of the current process on the node."""
+    """Local rank on the node."""
 
     local_world_size: int
-    """Number of workers on the current node."""
+    """Number of processes on the node."""
 
     dp_rank: int
-    """Rank of the current process in the data parallel group."""
+    """Rank in the DP group."""
 
     dp_size: int
-    """Size of the data parallel group."""
+    """Size of the DP group."""
 
     pp_rank: int
-    """Rank of the current process in the pipeline parallel group."""
+    """Rank in the PP group."""
 
     pp_size: int
-    """Size of the pipeline parallel group."""
+    """Size of the PP group."""
 
     cp_rank: int
-    """Rank of the current process in the context parallel group."""
+    """Rank in the CP group."""
 
     cp_size: int
-    """Size of the context parallel group."""
+    """Size of the CP group."""
 
     ep_rank: int
-    """Rank of the current process in the expert parallel group."""
+    """Rank in the EP group."""
 
     ep_size: int
-    """Size of the expert parallel group."""
+    """Size of the EP group."""
 
     device_mesh: torch.distributed.DeviceMesh
-    """Collection of process groups for multi-dimensional parallelism."""
+    """Device mesh over PP/DP/CP/EP."""
+
+
+def setup_torch_runtime() -> None:
+    """Apply torch runtime tuning: enable TF32 matmul and raise the dynamo recompile cap."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch._dynamo.config.recompile_limit = 64
 
 
 def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> None:
     """
-    Setup the default process group.
+    Initialize the default process group from torchrun environment variables.
 
-    This function initializes the default process group using environment variables by torchrun.
-    It also sets the current CUDA device based on the LOCAL_RANK environment variable. A cleanup
-    function is registered to destroy the process group at program exit.
+    Read global/local rank info into ctx, apply NCCL env tuning, register cleanup at exit, and set
+    the current CUDA device from the local rank.
     """
     assert torch.cuda.is_available(), "CUDA is not available."
     assert "TORCHELASTIC_RUN_ID" in os.environ, "Not launched with torchrun."
@@ -148,10 +142,18 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     kwargs["device_id"] = ctx.local_rank
     kwargs["timeout"] = cfg.timeout
     torch.distributed.init_process_group(**kwargs)
+    atexit.register(torch.distributed.destroy_process_group)
+    torch.cuda.set_device(ctx.local_rank)
 
-    # Fail-fast on uncaught exceptions: destroy/abort_process_group drain in-flight
-    # NCCL work that peers will never satisfy, so the rank hangs and torchrun never
-    # sees the death. os._exit(1) bypasses the drain; peers' NCCL ops fail fast.
+
+def setup_failfast_excepthook() -> None:
+    """
+    Install a fail-fast excepthook that bypasses the NCCL drain on uncaught exceptions.
+
+    Default torch.distributed shutdown can hang indefinitely while draining in-flight NCCL work
+    that peers will never satisfy. Hard-exiting bypasses the drain so NCCL wor on other ranks
+    fail fast instead of hanging.
+    """
     original = sys.excepthook
 
     def excepthook(exc_type, exc_value, exc_tb, *_):
@@ -169,28 +171,23 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     sys.excepthook = excepthook
     threading.excepthook = lambda args: excepthook(*args)
 
-    atexit.register(torch.distributed.destroy_process_group)
-    torch.cuda.set_device(ctx.local_rank)
-
 
 def setup_device_mesh(cfg: DistributedCfg, ctx: DistributedCtx) -> None:
     """
-    Setup the device mesh.
+    Build the (PP, DP, CP, EP) device mesh and read per-axis ranks and sizes into ctx.
 
-    Process groups are created in the following order. EP and CP are the inner-most
-    dimensions to keep their frequent communications within the NVLink domain.
-
-    Mesh shape: ``(PP, DP, CP, EP)``
-
-    1. Pipeline Parallel (PP) - outermost
-    2. Data Parallel (DP)
-    3. Context Parallel (CP) - ring attention KV exchange
-    4. Expert Parallel (EP) - innermost, MoE all-to-all
+    Mesh dimensions go outer-to-inner: PP, DP, CP, EP. CP and EP sit innermost so frequent
+    collectives (ring K/V exchange, MoE all-to-all) stay within the NVLink domain.
     """
-    ctx.ep_size = cfg.expert_parallel_size
-    ctx.pp_size = cfg.pipeline_parallel_size
-    ctx.cp_size = cfg.context_parallel_size
-    ctx.dp_size = ctx.world_size // (ctx.ep_size * ctx.pp_size * ctx.cp_size)
+    ctx.pp_size = pp_size = cfg.pipeline_parallel_size
+    ctx.cp_size = cp_size = cfg.context_parallel_size
+    ctx.ep_size = ep_size = cfg.expert_parallel_size
+    world_size = ctx.world_size
+
+    divisor = pp_size * cp_size * ep_size
+    if world_size % divisor != 0:
+        raise RuntimeError(f"{world_size=} not divisible by {pp_size=} * {cp_size=} * {ep_size=}")
+    ctx.dp_size = world_size // divisor
 
     kwargs = dict()
     kwargs["device_type"] = "cuda"
@@ -209,9 +206,8 @@ def distributed_context(cfg: object, ctx: object) -> Generator[DistributedCtx, N
     """Context manager for distributed runtime."""
     assert hasattr(cfg, "distributed") and isinstance(cfg.distributed, DistributedCfg)
     assert hasattr(ctx, "distributed") and isinstance(ctx.distributed, DistributedCtx)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-    torch._dynamo.config.recompile_limit = 64
+    setup_torch_runtime()
     setup_default_process_group(cfg.distributed, ctx.distributed)
+    setup_failfast_excepthook()
     setup_device_mesh(cfg.distributed, ctx.distributed)
     yield ctx.distributed
