@@ -50,13 +50,12 @@ class DistributedCfg(SlottedDefault):
     processing 2 experts. The number of experts should be divisible by the expert parallel size.
     """
 
-    nccl_timeout_seconds: int = 180
+    timeout: timedelta = timedelta(seconds=180)
     """
-    Timeout for NCCL collective operations and watchdog heartbeat, in seconds.
+    Timeout for distributed operations.
 
-    Bounds how long a rank waits on a hung collective before NCCL's watchdog
-    aborts the job. Applies both to the per-collective timeout passed to
-    ``torch.distributed.init_process_group`` and to ``TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC``.
+    Currently applied to NCCL collective operations and the watchdog heartbeat
+    (``torch.distributed.init_process_group`` timeout + ``TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC``).
 
     Scale up for large multi-node or deep-pipeline runs where first-iteration
     setup (NCCL channel build, FSDP all-gather, checkpoint load) can be slow.
@@ -142,12 +141,12 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
     os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
-    os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(cfg.nccl_timeout_seconds)
+    os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(cfg.timeout.total_seconds()))
 
     kwargs = dict()
     kwargs["backend"] = "nccl"
     kwargs["device_id"] = ctx.local_rank
-    kwargs["timeout"] = timedelta(seconds=cfg.nccl_timeout_seconds)
+    kwargs["timeout"] = cfg.timeout
     torch.distributed.init_process_group(**kwargs)
 
     # Fail-fast on uncaught exceptions: destroy/abort_process_group drain in-flight

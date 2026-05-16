@@ -1,6 +1,7 @@
 """PithTrain base classes."""
 
 from dataclasses import MISSING, asdict, fields
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -28,9 +29,11 @@ class SlottedDefault:
 
     @staticmethod
     def _make_json_serializable(obj):
-        """Recursively convert non-serializable types (e.g. Path) to strings."""
+        """Recursively convert non-serializable types into JSON primitives."""
         if isinstance(obj, dict):
             return {k: SlottedDefault._make_json_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, Path):
             return str(obj)
+        elif isinstance(obj, timedelta):
+            return obj.total_seconds()
         return obj
