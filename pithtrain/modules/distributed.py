@@ -5,7 +5,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Generator
+from typing import Generator, Literal
 
 import torch
 
@@ -47,6 +47,34 @@ class DistributedCfg(SlottedDefault):
 
     For example, if the model has 8 experts, then setting expert_parallel_size to 4 results in each GPU
     processing 2 experts. The number of experts should be divisible by the expert parallel size.
+    """
+
+    nccl_timeout_seconds: int = 180
+    """
+    Timeout for NCCL collective operations and watchdog heartbeat, in seconds.
+
+    Bounds how long a rank waits on a hung collective before NCCL's watchdog
+    aborts the job. Applies both to the per-collective timeout passed to
+    ``torch.distributed.init_process_group`` and to ``TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC``.
+
+    Scale up for large multi-node or deep-pipeline runs where first-iteration
+    setup (NCCL channel build, FSDP all-gather, checkpoint load) can be slow.
+    Keep small for single-node runs to fail fast.
+    """
+
+    sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp"
+    """
+    Sharding strategy for FSDP2.
+
+    - ``"fsdp"`` (default): Fully Sharded Data Parallel. Shards weights, gradients,
+      and optimizer states across the full data-parallel mesh (``dp x cp x ep``
+      for non-MoE parameters; ``dp x cp`` for MoE expert weights). Maximizes
+      memory savings.
+
+    - ``"hsdp"``: Hybrid Sharded Data Parallel. Shards within the inner mesh
+      dimension (``cp x ep`` for non-MoE; ``cp`` for MoE) and replicates across
+      the ``dp`` dimension. Lower memory savings than FSDP, but uses a smaller
+      FSDP group. Useful when the model fits comfortably in a single DP replica.
     """
 
 
@@ -110,11 +138,11 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     ctx.local_rank = int(os.environ["LOCAL_RANK"])
     ctx.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
 
+    shutdown.set_heartbeat_timeout(cfg.nccl_timeout_seconds)
     kwargs = dict()
     kwargs["backend"] = "nccl"
     kwargs["device_id"] = ctx.local_rank
-    # NCCL default per-collective timeout is 30 min; cap at 3 to bound worst-case hangs.
-    kwargs["timeout"] = timedelta(seconds=180)
+    kwargs["timeout"] = timedelta(seconds=cfg.nccl_timeout_seconds)
     torch.distributed.init_process_group(**kwargs)
     # See pithtrain.modules.shutdown for why os._exit(1), not destroy/abort.
     shutdown.install_failfast_excepthook()

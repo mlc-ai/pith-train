@@ -23,8 +23,12 @@ def set_env_defaults() -> None:
     """NCCL env defaults that bound failure detection. Must run before init."""
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
-    os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "180")
     os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
+
+
+def set_heartbeat_timeout(seconds: int) -> None:
+    """Set the NCCL watchdog heartbeat timeout. Must run before init_process_group."""
+    os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(seconds)
 
 
 def install_failfast_excepthook() -> None:

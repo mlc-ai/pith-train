@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.distributed.fsdp
 import torch.nn as nn
+from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
@@ -25,7 +26,7 @@ from pithtrain.models.qwen3_30b_a3b import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
 
-from .distributed import DistributedCtx
+from .distributed import DistributedCfg, DistributedCtx
 
 
 @dataclass(init=False, slots=True)
@@ -228,12 +229,27 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
             torch.nn.init.normal_(param, mean=0.0, std=init_std)
 
 
-def apply_fsdp(model, mesh: torch.distributed.DeviceMesh):
-    # MoE parameters are sharded by EP. We additionally shard on the DP and CP dimension.
-    # CP ranks hold identical parameters, so they participate in FSDP like DP.
-    # For other parameters, we shard on the both CP, DP and EP dimensions.
-    moe_fsdp_mesh = mesh["dp", "cp"]._flatten()
-    other_fsdp_mesh = mesh["dp", "cp", "ep"]._flatten()
+def apply_fsdp(
+    model,
+    mesh: DeviceMesh,
+    sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp",
+):
+    # MoE params: unique per EP rank, replicated across DP x CP.
+    # Non-MoE params: replicated across DP x CP x EP.
+    # FSDP shards along the replicated dims:
+    #   "fsdp": 1D mesh; FSDP2 shards across all participants.
+    #   "hsdp": 2D mesh; FSDP2 shards along the inner dim and replicates
+    #           along the outer (dp) dim. For non-MoE, cp and ep are folded
+    #           into a single inner shard dim via _concatenate.
+    if sharding_strategy == "fsdp":
+        moe_fsdp_mesh = mesh["dp", "cp"]._flatten()
+        other_fsdp_mesh = mesh["dp", "cp", "ep"]._flatten()
+    elif sharding_strategy == "hsdp":
+        moe_fsdp_mesh = mesh["dp", "cp"]
+        cp_ep_mesh = mesh["cp", "ep"]._flatten("cp_ep")
+        other_fsdp_mesh = DeviceMesh._concatenate([mesh["dp"], cp_ep_mesh])
+    else:
+        raise ValueError(f"Unknown sharding_strategy: {sharding_strategy!r}")
     mp = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.float32,
@@ -280,7 +296,12 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh):
     return model
 
 
-def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx) -> None:
+def setup_model(
+    cfg: TrainingCfg,
+    ctx: TrainingCtx,
+    distributed_cfg: DistributedCfg,
+    distributed: DistributedCtx,
+) -> None:
     from pithtrain.dualpipe.utils import FP8WeightCacheControl
     from pithtrain.layers.factory import ModelImplMode
 
@@ -352,7 +373,7 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
         init_weights(module, num_layers, cfg.init_std)
 
     modules = nn.Sequential(*modules)
-    apply_fsdp(modules, device_mesh)
+    apply_fsdp(modules, device_mesh, distributed_cfg.sharding_strategy)
 
     local_seq_len = cfg.sequence_length // cp_size
     # sequence_length = cfg.sequence_length, TODO this is kept here for stripe context parallelism
@@ -414,7 +435,7 @@ def training_context(cfg: object, ctx: object) -> Generator[TrainingCtx, None, N
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, ctx.training, ctx.distributed)
+    setup_model(cfg.training, ctx.training, cfg.distributed, ctx.distributed)
     setup_optimizer(cfg.training, ctx.training)
     setup_scheduler(cfg.training, ctx.training)
     try:
