@@ -2,6 +2,8 @@
 
 import atexit
 import os
+import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -10,7 +12,6 @@ from typing import Generator, Literal
 import torch
 
 from pithtrain.config import SlottedDefault
-from pithtrain.modules import shutdown
 
 
 @dataclass(init=False, slots=True)
@@ -138,14 +139,37 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     ctx.local_rank = int(os.environ["LOCAL_RANK"])
     ctx.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
 
-    shutdown.set_heartbeat_timeout(cfg.nccl_timeout_seconds)
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
+    os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
+    os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(cfg.nccl_timeout_seconds)
+
     kwargs = dict()
     kwargs["backend"] = "nccl"
     kwargs["device_id"] = ctx.local_rank
     kwargs["timeout"] = timedelta(seconds=cfg.nccl_timeout_seconds)
     torch.distributed.init_process_group(**kwargs)
-    # See pithtrain.modules.shutdown for why os._exit(1), not destroy/abort.
-    shutdown.install_failfast_excepthook()
+
+    # Fail-fast on uncaught exceptions: destroy/abort_process_group drain in-flight
+    # NCCL work that peers will never satisfy, so the rank hangs and torchrun never
+    # sees the death. os._exit(1) bypasses the drain; peers' NCCL ops fail fast.
+    original = sys.excepthook
+
+    def excepthook(exc_type, exc_value, exc_tb, *_):
+        try:
+            original(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(1)
+
+    sys.excepthook = excepthook
+    threading.excepthook = lambda args: excepthook(*args)
+
     atexit.register(torch.distributed.destroy_process_group)
     torch.cuda.set_device(ctx.local_rank)
 

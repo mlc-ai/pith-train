@@ -12,6 +12,7 @@ import torch
 import torch.distributed.fsdp
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
@@ -21,7 +22,6 @@ from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2LiteMoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_30b_a3b import Qwen3MoeGate, Qwen3MoeModel
-from pithtrain.modules import shutdown
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 
 
@@ -387,7 +387,7 @@ def main(ctx: DistributedCtx, model_name: str):
     torch.distributed.barrier()
 
 
-@shutdown.record
+@record
 def _entry() -> None:
     models = []
     models.append("examples/pretrain_language_model/deepseek-v2-lite/config.json")

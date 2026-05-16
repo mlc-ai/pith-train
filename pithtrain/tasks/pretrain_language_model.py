@@ -21,11 +21,11 @@ from torch.distributed.checkpoint.state_dict import (
     set_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
-from pithtrain.modules import shutdown
 from pithtrain.modules.checkpoint import (
     to_canonical_model,
     to_canonical_optim,
@@ -481,7 +481,7 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     gc.collect()
 
 
-@shutdown.record
+@record
 def launch(cfg: PretrainLanguageModelCfg) -> None:
     """Launch the pretraining of a language model."""
     with ExitStack() as stack:
