@@ -68,46 +68,36 @@ class DistributedCfg(SlottedDefault):
 
 @dataclass(init=False, slots=True)
 class DistributedCtx:
-    """Context for distributed runtime."""
+    """
+    Context for distributed runtime.
+
+    Hold the torchrun ranks alongside the (PP, DP, CP, EP) device mesh, providing a single source
+    of truth that the training loop, model constructors, and collectives reference.
+    """
 
     rank: int
-    """Global rank of this process."""
+    """Global worker rank."""
 
     world_size: int
-    """Total number of processes."""
+    """Total number of workers."""
 
     local_rank: int
-    """Local rank on the node."""
+    """Worker rank within the node."""
 
     local_world_size: int
-    """Number of processes on the node."""
-
-    dp_rank: int
-    """Rank in the DP group."""
-
-    dp_size: int
-    """Size of the DP group."""
-
-    pp_rank: int
-    """Rank in the PP group."""
-
-    pp_size: int
-    """Size of the PP group."""
-
-    cp_rank: int
-    """Rank in the CP group."""
-
-    cp_size: int
-    """Size of the CP group."""
-
-    ep_rank: int
-    """Rank in the EP group."""
-
-    ep_size: int
-    """Size of the EP group."""
+    """Number of workers on the node."""
 
     device_mesh: torch.distributed.DeviceMesh
-    """Device mesh over PP/DP/CP/EP."""
+    """4D mesh over (PP, DP, CP, EP) axes."""
+
+    pp_rank: int
+    pp_size: int
+    dp_rank: int
+    dp_size: int
+    cp_rank: int
+    cp_size: int
+    ep_rank: int
+    ep_size: int
 
 
 def setup_torch_runtime() -> None:
