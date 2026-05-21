@@ -341,10 +341,10 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
         # Pushed right after cudaProfilerStart so it is the earliest in-window NVTX per globalTid
         # (enables pid to mesh-coord lookup); range, not mark, so nsys-ui renders on the thread row.
         d, t, parts = ctx.distributed, cfg.training, list()
-        parts.append(f"pp={d.pp_rank}/{d.pp_size} dp={d.dp_rank}/{d.dp_size}")
-        parts.append(f"cp={d.cp_rank}/{d.cp_size} ep={d.ep_rank}/{d.ep_size}")
+        parts.append(f"rank={d.rank}")
+        parts.append(f"pp={d.pp_rank}/{d.pp_size} dp={d.dp_rank}/{d.dp_size} cp={d.cp_rank}/{d.cp_size} ep={d.ep_rank}/{d.ep_size}")
         parts.append(f"mbs={t.micro_batch_size} seq={t.sequence_length}")
-        torch.cuda.nvtx.range_push(" ".join(parts))
+        torch.cuda.nvtx.range_push("; ".join(parts))
     start = cfg.training.memory_profile_start
     if start is not None and ctx.training.step == start:
         torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
