@@ -1,6 +1,7 @@
 """deepseek-ai/DeepSeek-V2-Lite."""
 
 import math
+import os
 from dataclasses import fields
 from typing import List, Optional, Tuple
 
@@ -19,13 +20,22 @@ from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
-from pithtrain.operators.ring_attention import mla_ring_attention_func
+from pithtrain.operators.ring_attention import mla_ring_attention_func, ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
+
+# MLA context-parallel attention implementation. Default "latent" = pass-latent ring
+# (rotate the compressed KV latent, decompress locally). Set PITHTRAIN_MLA_CP=decompress
+# for the legacy path (decompress to full per-head K/V, then standard zigzag ring). The
+# two are operator-equivalent; the flag exists for A/B correctness + throughput comparison.
+_MLA_CP_DECOMPRESS = os.environ.get("PITHTRAIN_MLA_CP", "latent") == "decompress"
+if _MLA_CP_DECOMPRESS:
+    # Self-document the non-default path so A/B logs confirm the flag took effect.
+    print("[pithtrain] MLA context-parallel attention: legacy decompress-then-ring", flush=True)
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
@@ -397,7 +407,8 @@ class DeepseekV2LiteAttention(nn.Module):
         cos, sin = position_embeddings
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
-        if self.use_ring_attn and not self._disable_ring_attn:
+        use_ring = self.use_ring_attn and not self._disable_ring_attn
+        if use_ring and not _MLA_CP_DECOMPRESS:
             # Proper MLA context parallelism: rotate the compressed latent
             # (normed_kv + shared k_pe) around the ring and decompress on each
             # rank via kv_b, instead of decompressing to full per-head K/V
@@ -418,16 +429,31 @@ class DeepseekV2LiteAttention(nn.Module):
                 bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            attn_output = mla_flash_attn_func(
-                q_nope,
-                q_pe,
-                k_nope,
-                k_pe,
-                value_states,
-                softmax_scale=self.softmax_scale,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                causal=True,
-            )
+            if use_ring:
+                # Legacy MLA CP (PITHTRAIN_MLA_CP=decompress): decompress to full
+                # per-head K/V, then rotate that around the standard zigzag ring.
+                # Operator-equivalent to the pass-latent path; kept for A/B
+                # correctness + throughput comparison.
+                query_states = torch.cat([q_nope, q_pe], dim=-1)
+                key_states = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+                attn_output = ring_attention_func(
+                    query_states,
+                    key_states,
+                    value_states.contiguous(),
+                    sm_scale=self.softmax_scale,
+                    cp_group=self.cp_group,
+                )
+            else:
+                attn_output = mla_flash_attn_func(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    value_states,
+                    softmax_scale=self.softmax_scale,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    causal=True,
+                )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
