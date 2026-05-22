@@ -407,11 +407,13 @@ class DualPipeV(nn.Module):
     def _commit_and_wait_comm(self) -> None:
         if not self.comm_ops:
             return
+        nvtx.range_push("pipeline send/recv")
         reqs = dist.batch_isend_irecv(self.comm_ops)
         for req in reqs:
             req.wait()
         self.comm_ops = []
         self._free_tensors()
+        nvtx.range_pop()
 
     def step(
         self,
