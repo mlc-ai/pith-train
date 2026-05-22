@@ -1,14 +1,4 @@
-"""
-Shared helpers for the analyze-nsys-profile skill scripts.
-
-Conventions used throughout this module:
-
-- pid is the Linux process ID — the per-rank key for every join — extracted
-  via globalTid / 0x1000000 % 0x1000000 (NVTX rows) and
-  globalPid / 0x1000000 % 0x1000000 (kernel rows).
-- All time-based queries filter start >= 0 to scope to the profiled window
-  (pre-cudaProfilerStart events carry negative timestamps).
-"""
+"""Shared helpers for the analyze-nsys-profile skill scripts."""
 
 import bisect
 import re
