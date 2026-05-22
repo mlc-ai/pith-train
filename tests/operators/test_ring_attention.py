@@ -4,10 +4,11 @@ from dataclasses import dataclass, fields
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx
-from pithtrain.operators.flash_attn_v4 import flash_attn_func
-from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, mla_flash_attn_func
+from pithtrain.operators.ring_attention import mla_ring_attention_func, ring_attention_func
 from tests.utilities import cosine_error, launch
 
 
@@ -98,3 +99,130 @@ def test_ring_attention_vs_dense(cp_size: int, req: Request) -> None:
     cfg = DistributedCfg()
     cfg.context_parallel_size = cp_size
     launch(cfg, verify, req)
+
+
+# ---------------------------------------------------------------------------
+# MLA "pass the latent" ring attention.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MLARequest:
+    B: int
+    S: int
+    H: int
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+    atol: float = 1e-3
+    atol_weight: float = 1e-2
+
+
+@dataclass
+class MLAResult:
+    out: torch.Tensor
+    dq_nope: torch.Tensor
+    dq_pe: torch.Tensor
+    d_normed_kv: torch.Tensor
+    d_k_pe: torch.Tensor
+
+
+def record_mla(ctx: DistributedCtx, req: MLARequest):
+    """
+    Reference: full-sequence MLA attention (decompress the latent via kv_b, then dense MLA
+    flash attention) with no CP. Implementation: rotate the compressed latent around the
+    zigzag ring and decompress on each rank. We compare the forward output and the input
+    gradients (dq_nope, dq_pe, d_normed_kv, d_k_pe) on this rank's zigzag slice, plus the
+    kv_b weight gradient -- which is global, so the per-rank partials are summed across CP.
+    """
+    cp_group = ctx.device_mesh.get_group("cp")
+    cp_rank, cp_size = cp_group.rank(), cp_group.size()
+    device = torch.cuda.current_device()
+    H, R = req.H, req.kv_lora_rank
+    nope, rope, vdim = req.qk_nope_head_dim, req.qk_rope_head_dim, req.v_head_dim
+    softmax_scale = (nope + rope) ** -0.5
+    out_features = H * (nope + vdim)
+
+    torch.manual_seed(42)
+    q_nope_full = torch.randn(req.B, req.S, H, nope, device=device, dtype=torch.bfloat16)
+    q_pe_full = torch.randn(req.B, req.S, H, rope, device=device, dtype=torch.bfloat16)
+    normed_kv_full = torch.randn(req.B, req.S, R, device=device, dtype=torch.bfloat16)
+    k_pe_full = torch.randn(req.B, req.S, 1, rope, device=device, dtype=torch.bfloat16)
+    w_full = torch.randn(out_features, R, device=device, dtype=torch.bfloat16) / (R**0.5)
+
+    # Reference: dense full-sequence MLA, no CP.
+    q_nope_r = q_nope_full.clone().requires_grad_(True)
+    q_pe_r = q_pe_full.clone().requires_grad_(True)
+    normed_kv_r = normed_kv_full.clone().requires_grad_(True)
+    k_pe_r = k_pe_full.clone().requires_grad_(True)
+    w_r = w_full.clone().requires_grad_(True)
+    kv = F.linear(normed_kv_r, w_r).view(req.B, req.S, H, nope + vdim)
+    k_nope, value = torch.split(kv, [nope, vdim], dim=-1)
+    out_r = mla_flash_attn_func(
+        q_nope_r,
+        q_pe_r,
+        k_nope.contiguous(),
+        k_pe_r,
+        value.contiguous(),
+        softmax_scale=softmax_scale,
+        qk_nope_head_dim=nope,
+        causal=True,
+    )
+    out_r.sum().backward()
+    ref = MLAResult(
+        extract_zigzag(out_r, cp_rank, cp_size),
+        extract_zigzag(q_nope_r.grad, cp_rank, cp_size),
+        extract_zigzag(q_pe_r.grad, cp_rank, cp_size),
+        extract_zigzag(normed_kv_r.grad, cp_rank, cp_size),
+        extract_zigzag(k_pe_r.grad, cp_rank, cp_size),
+    )
+    dW_ref = w_r.grad
+
+    # Implementation: zigzag-local latent rotated around the ring.
+    q_nope_i = extract_zigzag(q_nope_full, cp_rank, cp_size).clone().requires_grad_(True)
+    q_pe_i = extract_zigzag(q_pe_full, cp_rank, cp_size).clone().requires_grad_(True)
+    normed_kv_i = extract_zigzag(normed_kv_full, cp_rank, cp_size).clone().requires_grad_(True)
+    k_pe_i = extract_zigzag(k_pe_full, cp_rank, cp_size).clone().requires_grad_(True)
+    w_i = w_full.clone().requires_grad_(True)
+    out_i = mla_ring_attention_func(
+        q_nope_i,
+        q_pe_i,
+        normed_kv_i,
+        k_pe_i,
+        w_i,
+        sm_scale=softmax_scale,
+        qk_nope_head_dim=nope,
+        v_head_dim=vdim,
+        cp_group=cp_group,
+    )
+    out_i.sum().backward()
+    imp = MLAResult(out_i, q_nope_i.grad, q_pe_i.grad, normed_kv_i.grad, k_pe_i.grad)
+    # kv_b weight grad is global: sum the per-rank partials across CP (FSDP does this in training).
+    dW_imp = w_i.grad.clone()
+    torch.distributed.all_reduce(dW_imp, group=cp_group)
+
+    return ref, imp, dW_ref, dW_imp
+
+
+def verify_mla(ctx: DistributedCtx, req: MLARequest) -> None:
+    ref, imp, dW_ref, dW_imp = record_mla(ctx, req)
+    for f in fields(ref):
+        error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
+        if error >= req.atol:
+            raise AssertionError(f"{f.name} diverged: {error=:.2e} >= {req.atol=}")
+    werr = cosine_error(dW_ref, dW_imp)
+    if werr >= req.atol_weight:
+        raise AssertionError(f"kv_b_weight_grad diverged: {werr=:.2e} >= {req.atol_weight=}")
+
+
+MLA_REQUESTS = []
+MLA_REQUESTS.append(pytest.param(2, MLARequest(B=1, S=2048, H=16), id="CP2-MLA-S2048"))
+MLA_REQUESTS.append(pytest.param(4, MLARequest(B=1, S=2048, H=16), id="CP4-MLA-S2048"))
+
+
+@pytest.mark.parametrize("cp_size,req", MLA_REQUESTS)
+def test_mla_ring_attention_vs_dense(cp_size: int, req: MLARequest) -> None:
+    cfg = DistributedCfg()
+    cfg.context_parallel_size = cp_size
+    launch(cfg, verify_mla, req)
