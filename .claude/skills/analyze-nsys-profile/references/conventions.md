@@ -41,7 +41,7 @@ Within one chunk you'll find ~5-7 layers' worth of activity in both forward and 
 
 **Analysis window picking rule:** for each rank, filter NVTX ranges where `name LIKE 'forward chunk%backward chunk%'` (the substring match rules out per-stage forward markers like `forward chunk 0 (phase0)`) and the row's pid matches, sort by start time, take the **median-indexed** one. This is steady state — far from the pipeline warmup at the start and drain at the end. Implemented in `find_window.extract_window()`.
 
-Cross-rank: median chunks across ranks land within ~6 ms of each other on the wallclock, so they're suitable for cross-rank correlation (used by `compare_kernel.py`).
+Cross-rank: median chunks across ranks land within ~6 ms of each other on the wallclock, so they're suitable for cross-rank correlation.
 
 ## Layer-stage NVTX
 
@@ -56,7 +56,7 @@ layer<NN>.stage4_f, layer<NN>.stage4_b      # all-to-all COMBINE
 layer<NN>.stage5_f, layer<NN>.stage5_b      # weighted aggregate + residual
 ```
 
-There are also fused ranges at stage boundaries like `layer<NN>_stage5_b_layer<MM>_stage1_b` (DualPipeV merges adjacent backward stages across layers). The helper `stage_of(nvtx_name)` in `scripts/common.py` canonicalizes both plain and fused names to a `stage<N>_<f|b|w>` key; use it instead of writing your own regex.
+There are also fused ranges at stage boundaries like `layer<NN>_stage5_b_layer<MM>_stage1_b` (DualPipeV merges adjacent backward stages across layers). The helper `stage_of(nvtx_name)` in `scripts/common.py` canonicalizes both plain and fused names to a `stage<N>_<f|b|w>` key; use it instead of writing your own regex. For fused ranges it returns the **last** stage marker — so a `stage5_*_stage1_*` fusion is attributed to `stage1_*`, the comm-launching side (matters once CP ring attention adds stage1 comm).
 
 **Direction (`_f` vs `_b`) maps to the corresponding op in that direction:**
 
@@ -100,6 +100,6 @@ Compute streams aren't purpose-labelled: PithTrain shares one stream across all 
 ## Common pitfalls
 
 - **Don't classify by kernel name alone.** `ncclDevKernel_SendRecv` is used by NCCL for both EP all-to-all (implemented internally as point-to-point) AND pipeline-parallel P2P. The difference is stream identity, which you derive from NVTX context.
-- **Don't infer "this kernel is real data movement" from its duration.** Long NCCL kernels can be either real work or straggler waits. Use `compare_kernel.py` to disambiguate via cross-rank durations.
+- **Don't infer "this kernel is real data movement" from its duration.** Long NCCL kernels can be either real work or straggler waits — disambiguate by comparing the kernel's duration across ranks (the straggler is the one ahead/behind the cluster).
 - **Don't sum overlap across the whole step.** Warmup, drain, and optimizer steps dilute the signal. Always use the median-chunk window.
 - **Don't ignore the barrier comm.** NCCL on the compute stream is non-zero (~200-300 ms per rank in a representative capture). It's structurally serial with compute and should be reported separately from overlap-eligible comm.

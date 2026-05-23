@@ -327,7 +327,7 @@ class DualPipeV(nn.Module):
         self._commit_and_wait_comm()
 
         # Assume FIFO
-        nvtx.range_push(f"weight chunk")
+        nvtx.range_push("weight chunk")
         WeightGradStore.pop()
         nvtx.range_pop()
 

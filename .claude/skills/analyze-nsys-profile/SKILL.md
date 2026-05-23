@@ -1,6 +1,6 @@
 ---
 name: analyze-nsys-profile
-description: Query a captured PithTrain Nsight Systems profile to answer specific questions about kernel timing, compute/communication overlap, per-rank behavior, and pipeline structure. Use when the user asks to "analyze an nsys profile", "check overlap quality", "find exposed comm", "compare ranks", "investigate a long NCCL kernel", or any question that begins from an existing `.nsys-rep` file. Tool-first skill — assumes the trace was already captured (see capture-nsys-profile) and provides query primitives the agent composes to answer the specific question being asked.
+description: Query a captured PithTrain Nsight Systems profile to measure compute/communication overlap, locate exposed comm by DualPipeV stage, and inspect per-rank stream behavior. Use when the user asks to "analyze an nsys profile", "check overlap quality", "find exposed comm", "which stage is the bottleneck", or any question that starts from an existing `.nsys-rep` file. Assumes the trace was already captured (see capture-nsys-profile); provides query primitives the agent composes for the specific question being asked.
 ---
 
 # Analyze Nsys Profile
@@ -16,9 +16,7 @@ A passive query toolkit for PithTrain nsys traces. The agent asks a specific que
 ## Step 1 — Export the trace to SQLite
 
 ```bash
-nsys export --type=sqlite --force-overwrite=true \
-    --output=workspace/capture-nsys-profile/pithtrain_node0.sqlite \
-    workspace/capture-nsys-profile/pithtrain_node0.nsys-rep
+nsys export --type=sqlite --force-overwrite=true --output=workspace/capture-nsys-profile/pithtrain_node0.sqlite workspace/capture-nsys-profile/pithtrain_node0.nsys-rep
 ```
 
 All subsequent queries hit the SQLite, not the raw `.nsys-rep`.
@@ -35,15 +33,15 @@ Three primitives establish *who*, *when*, and *what* — every downstream analys
 
 Pipeline: `show_setup` → `find_window` → `classify_streams`. show_setup gives you the mapping `pid ↔ rank ↔ mesh coordinates`; find_window picks the median DualPipeV chunk per rank (deterministic across re-runs, so before/after comparisons are valid); classify_streams identifies which CUDA streams in that window are compute vs comm, and labels the comm streams' purpose (`ep_a2a`, `cp_ring`, `pp_p2p`).
 
-## Step 3 — Run the analysis script for the question
+## Step 3 — Measure overlap per DualPipeV stage
 
-| Question | Primitive |
-|---|---|
-| How well does comm overlap with compute in the steady-state window? | `compute_overlap.py` |
-| Which DualPipeV stage has the worst exposure or the largest idle gaps? | `summarize_stages.py --view exposed`/`gaps` |
-| Is this specific NCCL kernel data movement or a straggler wait? | `compare_kernel.py` |
+```bash
+python .claude/skills/analyze-nsys-profile/scripts/compute_overlap.py workspace/capture-nsys-profile/pithtrain_node0.sqlite
+```
 
-All scripts live under `.claude/skills/analyze-nsys-profile/scripts/` and take the SQLite path as the first positional argument.
+Emits one row per `(rank, stage)` with columns: `pid | stage | exposed_ns | overlap | overlap_min | overlap_max`. The `overlap` column is the time-weighted hidden fraction across the stage's comm kernels; `overlap_min` / `overlap_max` are the extremes of the per-kernel overlap percentage and surface whether the stage is uniformly bad or bimodal.
+
+See [references/examples.md](references/examples.md) for recipes that compose this with the Step 2 primitives.
 
 ## Critical conventions
 
@@ -61,28 +59,22 @@ Before composing a custom SQL query, read [references/conventions.md](references
 Avoid these heuristics — they break across configs:
 
 - "Stream with > N kernels of type X is comm" (N depends on layer count, chunks, seq length).
-- "Kernel duration > T µs means data movement" (long duration can be straggler wait — see `compare_kernel.py`).
+- "Kernel duration > T µs means data movement" (long duration can also be a straggler wait).
 - "Stream with avg µs < threshold is EP" (depends on token volume per rank).
 
 Use these instead:
 
 - One-sided purity check for compute-vs-comm streams.
-- NVTX-context labeling for stream purpose: sample a few kernels per stream, look up the innermost PithTrain stage range, take the mode. Implemented in `classify_streams.py`.
-- Cross-rank duration comparison for the bubble-vs-data question. Implemented in `compare_kernel.py`.
+- NVTX-context labeling for stream purpose: look up the innermost PithTrain stage range enclosing each kernel and require unanimous agreement. Implemented in `classify_streams.py`.
 
 ## Worked examples
 
 See [references/examples.md](references/examples.md) for recipe-style answers to:
 
-- How much EP all-to-all is being overlapped with compute?
-- Which EP phase (dispatch-f/b, combine-f/b) has the worst overlap?
-- Which stage has the largest idle gaps between kernels?
-- Is rank N's long NCCL kernel real comm or a pipeline bubble?
+- How well is each EP phase overlapped with compute?
+- Which EP phase has the worst overlap?
 - Are the PP stages balanced?
-
-## When to dispatch sub-agents
-
-A common pattern: a primary analysis surfaces K interesting kernels (e.g. the top-K longest exposed comm kernels from `compute_overlap.py`). Each kernel can be investigated independently and concurrently. Use the prompt template in [references/subagent-template.md](references/subagent-template.md); each sub-agent runs `compare_kernel.py` on its assigned kernel and reports back with a bubble-vs-data verdict.
+- Which (rank, stage) carries the most exposed comm?
 
 ## Output guidance
 
@@ -95,7 +87,7 @@ A common pattern: a primary analysis surfaces K interesting kernels (e.g. the to
 
 - **`classify_streams.py` only reports streams active in the analysis window**, not every stream that exists in the trace. A rank typically has 6-8 streams overall but only 2-3 inside a single steady-state chunk. This is intentional — analyzing a small window does not need the inactive streams.
 - **PP P2P kernels rarely appear in a single chunk window** — they fire between chunks. Widen the window (`--start NS --end NS` on the analysis script) if you specifically want to see the PP P2P comm stream.
-- **`hidden_pct` and `exposed_pct` are both 0-100** (not 0-1 fractions). Both `compute_overlap.py` and `summarize_stages.py` follow this convention.
+- **`compute_overlap.py`'s percent cells include a trailing `%`** (`58.4%`, not `0.584`). Sort/compare numerically by stripping the `%` first. Absolute time columns (`exposed_ns`) are bare integer nanoseconds.
 - **CPU launch time vs GPU execution time** — for any NVTX-context lookup on a kernel, use `kernel["launch_start"]` (CPU-side `cudaLaunchKernel` time) rather than `kernel["start"]` (GPU-side execution time). All scripts already do this; if you write an ad-hoc query, call `common.innermost_nvtx` on launch_start values.
 - **Comm-stream purpose uses unanimity, not majority** — every kernel on the stream must agree on its enclosing-NVTX category, otherwise the label is `mixed`. A single mis-categorized kernel surfaces as `mixed` instead of silently being out-voted.
 
@@ -105,9 +97,9 @@ A common pattern: a primary analysis surfaces K interesting kernels (e.g. the to
 
 The `.nsys-rep` has not been exported yet. Run the `nsys export` command from Step 1.
 
-### Overlap headline looks wrong (e.g. PP P2P inflating "comm time")
+### PP P2P comm is missing from the overlap output
 
-You probably summed across all streams without classifying. PP P2P recv kernels block on remote sends — they are pipeline-bubble waits, not overlap candidates. Run `classify_streams.py` first to identify which streams carry EP a2a, then run `compute_overlap.py` per comm stream.
+By design. `compute_overlap.py` buckets kernels by their enclosing PithTrain stage NVTX (`stage1_*` through `stage5_*`); PP P2P kernels live inside the `pipeline send/recv` wrapper, which is not a stage marker, so they are filtered out. Widen the window with `--start NS --end NS` if you need to investigate them — they typically fire between chunks, not inside.
 
 ### Negative timestamps on NVTX events
 
