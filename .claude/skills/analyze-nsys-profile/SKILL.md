@@ -94,7 +94,6 @@ A common pattern: a primary analysis surfaces K interesting kernels (e.g. the to
 ## Gotchas (surfaced by prior agent runs)
 
 - **`classify_streams.py` only reports streams active in the analysis window**, not every stream that exists in the trace. A rank typically has 6-8 streams overall but only 2-3 inside a single steady-state chunk. This is intentional — analyzing a small window does not need the inactive streams.
-- **`--exposed-top N` in `compute_overlap.py` is per-rank**, not global. Set N high (100+) before aggregating across ranks. In PP=2/EP=4 a single chunk only has ~24 comm kernels, so any reasonable N is non-truncating.
 - **PP P2P kernels rarely appear in a single chunk window** — they fire between chunks. Widen the window (`--start NS --end NS` on the analysis script) if you specifically want to see the PP P2P comm stream.
 - **`hidden_pct` and `exposed_pct` are both 0-100** (not 0-1 fractions). Both `compute_overlap.py` and `summarize_stages.py` follow this convention.
 - **CPU launch time vs GPU execution time** — for any NVTX-context lookup on a kernel, use `kernel["launch_start"]` (CPU-side `cudaLaunchKernel` time) rather than `kernel["start"]` (GPU-side execution time). All scripts already do this; if you write an ad-hoc query, call `common.innermost_nvtx` on launch_start values.

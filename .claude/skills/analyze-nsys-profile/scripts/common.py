@@ -146,14 +146,17 @@ def sweep_overlap(set_a: list[tuple[int, int]], set_b: list[tuple[int, int]]) ->
 
 def stage_of(nvtx_name: str | None) -> str | None:
     """
-    Canonicalize an NVTX range name to a stage<N>_<f|b|w> key. Handles plain ranges like
-    layer13.stage3_b and DualPipeV's fused boundary ranges like layer05_stage5_b_layer04_stage1_b
-    by taking the FIRST stage marker. Returns None for non-stage ranges (NCCL emissions, etc.).
+    Canonicalize an NVTX range name to a stage<N>_<f|b|w> key. For DualPipeV's fused boundary
+    ranges (e.g. layer05_stage5_b_layer06_stage1_b), returns the LAST stage marker -- the
+    comm-launching side of stage5+stage1 fusions is always stage1 (matters once CP ring
+    attention adds stage1 comm). Returns None for non-stage ranges.
     """
     if nvtx_name is None:
         return None
-    match = STAGE_PATTERN.search(nvtx_name)
-    return f"stage{match.group(1)}_{match.group(2)}" if match else None
+    matches = STAGE_PATTERN.findall(nvtx_name)
+    if not matches:
+        return None
+    return f"stage{matches[-1][0]}_{matches[-1][1]}"
 
 
 def innermost_nvtx(
