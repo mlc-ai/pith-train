@@ -16,7 +16,7 @@ RDZV_HOST=$(command -v scontrol &>/dev/null && scontrol show hostnames $SLURM_ST
 NSYS_ARGS=()
 NSYS_ARGS+=(profile)
 NSYS_ARGS+=(--stats=false)
-NSYS_ARGS+=(--trace=cuda,osrt,nvtx)
+NSYS_ARGS+=(--trace=cuda,nvtx)
 NSYS_ARGS+=(--force-overwrite=true)
 NSYS_ARGS+=(--output=$OUTDIR/pithtrain_node${SLURM_NODEID})
 NSYS_ARGS+=(--cuda-graph-trace=node)

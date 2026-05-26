@@ -147,7 +147,7 @@ class DualPipeV(nn.Module):
 
         is_last_stage = self.is_first_pp_rank and phase == 1
 
-        nvtx.range_push(f"rank {self.rank} forward chunk {chunk_id} (phase{phase})")
+        nvtx.range_push(f"forward chunk {chunk_id} (phase{phase})")
         # Set pre-allocated intermediate_tensors on module to avoid FSDP kwarg handling issues
         intermediate_tensors = self.intermediate_tensors_chunks[phase][chunk_id]
         self.module[phase]._intermediate_tensors = intermediate_tensors
@@ -175,7 +175,7 @@ class DualPipeV(nn.Module):
 
         is_last_stage = self.is_first_pp_rank and phase == 1
 
-        nvtx.range_push(f"rank {self.rank} backward chunk {chunk_id} (phase{phase})")
+        nvtx.range_push(f"backward chunk {chunk_id} (phase{phase})")
         WeightGradStore.enabled = enable_zb
         if is_last_stage:
             loss = self.loss_chunks[chunk_id]
@@ -254,7 +254,7 @@ class DualPipeV(nn.Module):
 
         # forward & backward (intermediate_tensors0 is modified in place)
         nvtx.range_push(
-            f"rank {self.rank} overlapped forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
+            f"forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
         )
         outputs0, loss0, input_grads1 = overlapped_forward_backward(
             module0,
@@ -327,7 +327,7 @@ class DualPipeV(nn.Module):
         self._commit_and_wait_comm()
 
         # Assume FIFO
-        nvtx.range_push(f"rank {self.rank} weight chunk")
+        nvtx.range_push("weight chunk")
         WeightGradStore.pop()
         nvtx.range_pop()
 
@@ -407,11 +407,13 @@ class DualPipeV(nn.Module):
     def _commit_and_wait_comm(self) -> None:
         if not self.comm_ops:
             return
+        nvtx.range_push("pipeline send/recv")
         reqs = dist.batch_isend_irecv(self.comm_ops)
         for req in reqs:
             req.wait()
         self.comm_ops = []
         self._free_tensors()
+        nvtx.range_pop()
 
     def step(
         self,
