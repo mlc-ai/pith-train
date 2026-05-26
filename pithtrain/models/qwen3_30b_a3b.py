@@ -346,7 +346,6 @@ class Qwen3MoeAttention(nn.Module):
         self.scaling = head_dim**-0.5
         self.cp_group = cp_group
         self.use_ring_attn = cp_group is not None and cp_group.size() > 1
-        self._disable_ring_attn = False
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
@@ -393,7 +392,7 @@ class Qwen3MoeAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if not self.use_ring_attn or self._disable_ring_attn:
+        if not self.use_ring_attn:
             attn_output = flash_attn_func(
                 query_states,
                 key_states,
@@ -633,14 +632,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if position_embeddings is None:
             raise RuntimeError("Position embeddings must be set before calling reference_forward")
 
-        self.self_attn._disable_ring_attn = True
-        try:
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-            )
-        finally:
-            self.self_attn._disable_ring_attn = False
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states

@@ -603,10 +603,6 @@ class MLAZigzagRingAttention(torch.autograd.Function):
             raise ValueError("MLA ring attention requires contiguous normed_kv and k_pe")
         if q_nope.shape[1] % 2:
             raise ValueError(f"zigzag layout needs even local seq len, got {q_nope.shape[1]}")
-        if get_world_size(cp_group) < 2:
-            raise ValueError(
-                f"MLA ring attention requires cp_size >= 2, got {get_world_size(cp_group)}"
-            )
         out, lse = mla_zigzag_forward(
             q_nope,
             q_pe,
