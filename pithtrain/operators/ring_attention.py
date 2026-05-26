@@ -364,7 +364,11 @@ def _mla_decompress(
     kv = F.linear(normed_kv, kv_b_weight)
     kv = kv.view(b, n, num_heads, qk_nope_head_dim + v_head_dim)
     k_nope, value = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
-    return k_nope.contiguous(), value.contiguous()
+    # k_nope is consumed only by `torch.cat([k_nope, k_pe.expand(...)], dim=-1)`, which
+    # materialises a fresh contiguous output regardless of input strides -- the .contiguous()
+    # would be a redundant copy. value goes straight into _flash_attn_{fwd,bwd}, which require
+    # contiguous K/V on the FA4 cute path, so the asymmetry is intentional.
+    return k_nope, value.contiguous()
 
 
 def mla_zigzag_forward(
@@ -385,6 +389,9 @@ def mla_zigzag_forward(
     block = q_nope.shape[1] // 2
 
     q = torch.cat([q_nope, q_pe], dim=-1)
+    # q_back is a strided view (kept non-contiguous in forward to match the standard zigzag
+    # ring at line 144 -- FA4 forward tolerates strided q). Backward explicitly contiguous-ifies
+    # the same slice (line 462) because FA4 backward has tighter strider requirements on q.
     q_back = q[:, block:]
 
     out: Optional[torch.Tensor] = None
@@ -540,6 +547,11 @@ def mla_zigzag_backward(
 
         # Latent gradient ring (mirrors the standard dk/dv ring, on the 576-d latent).
         if step == 0:
+            # `d_nkv` aliases `d_nkv_blk` (the fp32 matmul output). Safe as a send buffer
+            # for `post_ring_kv` below because subsequent iterations rebind d_nkv_blk to a
+            # fresh matmul result -- the step-0 buffer is never mutated before step-1's
+            # wait_ring(grad_work). If a future refactor adds in-place ops on d_nkv_blk,
+            # replace these with .clone() to break the alias.
             d_nkv = d_nkv_blk
             d_kpe = d_kpe_blk
         else:
@@ -569,7 +581,7 @@ def mla_zigzag_backward(
         dq_pe.contiguous().to(dtype),
         incoming_dnkv.to(dtype),
         incoming_dkpe.to(dtype),
-        dW.to(dtype),
+        dW,
     )
 
 
@@ -591,6 +603,10 @@ class MLAZigzagRingAttention(torch.autograd.Function):
             raise ValueError("MLA ring attention requires contiguous normed_kv and k_pe")
         if q_nope.shape[1] % 2:
             raise ValueError(f"zigzag layout needs even local seq len, got {q_nope.shape[1]}")
+        if get_world_size(cp_group) < 2:
+            raise ValueError(
+                f"MLA ring attention requires cp_size >= 2, got {get_world_size(cp_group)}"
+            )
         out, lse = mla_zigzag_forward(
             q_nope,
             q_pe,

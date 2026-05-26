@@ -117,6 +117,11 @@ class MLARequest:
     v_head_dim: int = 128
     atol: float = 1e-3
     atol_weight: float = 1e-2
+    # Relative-error tolerance for the kv_b weight gradient. Cosine is scale-invariant
+    # and would hide a uniform magnitude bug (e.g. a missed cross-CP sum), so we ALSO
+    # require ||dW_imp - dW_ref|| / ||dW_ref|| < rtol_weight. Bf16-noise floor at the
+    # sizes we test (S<=2048, H<=16, R=512) is ~5e-3.
+    rtol_weight: float = 1e-2
 
 
 @dataclass
@@ -211,9 +216,19 @@ def verify_mla(ctx: DistributedCtx, req: MLARequest) -> None:
         error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
         if error >= req.atol:
             raise AssertionError(f"{f.name} diverged: {error=:.2e} >= {req.atol=}")
-    werr = cosine_error(dW_ref, dW_imp)
+    # Promote to fp32 for the dW comparison: the implementation now returns dW in fp32
+    # (kept full-precision through FSDP's fp32 reduce-scatter), while the reference is
+    # bf16 from autograd through F.linear -- norm/dot are dtype-sensitive at small mags.
+    dW_ref_f = dW_ref.to(torch.float32)
+    dW_imp_f = dW_imp.to(torch.float32)
+    werr = cosine_error(dW_ref_f, dW_imp_f)
     if werr >= req.atol_weight:
         raise AssertionError(f"kv_b_weight_grad diverged: {werr=:.2e} >= {req.atol_weight=}")
+    rel = ((dW_imp_f - dW_ref_f).norm() / dW_ref_f.norm()).item()
+    if rel >= req.rtol_weight:
+        raise AssertionError(
+            f"kv_b_weight_grad relative error too large: {rel=:.2e} >= {req.rtol_weight=}"
+        )
 
 
 MLA_REQUESTS = []

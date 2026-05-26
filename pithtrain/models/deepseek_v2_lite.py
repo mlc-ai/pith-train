@@ -32,8 +32,14 @@ from pithtrain.operators.token_scatter import (
 # (rotate the compressed KV latent, decompress locally). Set PITHTRAIN_MLA_CP=decompress
 # for the legacy path (decompress to full per-head K/V, then standard zigzag ring). The
 # two are operator-equivalent; the flag exists for A/B correctness + throughput comparison.
-_MLA_CP_DECOMPRESS = os.environ.get("PITHTRAIN_MLA_CP", "latent") == "decompress"
-if _MLA_CP_DECOMPRESS:
+# Read at every forward call so tests / harnesses can toggle via os.environ at runtime.
+
+
+def _use_mla_cp_decompress() -> bool:
+    return os.environ.get("PITHTRAIN_MLA_CP", "latent") == "decompress"
+
+
+if _use_mla_cp_decompress() and int(os.environ.get("RANK", "0")) == 0:
     # Self-document the non-default path so A/B logs confirm the flag took effect.
     print("[pithtrain] MLA context-parallel attention: legacy decompress-then-ring", flush=True)
 
@@ -408,7 +414,7 @@ class DeepseekV2LiteAttention(nn.Module):
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
         use_ring = self.use_ring_attn and not self._disable_ring_attn
-        if use_ring and not _MLA_CP_DECOMPRESS:
+        if use_ring and not _use_mla_cp_decompress():
             # Proper MLA context parallelism: rotate the compressed latent
             # (normed_kv + shared k_pe) around the ring and decompress on each
             # rank via kv_b, instead of decompressing to full per-head K/V
