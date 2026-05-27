@@ -6,6 +6,17 @@ import torch
 import torch.distributed
 
 
+def _expert_token_counts(idx_flat: torch.Tensor, n_bins: int) -> torch.Tensor:
+    """Equivalent to ``torch.bincount(idx_flat, minlength=n_bins)`` but without
+    the synchronous ``input.max().item()`` that ATen's CUDA bincount issues to
+    size its output. Assumes all values in ``[0, n_bins)``."""
+    out = torch.zeros(n_bins, dtype=torch.long, device=idx_flat.device)
+    # Stride-0 view of a single 1 avoids materializing a full-size ones tensor.
+    ones = torch.ones(1, dtype=torch.long, device=idx_flat.device).expand_as(idx_flat)
+    out.scatter_add_(0, idx_flat, ones)
+    return out
+
+
 class MoELoadBalanceLossInjector(torch.autograd.Function):
     """
     Attach a load balance loss to the computation graph. The output tensor
@@ -45,7 +56,7 @@ class MicroBatchLoadBalanceLoss:
     ) -> torch.Tensor:
         num_tokens = scores.shape[0]
 
-        tokens_per_expert = torch.bincount(topk_idx.reshape(-1), minlength=num_experts)
+        tokens_per_expert = _expert_token_counts(topk_idx.reshape(-1), num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype)
         f = tokens_per_expert / (num_tokens * top_k)
         p = scores.mean(dim=0)
@@ -99,7 +110,7 @@ class GlobalBatchLoadBalanceLoss:
     ) -> torch.Tensor:
         num_tokens = scores.shape[0]
 
-        tokens_per_expert = torch.bincount(topk_idx.reshape(-1), minlength=num_experts)
+        tokens_per_expert = _expert_token_counts(topk_idx.reshape(-1), num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype)
 
         # Synchronise counts across DP x EP ranks.
@@ -167,7 +178,7 @@ class SequenceLevelLoadBalanceLoss:
         batch_offsets = torch.arange(bsz, device=topk_idx.device)
         batch_offsets = batch_offsets.unsqueeze(1).expand(-1, sequence_length * top_k) * num_experts
         flat_idx = topk_idx.view(bsz, -1) + batch_offsets
-        tokens_per_expert = torch.bincount(flat_idx.reshape(-1), minlength=bsz * num_experts)
+        tokens_per_expert = _expert_token_counts(flat_idx.reshape(-1), bsz * num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype).view(bsz, num_experts)
 
         tokens_per_expert = self._all_reduce_expert_counts(tokens_per_expert)
