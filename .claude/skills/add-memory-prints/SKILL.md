@@ -12,7 +12,7 @@ Add comprehensive memory profiling instrumentation to the pithtrain training fra
 
 Parse the following from `$ARGUMENTS`:
 
-1. **model** (required): Model name matching a file under `pithtrain/models/` (e.g., `qwen3-30b-a3b` maps to `pithtrain/models/qwen3_30b_a3b.py`).
+1. **model** (required): Model name matching a file under `pithtrain/models/` (e.g., `qwen3-moe` maps to `pithtrain/models/qwen3_moe.py`).
 2. **--ranks** (optional, default: `{0}`): Comma-separated GPU **global** ranks to print on. E.g., `--ranks 3,14` becomes the Python set `{3, 14}`. If not provided, defaults to `{0}`.
 3. **--detail-layers** (optional, default: auto): Comma-separated layer indices for fine-grained per-layer profiling. If omitted, auto-select by reading the model file to find the MoE-vs-dense layer condition, then pick the first MoE layer and the next one (2 layers total).
 

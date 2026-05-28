@@ -1,4 +1,4 @@
-"""Pretrain Qwen3-30B-A3B with 2-way pipeline parallelism and 8-way expert parallelism."""
+"""Pretrain Qwen3-30B-A3B on a single 8-GPU H200/B200 node with 8-way expert parallelism."""
 
 from pathlib import Path
 
@@ -7,9 +7,11 @@ from pithtrain.tasks.pretrain_language_model import PretrainLanguageModelCfg, la
 
 cfg = PretrainLanguageModelCfg()
 
+# Fits a single 8-GPU H200/B200 node. On 8xH100 (80GB) this does not fit; use
+# two nodes with pp=2, ep=8 (16 GPUs).
 distributed = cfg.distributed
 distributed.context_parallel_size = 1
-distributed.pipeline_parallel_size = 2
+distributed.pipeline_parallel_size = 1
 distributed.expert_parallel_size = 8
 
 training = cfg.training

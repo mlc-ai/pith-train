@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="131 28 351 304" role="img" aria-label="PithTrain">
+  <title>PithTrain</title>
+  <defs>
+    <linearGradient id="auroraD" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#14B8A6"/>
+      <stop offset="48%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#60A5FA"/>
+    </linearGradient>
+    <linearGradient id="trainBody" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="58%" stop-color="#F1F5F9"/>
+      <stop offset="100%" stop-color="#CBD5E1"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(290, 180)">
+    <path d="M -62 -107.4 A 124 124 0 1 1 -119.2 -34.2" fill="none" stroke="url(#auroraD)" stroke-width="28" stroke-linecap="round" opacity="0.92"/>
+    <polygon points="-106.7,-77.8 -98.9,-19.3 -144.3,-32.3" fill="#60A5FA"/>
+    <g transform="translate(30,0) scale(1.12)">
+      <path d="M -89.2 -40 Q -100 -40 -100 -30 L -100 30 Q -100 40 -89.2 40 L 94.4 40 C 112.4 40 123.2 33.3 127.7 20 C 130.4 10.8 130.4 -5.8 126.8 -16.7 C 110.6 -33.3 54.8 -40 -6.4 -40 Z" fill="url(#trainBody)" stroke="#0f172a" stroke-width="5" stroke-linejoin="round"/>
+      <path d="M -85.6 -30 C -35.2 -35 40.4 -35.8 107 -23.3" fill="none" stroke="#94a3b8" stroke-width="3.5" stroke-linecap="round" opacity="0.5"/>
+      <path d="M 47.6 -30 C 78.2 -34.2 108.8 -31.7 125 -19.2 C 126.8 -10.8 114.2 -6.7 90.8 -8.3 C 67.4 -10 56.6 -18.3 47.6 -30 Z" fill="#1e293b"/>
+      <path d="M 56.6 -19.2 C 83.6 -23.3 112.4 -20.8 123.2 -14.2" fill="none" stroke="#f8fafc" stroke-width="2.4" stroke-linecap="round"/>
+      <rect x="-85.6" y="-8" width="21.6" height="12" rx="2.5" fill="#1e293b"/>
+      <rect x="-49.6" y="-8" width="21.6" height="12" rx="2.5" fill="#1e293b"/>
+      <rect x="-13.6" y="-8" width="21.6" height="12" rx="2.5" fill="#1e293b"/>
+      <rect x="22.4" y="-8" width="21.6" height="12" rx="2.5" fill="#1e293b"/>
+      <circle cx="116.9" cy="14" r="4.5" fill="#f8fafc"/>
+      <line x1="-89.2" y1="32" x2="76.4" y2="32" stroke="#0f172a" stroke-width="4.5" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

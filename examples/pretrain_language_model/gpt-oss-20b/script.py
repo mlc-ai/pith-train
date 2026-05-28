@@ -6,8 +6,8 @@ from pithtrain.tasks.pretrain_language_model import PretrainLanguageModelCfg, la
 cfg = PretrainLanguageModelCfg()
 
 cfg.distributed.context_parallel_size = 1
-cfg.distributed.pipeline_parallel_size = 2
-cfg.distributed.expert_parallel_size = 4
+cfg.distributed.pipeline_parallel_size = 1
+cfg.distributed.expert_parallel_size = 8
 
 cfg.training.model = Path("examples/pretrain_language_model/gpt-oss-20b/config.json")
 cfg.training.optimizer = "Adam"

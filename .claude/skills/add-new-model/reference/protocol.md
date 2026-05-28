@@ -3,7 +3,7 @@
 This reference defines the contract every new model must satisfy. It also
 covers the model-level `forward` / `backward` and the critical
 stage-record copy pattern. Keep `pithtrain/models/interface.py` and an
-existing model (`pithtrain/models/qwen3_30b_a3b.py` is cleanest) open
+existing model (`pithtrain/models/qwen3_moe.py` is cleanest) open
 alongside this file while writing.
 
 ## The five stages

@@ -1,4 +1,4 @@
-"""Pretrain DeepSeek-V2-Lite with 2-way pipeline parallelism and 2-way expert parallelism."""
+"""Pretrain DeepSeek-V2-Lite on a single 8-GPU node with 8-way expert parallelism."""
 
 from pathlib import Path
 
@@ -9,8 +9,8 @@ cfg = PretrainLanguageModelCfg()
 
 distributed = cfg.distributed
 distributed.context_parallel_size = 1
-distributed.pipeline_parallel_size = 2
-distributed.expert_parallel_size = 2
+distributed.pipeline_parallel_size = 1
+distributed.expert_parallel_size = 8
 
 training = cfg.training
 training.model = Path("examples/pretrain_language_model/deepseek-v2-lite/config.json")

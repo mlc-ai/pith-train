@@ -1,17 +1,22 @@
-<h1 align="center">PithTrain</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/_static/img/pithtrain-logo-text-dark.png">
+    <img alt="PithTrain" src="docs/_static/img/pithtrain-logo-text-light.png" width="480">
+  </picture>
+</p>
 
-<p align="center"><strong>Compact and Agent-Native MoE Training System</strong></p>
+<h3 align="center">Compact and Agent-Native MoE Training System</h3>
 
 Production MoE training frameworks deliver peak throughput and broad model coverage, but evolving them for new architectures or system optimizations remains expensive. Meanwhile, the design patterns that make these stacks work for humans, such as plugin systems, registry-based indirection, and heavy compiled extensions, are harder for AI coding agents to navigate.
 
-PithTrain is an MoE training framework designed agent-native from the start: ~10K lines of Python, no implicit indirection, with shipped agent skills for recurring tasks. It delivers production-grade performance, including 4D parallelism, compute-communication overlap, and FP8 training, in a codebase compact enough that an agent (or a human) can read it end-to-end.
+PithTrain is an MoE training framework designed agent-native from the start: ~11K lines of Python, minimal implicit indirection, with shipped agent skills for recurring tasks. It delivers production-grade performance, including 4D parallelism, compute-communication overlap, and FP8 training, in a codebase compact enough that an agent (or a human) can read it end-to-end.
 
 ## Installation
 
-NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA 13.0 and Python >= 3.12 are required. We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
+NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Python >= 3.12 are required. We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
 
 ```bash
-git clone https://github.com/mlc-ai/Pith-Train.git && cd Pith-Train
+git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
 uv venv  # skip if you already have a virtual environment
 ```
 
@@ -59,10 +64,12 @@ bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b
 
 Convert a training checkpoint to standard Hugging Face format for evaluation or inference. The same tool also supports importing Hugging Face checkpoints for continued pretraining.
 
+For hardware requirements, supported models, scaling and multi-node runs, troubleshooting, etc., see the [User Guide](docs/user-guide.md).
+
 ## Architecture
 
 <p align="center">
-  <img src="docs/PithTrain-arch.svg" width="100%">
+  <img src="docs/_static/img/PithTrain-arch.svg" width="100%">
 </p>
 
 PithTrain is structured in three layers:
@@ -75,6 +82,12 @@ PithTrain is structured in three layers:
   - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x FSDP x CP x EP).
   - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
 - **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton).
+
+For a developer-level tour of the system — the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc. — see [`docs/architecture.md`](docs/architecture.md).
+
+## Contributing
+
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc.
 
 ## Acknowledgement
 

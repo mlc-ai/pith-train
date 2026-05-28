@@ -22,7 +22,7 @@ from pithtrain.config import SlottedDefault
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
 from pithtrain.models.gpt_oss import GptOssModel
-from pithtrain.models.qwen3_30b_a3b import Qwen3MoeModel
+from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
 
@@ -80,7 +80,7 @@ class TrainingCfg(SlottedDefault):
     """
     The model to use for training. Can be a HuggingFace model ID
     (e.g. ``"Qwen/Qwen3-30B-A3B"``) or a local path to a config JSON file
-    (e.g. ``"examples/.../qwen3_30b_a3b_config.json"``).
+    (e.g. ``"examples/pretrain_language_model/qwen3-30b-a3b/config.json"``).
     """
 
     save_interval: Optional[int] = None

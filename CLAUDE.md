@@ -33,24 +33,21 @@ pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
-pytest tests/test_ring_attention.py tests/test_layer_partition.py -v
-pytest tests/operators/mla/test_triton.py -v
+pytest tests/operators/test_ring_attention.py tests/test_layer_partition.py -v
 
 # Single test function
 pytest tests/test_fp8_quantize_kernels.py::test_name -v
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
 bash tests/test_fsdp.sh
-
-# Inference tests must also go through DualPipeV (.step(forward_only=True))
-pytest tests/test_gpt_oss_single_gpu.py -v
 ```
 
 ### Benchmarks
 
 ```bash
 python3 -m benchmarks.operators.fp8.test_deepgemm
-python3 -m benchmarks.operators.mla.test_triton
+# ring attention: multi-GPU launcher (torchrun), scenario = <model>-cp<N>-s<N>k
+bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
 ```
 
 ### Training & Data Prep
@@ -78,7 +75,7 @@ python -m tools.memory_estimator --help   # peak-memory simulator for a given pa
 
 ### DualPipeV Pipeline (`pithtrain/dualpipe/`)
 
-The core pipeline runs two model replicas with overlapped forward-backward execution across micro-batches. Each transformer layer is split into 5 stages:
+The core pipeline assigns each rank two model chunks in a V-shape (the model is cut into `2 * pp_size` chunks; rank `r` holds chunks `r` and `2*pp_size-1-r`) and overlaps forward and backward execution across micro-batches. Each transformer layer is split into 5 stages:
 
 1. **Attention** — LayerNorm + Attention + LayerNorm + Expert routing
 2. **Dispatch** — All-to-all send tokens to assigned experts (async on comm stream)
@@ -101,17 +98,17 @@ Key files:
 
 ### Distributed Parallelism (`pithtrain/modules/distributed.py`)
 
-Four dimensions: Pipeline Parallel (PP), Expert Parallel (EP), Context Parallel (CP, ring attention), Data Parallel (DP via FSDP2 `fully_shard`). Configured through `DistributedCfg`. `pithtrain/modules/shutdown.py` installs fast-fail cleanup + a 180s NCCL heartbeat so a failed rank does not make peers wait on the watchdog.
+Four dimensions: Pipeline Parallel (PP), Expert Parallel (EP), Context Parallel (CP, ring attention), Data Parallel (DP via FSDP2 `fully_shard`). PP/CP/EP are configured through `DistributedCfg`; DP is inferred from the world size. The `(PP, DP, CP, EP)` device mesh and process groups are built in `setup_device_mesh`/`setup_default_process_group`. The same module installs a fail-fast excepthook plus an NCCL heartbeat timeout (driven by `DistributedCfg.timeout`, default 15 min) so a failed rank does not make peers wait on the watchdog.
 
 ### Model Layer Protocol (`pithtrain/models/interface.py`)
 
-Models implement `ModelProtocol` with layers that expose `forward_attn`, `forward_mlp`, `forward_aggregate` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2_lite.py`), Qwen3-30B-A3B (`qwen3_30b_a3b.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+Models implement `ModelProtocol` with layers that expose `forward_attn`, `forward_mlp`, `forward_aggregate` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2_lite.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
 
 ### Optimized Operators (`pithtrain/operators/`)
 
-- **MLA** (`mla/`) — Multi-head Latent Attention (Triton + TileLang)
-- **Ring Attention** (`ring_attention/`) — `standard.py` and `mla.py` for context parallelism
+- **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
 - **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
+- **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2_lite.py`), with MLA-aware ring attention in `ring_attention.py`
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
@@ -137,8 +134,8 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 ## Config Base Classes
 
-`pithtrain/config.py` defines `SlottedDefault` — all config/context dataclasses inherit from this. Uses `__init_subclass__` to enforce `slots=True` and provides default initialization.
+`pithtrain/config.py` defines `SlottedDefault` — all config/context dataclasses inherit from this. Subclasses are declared `@dataclass(init=False, slots=True)`; `SlottedDefault.__init__` auto-applies every field's default (leaving required fields unset), and `to_json_dict()` returns a JSON-serializable representation.
 
 ## Agent Skills
 
-This repo ships agent-native workflows under `.claude/skills/` (e.g. `add-new-model`, `capture-nsys-profile`, `validate-correctness`, `estimate-memory`, `setup-benchmark-inputs`, `add-memory-prints`, `launch-with-slurm`). When the user's request matches one of those, invoke the skill rather than re-deriving the workflow from scratch.
+This repo ships agent-native workflows under `.claude/skills/` (`add-new-model`, `add-memory-prints`, `capture-nsys-profile`, `analyze-nsys-profile`, `validate-correctness`, `estimate-memory`, `setup-benchmark-inputs`, `launch-with-slurm`). When the user's request matches one of those, invoke the skill rather than re-deriving the workflow from scratch.

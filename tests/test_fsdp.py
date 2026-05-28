@@ -21,7 +21,7 @@ from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2LiteMoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
-from pithtrain.models.qwen3_30b_a3b import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 
 

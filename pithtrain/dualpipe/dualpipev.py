@@ -579,9 +579,8 @@ class DualPipeV(nn.Module):
                             fsdp_param.to_accumulated_grad_if_needed()
                     state._fsdp_param_group.post_backward()
 
-            # it would be much better if pipelining backward invoked .backward so autograd hooks
-            # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
-            # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
+            # Pipeline backward bypasses .backward(), so FSDP's autograd hooks never fire. Call its
+            # post-backward callback manually to sync grad reduction ops back to the default stream.
             fsdp_state._root_post_backward_final_callback()
 
         for module in self.module:
