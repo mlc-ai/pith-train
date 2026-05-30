@@ -18,16 +18,9 @@ if [ $# -ne 1 ]; then
 fi
 
 # Setup distributed.
-SLURM_NNODES=${SLURM_NNODES:-1}
-SLURM_NODEID=${SLURM_NODEID:-0}
-SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-${CUDA_VISIBLE_DEVICES:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd,)}}
-SLURM_STEP_NODELIST=${SLURM_STEP_NODELIST:-$(hostname)}
-
 LAUNCH_ARGS=()
-LAUNCH_ARGS+=(--nnodes=$SLURM_NNODES --node-rank=$SLURM_NODEID)
-LAUNCH_ARGS+=(--nproc-per-node=$(echo "$SLURM_STEP_GPUS" | tr ',' '\n' | wc -l))
-LAUNCH_ARGS+=(--rdzv-backend=c10d)
-LAUNCH_ARGS+=(--rdzv-endpoint=$(command -v scontrol &>/dev/null && scontrol show hostnames $SLURM_STEP_NODELIST | head -n 1 || echo localhost):15213)
+LAUNCH_ARGS+=(--nnodes=${SLURM_NNODES:-1} --node-rank=${SLURM_NODEID:-0} --nproc-per-node=gpu)
+LAUNCH_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=${SLURM_LAUNCH_NODE_IPADDR:-localhost}:15213)
 
 # Launch the training.
 SCRIPT=examples/pretrain_language_model/$1/script.py
