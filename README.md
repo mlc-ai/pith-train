@@ -7,6 +7,12 @@
 
 <h3 align="center">Compact and Agent-Native MoE Training System</h3>
 
+<p align="center">
+  <a href="https://blog.mlc.ai/2026/06/01/pithtrain-compact-agent-native-moe-training-system">Blog</a>
+  &nbsp;|&nbsp;
+  <a href="https://arxiv.org/abs/2605.31463">Paper</a>
+</p>
+
 Production MoE training frameworks deliver peak throughput and broad model coverage, but evolving them for new architectures or system optimizations remains expensive. Meanwhile, the design patterns that make these stacks work for humans, such as plugin systems, registry-based indirection, and heavy compiled extensions, are harder for AI coding agents to navigate.
 
 PithTrain is an MoE training framework designed agent-native from the start: ~11K lines of Python, minimal implicit indirection, with shipped agent skills for recurring tasks. It delivers production-grade performance, including 4D parallelism, compute-communication overlap, and FP8 training, in a codebase compact enough that an agent (or a human) can read it end-to-end.
@@ -92,6 +98,22 @@ Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the devel
 ## Acknowledgement
 
 PithTrain is developed by contributors from CMU. It is built on top of DeepSeek's [DualPipe](https://github.com/deepseek-ai/DualPipe), which provides the original pipeline parallelism schedule and examples. We thank the [CMU Foundation and Language Model (FLAME) Center](https://www.cmu.edu/flame/) for providing the compute resources to develop PithTrain. We also acknowledge the support of DGX B200 from NVIDIA.
+
+## Citation
+
+If you find PithTrain useful in your research, please consider citing:
+
+```bibtex
+@misc{pithtrain2026,
+  title={PithTrain: A Compact and Agent-Native MoE Training System},
+  author={Ruihang Lai and Hao Kang and Haozhan Tang and Akaash R. Parthasarathy and Zichun Yu and Junru Shao and Todd C. Mowry and Chenyan Xiong and Tianqi Chen},
+  year={2026},
+  eprint={2605.31463},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  url={https://arxiv.org/abs/2605.31463},
+}
+```
 
 ## License
 
