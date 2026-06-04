@@ -375,6 +375,9 @@ class DeepseekV2LiteAttention(nn.Module):
 
         self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
+        # When fp8 training is on, kv_b_proj is an FP8Linear; the pass-latent ring decompresses
+        # the rotated latent via the FP8 deep_gemm path instead of a silent bf16 F.linear.
+        self._fp8 = ModelImplMode.fp8_training == "deep-gemm"
 
     def forward(
         self,
@@ -401,6 +404,7 @@ class DeepseekV2LiteAttention(nn.Module):
             # k_pe) around the ring and decompress on each rank via kv_b, instead of
             # decompressing to full per-head K/V before rotating. ~9x less ring traffic
             # for DeepSeek-V2-Lite.
+            kv_b_quant = self.kv_b_proj._get_quantized_weight() if self._fp8 else None
             attn_output = mla_ring_attention_func(
                 q_nope,
                 q_pe,
@@ -411,6 +415,7 @@ class DeepseekV2LiteAttention(nn.Module):
                 qk_nope_head_dim=self.qk_nope_head_dim,
                 v_head_dim=self.v_head_dim,
                 cp_group=self.cp_group,
+                kv_b_quant=kv_b_quant,
             )
         else:
             kv = self.kv_b_proj(normed_kv).view(
