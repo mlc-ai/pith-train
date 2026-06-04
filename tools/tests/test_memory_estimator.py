@@ -24,7 +24,7 @@ def _qwen3_model_cfg():
     from tools.memory_estimator.model_profile import ModelConfig
 
     return ModelConfig.from_json(
-        REPO_ROOT / "examples" / "pretrain_language_model" / "qwen3-30b-a3b" / "config.json"
+        REPO_ROOT / "examples" / "pretrain_lm" / "qwen3-30b-a3b" / "config.json"
     )
 
 
@@ -264,9 +264,7 @@ class TestDeepSeekV2Lite:
         )
         from tools.memory_estimator.schedule_simulator import ScheduleSimulator
 
-        config_path = (
-            REPO_ROOT / "examples" / "pretrain_language_model" / "deepseek-v2-lite" / "config.json"
-        )
+        config_path = REPO_ROOT / "examples" / "pretrain_lm" / "deepseek-v2-lite" / "config.json"
         model_cfg = ModelConfig.from_json(config_path)
 
         parallel_cfg = ParallelismConfig(

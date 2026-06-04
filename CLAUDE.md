@@ -56,10 +56,10 @@ The `examples/` tree drives end-to-end workflows; each subdir has a `launch.sh` 
 
 ```bash
 # Tokenize a pretraining corpus (per-tokenizer; rerun when switching models)
-bash examples/build_tokenized_corpus/launch.sh dclm-qwen3
+bash examples/tokenize_corpus/launch.sh dclm-qwen3
 
 # Pretrain (qwen3-30b-a3b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
-bash examples/pretrain_language_model/launch.sh qwen3-30b-a3b
+bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 
 # Convert a training checkpoint to / from HuggingFace
 bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b
@@ -117,9 +117,16 @@ Models implement `ModelProtocol` with layers that expose `forward_attn`, `forwar
 
 Each operator ships a PyTorch reference impl for correctness testing.
 
-### Training Orchestration (`pithtrain/tasks/pretrain_language_model.py`)
+### Training Orchestration (`pithtrain/tasks/pretrain_lm.py`)
 
-`PretrainLanguageModelCfg` composes `DistributedCfg`, `TrainingCfg`, and `LoggingCfg`. The training loop uses context managers (`distributed_context`, `training_context`, `logging_context`) to set up the full environment.
+`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg`, and `LoggingCfg`. The training loop uses context managers (`distributed_context`, `training_context`, `logging_context`) to set up the full environment.
+
+### Task Module Convention (`pithtrain/tasks/`)
+
+Each task module (`pretrain_lm`, `tokenize_corpus`, `convert_checkpoint`) exposes a `launch(cfg)` entry point plus a task-level `<Task>Cfg`/`<Task>Ctx` (e.g. `PretrainLMCfg`, `TokenizeCorpusCfg`). Two rules keep this consistent:
+
+- **Configs/contexts keep unique, descriptive names** (`PretrainLMCfg`, not bare `Cfg`) so they stay one-shot greppable — this repo is agent-native and `grep PretrainLMCfg` must locate every use. Import them by symbol: `from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch`.
+- **`launch` is the generic verb** every task shares. In a single-task file import it directly; in a file that drives several tasks, import the *modules* and qualify the call (`tokenize_corpus.launch(...)`, `convert_checkpoint.launch(...)`) to avoid collisions. The composable building blocks (`DistributedCfg`, `TrainingCfg`, `LoggingCfg`) live in `pithtrain/modules/` and are always referenced by their descriptive names.
 
 ### Checkpointing (`pithtrain/modules/checkpoint.py`)
 

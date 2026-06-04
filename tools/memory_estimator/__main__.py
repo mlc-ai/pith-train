@@ -3,7 +3,7 @@ CLI entry point for the PithTrain memory estimator.
 
 Usage:
     python -m tools.memory_estimator \
-        --model examples/pretrain_language_model/qwen3-30b-a3b/config.json \
+        --model examples/pretrain_lm/qwen3-30b-a3b/config.json \
         --pp-size 2 --ep-size 8 --total-gpus 32 \
         --micro-batch-size 1 --global-batch-size 1024 --sequence-length 2048 \
         --gpu-memory-gb 80

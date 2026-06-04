@@ -45,19 +45,19 @@ Pretrain Qwen3-30B-A3B from scratch. Datasets and checkpoints are stored in the 
 **1. Prepare the dataset**
 
 ```bash
-bash examples/build_tokenized_corpus/launch.sh dclm-qwen3
+bash examples/tokenize_corpus/launch.sh dclm-qwen3
 ```
 
 Download and tokenize the DCLM pretraining corpus into mmap-friendly packed sequences. Each model uses its own tokenizer, so switching to a different model requires running this step again.
 
 **2. Configure training**
 
-Edit [`examples/pretrain_language_model/qwen3-30b-a3b/script.py`](examples/pretrain_language_model/qwen3-30b-a3b/script.py) to adjust parallelism, batch size, learning rate, and other hyperparameters. The model architecture is defined in the accompanying [`config.json`](examples/pretrain_language_model/qwen3-30b-a3b/config.json).
+Edit [`examples/pretrain_lm/qwen3-30b-a3b/script.py`](examples/pretrain_lm/qwen3-30b-a3b/script.py) to adjust parallelism, batch size, learning rate, and other hyperparameters. The model architecture is defined in the accompanying [`config.json`](examples/pretrain_lm/qwen3-30b-a3b/config.json).
 
 **3. Launch training**
 
 ```bash
-bash examples/pretrain_language_model/launch.sh qwen3-30b-a3b
+bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 ```
 
 The launch script auto-detects GPUs and supports both single-node and multi-node (SLURM) setups. Training resumes from the latest checkpoint automatically, and checkpoints are reshardable across different parallelism.

@@ -7,17 +7,17 @@ Pretrain a Mixture-of-Experts (MoE) language model with pipeline parallelism, ex
 Tokenize the training corpus (one-time step):
 
 ```bash
-bash examples/build_tokenized_corpus/launch.sh dclm-qwen3
-bash examples/build_tokenized_corpus/launch.sh dclm-deepseek-v2
+bash examples/tokenize_corpus/launch.sh dclm-qwen3
+bash examples/tokenize_corpus/launch.sh dclm-deepseek-v2
 ```
 
-See [build_tokenized_corpus](../build_tokenized_corpus/) for details.
+See [tokenize_corpus](../tokenize_corpus/) for details.
 
 ## Step 2: Launch Training
 
 ```bash
-bash examples/pretrain_language_model/launch.sh qwen3-30b-a3b
-bash examples/pretrain_language_model/launch.sh deepseek-v2-lite
+bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
+bash examples/pretrain_lm/launch.sh deepseek-v2-lite
 ```
 
 The launch script auto-detects available GPUs and works with both single-node and multi-node (SLURM) setups.

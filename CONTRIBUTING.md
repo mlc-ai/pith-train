@@ -143,7 +143,7 @@ tests. The shape of the work:
    in action.
 2. **Wiring** — register the model where models are constructed (`setup_model`),
    add FSDP wrapping (`apply_fsdp`), and a config under
-   `examples/pretrain_language_model/<model>/` (`script.py` + `config.json`).
+   `examples/pretrain_lm/<model>/` (`script.py` + `config.json`).
 3. **Checkpoint conversion** (optional) — a converter under
    `tasks/convert_checkpoint/` if you want HuggingFace import/export.
 4. **Tests** — add the model to `tests/test_fsdp.sh` and bring it up from

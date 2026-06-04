@@ -44,7 +44,7 @@ inventory):
 
 ```
 pithtrain/
-├── tasks/        # APPLICATION — entry points you launch; e.g. pretrain_language_model.py -> launch(cfg)
+├── tasks/        # APPLICATION — entry points you launch; e.g. pretrain_lm.py -> launch(cfg)
 ├── dualpipe/     # ENGINE — the DualPipeV scheduler; dualpipev.py is the entry, overlap.py the F/B interleave
 ├── models/       # ENGINE — one self-contained file per model family (e.g. qwen3_moe.py); interface.py is the contract
 ├── layers/       # ENGINE — linear building blocks + the BF16/FP8 factory (factory.py)
@@ -187,7 +187,7 @@ job down quickly instead of leaving peers to hang on the watchdog.
 ## 5. End-to-end training flow
 
 Putting it together, here is one training run, top to bottom
-([`tasks/pretrain_language_model.py`](../pithtrain/tasks/pretrain_language_model.py)):
+([`tasks/pretrain_lm.py`](../pithtrain/tasks/pretrain_lm.py)):
 
 ```
 launch(cfg)
@@ -303,7 +303,7 @@ subsystem has a declarative `*Cfg` (user-set knobs, serializable) and a derived
 `*Ctx` (live runtime state — process groups, device mesh, built model,
 optimizer). Both inherit from `SlottedDefault`
 ([`config.py`](../pithtrain/config.py)) as `@dataclass(init=False, slots=True)`.
-The top-level `PretrainLanguageModelCfg` composes the per-subsystem configs, and
+The top-level `PretrainLMCfg` composes the per-subsystem configs, and
 matching `*_context` managers (`logging_context`, `distributed_context`,
 `training_context`) set up and tear down each subsystem in order. Follow the
 same `Cfg` + `Ctx` + `*_context` shape when adding a subsystem.
@@ -318,5 +318,5 @@ same `Cfg` + `Ctx` + `*_context` shape when adding a subsystem.
 | Add / change a kernel | `operators/<op>.py` (+ its reference impl) and `tests/` |
 | Understand the schedule | `dualpipe/dualpipev.py` → `dualpipe/overlap.py` |
 | Change parallelism behavior | `modules/distributed.py` |
-| Trace a full training step | `tasks/pretrain_language_model.py` (`train_step`) |
+| Trace a full training step | `tasks/pretrain_lm.py` (`train_step`) |
 | Estimate memory for a config | `python -m tools.memory_estimator --help` (still under construction) |

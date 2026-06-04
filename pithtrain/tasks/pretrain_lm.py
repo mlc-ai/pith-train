@@ -40,7 +40,7 @@ from pithtrain.operators.cross_entropy import cross_entropy
 
 
 @dataclass(init=False, slots=True)
-class PretrainLanguageModelCfg(SlottedDefault):
+class PretrainLMCfg(SlottedDefault):
     """Configuration for pretraining a language model."""
 
     distributed: DistributedCfg = field(default_factory=DistributedCfg)
@@ -54,7 +54,7 @@ class PretrainLanguageModelCfg(SlottedDefault):
 
 
 @dataclass(init=False, slots=True)
-class PretrainLanguageModelCtx(SlottedDefault):
+class PretrainLMCtx(SlottedDefault):
     """Context for pretraining a language model."""
 
     logging: LoggingCtx = field(default_factory=LoggingCtx)
@@ -68,7 +68,7 @@ class PretrainLanguageModelCtx(SlottedDefault):
 
 
 def get_global_batch(
-    cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx, device: torch.device
+    cfg: PretrainLMCfg, ctx: PretrainLMCtx, device: torch.device
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Gather this rank's portion of the global batch on pipeline parallel rank 0."""
     if ctx.distributed.pp_rank != 0:
@@ -227,9 +227,7 @@ class AppState(Stateful):
             self.scheduler.load_state_dict(sched_state)
 
 
-def raise_if_dataset_insufficient(
-    cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
-) -> None:
+def raise_if_dataset_insufficient(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     """Raise if configured run requires more samples than available in dataset."""
     global_batch_size = cfg.training.global_batch_size
     max_steps = cfg.training.max_steps
@@ -257,7 +255,7 @@ def raise_if_dataset_insufficient(
     raise SystemExit(1)
 
 
-def save_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> None:
+def save_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     """
     Save the checkpoint at the current step.
 
@@ -298,7 +296,7 @@ def save_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
     stdout.info("Save checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def load_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> None:
+def load_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     """Load the checkpoint from the latest step."""
     stdout = ctx.logging.stdout
     if cfg.training.save_location is None:
@@ -332,7 +330,7 @@ def load_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
     stdout.info("Load checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> None:
+def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     """Execute one step of training."""
     # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
@@ -493,10 +491,10 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
 
 
 @record
-def launch(cfg: PretrainLanguageModelCfg) -> None:
+def launch(cfg: PretrainLMCfg) -> None:
     """Launch the pretraining of a language model."""
     with ExitStack() as stack:
-        ctx = PretrainLanguageModelCtx()
+        ctx = PretrainLMCtx()
         stack.enter_context(logging_context(cfg, ctx))
         stack.enter_context(distributed_context(cfg, ctx))
         stack.enter_context(training_context(cfg, ctx))

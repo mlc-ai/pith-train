@@ -17,7 +17,7 @@ def parse_scenario(scenario: str) -> tuple[dict, int, int]:
     if not m:
         raise ValueError(f"invalid scenario '{scenario}', expected <model>-cp<N>-s<N>k")
     model = m.group(1)
-    with open(Path(f"examples/pretrain_language_model/{model}/config.json")) as f:
+    with open(Path(f"examples/pretrain_lm/{model}/config.json")) as f:
         config = json.load(f)
     return config, int(m.group(2)), int(m.group(3)) * 1024
 

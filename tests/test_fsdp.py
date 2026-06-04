@@ -390,10 +390,10 @@ def main(ctx: DistributedCtx, model_name: str):
 @record
 def _entry() -> None:
     models = []
-    models.append("examples/pretrain_language_model/deepseek-v2-lite/config.json")
-    models.append("examples/pretrain_language_model/qwen3-30b-a3b/config.json")
-    models.append("examples/pretrain_language_model/gpt-oss-20b/config.json")
-    models.append("examples/pretrain_language_model/gpt-oss-120b/config.json")
+    models.append("examples/pretrain_lm/deepseek-v2-lite/config.json")
+    models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
+    models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
+    models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)

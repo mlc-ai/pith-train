@@ -537,7 +537,7 @@ Then:
 
 ---
 
-## Group 6: Checkpoint Load Prints (`pithtrain/tasks/pretrain_language_model.py`)
+## Group 6: Checkpoint Load Prints (`pithtrain/tasks/pretrain_lm.py`)
 
 In `load_checkpoint`, after `dcp.load(...)`:
 
@@ -570,7 +570,7 @@ Ensure `DTensor` is imported: `from torch.distributed.tensor import DTensor`. Ch
 
 ---
 
-## Group 7: Memory Snapshot (`pithtrain/tasks/pretrain_language_model.py`)
+## Group 7: Memory Snapshot (`pithtrain/tasks/pretrain_lm.py`)
 
 In `train_step`, instrument the first training step with a full memory timeline snapshot.
 
@@ -636,7 +636,7 @@ if _mem_profile:
 3. `pithtrain/models/<model>.py` — Groups 5B, 5C, 5D, 5E
 4. `pithtrain/modules/distributed.py` — Group 2
 5. `pithtrain/modules/training.py` — Groups 1C, 3
-6. `pithtrain/tasks/pretrain_language_model.py` — Groups 6, 7
+6. `pithtrain/tasks/pretrain_lm.py` — Groups 6, 7
 
 ## After Completing
 

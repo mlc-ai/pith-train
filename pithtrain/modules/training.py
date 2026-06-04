@@ -80,7 +80,7 @@ class TrainingCfg(SlottedDefault):
     """
     The model to use for training. Can be a HuggingFace model ID
     (e.g. ``"Qwen/Qwen3-30B-A3B"``) or a local path to a config JSON file
-    (e.g. ``"examples/pretrain_language_model/qwen3-30b-a3b/config.json"``).
+    (e.g. ``"examples/pretrain_lm/qwen3-30b-a3b/config.json"``).
     """
 
     save_interval: Optional[int] = None

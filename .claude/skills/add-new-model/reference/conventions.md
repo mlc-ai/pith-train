@@ -278,7 +278,7 @@ that only surfaces weeks later in training runs that are hard to bisect.
 
 ## Rule 5 — Example configs mirror upstream HF, field-by-field <a id="example-config"></a>
 
-When adding `examples/pretrain_language_model/<model>/config.json`, it
+When adding `examples/pretrain_lm/<model>/config.json`, it
 must match the upstream HuggingFace `config.json` on every
 semantically-meaningful knob — especially the nested blocks
 (`rope_scaling`, `quantization_config`, any `*_parameters` dicts, etc.).
@@ -292,7 +292,7 @@ compute against subtly different numerics.
 python -c "
 import json
 hf   = json.load(open('<hf_snapshot>/config.json'))
-ours = json.load(open('examples/pretrain_language_model/<model>/config.json'))
+ours = json.load(open('examples/pretrain_lm/<model>/config.json'))
 for k in sorted(set(hf) | set(ours)):
     if hf.get(k) != ours.get(k):
         print(k, 'HF=', hf.get(k), 'ours=', ours.get(k))

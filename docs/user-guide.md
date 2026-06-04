@@ -41,7 +41,7 @@ uv pip install .
 | GPT-OSS-20B | ~21B / ~3.6B | `gpt-oss-20b` | `pp=1, ep=8` | 8 (1 node) |
 | GPT-OSS-120B | ~117B / ~5B | `gpt-oss-120b` | `pp=4, ep=8` | 32 (4 nodes) |
 
-Example dirs live under `examples/pretrain_language_model/<dir>/`. The default
+Example dirs live under `examples/pretrain_lm/<dir>/`. The default
 meshes are starting points — see [Scaling](#scaling-a-run) to change them.
 DeepSeek-V2-Lite and GPT-OSS-20B fit any single 8-GPU node. **Qwen3-30B-A3B at
 the default `pp=1, ep=8` needs a high-memory single node — 8×H200 (141 GB) or
@@ -60,18 +60,18 @@ architecture).
 per model family. Output lands in `workspace/datasets/dclm-baseline/toktxt/<model>/`.
 
 ```bash
-bash examples/build_tokenized_corpus/launch.sh dclm-qwen3   # see examples/build_tokenized_corpus/ for other tokenizers
+bash examples/tokenize_corpus/launch.sh dclm-qwen3   # see examples/tokenize_corpus/ for other tokenizers
 ```
 
-**2. Configure.** Edit `examples/pretrain_language_model/<model>/script.py` for
+**2. Configure.** Edit `examples/pretrain_lm/<model>/script.py` for
 parallelism, batch size, learning rate, etc. (see [Configuring a run](#configuring-a-run)).
 The model architecture is in the sibling `config.json`.
 
 **3. Train.** The launcher auto-detects single-node vs. SLURM and forwards to
-`torchrun`. Logs are written to `logging/pretrain_language_model/`.
+`torchrun`. Logs are written to `logging/pretrain_lm/`.
 
 ```bash
-bash examples/pretrain_language_model/launch.sh qwen3-30b-a3b
+bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 ```
 
 Training **resumes automatically** from the latest checkpoint in
@@ -136,7 +136,7 @@ whatever is left over becomes DP. Some worked examples on an 8-GPU node:
 `SLURM_*` env vars to build the `torchrun` rendezvous automatically:
 
 ```bash
-srun -W 0 examples/pretrain_language_model/launch.sh qwen3-30b-a3b
+srun -W 0 examples/pretrain_lm/launch.sh qwen3-30b-a3b
 ```
 
 **Sizing memory before you launch.** Use the estimator to check a mesh fits

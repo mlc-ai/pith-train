@@ -1,10 +1,10 @@
-"""Download one shard of the DCLM corpus and tokenize with the DeepSeek-V2 model."""
+"""Download one shard of the DCLM corpus and tokenize with the Qwen3 model."""
 
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-from pithtrain.tasks.build_tokenized_corpus import BuildTokenizedCorpusCfg, launch
+from pithtrain.tasks.tokenize_corpus import TokenizeCorpusCfg, launch
 
 if __name__ == "__main__":
     kwargs = dict()
@@ -14,8 +14,8 @@ if __name__ == "__main__":
     snapshot_download("mlfoundations/dclm-baseline-1.0", **kwargs)
 
 if __name__ == "__main__":
-    cfg = BuildTokenizedCorpusCfg()
-    cfg.tokenizer_name = "deepseek-ai/DeepSeek-V2-Lite"
+    cfg = TokenizeCorpusCfg()
+    cfg.tokenizer_name = "Qwen/Qwen3-30B-A3B"
     cfg.source_path = Path("workspace/datasets/dclm-baseline/rawtxt")
-    cfg.output_path = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
+    cfg.output_path = Path("workspace/datasets/dclm-baseline/toktxt/qwen3")
     launch(cfg)

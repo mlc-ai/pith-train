@@ -1,15 +1,15 @@
 from pathlib import Path
 
 from pithtrain.modules.logging import LoggingWandbCfg  # noqa: F401
-from pithtrain.tasks.pretrain_language_model import PretrainLanguageModelCfg, launch
+from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
-cfg = PretrainLanguageModelCfg()
+cfg = PretrainLMCfg()
 
 cfg.distributed.context_parallel_size = 1
 cfg.distributed.pipeline_parallel_size = 1
 cfg.distributed.expert_parallel_size = 8
 
-cfg.training.model = Path("examples/pretrain_language_model/gpt-oss-20b/config.json")
+cfg.training.model = Path("examples/pretrain_lm/gpt-oss-20b/config.json")
 cfg.training.optimizer = "Adam"
 cfg.training.scheduler = "CosineAnnealing"
 cfg.training.max_lr = 3.0e-4

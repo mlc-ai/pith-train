@@ -6,9 +6,9 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from pithtrain.tasks import build_tokenized_corpus, convert_checkpoint
-from pithtrain.tasks.build_tokenized_corpus import BuildTokenizedCorpusCfg
+from pithtrain.tasks import convert_checkpoint, tokenize_corpus
 from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
+from pithtrain.tasks.tokenize_corpus import TokenizeCorpusCfg
 
 CORPUS_RAWTXT = "workspace/datasets/dclm-baseline/rawtxt"
 
@@ -43,12 +43,12 @@ def build_toktxt(specs):
     if toktxt.exists() and any(toktxt.glob("*.bin")):
         print(f"[skip] corpus already tokenized at {toktxt}")
         return
-    cfg = BuildTokenizedCorpusCfg()
+    cfg = TokenizeCorpusCfg()
     cfg.tokenizer_name = specs["model_id"]
     cfg.source_path = Path(CORPUS_RAWTXT)
     cfg.output_path = toktxt
     cfg.num_workers = min(os.cpu_count() or 1, 24)
-    build_tokenized_corpus.launch(cfg)
+    tokenize_corpus.launch(cfg)
 
 
 def fetch_checkpoint(specs):

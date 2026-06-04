@@ -4,18 +4,18 @@ import argparse
 import os
 from pathlib import Path
 
-from pithtrain.tasks.pretrain_language_model import PretrainLanguageModelCfg, launch
+from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 MODELS = {
     "deepseek-v2-lite": {
-        "config": "examples/pretrain_language_model/deepseek-v2-lite/config.json",
+        "config": "examples/pretrain_lm/deepseek-v2-lite/config.json",
         "dataset": "workspace/datasets/dclm-baseline/toktxt/deepseek-v2",
         "save_location": "workspace/checkpoints/deepseek-v2-lite",
         "moe_load_balance_type": "sequence",
         "moe_load_balance_coef": 1e-3,
     },
     "qwen3-30b-a3b": {
-        "config": "examples/pretrain_language_model/qwen3-30b-a3b/config.json",
+        "config": "examples/pretrain_lm/qwen3-30b-a3b/config.json",
         "dataset": "workspace/datasets/dclm-baseline/toktxt/qwen3",
         "save_location": "workspace/checkpoints/qwen3-30b-a3b",
         "moe_load_balance_type": "global-batch",
@@ -41,7 +41,7 @@ cp_size = parsed.context_parallel_size
 dp_size = int(os.environ["WORLD_SIZE"]) // (pp_size * cp_size * ep_size)
 global_batch_size = 32 * dp_size * ep_size
 
-cfg = PretrainLanguageModelCfg()
+cfg = PretrainLMCfg()
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = pp_size

@@ -4,7 +4,7 @@ Everything in this file is empirically verified against a representative capture
 
 ## Per-rank setup label (first NVTX event per rank)
 
-`pithtrain/tasks/pretrain_language_model.py` emits an `nvtx.range_push` immediately after `cudaProfilerStart`. Format (three semicolon-separated groups: identity, topology, training config):
+`pithtrain/tasks/pretrain_lm.py` emits an `nvtx.range_push` immediately after `cudaProfilerStart`. Format (three semicolon-separated groups: identity, topology, training config):
 
 ```
 rank=N; pp=R/S dp=R/S cp=R/S ep=R/S; mbs=M seq=Q

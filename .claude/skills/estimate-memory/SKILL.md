@@ -19,7 +19,7 @@ Extract these parameters from the user's message. If any required parameters are
 
 | Parameter | CLI flag | How to determine |
 |---|---|---|
-| Model config | `--model` | Path to a HuggingFace-style `config.json`. Available models: `examples/pretrain_language_model/qwen3-30b-a3b/config.json`, `examples/pretrain_language_model/deepseek-v2-lite/config.json`. If the user names a model, find its config under `examples/`. |
+| Model config | `--model` | Path to a HuggingFace-style `config.json`. Available models: `examples/pretrain_lm/qwen3-30b-a3b/config.json`, `examples/pretrain_lm/deepseek-v2-lite/config.json`. If the user names a model, find its config under `examples/`. |
 | PP size | `--pp-size` | Pipeline parallel degree. If the user says "2-way pipeline", use 2. |
 | EP size | `--ep-size` | Expert parallel degree. |
 | CP size | `--cp-size` | Context parallel degree. Use 1 if not using context parallelism. |
@@ -107,7 +107,7 @@ User: "Qwen3-30B-A3B, 32 H100s, pp=4, ep=8, cp=1, micro_bs=1, gbs=1024, seq_len=
 
 ```bash
 python -m tools.memory_estimator \
-    --model examples/pretrain_language_model/qwen3-30b-a3b/config.json \
+    --model examples/pretrain_lm/qwen3-30b-a3b/config.json \
     --pp-size 4 --ep-size 8 --cp-size 1 --total-gpus 32 \
     --micro-batch-size 1 --global-batch-size 1024 --sequence-length 4096 \
     --gpu-memory-gb 80

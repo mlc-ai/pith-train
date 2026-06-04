@@ -50,7 +50,7 @@ torch.manual_seed(1234)
 device = torch.device("cuda")
 torch.set_default_device(device)
 
-config = AutoConfig.from_pretrained("examples/pretrain_language_model/<model>/config.json")
+config = AutoConfig.from_pretrained("examples/pretrain_lm/<model>/config.json")
 # Truncate layers to keep the test fast.  Also truncate any
 # parallel arrays like layer_types to match.
 keep = min(config.num_hidden_layers, 4)
@@ -127,7 +127,7 @@ in N+1 is the suspect.
 nvidia-smi --query-gpu=index,memory.free --format=csv
 
 # Configuration knobs:
-CFG=examples/pretrain_language_model/<model>/config.json
+CFG=examples/pretrain_lm/<model>/config.json
 RDZV="--rdzv-backend=c10d --rdzv-endpoint=localhost:15213"
 
 # 1. pp=1, ep=1 (one GPU)

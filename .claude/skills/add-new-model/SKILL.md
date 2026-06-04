@@ -217,7 +217,7 @@ No new reference file needed — the changes are small and mechanical.
      (the router has `num_experts` too and must not be sharded).
 3. Add the model config and HF ID to the `models` list at the bottom of
    `tests/test_fsdp.py`.
-4. Write `examples/pretrain_language_model/<model>/config.json`. Mirror
+4. Write `examples/pretrain_lm/<model>/config.json`. Mirror
    upstream HF's `config.json` field-by-field — including every nested
    block (`rope_scaling`, `quantization_config`, etc.). See
    `reference/conventions.md` §example-config for the diff command and

@@ -41,8 +41,8 @@ from pithtrain.modules.logging import LoggingCfg, LoggingCtx, StdoutLogger, logg
 
 
 @dataclass(init=False, slots=True)
-class BuildTokenizedCorpusCfg(SlottedDefault):
-    """User-provided settings for build_tokenized_corpus."""
+class TokenizeCorpusCfg(SlottedDefault):
+    """User-provided settings for tokenize_corpus."""
 
     tokenizer_name: str
     """Hugging Face tokenizer model name."""
@@ -61,8 +61,8 @@ class BuildTokenizedCorpusCfg(SlottedDefault):
 
 
 @dataclass(init=False, slots=True)
-class BuildTokenizedCorpusCtx(SlottedDefault):
-    """Runtime context for build_tokenized_corpus."""
+class TokenizeCorpusCtx(SlottedDefault):
+    """Runtime context for tokenize_corpus."""
 
     logging: LoggingCtx = field(default_factory=LoggingCtx)
     """Active logging context."""
@@ -148,7 +148,7 @@ class Writer:
         self.splits.clear()
 
 
-def leader(queue: Queue, psize: int, cfg: BuildTokenizedCorpusCfg, npath: int):
+def leader(queue: Queue, psize: int, cfg: TokenizeCorpusCfg, npath: int):
     """
     Leader for a file group. Pulls files from the shared queue and tokenizes
     each file using a dedicated pool of wf workers.
@@ -192,10 +192,10 @@ def leader(queue: Queue, psize: int, cfg: BuildTokenizedCorpusCfg, npath: int):
         pool.terminate()
 
 
-def launch(cfg: BuildTokenizedCorpusCfg):
+def launch(cfg: TokenizeCorpusCfg):
     """Launch the tokenization process."""
     with ExitStack() as stack:
-        ctx = BuildTokenizedCorpusCtx()
+        ctx = TokenizeCorpusCtx()
         stack.enter_context(logging_context(cfg, ctx))
         stdout = ctx.logging.stdout
         stdout.info("launch(cfg=%s)" % cfg)
