@@ -1,5 +1,6 @@
 #!/bin/bash
 # Benchmark the training throughput of Qwen3-30B-A3B with 2x8 H100.
+# The workspace is a node-isolated storage that provides fast access.
 
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
