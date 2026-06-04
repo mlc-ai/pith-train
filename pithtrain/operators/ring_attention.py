@@ -50,6 +50,7 @@ Every step costs the same: one causal pass on length 2*block, or one non-causal 
 
 from typing import List, Optional, Tuple
 
+import deep_gemm
 import torch
 import torch.nn.functional as F
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
@@ -65,18 +66,12 @@ from torch.distributed import (
     isend,
 )
 
-# FP8 (deep-gemm) primitives for the in-ring kv_b decompression. Guarded so the BF16 path
-# (and environments without deep_gemm) import ring_attention cleanly; only reached when the
-# caller passes a quantized kv_b weight (i.e. fp8_training="deep-gemm").
-try:
-    import deep_gemm
-
-    from pithtrain.operators.deepgemm_fp8_quantize import (
-        fused_rowwise_blockwise_transpose_cast_to_fp8,
-        fused_rowwise_transpose_cast_to_fp8,
-    )
-except ImportError:
-    deep_gemm = None
+# FP8 (deep-gemm) primitives for the in-ring kv_b decompression; reached only when the caller
+# passes a quantized kv_b weight (i.e. fp8_training="deep-gemm").
+from pithtrain.operators.deepgemm_fp8_quantize import (
+    fused_rowwise_blockwise_transpose_cast_to_fp8,
+    fused_rowwise_transpose_cast_to_fp8,
+)
 
 
 def post_ring_kv(
