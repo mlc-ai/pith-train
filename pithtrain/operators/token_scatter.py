@@ -8,17 +8,13 @@ import triton.language as tl
 # Used by both ScatterForGroupedGemm and moe_ep_prepare_dispatch to avoid
 # per-call cudaStreamSynchronize overhead from .tolist() / .item().
 #
-# Thread-safety: the pinned-buffer cache below and the per-class copy stream/event in
-# ScatterForGroupedGemm are process-global (shared, not per-thread). This is safe only
-# because these ops run on a single thread at a time: DualPipeV issues every forward stage
-# from one Python thread and runs all backward through run_backward(), which disables
-# autograd multithreading (see dualpipe/utils.py), and there is no activation recomputation
-# that would re-enter the MoE forward on another thread. If some future path ever calls
-# these concurrently from multiple threads -- e.g. in-process multi-model stepping, or a
-# plain .backward() (multithreading enabled) whose recompute overlaps a main-thread forward
-# -- the shared state would race: a clobbered ks / EP-splits read-back yields bad
-# grouped-GEMM offsets and OOB. The fix then is to make these per-thread (key the buffer by
-# threading.get_ident() and drop the shared copy stream/event).
+# These are process-global, not per-thread, which is fine because the MoE ops only ever run
+# on one thread at a time. DualPipeV launches forwards from a single thread and runs every
+# backward through run_backward(), which disables autograd multithreading (dualpipe/utils.py),
+# and nothing recomputes the MoE forward on a separate thread. If that ever changes (two
+# models stepping in one process, or a plain multithreaded .backward() overlapping a forward)
+# the shared buffers would race and corrupt the ks / EP-splits read-back, so key the buffer
+# by threading.get_ident() and drop the shared copy stream/event at that point.
 
 _pinned_buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 _GEMM_ALLOC_ALIGNMENT = 1024
