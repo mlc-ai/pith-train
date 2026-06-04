@@ -1,14 +1,15 @@
+import threading
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-# -- Shared async D-to-H copy infrastructure --
-# Used by both ScatterForGroupedGemm and moe_ep_prepare_dispatch to avoid
-# per-call cudaStreamSynchronize overhead from .tolist() / .item().
+# -- Cached pinned-memory host buffers for D-to-H copies --
+# Used by both ScatterForGroupedGemm and moe_ep_prepare_dispatch to avoid per-call
+# pinned allocation when reading small GPU metadata (ks, EP splits) back to the host.
 
-_pinned_buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+_pinned_buffers: dict[tuple[int, str, torch.dtype, int], torch.Tensor] = {}
 _GEMM_ALLOC_ALIGNMENT = 1024
 
 
@@ -16,7 +17,14 @@ def get_pinned_buffer(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor
     # Cache pinned-memory buffers to avoid per-call allocation.
     # Freeing a pinned tensor triggers cudaEventRecordWithFlags (~10 us)
     # in PyTorch's CachingHostAllocator.
-    key = (name, dtype, numel)
+    #
+    # Keyed by thread id: under DualPipeV, activation recomputation re-runs the MoE
+    # forward on the autograd backward thread concurrently with the main-thread forward,
+    # so two callers can request the same (name, dtype, numel) at once. A process-wide
+    # shared buffer would be clobbered between them, corrupting the host values read back
+    # (e.g. ``ks`` / the EP splits) and producing invalid grouped-GEMM offsets. A
+    # per-thread buffer keeps each concurrent caller isolated.
+    key = (threading.get_ident(), name, dtype, numel)
     buf = _pinned_buffers.get(key)
     if buf is None:
         buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
@@ -151,16 +159,6 @@ class ScatterForGroupedGemm(torch.autograd.Function):
     Backward: gathers gradients back using reverse_shuffle_idxs.
     """
 
-    _copy_stream: Optional[torch.cuda.Stream] = None
-    _copy_event: Optional[torch.cuda.Event] = None
-
-    @staticmethod
-    def _get_copy_stream_and_event(device):
-        if ScatterForGroupedGemm._copy_stream is None:
-            ScatterForGroupedGemm._copy_stream = torch.cuda.Stream(device=device)
-            ScatterForGroupedGemm._copy_event = torch.cuda.Event()
-        return ScatterForGroupedGemm._copy_stream, ScatterForGroupedGemm._copy_event
-
     @staticmethod
     def forward(ctx, sorted_tokens, expert_idxs, num_groups, padding_alignment=128):
         m = sorted_tokens.shape[0]
@@ -213,12 +211,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
             BLOCK=BLOCK,
         )
 
-        # Async D-to-H: ks_tensor is done after the prep kernel; copy it on
-        # a separate stream so the memcpy overlaps with the scatter kernel.
-        copy_stream, copy_event = ScatterForGroupedGemm._get_copy_stream_and_event(device)
-        copy_event.record()  # marks prep kernel completion on default stream
-
-        # Scatter kernel (on default stream, overlaps with D-to-H copy)
+        # Scatter kernel (current stream, after the prep kernel)
         BLOCK_H = 256
         NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
         _scatter_for_grouped_gemm_kernel[(m,)](
@@ -245,11 +238,16 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         # so this size is sufficient for BF16 grouped GEMM AND for DeepGEMM's
         # FP8 ``k_grouped_fp8_gemm_tn_contiguous`` which asserts the data row
         # count equals ``sum(ks)`` exactly.
+        #
+        # Read ks back to the host with a copy on the current stream (ordered after the
+        # prep + scatter kernels) into a thread-local pinned buffer, then sync. This must
+        # NOT use a process-wide shared stream/event/buffer: DualPipeV runs this forward
+        # on the autograd backward thread (activation recomputation) concurrently with the
+        # main-thread forward, and shared state would let one caller's copy/read race the
+        # other's -> corrupted ks -> invalid grouped_mm_offs -> OOB in the grouped GEMM.
         ks_cpu = get_pinned_buffer("ks", num_groups, torch.int32)
-        with torch.cuda.stream(copy_stream):
-            copy_stream.wait_event(copy_event)
-            ks_cpu.copy_(ks_tensor, non_blocking=True)
-        copy_stream.synchronize()
+        ks_cpu.copy_(ks_tensor, non_blocking=True)
+        torch.cuda.current_stream(device).synchronize()
         ks = ks_cpu.tolist()
         actual_M = sum(ks)
         output_tokens = output_tokens[:actual_M]
