@@ -41,6 +41,66 @@ def _m_grouped_fp8_gemm_nt(a, b, d, grouped_mm_offs, M, group_indices=None):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, group_indices)
 
 
+def _fp8_gemm_nt(
+    a_fp8: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_fp8: torch.Tensor,
+    b_scale: torch.Tensor,
+    m: int,
+    n: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """``out[m, n] = a @ b.T`` via the DeepGEMM fp8 NT GEMM. The single place that owns the
+    allocate-then-``fp8_fp4_gemm_nt`` convention shared by the FP8 linear layer and the MLA
+    pass-latent ring decompress."""
+    out = torch.empty((m, n), device=device, dtype=dtype)
+    deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
+    return out
+
+
+def fp8_act_weight_gemm(
+    input_2d: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    scale_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FP8 forward GEMM ``y = x @ W.T``: rowwise-quantize the activation, run the NT GEMM, and
+    return ``(output, input_t_fp8, scale_input_t)`` -- the transposed activation is handed back
+    so a later wgrad can reuse it. Shared by ``_fp8_linear_fwd`` and the MLA ring so the recipe
+    has one source of truth."""
+    m, n = input_2d.shape[0], weight_fp8.shape[0]
+    input_fp8, scale_input, input_t_fp8, scale_input_t = (
+        fused_rowwise_blockwise_transpose_cast_to_fp8(input_2d)
+    )
+    output = _fp8_gemm_nt(
+        input_fp8, scale_input, weight_fp8, scale_weight, m, n, input_2d.device, input_2d.dtype
+    )
+    return output, input_t_fp8, scale_input_t
+
+
+def fp8_dgrad_wgrad(
+    grad_2d: torch.Tensor,
+    weight_t_fp8: torch.Tensor,
+    scale_weight_t: torch.Tensor,
+    input_t_fp8: torch.Tensor,
+    scale_input_t: torch.Tensor,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FP8 backward GEMMs: ``grad_input = grad @ W`` (via the transposed weight) and
+    ``weight_grad = grad.T @ x`` (via the transposed activation), both returned in ``grad_2d``'s
+    dtype. Shared by ``_fp8_linear_bwd`` and the MLA ring so dgrad/wgrad have one source of
+    truth; the caller supplies ``input_t_fp8`` (saved from the forward, or recomputed)."""
+    m, n = grad_2d.shape
+    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fused_rowwise_transpose_cast_to_fp8(grad_2d)
+    grad_input = _fp8_gemm_nt(
+        grad_fp8, scale_grad, weight_t_fp8, scale_weight_t, m, k, grad_2d.device, grad_2d.dtype
+    )
+    weight_grad = _fp8_gemm_nt(
+        grad_t_fp8, scale_grad_t, input_t_fp8, scale_input_t, n, k, grad_2d.device, grad_2d.dtype
+    )
+    return grad_input, weight_grad
+
+
 @torch.library.custom_op("pithtrain::fp8_linear_fwd", mutates_args=())
 def _fp8_linear_fwd(
     input_2d: torch.Tensor,
@@ -62,13 +122,7 @@ def _fp8_linear_fwd(
     scale_input_t : torch.Tensor
         Block scales for input_t_fp8, saved for wgrad.
     """
-    (M, _), N = input_2d.shape, weight.shape[0]
-    input_fp8, scale_input, input_t_fp8, scale_input_t = (
-        fused_rowwise_blockwise_transpose_cast_to_fp8(input_2d)
-    )
-    output = torch.empty((M, N), device=input_2d.device, dtype=input_2d.dtype)
-    deep_gemm.fp8_fp4_gemm_nt((input_fp8, scale_input), (weight_fp8, scale_weight), output)
-    return output, input_t_fp8, scale_input_t
+    return fp8_act_weight_gemm(input_2d, weight_fp8, scale_weight)
 
 
 @_fp8_linear_fwd.register_fake
@@ -100,15 +154,9 @@ def _fp8_linear_bwd(
     weight_grad : torch.Tensor
         (N, K) weight gradient.
     """
-    M, N = grad_output_2d.shape
-    grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fused_rowwise_transpose_cast_to_fp8(
-        grad_output_2d
+    return fp8_dgrad_wgrad(
+        grad_output_2d, weight_t_fp8, scale_weight_t, input_t_fp8, scale_input_t, K
     )
-    grad_input = torch.empty((M, K), device=grad_output_2d.device, dtype=grad_output_2d.dtype)
-    deep_gemm.fp8_fp4_gemm_nt((grad_fp8, scale_grad), (weight_t_fp8, scale_weight_t), grad_input)
-    weight_grad = torch.empty((N, K), device=grad_output_2d.device, dtype=grad_output_2d.dtype)
-    deep_gemm.fp8_fp4_gemm_nt((grad_t_fp8, scale_grad_t), (input_t_fp8, scale_input_t), weight_grad)
-    return grad_input, weight_grad
 
 
 @_fp8_linear_bwd.register_fake

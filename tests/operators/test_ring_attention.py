@@ -345,30 +345,35 @@ def record_mla_fp8(ctx: DistributedCtx, req: MLARequest):
     return ref, imp, dW_ref, dW_imp
 
 
+def _relerr(ref: torch.Tensor, imp: torch.Tensor) -> float:
+    r = ref.to(torch.float32)
+    return ((imp.to(torch.float32) - r).norm() / (r.norm() + 1e-12)).item()
+
+
 def verify_mla_fp8(ctx: DistributedCtx, req: MLARequest) -> None:
     ref, imp, dW_ref, dW_imp = record_mla_fp8(ctx, req)
     # fp8-vs-fp8 reference: the only differences are the ring vs dense flash recompute order
-    # and per-hop vs whole-sequence activation quant blocking -- both small. Tolerances are
-    # looser than the bf16 test (e4m3 noise) but tight enough to catch a broken fp8 GEMM,
-    # which would give O(1) error.
-    atol_fp8 = 2e-2
-    # dW is the accumulated wgrad over all CP hops; each hop quantizes the activation
-    # to e4m3 at its own block granularity, so the relerr is a few percent (observed
-    # ~3.6e-2). A broken/transposed fp8 GEMM gives O(1) error, so this still catches it.
-    rtol_dW_fp8 = 6e-2
+    # and per-hop vs whole-sequence activation quant blocking -- both small. Check BOTH cosine
+    # (direction) AND relative L2 error (magnitude): cosine is scale-invariant and would hide a
+    # uniform fp8 scale bug, so relerr is the one that actually pins down magnitude. Tolerances
+    # are looser than the bf16 test (e4m3 noise) but a broken/transposed fp8 GEMM gives O(1)
+    # error on both, so this still catches it.
+    atol_fp8 = 2e-2  # cosine
+    # relerr is a few percent under fp8 (per-hop e4m3 block quant; dW, summed over all CP hops,
+    # is the worst at ~3.6e-2 observed). A broken fp8 GEMM gives O(1) relerr, so 6e-2 still
+    # catches it while leaving headroom for legitimate quant noise.
+    rtol_fp8 = 6e-2
     for f in fields(ref):
-        error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
-        if error >= atol_fp8:
-            raise AssertionError(f"[fp8] {f.name} diverged: {error=:.2e} >= {atol_fp8=}")
-    dW_ref_f = dW_ref.to(torch.float32)
-    dW_imp_f = dW_imp.to(torch.float32)
-    werr = cosine_error(dW_ref_f, dW_imp_f)
-    if werr >= atol_fp8:
-        raise AssertionError(f"[fp8] kv_b_weight_grad diverged: {werr=:.2e} >= {atol_fp8=}")
-    rel = ((dW_imp_f - dW_ref_f).norm() / dW_ref_f.norm()).item()
-    if rel >= rtol_dW_fp8:
+        a, b = getattr(ref, f.name), getattr(imp, f.name)
+        cos, rel = cosine_error(a, b), _relerr(a, b)
+        if cos >= atol_fp8 or rel >= rtol_fp8:
+            raise AssertionError(
+                f"[fp8] {f.name} diverged: cosine={cos:.2e} (>={atol_fp8}) relerr={rel:.2e} (>={rtol_fp8})"
+            )
+    cos, rel = cosine_error(dW_ref, dW_imp), _relerr(dW_ref, dW_imp)
+    if cos >= atol_fp8 or rel >= rtol_fp8:
         raise AssertionError(
-            f"[fp8] kv_b_weight_grad relerr too large: {rel=:.2e} >= {rtol_dW_fp8=}"
+            f"[fp8] kv_b_weight_grad diverged: cosine={cos:.2e} (>={atol_fp8}) relerr={rel:.2e} (>={rtol_fp8})"
         )
 
 

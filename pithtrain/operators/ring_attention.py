@@ -50,7 +50,6 @@ Every step costs the same: one causal pass on length 2*block, or one non-causal 
 
 from typing import List, Optional, Tuple
 
-import deep_gemm
 import torch
 import torch.nn.functional as F
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
@@ -66,11 +65,12 @@ from torch.distributed import (
     isend,
 )
 
-# FP8 (deep-gemm) primitives for the in-ring kv_b decompression; reached only when the caller
-# passes a quantized kv_b weight (i.e. fp8_training="deep-gemm").
+# FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
+# decompression; reached only when the caller passes a quantized kv_b weight
+# (i.e. fp8_training="deep-gemm").
+from pithtrain.layers.deepgemm_fp8_linear import fp8_act_weight_gemm, fp8_dgrad_wgrad
 from pithtrain.operators.deepgemm_fp8_quantize import (
     fused_rowwise_blockwise_transpose_cast_to_fp8,
-    fused_rowwise_transpose_cast_to_fp8,
 )
 
 
@@ -378,12 +378,9 @@ def _mla_decompress(
     is pre-quantized once per micro-batch by the caller (``weight_fp8``/``scale_weight``).
     """
     b, n, _ = normed_kv.shape
-    out_features = kv_b_weight.shape[0]
     if use_fp8:
         x2d = normed_kv.reshape(b * n, normed_kv.shape[-1])
-        x_fp8, x_scale, _, _ = fused_rowwise_blockwise_transpose_cast_to_fp8(x2d)
-        kv2d = torch.empty((b * n, out_features), device=normed_kv.device, dtype=normed_kv.dtype)
-        deep_gemm.fp8_fp4_gemm_nt((x_fp8, x_scale), (weight_fp8, scale_weight), kv2d)
+        kv2d, _, _ = fp8_act_weight_gemm(x2d, weight_fp8, scale_weight)
         kv = kv2d.view(b, n, num_heads, qk_nope_head_dim + v_head_dim)
     else:
         kv = F.linear(normed_kv, kv_b_weight).view(b, n, num_heads, qk_nope_head_dim + v_head_dim)
@@ -572,31 +569,21 @@ def mla_zigzag_backward(
         dk_nope, dk_pe = torch.split(dkey_step, [qk_nope_head_dim, rope_dim], dim=-1)
         n = dk_nope.shape[1]
         if use_fp8:
-            # FP8 dgrad/wgrad, mirroring _fp8_linear_bwd. dy = [dk_nope | dvalue] (M, out_features).
+            # FP8 dgrad/wgrad via the shared recipe. dy = [dk_nope | dvalue] (M, out_features).
+            # The wgrad needs this hop's latent block transposed; we re-quantize it here rather
+            # than stash it from the forward (recompute is the deliberate memory/compute trade).
             dy2d = (
                 torch.cat([dk_nope, dvalue_step], dim=-1)
                 .reshape(b * n, out_features)
                 .to(normed_kv.dtype)
             )
-            grad_fp8, scale_grad, grad_t_fp8, scale_grad_t = fused_rowwise_transpose_cast_to_fp8(
-                dy2d
-            )
-            # dgrad: d_normed_kv = dy @ W, via the pre-transposed fp8 weight.
-            d_nkv_2d = torch.empty(
-                (b * n, lora_rank), device=normed_kv.device, dtype=normed_kv.dtype
-            )
-            deep_gemm.fp8_fp4_gemm_nt(
-                (grad_fp8, scale_grad), (weight_t_fp8, scale_weight_t), d_nkv_2d
-            )
-            d_nkv_blk = d_nkv_2d.view(b, n, lora_rank).to(torch.float32)
-            # wgrad: dW += dy^T @ x, re-quantizing this hop's latent block (transposed).
             _, _, x_t_fp8, scale_x_t = fused_rowwise_blockwise_transpose_cast_to_fp8(
                 nkv_blk.reshape(b * n, lora_rank)
             )
-            dW_blk = torch.empty(
-                (out_features, lora_rank), device=normed_kv.device, dtype=normed_kv.dtype
+            d_nkv_2d, dW_blk = fp8_dgrad_wgrad(
+                dy2d, weight_t_fp8, scale_weight_t, x_t_fp8, scale_x_t, lora_rank
             )
-            deep_gemm.fp8_fp4_gemm_nt((grad_t_fp8, scale_grad_t), (x_t_fp8, scale_x_t), dW_blk)
+            d_nkv_blk = d_nkv_2d.view(b, n, lora_rank).to(torch.float32)
             dW += dW_blk.to(torch.float32)
         else:
             d_kv = (
