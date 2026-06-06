@@ -5,8 +5,8 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "deep-gemm",
-    "flash-attn-4[cu13]>=4.0.0b12",
-    "torch>=2.10.0",
+    "flash-attn-4[cu13]>=4.0.0b16",
+    "torch>=2.12.0",
     "transformers",
     "wandb",
     "zstandard",
@@ -35,7 +35,7 @@ torch = { index = "torch-cu130" }
 
 [tool.uv.extra-build-dependencies]
 deep-gemm = [
-    "torch>=2.10.0",
+    "torch>=2.12.0",
     "packaging",
     "setuptools",
     "wheel",
