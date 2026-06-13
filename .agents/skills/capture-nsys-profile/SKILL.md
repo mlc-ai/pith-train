@@ -44,13 +44,13 @@ If `$SLURM_JOB_ID` is set, use the **launch-with-slurm** skill to read the alloc
 
 ```bash
 # Single-node, minimum GPUs (DeepSeek-V2-Lite, pp=2 ep=2)
-bash .claude/skills/capture-nsys-profile/scripts/launch_capture.sh --model deepseek-v2-lite --pipeline-parallel-size 2 --expert-parallel-size 2
+bash .agents/skills/capture-nsys-profile/scripts/launch_capture.sh --model deepseek-v2-lite --pipeline-parallel-size 2 --expert-parallel-size 2
 
 # Multi-node via SLURM (Qwen3-30B-A3B, pp=2 ep=8 -> 2 nodes)
-srun -N 2 -W 0 .claude/skills/capture-nsys-profile/scripts/launch_capture.sh --model qwen3-30b-a3b --pipeline-parallel-size 2 --expert-parallel-size 8
+srun -N 2 -W 0 .agents/skills/capture-nsys-profile/scripts/launch_capture.sh --model qwen3-30b-a3b --pipeline-parallel-size 2 --expert-parallel-size 8
 
 # Custom sequence length (Qwen3-30B-A3B, pp=4 ep=8 -> 4 nodes, seq=4096)
-srun -N 4 -W 0 .claude/skills/capture-nsys-profile/scripts/launch_capture.sh --model qwen3-30b-a3b --pipeline-parallel-size 4 --expert-parallel-size 8 --sequence-length 4096
+srun -N 4 -W 0 .agents/skills/capture-nsys-profile/scripts/launch_capture.sh --model qwen3-30b-a3b --pipeline-parallel-size 4 --expert-parallel-size 8 --sequence-length 4096
 ```
 
 ## Output

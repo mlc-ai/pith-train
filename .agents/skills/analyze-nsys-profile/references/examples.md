@@ -8,7 +8,7 @@ Setup for all examples:
 ```bash
 source .venv/bin/activate
 SQLITE=workspace/capture-nsys-profile/pithtrain_node0.sqlite
-SKILL=.claude/skills/analyze-nsys-profile/scripts
+SKILL=.agents/skills/analyze-nsys-profile/scripts
 nsys export --type=sqlite --force-overwrite=true --output=$SQLITE workspace/capture-nsys-profile/pithtrain_node0.nsys-rep
 ```
 

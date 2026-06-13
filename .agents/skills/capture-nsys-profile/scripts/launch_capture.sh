@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 
 OUTDIR=workspace/capture-nsys-profile; mkdir -p $OUTDIR
-SCRIPT=.claude/skills/capture-nsys-profile/scripts/capture.py
+SCRIPT=.agents/skills/capture-nsys-profile/scripts/capture.py
 
 NSYS_ARGS=()
 NSYS_ARGS+=(profile)

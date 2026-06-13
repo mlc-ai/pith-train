@@ -1,6 +1,6 @@
 # Templates that carry placeholder tokens (`<model>`, `<Model>Model`) are
 # not valid Python until filled in; skip them across all hooks.
-exclude: '^\.claude/skills/.+/templates/.+$'
+exclude: '^\.agents/skills/.+/templates/.+$'
 
 repos:
   # Basic file hygiene

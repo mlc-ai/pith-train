@@ -71,7 +71,7 @@ in most cases that's exactly how past bugs landed.
    coefficients, spec-defined magic numbers) stay as module-level
    literals, and they get a one-line comment naming the source. See
    `reference/conventions.md` §thread-config.
-9. **Never stage `.claude/`, `CLAUDE.md`, or `docs/` in commits.**
+9. **Never stage `.agents/`, `.claude/`, `AGENTS.md`, `CLAUDE.md`, or `docs/` in commits.**
 
 ## Phase overview
 
@@ -327,7 +327,7 @@ high-signal self-reviews that save a review round-trip:
    heavy optional deps. Ruff doesn't flag it; reviewers will. Grep for
    indented `import`/`from` in the new model file; move them to
    module level.
-2. **Dangling `docs/`, `CLAUDE.md`, `.claude/` pointers in comments or
+2. **Dangling `docs/`, `AGENTS.md`, `CLAUDE.md`, `.agents/`, `.claude/` pointers in comments or
    docstrings.** Those paths aren't committed, so any pointer is a
    broken link. Grep the new files and inline the derivation or delete.
 3. **Unused parameters for interface compatibility.** Accept them

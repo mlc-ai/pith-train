@@ -5,7 +5,7 @@ set -euo pipefail
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 
-SCRIPT=.claude/skills/validate-correctness/scripts/validate.py
+SCRIPT=.agents/skills/validate-correctness/scripts/validate.py
 
 TORCHRUN_ARGS=()
 TORCHRUN_ARGS+=(--nnodes=${SLURM_NNODES:-1} --node-rank=${SLURM_NODEID:-0} --nproc-per-node=gpu)

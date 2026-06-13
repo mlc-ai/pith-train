@@ -282,13 +282,13 @@ The rest are smaller fused activation, loss, and attention-wrapper kernels.
 ## 9. Agent skills
 
 PithTrain ships agent skills under
-[`.claude/skills/`](../.claude/skills/) — procedural playbooks a coding agent
+[`.agents/skills/`](../.agents/skills/) — procedural playbooks a coding agent
 loads on demand for recurring framework tasks. They are part of the system's
 design, not an add-on: each encodes a scoped procedure with explicit
 prerequisites and a verifiable PASS/FAIL outcome.
 
 Current skills include `add-new-model`, `capture-nsys-profile`,
-`validate-correctness`, etc. — see [`.claude/skills/`](../.claude/skills/) for
+`validate-correctness`, etc. — see [`.agents/skills/`](../.agents/skills/) for
 the full set.
 
 When a task matches a skill, use the skill rather than re-deriving the

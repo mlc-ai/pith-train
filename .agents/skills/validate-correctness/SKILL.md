@@ -34,8 +34,8 @@ mkdir -p $REPOROOT/workspace/loggings
 Under SLURM, wrap with `srun` (see **launch-with-slurm**). Log paths must differ — `workspace/` is shared between the two runs.
 
 ```bash
-cd $WORKTREE && srun -N <nodes> -W 0 -o workspace/loggings/validate-<model>-base.log .claude/skills/validate-correctness/scripts/launch_validate.sh --model <model> --pipeline-parallel-size <PP> --expert-parallel-size <EP>
-cd $REPOROOT && srun -N <nodes> -W 0 -o workspace/loggings/validate-<model>-feat.log .claude/skills/validate-correctness/scripts/launch_validate.sh --model <model> --pipeline-parallel-size <PP> --expert-parallel-size <EP>
+cd $WORKTREE && srun -N <nodes> -W 0 -o workspace/loggings/validate-<model>-base.log .agents/skills/validate-correctness/scripts/launch_validate.sh --model <model> --pipeline-parallel-size <PP> --expert-parallel-size <EP>
+cd $REPOROOT && srun -N <nodes> -W 0 -o workspace/loggings/validate-<model>-feat.log .agents/skills/validate-correctness/scripts/launch_validate.sh --model <model> --pipeline-parallel-size <PP> --expert-parallel-size <EP>
 ```
 
 Optional flags: `--context-parallel-size` (default 1), `--sequence-length` (default 2048), `--max-steps` (default 25). Global batch size is fixed at 1024.
@@ -43,7 +43,7 @@ Optional flags: `--context-parallel-size` (default 1), `--sequence-length` (defa
 ## Step 3: Compare
 
 ```bash
-python3 .claude/skills/validate-correctness/scripts/compare.py workspace/loggings/validate-<model>-base.log workspace/loggings/validate-<model>-feat.log
+python3 .agents/skills/validate-correctness/scripts/compare.py workspace/loggings/validate-<model>-base.log workspace/loggings/validate-<model>-feat.log
 ```
 
 Tune `--tolerance` (default `5e-3`) if FP8/flash-attention non-determinism causes spurious misses. Exit 0 = correctness PASS, 1 = FAIL.

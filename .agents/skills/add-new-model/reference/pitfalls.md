@@ -366,6 +366,6 @@ Instead, print magnitudes and diagnose. See
   `tests/` as untracked files; they are not part of the committed
   test suite.
 
-- **Don't commit `docs/`, `CLAUDE.md`, or `.claude/`.** Per user
-  preferences. This skill itself lives under `.claude/skills/` — it's
+- **Don't commit `docs/`, `AGENTS.md`, `CLAUDE.md`, `.agents/`, or `.claude/`.** Per user
+  preferences. This skill itself lives under `.agents/skills/` — it's
   not committed.

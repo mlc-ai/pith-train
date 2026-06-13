@@ -37,7 +37,7 @@ are not bureaucracy — they are the property the project exists to demonstrate.
 
 4. **Ship skills for recurring procedures.** If you add a workflow that will be
    repeated (a new kind of profiling, a migration, a validation), consider
-   shipping it as an agent skill under `.claude/skills/` with a scoped
+   shipping it as an agent skill under `.agents/skills/` with a scoped
    description, explicit prerequisites, and a verifiable PASS/FAIL check.
 
 When in doubt, optimize for the next reader (human or agent) being able to

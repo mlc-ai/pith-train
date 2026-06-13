@@ -5,7 +5,7 @@ description: Reference for launching jobs inside a SLURM allocation via srun (si
 
 # Launch with SLURM
 
-Reference for dispatching work inside a SLURM allocation via `srun`. Most of the time Claude is invoked from inside an existing allocation — the compute is already reserved, and the job is to use it well. Applies to both single-node and multi-node allocations.
+Reference for dispatching work inside a SLURM allocation via `srun`. Most of the time the agent is invoked from inside an existing allocation — the compute is already reserved, and the job is to use it well. Applies to both single-node and multi-node allocations.
 
 Default to `srun` over raw `torchrun`/`bash` whenever `$SLURM_JOB_ID` is set. `srun` propagates env vars, handles distributed-aware I/O, and manages signals across ranks correctly — even on a single node with multiple GPUs.
 

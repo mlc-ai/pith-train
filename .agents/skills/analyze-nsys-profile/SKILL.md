@@ -36,7 +36,7 @@ Pipeline: `show_setup` → `find_window` → `classify_streams`. show_setup give
 ## Step 3 — Measure overlap per DualPipeV stage
 
 ```bash
-python .claude/skills/analyze-nsys-profile/scripts/compute_overlap.py workspace/capture-nsys-profile/pithtrain_node0.sqlite
+python .agents/skills/analyze-nsys-profile/scripts/compute_overlap.py workspace/capture-nsys-profile/pithtrain_node0.sqlite
 ```
 
 Emits one row per `(rank, stage)` with columns: `pid | stage | exposed_ns | overlap | overlap_min | overlap_max`. The `overlap` column is the time-weighted hidden fraction across the stage's comm kernels; `overlap_min` / `overlap_max` are the extremes of the per-kernel overlap percentage and surface whether the stage is uniformly bad or bimodal.
