@@ -78,7 +78,9 @@ class GptOssConverter:
         return False
 
     def detect_dcp(self, metadata) -> bool:
-        return any("gate_up_proj" in k for k in metadata.state_dict_metadata.keys())
+        # Gate on the per-expert bias, which is unique to GPT-OSS among our
+        # fused-expert models (Qwen3.5-MoE also has gate_up_proj but no bias).
+        return any("gate_up_proj_bias" in k for k in metadata.state_dict_metadata.keys())
 
     def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
         with open(Path(load_path, "model.safetensors.index.json")) as f:

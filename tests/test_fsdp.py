@@ -21,6 +21,11 @@ from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2LiteMoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
+from pithtrain.models.qwen3_5_moe import (
+    Qwen3_5MoeExperts,
+    Qwen3_5MoeModel,
+    Qwen3_5MoeTopKRouter,
+)
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 
@@ -32,11 +37,13 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, GptOssExperts):
+    elif isinstance(module, (GptOssExperts, Qwen3_5MoeExperts)):
         # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
-    elif isinstance(module, (DeepseekV2LiteMoEGate, Qwen3MoeGate, GptOssTopKRouter)):
+    elif isinstance(
+        module, (DeepseekV2LiteMoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen3_5MoeTopKRouter)
+    ):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
@@ -132,7 +139,9 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel))
+        assert isinstance(
+            model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen3_5MoeModel)
+        )
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
@@ -208,6 +217,19 @@ def main(ctx: DistributedCtx, model_name: str):
         if getattr(config, "layer_types", None) is not None:
             config.layer_types = config.layer_types[:keep]
         config.num_hidden_layers = keep
+    elif config.model_type == "qwen3_5_moe_text":
+        ModelClass = Qwen3_5MoeModel
+        # Keep the linear/full attention layer pattern when slicing layers.
+        keep = min(config.num_hidden_layers, 8)
+        if getattr(config, "layer_types", None) is not None:
+            config.layer_types = config.layer_types[:keep]
+        config.num_hidden_layers = keep
+        # The released config (256 experts, 248320-token vocab) cannot be
+        # instantiated in fp32 on a single GPU for the reference model. Shrink
+        # the memory drivers — correctness of the 5-stage / EP / PP paths is
+        # independent of the exact expert count and vocabulary size.
+        config.num_experts = 32
+        config.vocab_size = 8192
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
@@ -394,6 +416,7 @@ def _entry() -> None:
     models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
+    models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)

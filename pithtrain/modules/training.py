@@ -24,6 +24,7 @@ from pithtrain.config import SlottedDefault
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
 from pithtrain.models.gpt_oss import GptOssModel
+from pithtrain.models.qwen3_5_moe import Qwen3_5MoeModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
@@ -372,7 +373,9 @@ def apply_fsdp(
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel))
+        assert isinstance(
+            model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen3_5MoeModel)
+        )
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
@@ -468,6 +471,9 @@ def setup_model(
         model_kwargs = {"cp_group": cp_group}
     elif module_config.model_type == "gpt_oss":
         ModelClass = GptOssModel
+        model_kwargs = {"cp_group": cp_group}
+    elif module_config.model_type == "qwen3_5_moe_text":
+        ModelClass = Qwen3_5MoeModel
         model_kwargs = {"cp_group": cp_group}
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
