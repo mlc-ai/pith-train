@@ -224,6 +224,18 @@ class AppState(Stateful):
             options = StateDictOptions(strict=False)
             set_model_state_dict(self.model, model_state, options=options)
         if sched_state:
+            # The scheduler is a SequentialLR whose phase count depends on the config
+            # (warmup/scheduler/WSD-decay). Loading a saved phase list into a differently
+            # shaped scheduler silently corrupts the LR (or raises IndexError), so refuse a
+            # structural mismatch with a clear message instead.
+            saved_n = len(sched_state.get("_schedulers", []))
+            cur_n = len(getattr(self.scheduler, "_schedulers", []))
+            if saved_n != cur_n:
+                raise ValueError(
+                    f"Checkpoint scheduler has {saved_n} phase(s) but the current config "
+                    f"builds {cur_n}; resuming across a scheduler/warmup/decay change is not "
+                    f"supported. Resume with the same scheduler config, or train from scratch."
+                )
             self.scheduler.load_state_dict(sched_state)
 
 

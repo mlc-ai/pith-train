@@ -419,16 +419,29 @@ def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
 def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     min_lr, max_lr = cfg.min_lr, cfg.max_lr
     warmup_steps, max_steps = cfg.warmup_steps, cfg.max_steps
-    warmup = LinearLR(ctx.optimizer, min_lr / max_lr, 1.0, warmup_steps)
-    phases, milestones = [warmup], [warmup_steps]
+    post_steps = max_steps - warmup_steps
+    # Linear warmup min_lr -> max_lr. Skipped when warmup_steps == 0: a zero-length
+    # LinearLR is degenerate and would otherwise pin the following phase at min_lr.
+    phases, milestones = [], []
+    if warmup_steps > 0:
+        phases.append(LinearLR(ctx.optimizer, min_lr / max_lr, 1.0, warmup_steps))
+        milestones.append(warmup_steps)
     match cfg.scheduler:
         case "CosineAnnealing":
-            phases.append(CosineAnnealingLR(ctx.optimizer, max_steps - warmup_steps, min_lr))
+            phases.append(CosineAnnealingLR(ctx.optimizer, post_steps, min_lr))
         case "Constant":
-            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, max_steps - warmup_steps))
+            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, post_steps))
         case "WSD":
             # warmup -> stable (hold max_lr) -> decay (max_lr to min_lr) over decay_steps.
-            stable_steps = max_steps - warmup_steps - cfg.decay_steps
+            # Bound decay_steps so both the stable and decay phases are non-degenerate:
+            # 0-length phases give SequentialLR a zero T_max/total_iters (ZeroDivisionError)
+            # or non-increasing milestones (silently wrong LR).
+            if not 0 < cfg.decay_steps < post_steps:
+                raise ValueError(
+                    f"WSD needs 0 < decay_steps < max_steps - warmup_steps; got "
+                    f"decay_steps={cfg.decay_steps}, warmup_steps={warmup_steps}, max_steps={max_steps}"
+                )
+            stable_steps = post_steps - cfg.decay_steps
             phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, stable_steps))
             phases.append(
                 LinearLR(ctx.optimizer, 1.0, min_lr / max_lr, cfg.decay_steps)
@@ -438,7 +451,9 @@ def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
             milestones.append(warmup_steps + stable_steps)
         case _:
             raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
-    ctx.scheduler = SequentialLR(ctx.optimizer, phases, milestones)
+    ctx.scheduler = (
+        SequentialLR(ctx.optimizer, phases, milestones) if len(phases) > 1 else phases[0]
+    )
 
 
 @contextmanager
