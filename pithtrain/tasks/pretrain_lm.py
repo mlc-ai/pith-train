@@ -163,6 +163,23 @@ def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -
     return total_norm
 
 
+def _scheduler_structure_mismatch(state: dict, sched: LRScheduler) -> bool:
+    """True if a saved scheduler state_dict has a different structure than the live scheduler
+    (phase count or per-phase type), which torch's load_state_dict would silently corrupt.
+    Recurses into SequentialLR children and distinguishes CosineAnnealingLR (has ``T_max``)
+    from LinearLR -- the two leaf schedulers ``setup_scheduler`` builds."""
+    has_state_subs = "_schedulers" in state
+    has_sched_subs = hasattr(sched, "_schedulers")
+    if has_state_subs != has_sched_subs:
+        return True
+    if has_state_subs:
+        subs_state, subs_sched = state["_schedulers"], sched._schedulers
+        if len(subs_state) != len(subs_sched):
+            return True
+        return any(_scheduler_structure_mismatch(s, c) for s, c in zip(subs_state, subs_sched))
+    return ("T_max" in state) != hasattr(sched, "T_max")
+
+
 class AppState(Stateful):
     """Stateful object to save and load the checkpoint."""
 
@@ -224,17 +241,15 @@ class AppState(Stateful):
             options = StateDictOptions(strict=False)
             set_model_state_dict(self.model, model_state, options=options)
         if sched_state:
-            # The scheduler is a SequentialLR whose phase count depends on the config
-            # (warmup/scheduler/WSD-decay). Loading a saved phase list into a differently
-            # shaped scheduler silently corrupts the LR (or raises IndexError), so refuse a
-            # structural mismatch with a clear message instead.
-            saved_n = len(sched_state.get("_schedulers", []))
-            cur_n = len(getattr(self.scheduler, "_schedulers", []))
-            if saved_n != cur_n:
+            # A scheduler's structure (phase count AND per-phase type) depends on the config
+            # (warmup / scheduler / WSD decay shape). torch load_state_dict just updates
+            # __dict__, so loading a mismatched structure silently corrupts the LR or crashes;
+            # refuse any structural/type mismatch with a clear message instead.
+            if _scheduler_structure_mismatch(sched_state, self.scheduler):
                 raise ValueError(
-                    f"Checkpoint scheduler has {saved_n} phase(s) but the current config "
-                    f"builds {cur_n}; resuming across a scheduler/warmup/decay change is not "
-                    f"supported. Resume with the same scheduler config, or train from scratch."
+                    "Checkpoint scheduler structure does not match the current config; "
+                    "resuming across a scheduler/warmup/decay change is not supported. "
+                    "Resume with the same scheduler config, or train from scratch."
                 )
             self.scheduler.load_state_dict(sched_state)
 

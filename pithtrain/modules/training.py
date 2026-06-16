@@ -420,6 +420,11 @@ def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     min_lr, max_lr = cfg.min_lr, cfg.max_lr
     warmup_steps, max_steps = cfg.warmup_steps, cfg.max_steps
     post_steps = max_steps - warmup_steps
+    if post_steps <= 0:
+        raise ValueError(
+            f"max_steps must be greater than warmup_steps; got "
+            f"max_steps={max_steps}, warmup_steps={warmup_steps}"
+        )
     # Linear warmup min_lr -> max_lr. Skipped when warmup_steps == 0: a zero-length
     # LinearLR is degenerate and would otherwise pin the following phase at min_lr.
     phases, milestones = [], []
@@ -443,11 +448,13 @@ def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
                 )
             stable_steps = post_steps - cfg.decay_steps
             phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, stable_steps))
-            phases.append(
-                LinearLR(ctx.optimizer, 1.0, min_lr / max_lr, cfg.decay_steps)
-                if cfg.decay_type == "linear"
-                else CosineAnnealingLR(ctx.optimizer, cfg.decay_steps, min_lr)
-            )
+            match cfg.decay_type:
+                case "linear":
+                    phases.append(LinearLR(ctx.optimizer, 1.0, min_lr / max_lr, cfg.decay_steps))
+                case "cosine":
+                    phases.append(CosineAnnealingLR(ctx.optimizer, cfg.decay_steps, min_lr))
+                case _:
+                    raise ValueError(f"Unknown decay_type: {cfg.decay_type!r}")
             milestones.append(warmup_steps + stable_steps)
         case _:
             raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
