@@ -65,8 +65,15 @@ class TrainingCfg(SlottedDefault):
     optimizer: Literal["Adam"]
     """The optimizer to use during training."""
 
-    scheduler: Literal["CosineAnnealing", "Constant"]
+    scheduler: Literal["CosineAnnealing", "Constant", "WSD"]
     """The learning rate scheduler to use after linear warmup."""
+
+    decay_type: Literal["linear", "cosine"] = "cosine"
+    """Shape of the WSD decay tail. Only used when ``scheduler == "WSD"``."""
+
+    decay_steps: int = 0
+    """Number of steps in the WSD decay tail; the stable phase is the remainder
+    (``max_steps - warmup_steps - decay_steps``). Only used when ``scheduler == "WSD"``."""
 
     model: Union[
         Path,
@@ -413,14 +420,25 @@ def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     min_lr, max_lr = cfg.min_lr, cfg.max_lr
     warmup_steps, max_steps = cfg.warmup_steps, cfg.max_steps
     warmup = LinearLR(ctx.optimizer, min_lr / max_lr, 1.0, warmup_steps)
+    phases, milestones = [warmup], [warmup_steps]
     match cfg.scheduler:
         case "CosineAnnealing":
-            stable = CosineAnnealingLR(ctx.optimizer, max_steps - warmup_steps, min_lr)
+            phases.append(CosineAnnealingLR(ctx.optimizer, max_steps - warmup_steps, min_lr))
         case "Constant":
-            stable = LinearLR(ctx.optimizer, 1.0, 1.0, max_steps - warmup_steps)
+            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, max_steps - warmup_steps))
+        case "WSD":
+            # warmup -> stable (hold max_lr) -> decay (max_lr to min_lr) over decay_steps.
+            stable_steps = max_steps - warmup_steps - cfg.decay_steps
+            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, stable_steps))
+            phases.append(
+                LinearLR(ctx.optimizer, 1.0, min_lr / max_lr, cfg.decay_steps)
+                if cfg.decay_type == "linear"
+                else CosineAnnealingLR(ctx.optimizer, cfg.decay_steps, min_lr)
+            )
+            milestones.append(warmup_steps + stable_steps)
         case _:
             raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
-    ctx.scheduler = SequentialLR(ctx.optimizer, [warmup, stable], [warmup_steps])
+    ctx.scheduler = SequentialLR(ctx.optimizer, phases, milestones)
 
 
 @contextmanager
