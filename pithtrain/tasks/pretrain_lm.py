@@ -23,7 +23,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
 
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.checkpoint import (
@@ -166,8 +166,9 @@ def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -
 def _scheduler_structure_mismatch(state: dict, sched: LRScheduler) -> bool:
     """True if a saved scheduler state_dict has a different structure than the live scheduler
     (phase count or per-phase type), which torch's load_state_dict would silently corrupt.
-    Recurses into SequentialLR children and distinguishes CosineAnnealingLR (has ``T_max``)
-    from LinearLR -- the two leaf schedulers ``setup_scheduler`` builds."""
+    Recurses into SequentialLR children; at the leaves the saved type is inferred from its
+    state keys (only CosineAnnealingLR carries ``T_max``) and compared to the live scheduler's
+    class -- CosineAnnealingLR vs LinearLR are the two leaf types ``setup_scheduler`` builds."""
     has_state_subs = "_schedulers" in state
     has_sched_subs = hasattr(sched, "_schedulers")
     if has_state_subs != has_sched_subs:
@@ -177,7 +178,7 @@ def _scheduler_structure_mismatch(state: dict, sched: LRScheduler) -> bool:
         if len(subs_state) != len(subs_sched):
             return True
         return any(_scheduler_structure_mismatch(s, c) for s, c in zip(subs_state, subs_sched))
-    return ("T_max" in state) != hasattr(sched, "T_max")
+    return ("T_max" in state) != isinstance(sched, CosineAnnealingLR)
 
 
 class AppState(Stateful):
@@ -241,10 +242,6 @@ class AppState(Stateful):
             options = StateDictOptions(strict=False)
             set_model_state_dict(self.model, model_state, options=options)
         if sched_state:
-            # A scheduler's structure (phase count AND per-phase type) depends on the config
-            # (warmup / scheduler / WSD decay shape). torch load_state_dict just updates
-            # __dict__, so loading a mismatched structure silently corrupts the LR or crashes;
-            # refuse any structural/type mismatch with a clear message instead.
             if _scheduler_structure_mismatch(sched_state, self.scheduler):
                 raise ValueError(
                     "Checkpoint scheduler structure does not match the current config; "
