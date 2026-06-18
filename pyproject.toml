@@ -23,6 +23,14 @@ requires = ["setuptools>=61"]
 include = ["pithtrain*"]
 
 [tool.uv]
+# Exclude the redundant `-libs-base` wheel. It and `-libs-cu13` ship the same file
+# paths with different content, so a parallel `uv sync` can race into a broken mix
+# that breaks FA4's cute-dsl JIT (depends on the install filesystem, not the Python
+# version). cu13 is a strict superset of base, so nothing is lost. NVIDIA/cutlass#3259.
+# `override-dependencies` with a never-true marker is uv's idiom for dropping a dep.
+override-dependencies = [
+    "nvidia-cutlass-dsl-libs-base; python_version < '0'",
+]
 
 [[tool.uv.index]]
 name = "torch-cu130"
