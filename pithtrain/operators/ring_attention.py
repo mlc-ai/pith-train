@@ -64,6 +64,7 @@ from torch.distributed import (
     irecv,
     isend,
 )
+from torch.distributed.distributed_c10d import _resolve_process_group
 
 # FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
 # decompression; reached only when the caller passes a quantized kv_b weight
@@ -278,24 +279,86 @@ def zigzag_backward(
     return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype)
 
 
-class ZigzagRingAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, sm_scale, cp_group):
-        if not (k.is_contiguous() and v.is_contiguous()):
-            raise ValueError("ring attention requires contiguous k and v")
-        if q.shape[1] % 2:
-            raise ValueError(f"zigzag layout needs even local seq len, got {q.shape[1]}")
-        out, lse = zigzag_forward(q, k, v, sm_scale, cp_group)
-        ctx.save_for_backward(q, k, v, out, lse)
-        ctx.sm_scale = sm_scale
-        ctx.cp_group = cp_group
-        return out
+# ---------------------------------------------------------------------------
+# Opaque custom-op wrappers.
+#
+# The ring forward/backward are wrapped as torch.library.custom_op so torch.compile sees
+# the whole ring -- P2P collectives, flash kernels, online-softmax merge -- as one black
+# box, exactly like the FA4 kernels in flash_attn_v4.py. This lets the decoder layer keep
+# `_forward_attn_compute` under @torch.compile(fullgraph=True) even under context
+# parallelism (Dynamo fuses the surrounding LN/RoPE/residual and emits an opaque call for
+# the ring) instead of falling back to eager. The collectives never enter the Inductor
+# graph; the op body runs eagerly at runtime.
+#
+# A ProcessGroup is not a legal custom-op argument, so the public funcs pass the group's
+# registered name (`cp_group.group_name`) and the op body resolves it via
+# `_resolve_process_group` -- the same name<->group registry the functional collectives use.
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def backward(ctx, dout):
-        q, k, v, out, lse = ctx.saved_tensors
-        dq, dk, dv = zigzag_backward(dout, q, k, v, out, lse, ctx.sm_scale, ctx.cp_group)
-        return dq, dk, dv, None, None
+
+@torch.library.custom_op("pithtrain::zigzag_ring_fwd", mutates_args=())
+def _zigzag_ring_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not (k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("ring attention requires contiguous k and v")
+    if q.shape[1] % 2:
+        raise ValueError(f"zigzag layout needs even local seq len, got {q.shape[1]}")
+    return zigzag_forward(q, k, v, sm_scale, _resolve_process_group(group_name))
+
+
+@_zigzag_ring_fwd.register_fake
+def _(q, k, v, sm_scale, group_name):
+    b, s, hq, _ = q.shape
+    out = torch.empty((b, s, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
+    lse = torch.empty((b, hq, s), dtype=torch.float32, device=q.device)
+    return out, lse
+
+
+@torch.library.custom_op("pithtrain::zigzag_ring_bwd", mutates_args=())
+def _zigzag_ring_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return zigzag_backward(dout, q, k, v, out, lse, sm_scale, _resolve_process_group(group_name))
+
+
+@_zigzag_ring_bwd.register_fake
+def _(dout, q, k, v, out, lse, sm_scale, group_name):
+    # dk/dv take q.dtype to match zigzag_backward's `.to(q.dtype)` cast, not k/v's dtype
+    # (identical today since q/k/v share a dtype, but the meta must track the real contract).
+    return (
+        torch.empty_like(q),
+        torch.empty(k.shape, dtype=q.dtype, device=q.device),
+        torch.empty(v.shape, dtype=q.dtype, device=q.device),
+    )
+
+
+def _zigzag_setup_context(ctx, inputs, output):
+    q, k, v, sm_scale, group_name = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.sm_scale = sm_scale
+    ctx.group_name = group_name
+
+
+def _zigzag_backward(ctx, grad_out, grad_lse):
+    q, k, v, out, lse = ctx.saved_tensors
+    dq, dk, dv = _zigzag_ring_bwd(grad_out, q, k, v, out, lse, ctx.sm_scale, ctx.group_name)
+    return dq, dk, dv, None, None
+
+
+_zigzag_ring_fwd.register_autograd(_zigzag_backward, setup_context=_zigzag_setup_context)
 
 
 def ring_attention_func(
@@ -332,7 +395,8 @@ def ring_attention_func(
         Attention output of shape [batch, S_local, num_q_heads, head_dim_v] in q.dtype,
         returned in the same zigzag local layout as q.
     """
-    return ZigzagRingAttention.apply(q, k, v, sm_scale, cp_group)
+    out, _ = _zigzag_ring_fwd(q, k, v, sm_scale, cp_group.group_name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -643,10 +707,28 @@ def mla_zigzag_backward(
     )
 
 
-class MLAZigzagRingAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
+@torch.library.custom_op("pithtrain::mla_zigzag_ring_fwd", mutates_args=())
+def _mla_zigzag_ring_fwd(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    normed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_b_weight: torch.Tensor,
+    sm_scale: float,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    group_name: str,
+    use_fp8: bool,
+    weight_fp8: Optional[torch.Tensor],
+    scale_weight: Optional[torch.Tensor],
+    weight_t_fp8: Optional[torch.Tensor],
+    scale_weight_t: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not (normed_kv.is_contiguous() and k_pe.is_contiguous()):
+        raise ValueError("MLA ring attention requires contiguous normed_kv and k_pe")
+    if q_nope.shape[1] % 2:
+        raise ValueError(f"zigzag layout needs even local seq len, got {q_nope.shape[1]}")
+    return mla_zigzag_forward(
         q_nope,
         q_pe,
         normed_kv,
@@ -655,69 +737,185 @@ class MLAZigzagRingAttention(torch.autograd.Function):
         sm_scale,
         qk_nope_head_dim,
         v_head_dim,
-        cp_group,
-        kv_b_quant=None,
-    ):
-        if not (normed_kv.is_contiguous() and k_pe.is_contiguous()):
-            raise ValueError("MLA ring attention requires contiguous normed_kv and k_pe")
-        if q_nope.shape[1] % 2:
-            raise ValueError(f"zigzag layout needs even local seq len, got {q_nope.shape[1]}")
-        # kv_b_quant is the FP8-quantized kv_b weight tuple (weight_fp8, scale_weight,
-        # weight_t_fp8, scale_weight_t), pre-quantized once per micro-batch by the caller when
-        # fp8_training="deep-gemm"; None -> bf16 F.linear decompress.
-        use_fp8 = kv_b_quant is not None
-        weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = (
-            kv_b_quant if use_fp8 else (None, None, None, None)
-        )
-        out, lse = mla_zigzag_forward(
-            q_nope,
-            q_pe,
-            normed_kv,
-            k_pe,
-            kv_b_weight,
-            sm_scale,
-            qk_nope_head_dim,
-            v_head_dim,
-            cp_group,
-            use_fp8=use_fp8,
-            weight_fp8=weight_fp8,
-            scale_weight=scale_weight,
-        )
-        ctx.save_for_backward(q_nope, q_pe, normed_kv, k_pe, kv_b_weight, out, lse)
-        ctx.sm_scale = sm_scale
-        ctx.qk_nope_head_dim = qk_nope_head_dim
-        ctx.v_head_dim = v_head_dim
-        ctx.cp_group = cp_group
-        ctx.use_fp8 = use_fp8
-        ctx.weight_fp8 = weight_fp8
-        ctx.scale_weight = scale_weight
-        ctx.weight_t_fp8 = weight_t_fp8
-        ctx.scale_weight_t = scale_weight_t
-        return out
+        _resolve_process_group(group_name),
+        use_fp8=use_fp8,
+        weight_fp8=weight_fp8,
+        scale_weight=scale_weight,
+    )
 
-    @staticmethod
-    def backward(ctx, dout):
-        q_nope, q_pe, normed_kv, k_pe, kv_b_weight, out, lse = ctx.saved_tensors
-        dq_nope, dq_pe, d_normed_kv, d_k_pe, dW = mla_zigzag_backward(
-            dout,
-            q_nope,
-            q_pe,
-            normed_kv,
-            k_pe,
-            kv_b_weight,
-            out,
-            lse,
-            ctx.sm_scale,
-            ctx.qk_nope_head_dim,
-            ctx.v_head_dim,
-            ctx.cp_group,
-            use_fp8=ctx.use_fp8,
-            weight_fp8=ctx.weight_fp8,
-            scale_weight=ctx.scale_weight,
-            weight_t_fp8=ctx.weight_t_fp8,
-            scale_weight_t=ctx.scale_weight_t,
-        )
-        return dq_nope, dq_pe, d_normed_kv, d_k_pe, dW, None, None, None, None, None
+
+@_mla_zigzag_ring_fwd.register_fake
+def _(
+    q_nope,
+    q_pe,
+    normed_kv,
+    k_pe,
+    kv_b_weight,
+    sm_scale,
+    qk_nope_head_dim,
+    v_head_dim,
+    group_name,
+    use_fp8,
+    weight_fp8,
+    scale_weight,
+    weight_t_fp8,
+    scale_weight_t,
+):
+    b, s, h, _ = q_nope.shape
+    out = torch.empty((b, s, h, v_head_dim), dtype=q_nope.dtype, device=q_nope.device)
+    lse = torch.empty((b, h, s), dtype=torch.float32, device=q_nope.device)
+    return out, lse
+
+
+@torch.library.custom_op("pithtrain::mla_zigzag_ring_bwd", mutates_args=())
+def _mla_zigzag_ring_bwd(
+    dout: torch.Tensor,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    normed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_b_weight: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    group_name: str,
+    use_fp8: bool,
+    weight_fp8: Optional[torch.Tensor],
+    scale_weight: Optional[torch.Tensor],
+    weight_t_fp8: Optional[torch.Tensor],
+    scale_weight_t: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return mla_zigzag_backward(
+        dout,
+        q_nope,
+        q_pe,
+        normed_kv,
+        k_pe,
+        kv_b_weight,
+        out,
+        lse,
+        sm_scale,
+        qk_nope_head_dim,
+        v_head_dim,
+        _resolve_process_group(group_name),
+        use_fp8=use_fp8,
+        weight_fp8=weight_fp8,
+        scale_weight=scale_weight,
+        weight_t_fp8=weight_t_fp8,
+        scale_weight_t=scale_weight_t,
+    )
+
+
+@_mla_zigzag_ring_bwd.register_fake
+def _(
+    dout,
+    q_nope,
+    q_pe,
+    normed_kv,
+    k_pe,
+    kv_b_weight,
+    out,
+    lse,
+    sm_scale,
+    qk_nope_head_dim,
+    v_head_dim,
+    group_name,
+    use_fp8,
+    weight_fp8,
+    scale_weight,
+    weight_t_fp8,
+    scale_weight_t,
+):
+    out_features, lora_rank = kv_b_weight.shape
+    dW = torch.empty((out_features, lora_rank), dtype=torch.float32, device=kv_b_weight.device)
+    # d_normed_kv / d_k_pe take q_nope.dtype to match mla_zigzag_backward's `.to(q_nope.dtype)`
+    # cast (identical today since latent and query share a dtype, but the meta must track it).
+    return (
+        torch.empty_like(q_nope),
+        torch.empty_like(q_pe),
+        torch.empty(normed_kv.shape, dtype=q_nope.dtype, device=q_nope.device),
+        torch.empty(k_pe.shape, dtype=q_nope.dtype, device=q_nope.device),
+        dW,
+    )
+
+
+def _mla_zigzag_setup_context(ctx, inputs, output):
+    (
+        q_nope,
+        q_pe,
+        normed_kv,
+        k_pe,
+        kv_b_weight,
+        sm_scale,
+        qk_nope_head_dim,
+        v_head_dim,
+        group_name,
+        use_fp8,
+        weight_fp8,
+        scale_weight,
+        weight_t_fp8,
+        scale_weight_t,
+    ) = inputs
+    out, lse = output
+    ctx.save_for_backward(q_nope, q_pe, normed_kv, k_pe, kv_b_weight, out, lse)
+    ctx.sm_scale = sm_scale
+    ctx.qk_nope_head_dim = qk_nope_head_dim
+    ctx.v_head_dim = v_head_dim
+    ctx.group_name = group_name
+    ctx.use_fp8 = use_fp8
+    # FP8 weight tensors (None in bf16) are non-differentiable inputs reused in backward;
+    # stash on ctx as the autograd.Function this replaced did. dW routes to kv_b_weight.
+    ctx.weight_fp8 = weight_fp8
+    ctx.scale_weight = scale_weight
+    ctx.weight_t_fp8 = weight_t_fp8
+    ctx.scale_weight_t = scale_weight_t
+
+
+def _mla_zigzag_backward(ctx, grad_out, grad_lse):
+    q_nope, q_pe, normed_kv, k_pe, kv_b_weight, out, lse = ctx.saved_tensors
+    dq_nope, dq_pe, d_normed_kv, d_k_pe, dW = _mla_zigzag_ring_bwd(
+        grad_out,
+        q_nope,
+        q_pe,
+        normed_kv,
+        k_pe,
+        kv_b_weight,
+        out,
+        lse,
+        ctx.sm_scale,
+        ctx.qk_nope_head_dim,
+        ctx.v_head_dim,
+        ctx.group_name,
+        ctx.use_fp8,
+        ctx.weight_fp8,
+        ctx.scale_weight,
+        ctx.weight_t_fp8,
+        ctx.scale_weight_t,
+    )
+    # Grads positionally match the fwd inputs; only the five differentiable tensors carry one.
+    return (
+        dq_nope,
+        dq_pe,
+        d_normed_kv,
+        d_k_pe,
+        dW,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+_mla_zigzag_ring_fwd.register_autograd(
+    _mla_zigzag_backward, setup_context=_mla_zigzag_setup_context
+)
 
 
 def mla_ring_attention_func(
@@ -768,7 +966,11 @@ def mla_ring_attention_func(
     torch.Tensor
         Attention output [batch, S_local, num_heads, v_head_dim] in q dtype, zigzag layout.
     """
-    return MLAZigzagRingAttention.apply(
+    use_fp8 = kv_b_quant is not None
+    weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = (
+        kv_b_quant if use_fp8 else (None, None, None, None)
+    )
+    out, _ = _mla_zigzag_ring_fwd(
         q_nope,
         q_pe,
         normed_kv,
@@ -777,6 +979,11 @@ def mla_ring_attention_func(
         sm_scale,
         qk_nope_head_dim,
         v_head_dim,
-        cp_group,
-        kv_b_quant,
+        cp_group.group_name,
+        use_fp8,
+        weight_fp8,
+        scale_weight,
+        weight_t_fp8,
+        scale_weight_t,
     )
+    return out

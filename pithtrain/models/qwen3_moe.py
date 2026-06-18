@@ -482,11 +482,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        if self.self_attn.use_ring_attn:
-            self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
-                self, type(self)
-            )
-
     @torch.compile(fullgraph=True)
     def _forward_attn_compute(
         self,

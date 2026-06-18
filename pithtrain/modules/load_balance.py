@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed
+import torch.distributed._functional_collectives as funcol
 
 
 def _expert_token_counts(idx_flat: torch.Tensor, n_bins: int) -> torch.Tensor:
@@ -113,9 +114,10 @@ class GlobalBatchLoadBalanceLoss:
         tokens_per_expert = _expert_token_counts(topk_idx.reshape(-1), num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype)
 
-        # Synchronise counts across DP x EP ranks.
+        # Synchronise counts across DP x EP ranks. Functional collective (not in-place
+        # all_reduce) keeps the compiled gate fullgraph-traceable; counts carry no gradient.
         if self.process_group is not None:
-            torch.distributed.all_reduce(tokens_per_expert, group=self.process_group)
+            tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.process_group)
 
         # Accumulate in the gradient-accumulation buffer (in-place tensor ops).
         self._count_buffer.add_(tokens_per_expert.detach())
@@ -158,9 +160,13 @@ class SequenceLevelLoadBalanceLoss:
         self.cp_size = cp_group.size() if cp_group is not None else 1
 
     def _all_reduce_expert_counts(self, tokens_per_expert: torch.Tensor) -> torch.Tensor:
-        """All-reduce expert counts across CP ranks (noop when cp_group is None)."""
+        """All-reduce expert counts across CP ranks (noop when cp_group is None).
+
+        Uses the functional collective (not in-place ``torch.distributed.all_reduce``) so the
+        gate's ``compute`` stays traceable under ``torch.compile(fullgraph=True)`` even with CP
+        active -- counts are non-differentiable, so the reduce never enters the backward."""
         if self.cp_group is not None:
-            torch.distributed.all_reduce(tokens_per_expert, group=self.cp_group)
+            tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.cp_group)
         return tokens_per_expert
 
     def __call__(

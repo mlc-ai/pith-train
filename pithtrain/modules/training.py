@@ -404,8 +404,6 @@ def setup_model(
                     if hasattr(loss_fn, "init_buffers"):
                         loss_fn.init_buffers(gate.num_experts, gate.weight.device)
                     gate.load_balance_loss_fn = loss_fn
-                    if cp_group is not None:
-                        gate.compute = gate.compute.__wrapped__.__get__(gate, type(gate))
 
     ctx.model = DualPipeV(modules, pp_group=pp_group, ep_group=ep_group)
     set_p2p_tensor_shapes([(micro_batch_size, local_seq_len, hidden_size)])
