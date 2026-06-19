@@ -187,13 +187,13 @@ class AppState(Stateful):
     def __init__(
         self,
         model: nn.Module,
-        optimizer: Optimizer,
-        scheduler: LRScheduler,
+        optimizers: tuple[Optimizer, ...],
+        schedulers: tuple[LRScheduler, ...],
         model_only: bool = False,
     ):
         self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+        self.optimizers = optimizers
+        self.schedulers = schedulers
         self.model_only = model_only
 
     def state_dict(self):
@@ -210,12 +210,12 @@ class AppState(Stateful):
         advertised so DCP's planner does not look for missing optimizer keys.
         """
         if self.model_only:
-            model_state, _ = get_state_dict(self.model, self.optimizer)
+            model_state, _ = get_state_dict(self.model, self.optimizers)
             return {"model": to_canonical_model(model_state, self.model)}
-        model_state, optim_state = get_state_dict(self.model, self.optimizer)
+        model_state, optim_state = get_state_dict(self.model, self.optimizers)
         model_state = to_canonical_model(model_state, self.model)
         optim_state = to_canonical_optim(optim_state, self.model)
-        sched_state = self.scheduler.state_dict()
+        sched_state = [s.state_dict() for s in self.schedulers]
         return {"model": model_state, "optimizer": optim_state, "scheduler": sched_state}
 
     def load_state_dict(self, state_dict):
@@ -235,20 +235,23 @@ class AppState(Stateful):
         sched_state = state_dict.get("scheduler")
 
         if optim_state:
-            optim_state = to_localized_optim(optim_state, self.model)
+            optim_state = to_localized_optim(optim_state, self.model, self.optimizers)
             kwargs = dict(model_state_dict=model_state, optim_state_dict=optim_state)
-            set_state_dict(self.model, self.optimizer, **kwargs)
+            set_state_dict(self.model, self.optimizers, **kwargs)
         else:
             options = StateDictOptions(strict=False)
             set_model_state_dict(self.model, model_state, options=options)
         if sched_state:
-            if _scheduler_structure_mismatch(sched_state, self.scheduler):
-                raise ValueError(
-                    "Checkpoint scheduler structure does not match the current config; "
-                    "resuming across a scheduler/warmup/decay change is not supported. "
-                    "Resume with the same scheduler config, or train from scratch."
-                )
-            self.scheduler.load_state_dict(sched_state)
+            if isinstance(sched_state, dict):  # legacy single-scheduler ckpt
+                sched_state = [sched_state]
+            for scheduler, st in zip(self.schedulers, sched_state):
+                if _scheduler_structure_mismatch(st, scheduler):
+                    raise ValueError(
+                        "Checkpoint scheduler structure does not match the current config; "
+                        "resuming across a scheduler/warmup/decay change is not supported. "
+                        "Resume with the same scheduler config, or train from scratch."
+                    )
+                scheduler.load_state_dict(st)
 
 
 def raise_if_dataset_insufficient(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
@@ -294,16 +297,16 @@ def save_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     assert cfg.training.save_location is not None
     save_location = Path(cfg.training.save_location, "torch-dcp", "step-%08d" % ctx.training.step)
     model = ctx.training.model
-    optimizer = ctx.training.optimizer
-    scheduler = ctx.training.scheduler
+    optimizers = ctx.training.optimizers
+    schedulers = ctx.training.schedulers
 
     options = StateDictOptions(cpu_offload=True)
-    model_state, optim_state = get_state_dict(model, optimizer, options=options)
+    model_state, optim_state = get_state_dict(model, optimizers, options=options)
     state_dict = dict()
     state_dict["app"] = dict()
     state_dict["app"]["model"] = to_canonical_model(model_state, model)
     state_dict["app"]["optimizer"] = to_canonical_optim(optim_state, model)
-    state_dict["app"]["scheduler"] = scheduler.state_dict()
+    state_dict["app"]["scheduler"] = [s.state_dict() for s in schedulers]
 
     stdout.info("Save checkpoint: %s" % save_location)
     t0 = time.monotonic()
@@ -338,8 +341,9 @@ def load_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     torch.cuda.empty_cache()
     metadata = FileSystemReader(str(load_location)).read_metadata()
     model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
-    model, optimizer, scheduler = ctx.training.model, ctx.training.optimizer, ctx.training.scheduler
-    app_state = AppState(model, optimizer, scheduler, model_only=model_only)
+    model = ctx.training.model
+    optimizers, schedulers = ctx.training.optimizers, ctx.training.schedulers
+    app_state = AppState(model, optimizers, schedulers, model_only=model_only)
     dcp.load({"app": app_state}, checkpoint_id=load_location)
     rank = torch.distributed.get_rank()
     rng_path = Path(load_location, "rng-rank-%05d.pt" % rank)
@@ -380,8 +384,8 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     torch.cuda.memory.reset_peak_memory_stats()
 
     model = ctx.training.model
-    optimizer = ctx.training.optimizer
-    scheduler = ctx.training.scheduler
+    optimizers = ctx.training.optimizers
+    schedulers = ctx.training.schedulers
     model.train()
 
     dp_size = ctx.distributed.dp_size
@@ -420,10 +424,13 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     # Clip the gradients.
     gradient_norm = clip_grad_norm_(model, max_norm=1.0, norm_type=2)
 
-    # Take an optimization step.
-    optimizer.step()
-    scheduler.step()
-    optimizer.zero_grad(set_to_none=True)
+    # Take an optimization step (composed optimizers + their schedulers).
+    for optimizer in optimizers:
+        optimizer.step()
+    for scheduler in schedulers:
+        scheduler.step()
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
     MoELoadBalanceLossTracker.reset()
 
     # Measure the elapsed time in seconds.
@@ -455,7 +462,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     if ctx.distributed.rank == 0:
         step = ctx.training.step
         max_steps = cfg.training.max_steps
-        loss, lr = torch.mean(loss).item(), scheduler.get_last_lr()[0]
+        loss, lr = torch.mean(loss).item(), schedulers[0].get_last_lr()[0]
         tokens_per_second = global_batch_size * cfg.training.sequence_length / elapsed
         statements = []
         statements.append("step %08d/%08d" % (step + 1, max_steps))

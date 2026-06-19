@@ -219,14 +219,45 @@ def to_canonical_model(
     return unpack(state_dict, dict(model.named_modules()), lambda v, n, i: v[i])
 
 
+def _expand_local_fqn(local_fqn: str, named_modules: Dict[str, nn.Module]) -> list:
+    """Map a local (runtime) FQN to its canonical (disk) FQN(s), expanding
+    stacked experts."""
+    canon = strip_prefix(local_fqn)
+    moe = find_moe(local_fqn, named_modules)
+    if moe is None:
+        return [canon]
+    start, end = expert_range(moe)
+    return [canon.replace(".experts.", ".experts.%d." % idx, 1) for idx in range(start, end)]
+
+
+def _local_param_group_fqns(model: nn.Module, optimizers) -> list:
+    """This rank's local FQNs per param group, across ``optimizers`` in order
+    (the order DCP combines them in). Needed on load: DCP dedups param_groups
+    metadata across PP ranks, so the loaded params lists aren't reliably this
+    rank's -- we rebuild membership from the live optimizers instead."""
+    param_to_fqn = {p: n for n, p in model.named_parameters()}
+    groups = []
+    for opt in optimizers:
+        for g in opt.param_groups:
+            groups.append([param_to_fqn[p] for p in g["params"]])
+    return groups
+
+
 def to_canonical_optim(optim_state: Dict, model: nn.Module) -> Dict:
-    """Canonicalize optimizer state: strip module prefix, unstack expert states."""
-    state = unpack(optim_state["state"], dict(model.named_modules()), unstack_optim)
-    params = list(state.keys())
+    """Canonicalize optimizer state: strip module prefix, unstack expert states.
+
+    Each param group keeps its *own* membership (its loaded FQNs mapped to
+    canonical, experts expanded) rather than collapsing to the full param set, so a
+    composed multi-optimizer state dict (Muon + AdamW, combined by DCP) round-trips
+    without one group's hyperparameters leaking onto another's. Plain Adam is the
+    degenerate case: its one group already owns every param.
+    """
+    named_modules = dict(model.named_modules())
+    state = unpack(optim_state["state"], named_modules, unstack_optim)
     param_groups = []
     for g in optim_state["param_groups"]:
         group = {k: v for k, v in g.items() if k != "params"}
-        group["params"] = params
+        group["params"] = [cf for lf in g["params"] for cf in _expand_local_fqn(lf, named_modules)]
         param_groups.append(group)
     return {"state": state, "param_groups": param_groups}
 
@@ -280,23 +311,29 @@ def to_localized_model(
     return result
 
 
-def to_localized_optim(optim_state: Dict, model: nn.Module) -> Dict:
+def to_localized_optim(optim_state: Dict, model: nn.Module, optimizers) -> Dict:
     """
     Localize optimizer state: remap FQNs, restack experts, rebuild param_groups.
 
-    The param_groups are rebuilt with ALL of the current model's local FQNs
-    (ignoring the loaded params lists) because DCP deduplicates non-tensor
-    metadata across PP ranks.  Hyperparameters (lr, betas, ...) are taken from
-    the loaded param_groups.
+    Membership is rebuilt from the live ``optimizers`` (DCP dedups param_groups
+    across PP ranks, so the loaded lists aren't reliably this rank's). Each loaded
+    group is matched by position to the live group (the order DCP combined them
+    in); its hyperparameters are kept, its membership replaced with that group's
+    local FQNs.
     """
     named_modules = dict(model.named_modules())
     fqn_map = {strip_prefix(n): n for n, _ in model.named_parameters()}
     state = repack(optim_state["state"], fqn_map, named_modules, restack_optim)
     rewrap_dtensor_experts(state, model)
-    all_local = list(fqn_map.values())
+    local_groups = _local_param_group_fqns(model, optimizers)
+    loaded_groups = optim_state["param_groups"]
+    assert len(loaded_groups) == len(local_groups), (
+        f"param_group count mismatch: checkpoint has {len(loaded_groups)}, "
+        f"live optimizers have {len(local_groups)}"
+    )
     param_groups = []
-    for g in optim_state["param_groups"]:
+    for g, members in zip(loaded_groups, local_groups):
         group = {k: v for k, v in g.items() if k != "params"}
-        group["params"] = all_local
+        group["params"] = members
         param_groups.append(group)
     return {"state": state, "param_groups": param_groups}

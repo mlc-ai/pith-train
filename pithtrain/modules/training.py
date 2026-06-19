@@ -14,7 +14,7 @@ import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.optim import Adam, Optimizer
+from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 from transformers import AutoConfig
 
@@ -25,6 +25,7 @@ from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
+from pithtrain.modules.optimizer import Muon, partition_muon_params
 
 from .distributed import DistributedCfg, DistributedCtx
 
@@ -63,8 +64,15 @@ class TrainingCfg(SlottedDefault):
     Gradients will be accumulated over multiple micro-batches to achieve this batch size.
     """
 
-    optimizer: Literal["Adam"]
-    """The optimizer to use during training."""
+    optimizer: Literal["Adam", "Muon"]
+    """
+    The optimizer to use during training.
+
+    * "Adam" - Adam over all parameters.
+    * "Muon" - Muon for 2D hidden weights, composed with a built-in AdamW for
+      everything else (embeddings, LM head, norms, biases, MoE router); the two
+      are stepped and scheduled together as a list.
+    """
 
     scheduler: Literal["CosineAnnealing", "Constant", "WSD"]
     """The learning rate scheduler to use after linear warmup."""
@@ -189,11 +197,11 @@ class TrainingCtx:
     model: DualPipeV
     """The model being trained."""
 
-    optimizer: Optimizer
-    """The optimizer used for training."""
+    optimizers: tuple[Optimizer, ...]
+    """Optimizer(s): Muon composes two (Muon + AdamW); Adam is a 1-tuple."""
 
-    scheduler: LRScheduler
-    """The learning rate scheduler used for training."""
+    schedulers: tuple[LRScheduler, ...]
+    """Scheduler(s), one per optimizer (same warmup/decay shape)."""
 
     step: int
     """The current training step."""
@@ -414,7 +422,19 @@ def setup_model(
 
 def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     model, max_lr = ctx.model, cfg.max_lr
-    ctx.optimizer = Adam(model.parameters(), lr=max_lr)
+    match cfg.optimizer:
+        case "Adam":
+            ctx.optimizers = (Adam(model.parameters(), lr=max_lr),)
+        case "Muon":
+            # Muon for hidden weights, AdamW for the rest; weight_decay=0.0
+            # keeps the shared-LR scheme with Muon.
+            muon_params, aux_params = partition_muon_params(model)
+            ctx.optimizers = (
+                Muon(muon_params, lr=max_lr),
+                AdamW(aux_params, lr=max_lr, weight_decay=0.0),
+            )
+        case _:
+            raise ValueError(f"Unknown optimizer: {cfg.optimizer!r}")
 
 
 def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
@@ -426,43 +446,48 @@ def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
             f"max_steps must be greater than warmup_steps; got "
             f"max_steps={max_steps}, warmup_steps={warmup_steps}"
         )
-    # Linear warmup min_lr -> max_lr. Skipped when warmup_steps == 0: a zero-length
-    # LinearLR is degenerate and would otherwise pin the following phase at min_lr.
-    phases, milestones = [], []
-    if warmup_steps > 0:
-        phases.append(LinearLR(ctx.optimizer, min_lr / max_lr, 1.0, warmup_steps))
-        milestones.append(warmup_steps)
-    match cfg.scheduler:
-        case "CosineAnnealing":
-            phases.append(CosineAnnealingLR(ctx.optimizer, post_steps, min_lr))
-        case "Constant":
-            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, post_steps))
-        case "WSD":
-            # warmup -> stable (hold max_lr) -> decay (max_lr to min_lr) over wsd_decay_steps.
-            # Bound it so both the stable and decay phases are non-degenerate: 0-length phases
-            # give SequentialLR a zero T_max/total_iters (ZeroDivisionError) or non-increasing
-            # milestones (silently wrong LR).
-            if not 0 < cfg.wsd_decay_steps < post_steps:
-                raise ValueError(
-                    f"WSD needs 0 < wsd_decay_steps < max_steps - warmup_steps; got "
-                    f"wsd_decay_steps={cfg.wsd_decay_steps}, warmup_steps={warmup_steps}, "
-                    f"max_steps={max_steps}"
-                )
-            stable_steps = post_steps - cfg.wsd_decay_steps
-            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, stable_steps))
-            match cfg.wsd_decay_type:
-                case "linear":
-                    phases.append(
-                        LinearLR(ctx.optimizer, 1.0, min_lr / max_lr, cfg.wsd_decay_steps)
+
+    def build(optimizer: Optimizer) -> LRScheduler:
+        # Linear warmup min_lr -> max_lr. Skipped when warmup_steps == 0: a
+        # zero-length LinearLR is degenerate and pins the next phase at min_lr.
+        phases, milestones = [], []
+        if warmup_steps > 0:
+            phases.append(LinearLR(optimizer, min_lr / max_lr, 1.0, warmup_steps))
+            milestones.append(warmup_steps)
+        match cfg.scheduler:
+            case "CosineAnnealing":
+                phases.append(CosineAnnealingLR(optimizer, post_steps, min_lr))
+            case "Constant":
+                phases.append(LinearLR(optimizer, 1.0, 1.0, post_steps))
+            case "WSD":
+                # warmup -> stable (hold max_lr) -> decay (to min_lr) over
+                # wsd_decay_steps. Bound it so the stable and decay phases are both
+                # non-degenerate (a 0-length phase gives SequentialLR a zero T_max
+                # or non-increasing milestones).
+                if not 0 < cfg.wsd_decay_steps < post_steps:
+                    raise ValueError(
+                        f"WSD needs 0 < wsd_decay_steps < max_steps - warmup_steps; got "
+                        f"wsd_decay_steps={cfg.wsd_decay_steps}, warmup_steps={warmup_steps}, "
+                        f"max_steps={max_steps}"
                     )
-                case "cosine":
-                    phases.append(CosineAnnealingLR(ctx.optimizer, cfg.wsd_decay_steps, min_lr))
-                case _:
-                    raise ValueError(f"Unknown wsd_decay_type: {cfg.wsd_decay_type!r}")
-            milestones.append(warmup_steps + stable_steps)
-        case _:
-            raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
-    ctx.scheduler = SequentialLR(ctx.optimizer, phases, milestones)
+                stable_steps = post_steps - cfg.wsd_decay_steps
+                phases.append(LinearLR(optimizer, 1.0, 1.0, stable_steps))
+                match cfg.wsd_decay_type:
+                    case "linear":
+                        phases.append(
+                            LinearLR(optimizer, 1.0, min_lr / max_lr, cfg.wsd_decay_steps)
+                        )
+                    case "cosine":
+                        phases.append(CosineAnnealingLR(optimizer, cfg.wsd_decay_steps, min_lr))
+                    case _:
+                        raise ValueError(f"Unknown wsd_decay_type: {cfg.wsd_decay_type!r}")
+                milestones.append(warmup_steps + stable_steps)
+            case _:
+                raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
+        return SequentialLR(optimizer, phases, milestones)
+
+    # One scheduler per optimizer, identical shape -> same LR curve for all.
+    ctx.schedulers = tuple(build(opt) for opt in ctx.optimizers)
 
 
 @contextmanager
