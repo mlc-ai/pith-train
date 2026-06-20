@@ -2,6 +2,7 @@
 
 from dataclasses import MISSING, asdict, fields
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 
 
@@ -36,4 +37,12 @@ class SlottedDefault:
             return str(obj)
         elif isinstance(obj, timedelta):
             return obj.total_seconds()
+        elif isinstance(obj, partial):
+            # e.g. partial(make_wsd_scheduler, decay_steps=512) -> the call form.
+            name = getattr(obj.func, "__name__", repr(obj.func))
+            kw = ", ".join(f"{k}={v!r}" for k, v in obj.keywords.items())
+            return f"{name}({kw})" if kw else name
+        elif callable(obj):
+            # Optimizer/scheduler ``make_*`` builders log by name.
+            return getattr(obj, "__name__", repr(obj))
         return obj

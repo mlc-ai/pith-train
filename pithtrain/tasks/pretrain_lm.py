@@ -23,7 +23,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
+from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.checkpoint import (
@@ -163,24 +163,6 @@ def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -
     return total_norm
 
 
-def _scheduler_structure_mismatch(state: dict, sched: LRScheduler) -> bool:
-    """True if a saved scheduler state_dict has a different structure than the live scheduler
-    (phase count or per-phase type), which torch's load_state_dict would silently corrupt.
-    Recurses into SequentialLR children; at the leaves the saved type is inferred from its
-    state keys (only CosineAnnealingLR carries ``T_max``) and compared to the live scheduler's
-    class -- CosineAnnealingLR vs LinearLR are the two leaf types ``setup_scheduler`` builds."""
-    has_state_subs = "_schedulers" in state
-    has_sched_subs = hasattr(sched, "_schedulers")
-    if has_state_subs != has_sched_subs:
-        return True
-    if has_state_subs:
-        subs_state, subs_sched = state["_schedulers"], sched._schedulers
-        if len(subs_state) != len(subs_sched):
-            return True
-        return any(_scheduler_structure_mismatch(s, c) for s, c in zip(subs_state, subs_sched))
-    return ("T_max" in state) != isinstance(sched, CosineAnnealingLR)
-
-
 class AppState(Stateful):
     """Stateful object to save and load the checkpoint."""
 
@@ -245,12 +227,6 @@ class AppState(Stateful):
             if isinstance(sched_state, dict):  # legacy single-scheduler ckpt
                 sched_state = [sched_state]
             for scheduler, st in zip(self.schedulers, sched_state):
-                if _scheduler_structure_mismatch(st, scheduler):
-                    raise ValueError(
-                        "Checkpoint scheduler structure does not match the current config; "
-                        "resuming across a scheduler/warmup/decay change is not supported. "
-                        "Resume with the same scheduler config, or train from scratch."
-                    )
                 scheduler.load_state_dict(st)
 
 
@@ -425,12 +401,10 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     gradient_norm = clip_grad_norm_(model, max_norm=1.0, norm_type=2)
 
     # Take an optimization step (composed optimizers + their schedulers).
-    for optimizer in optimizers:
+    for optimizer, scheduler in zip(optimizers, schedulers):
         optimizer.step()
-    for scheduler in schedulers:
-        scheduler.step()
-    for optimizer in optimizers:
         optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
     MoELoadBalanceLossTracker.reset()
 
     # Measure the elapsed time in seconds.

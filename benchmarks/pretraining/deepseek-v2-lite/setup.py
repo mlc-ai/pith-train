@@ -46,16 +46,15 @@ if __name__ == "__main__":
     if n_bin < n_zst or any(cfg.output_path.rglob("*.lock")):
         tokenize_corpus.launch(cfg)
 
+from pithtrain.modules.training import make_constant_scheduler, make_muon_optimizer
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 cfg = PretrainLMCfg()
 training = cfg.training
 training.model = Path("benchmarks/pretraining/deepseek-v2-lite/model.json")
-training.optimizer = "Adam"
-training.scheduler = "Constant"
-training.max_lr = 1.0e-6
-training.min_lr = 1.0e-6
-training.warmup_steps = 0
+training.optimizer = make_muon_optimizer
+training.scheduler = make_constant_scheduler
+training.lr = 1.0e-6
 training.max_steps = 25
 training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
 training.moe_load_balance_type = "global-batch"

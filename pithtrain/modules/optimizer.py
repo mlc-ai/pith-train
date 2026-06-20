@@ -2,10 +2,10 @@
 Muon optimizer: SGD momentum, then orthogonalize the update with a 5-step
 Newton-Schulz iteration.
 
-Only 2D hidden weights are Muon-eligible (:func:`is_muon_param`); embeddings,
-the LM head, norms, biases, and the MoE router go to a separate AdamW.
-:func:`partition_muon_params` splits a model into the two lists; the training
-setup composes ``[Muon, AdamW]`` and steps/schedules/checkpoints them together.
+Only 2D hidden weights are Muon-eligible; embeddings, the LM head, norms,
+biases, and the MoE router go to a separate AdamW. ``make_muon_optimizer`` (in
+``training.py``) splits the model and composes ``(Muon, AdamW)``, which the
+training loop steps and schedules together.
 
 Under FSDP2 a weight is a sharded DTensor and Newton-Schulz needs the full
 matrix. Instead of every rank gathering and orthogonalizing every weight
@@ -155,7 +155,7 @@ def orthogonalized_updates(params, updates, steps: int = 5, chunk_size: int | No
 class Muon(torch.optim.Optimizer):
     """Muon for 2D (and batched-3D-expert) hidden weights. One fp32
     ``momentum_buffer`` per param; each step is momentum -> Newton-Schulz ->
-    scale. Pass only Muon-eligible params (:func:`is_muon_param`)."""
+    scale. Pass only Muon-eligible params (the 2D hidden weights)."""
 
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
@@ -209,42 +209,3 @@ class Muon(torch.optim.Optimizer):
             ).redistribute(placements=p.placements)
         p.mul_(1 - lr * wd)
         p.add_(orth, alpha=-lr)
-
-
-# ---------------------------------------------------------------------------
-# Parameter classification
-# ---------------------------------------------------------------------------
-
-
-def is_muon_param(name: str, param: torch.Tensor) -> bool:
-    """True if ``param`` is a 2D hidden weight Muon should optimize.
-
-    Muon: attention q/k/v/o and MLA projections, dense/shared-expert
-    gate/up/down, and the stacked 3D expert weights. AdamW (False): all 1D
-    params (norms, biases, sinks), embeddings, the LM head, the MoE gate/router,
-    and the 2D stacked expert biases (caught by the ``_bias`` check).
-    """
-    if param.ndim < 2:
-        return False
-    if name.endswith(".bias") or name.endswith("_bias"):
-        return False
-    if name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight"):
-        return False
-    if ".gate.weight" in name or ".router.weight" in name:
-        return False
-    return True
-
-
-def partition_muon_params(model: torch.nn.Module):
-    """Split ``model``'s requires-grad params into ``(muon_params, aux_params)``
-    via :func:`is_muon_param`. Asserts the Muon list is non-empty."""
-    muon_params, aux_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        (muon_params if is_muon_param(name, param) else aux_params).append(param)
-
-    assert muon_params, (
-        "Muon selected no parameters; check the model classification in is_muon_param."
-    )
-    return muon_params, aux_params

@@ -21,6 +21,7 @@ import json
 import shutil
 import tempfile
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -28,7 +29,7 @@ from torch.distributed.tensor import DTensor
 
 from pithtrain.modules.distributed import distributed_context
 from pithtrain.modules.logging import logging_context
-from pithtrain.modules.training import setup_model, setup_optimizer, setup_scheduler
+from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
 from pithtrain.tasks.pretrain_lm import (
     PretrainLMCfg,
     PretrainLMCtx,
@@ -100,8 +101,9 @@ def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
     before = opt_state_snapshot(optimizers, model)
     save_checkpoint(cfg, ctx)
 
-    setup_optimizer(cfg.training, ctx.training)  # fresh, empty-state optimizers
-    setup_scheduler(cfg.training, ctx.training)
+    # fresh, empty-state optimizers + schedulers
+    ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
+    ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
     load_checkpoint(cfg, ctx)
     after = opt_state_snapshot(ctx.training.optimizers, model)
 
@@ -142,11 +144,10 @@ def _entry():
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = parsed.ep_size
     t = cfg.training
-    t.optimizer = "Muon"
-    t.scheduler = "CosineAnnealing"
-    t.max_lr = 4.2e-4
-    t.min_lr = 1.0e-5
-    t.warmup_steps = 8
+    t.optimizer = make_muon_optimizer
+    kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.2, final_lr=1.0e-5, decay_ratio=0.8)
+    t.scheduler = partial(make_wsd_scheduler, **kwargs)
+    t.lr = 4.2e-4
     t.max_steps = 40
     t.micro_batch_size = 1
     t.global_batch_size = 64
@@ -183,8 +184,8 @@ def _entry():
         ctx.training.step = 0
         torch.manual_seed(0)
         setup_model(cfg.training, ctx.training, cfg.distributed, ctx.distributed)
-        setup_optimizer(cfg.training, ctx.training)
-        setup_scheduler(cfg.training, ctx.training)
+        ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
+        ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
         main(cfg, ctx)
 
 

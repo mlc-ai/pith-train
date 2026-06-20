@@ -1,8 +1,10 @@
 """Pretrain Qwen3-30B-A3B on a single 8-GPU H200/B200 node with 8-way expert parallelism."""
 
+from functools import partial
 from pathlib import Path
 
 from pithtrain.modules.logging import LoggingWandbCfg  # noqa: F401
+from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
@@ -16,11 +18,10 @@ distributed.expert_parallel_size = 8
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3-30b-a3b/config.json")
-training.optimizer = "Adam"
-training.scheduler = "CosineAnnealing"
-training.max_lr = 3.0e-4
-training.min_lr = 1.0e-5
-training.warmup_steps = 128
+training.optimizer = make_muon_optimizer
+kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.03, final_lr=1.0e-5)
+training.scheduler = partial(make_wsd_scheduler, **kwargs)
+training.lr = 3.0e-4
 training.max_steps = 4096
 training.micro_batch_size = 1
 training.global_batch_size = 1024

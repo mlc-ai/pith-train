@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 
-from pithtrain.modules.optimizer import Muon, partition_muon_params
+from pithtrain.modules.optimizer import Muon
+from pithtrain.modules.training import is_muon_param
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -34,10 +35,12 @@ def test_muon_step_on_fp8_gradients():
         net(x).float().pow(2).mean().backward()
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
 
-        muon_params, aux_params = partition_muon_params(net)
+        muon_params, adamw_params = [], []
+        for name, p in net.named_parameters():
+            (muon_params if is_muon_param(name, p) else adamw_params).append(p)
         optimizers = [Muon(muon_params, lr=0.02)]
-        if aux_params:
-            optimizers.append(AdamW(aux_params, lr=0.02, weight_decay=0.0))
+        if adamw_params:
+            optimizers.append(AdamW(adamw_params, lr=0.02, weight_decay=0.0))
         for opt in optimizers:
             opt.step()
         for name, p in net.named_parameters():

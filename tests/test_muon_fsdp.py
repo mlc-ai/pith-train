@@ -29,7 +29,8 @@ from torch.optim import AdamW
 
 from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
-from pithtrain.modules.optimizer import Muon, partition_muon_params
+from pithtrain.modules.optimizer import Muon
+from pithtrain.modules.training import is_muon_param
 
 NUM_EXPERTS = 8  # divisible by the EP sizes we test (1, 2, 4)
 
@@ -37,10 +38,12 @@ NUM_EXPERTS = 8  # divisible by the EP sizes we test (1, 2, 4)
 def step_composed(model, lr):
     """Step the composed optimizers as training does: Muon for hidden weights,
     AdamW for the rest (separable, so it works element-wise on each shard)."""
-    muon_params, aux_params = partition_muon_params(model)
+    muon_params, adamw_params = [], []
+    for name, p in model.named_parameters():
+        (muon_params if is_muon_param(name, p) else adamw_params).append(p)
     Muon(muon_params, lr=lr).step()
-    if aux_params:
-        AdamW(aux_params, lr=lr, weight_decay=0.0).step()
+    if adamw_params:
+        AdamW(adamw_params, lr=lr, weight_decay=0.0).step()
 
 
 class _Model(nn.Module):

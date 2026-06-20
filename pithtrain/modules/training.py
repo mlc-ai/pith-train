@@ -1,12 +1,14 @@
 """PithTrain training module."""
 
+from __future__ import annotations
+
 import gc
 import math
 import random
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, Literal, Optional, Union
+from typing import Callable, Generator, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -14,8 +16,8 @@ import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.optim import Adam, AdamW, Optimizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
+from torch.optim import AdamW, Optimizer
+from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
@@ -25,9 +27,104 @@ from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
-from pithtrain.modules.optimizer import Muon, partition_muon_params
+from pithtrain.modules.optimizer import Muon
 
 from .distributed import DistributedCfg, DistributedCtx
+
+
+def is_muon_param(name: str, param: torch.Tensor) -> bool:
+    """
+    True if Muon should optimize ``param`` (False routes it to AdamW):
+
+    * Muon: 2D hidden weights (attention q/k/v/o, MLA projections, dense and
+      shared-expert gate/up/down, stacked 3D expert weights).
+    * AdamW: everything else (1D norms/biases/sinks, embeddings, LM head, MoE
+      gate/router, 2D stacked expert biases).
+    """
+    if param.ndim < 2:
+        return False
+    if name.endswith(".bias") or name.endswith("_bias"):
+        return False
+    if name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight"):
+        return False
+    if ".gate.weight" in name or ".router.weight" in name:
+        return False
+    return True
+
+
+def make_muon_optimizer(
+    cfg: TrainingCfg, ctx: TrainingCtx, *, weight_decay: float = 0.1
+) -> tuple[Optimizer, ...]:
+    """
+    Muon for the 2D hidden weights, AdamW for the rest (the :func:`is_muon_param`
+    split). Weight decay (0.1, per "Muon is Scalable for LLM Training") applies to
+    both: decaying the RMSNorm gamma keeps per-layer output RMS from blowing up.
+    """
+    muon_params, adamw_params = [], []
+    for name, param in ctx.model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_muon_param(name, param):
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
+    kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
+    return Muon(muon_params, **kwargs), AdamW(adamw_params, **kwargs)
+
+
+def make_adamw_optimizer(
+    cfg: TrainingCfg, ctx: TrainingCtx, *, weight_decay: float = 0.1
+) -> tuple[Optimizer, ...]:
+    """AdamW over all parameters."""
+    kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
+    return (AdamW(ctx.model.parameters(), **kwargs),)
+
+
+def make_wsd_scheduler(
+    cfg: TrainingCfg,
+    ctx: TrainingCtx,
+    *,
+    start_lr: float = 0.0,
+    warmup_ratio: float = 0.0,
+    final_lr: float = 0.0,
+    decay_ratio: float = 0.1,
+    decay_shape: Literal["cosine", "linear"] = "cosine",
+) -> tuple[LRScheduler, ...]:
+    """
+    Warmup-stable-decay: linear warmup, hold lr, then cosine or linear decay.
+    Set decay_ratio = 1 - warmup_ratio for a pure anneal.
+    """
+    if decay_shape not in ("cosine", "linear"):
+        raise ValueError(f"Unknown decay_shape: {decay_shape!r}")
+    if warmup_ratio + decay_ratio > 1:
+        raise ValueError("warmup_ratio + decay_ratio must be <= 1")
+
+    max_steps = cfg.max_steps
+    warmup_steps, decay_steps = round(warmup_ratio * max_steps), round(decay_ratio * max_steps)
+    stable_steps = max_steps - warmup_steps - decay_steps
+    start_factor, final_factor = start_lr / cfg.lr, final_lr / cfg.lr
+
+    def lr_lambda(step: int) -> float:
+        # Warmup start_lr -> lr.
+        if step < warmup_steps:
+            return start_factor + (1 - start_factor) * (step / warmup_steps)
+        # Stable at lr.
+        if decay_steps == 0 or step < warmup_steps + stable_steps:
+            return 1.0
+        # Decay lr -> final_lr.
+        t = min((step - warmup_steps - stable_steps) / decay_steps, 1.0)
+        match decay_shape:
+            case "cosine":
+                return final_factor + (1 - final_factor) * 0.5 * (1 + math.cos(math.pi * t))
+            case "linear":
+                return 1.0 + (final_factor - 1.0) * t
+
+    return tuple(LambdaLR(opt, lr_lambda) for opt in ctx.optimizers)
+
+
+def make_constant_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> tuple[LRScheduler, ...]:
+    """Hold lr constant for the whole run: no warmup, no decay."""
+    return tuple(LambdaLR(opt, lambda _: 1.0) for opt in ctx.optimizers)
 
 
 @dataclass(init=False, slots=True)
@@ -41,15 +138,8 @@ class TrainingCfg(SlottedDefault):
     seed: int = 1234
     """The random seed for reproducibility."""
 
-    min_lr: float
-    """The minimum learning rate to start with and decay to."""
-
-    max_lr: float
-    """The maximum learning rate."""
-
-    warmup_steps: int = 0
-    """The number of steps for linear warmup of the learning rate; 0 (the default) disables
-    warmup, e.g. for a mid-training decay run that plugs into an existing checkpoint."""
+    lr: float
+    """The base learning rate to construct the optimizer."""
 
     max_steps: int
     """The maximum number of training steps."""
@@ -64,25 +154,21 @@ class TrainingCfg(SlottedDefault):
     Gradients will be accumulated over multiple micro-batches to achieve this batch size.
     """
 
-    optimizer: Literal["Adam", "Muon"]
+    optimizer: Callable[[TrainingCfg, TrainingCtx], tuple[Optimizer, ...]]
     """
-    The optimizer to use during training.
+    Builder for the optimizer(s). Use a built-in below or make your own:
 
-    * "Adam" - Adam over all parameters.
-    * "Muon" - Muon for 2D hidden weights, composed with a built-in AdamW for
-      everything else (embeddings, LM head, norms, biases, MoE router); the two
-      are stepped and scheduled together as a list.
+    * :func:`make_muon_optimizer`: Muon + AdamW, split by :func:`is_muon_param`.
+    * :func:`make_adamw_optimizer`: AdamW over all parameters.
     """
 
-    scheduler: Literal["CosineAnnealing", "Constant", "WSD"]
-    """The learning rate scheduler to use after linear warmup."""
+    scheduler: Callable[[TrainingCfg, TrainingCtx], tuple[LRScheduler, ...]]
+    """
+    Builder for the scheduler(s), one per optimizer. Use a built-in below or make your own:
 
-    wsd_decay_type: Literal["linear", "cosine"] = "cosine"
-    """Shape of the WSD decay tail. Only used when ``scheduler == "WSD"``."""
-
-    wsd_decay_steps: int = 0
-    """Number of steps in the WSD decay tail; the stable phase is the remainder
-    (``max_steps - warmup_steps - wsd_decay_steps``). Only used when ``scheduler == "WSD"``."""
+    * :func:`make_wsd_scheduler`: warmup, stable hold, then cosine/linear decay.
+    * :func:`make_constant_scheduler`: hold lr constant for the whole run.
+    """
 
     model: Union[
         Path,
@@ -198,7 +284,7 @@ class TrainingCtx:
     """The model being trained."""
 
     optimizers: tuple[Optimizer, ...]
-    """Optimizer(s): Muon composes two (Muon + AdamW); Adam is a 1-tuple."""
+    """Optimizer(s): Muon composes two (Muon + AdamW); AdamW is a 1-tuple."""
 
     schedulers: tuple[LRScheduler, ...]
     """Scheduler(s), one per optimizer (same warmup/decay shape)."""
@@ -418,76 +504,6 @@ def setup_model(
     set_p2p_tensor_dtype(torch.bfloat16)
 
 
-def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
-    model, max_lr = ctx.model, cfg.max_lr
-    match cfg.optimizer:
-        case "Adam":
-            ctx.optimizers = (Adam(model.parameters(), lr=max_lr),)
-        case "Muon":
-            # Muon for hidden weights, AdamW for the rest; weight_decay=0.0
-            # keeps the shared-LR scheme with Muon.
-            muon_params, aux_params = partition_muon_params(model)
-            ctx.optimizers = (
-                Muon(muon_params, lr=max_lr),
-                AdamW(aux_params, lr=max_lr, weight_decay=0.0),
-            )
-        case _:
-            raise ValueError(f"Unknown optimizer: {cfg.optimizer!r}")
-
-
-def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
-    min_lr, max_lr = cfg.min_lr, cfg.max_lr
-    warmup_steps, max_steps = cfg.warmup_steps, cfg.max_steps
-    post_steps = max_steps - warmup_steps
-    if post_steps <= 0:
-        raise ValueError(
-            f"max_steps must be greater than warmup_steps; got "
-            f"max_steps={max_steps}, warmup_steps={warmup_steps}"
-        )
-
-    def build(optimizer: Optimizer) -> LRScheduler:
-        # Linear warmup min_lr -> max_lr. Skipped when warmup_steps == 0: a
-        # zero-length LinearLR is degenerate and pins the next phase at min_lr.
-        phases, milestones = [], []
-        if warmup_steps > 0:
-            phases.append(LinearLR(optimizer, min_lr / max_lr, 1.0, warmup_steps))
-            milestones.append(warmup_steps)
-        match cfg.scheduler:
-            case "CosineAnnealing":
-                phases.append(CosineAnnealingLR(optimizer, post_steps, min_lr))
-            case "Constant":
-                phases.append(LinearLR(optimizer, 1.0, 1.0, post_steps))
-            case "WSD":
-                # warmup -> stable (hold max_lr) -> decay (to min_lr) over
-                # wsd_decay_steps. Bound it so the stable and decay phases are both
-                # non-degenerate (a 0-length phase gives SequentialLR a zero T_max
-                # or non-increasing milestones).
-                if not 0 < cfg.wsd_decay_steps < post_steps:
-                    raise ValueError(
-                        f"WSD needs 0 < wsd_decay_steps < max_steps - warmup_steps; got "
-                        f"wsd_decay_steps={cfg.wsd_decay_steps}, warmup_steps={warmup_steps}, "
-                        f"max_steps={max_steps}"
-                    )
-                stable_steps = post_steps - cfg.wsd_decay_steps
-                phases.append(LinearLR(optimizer, 1.0, 1.0, stable_steps))
-                match cfg.wsd_decay_type:
-                    case "linear":
-                        phases.append(
-                            LinearLR(optimizer, 1.0, min_lr / max_lr, cfg.wsd_decay_steps)
-                        )
-                    case "cosine":
-                        phases.append(CosineAnnealingLR(optimizer, cfg.wsd_decay_steps, min_lr))
-                    case _:
-                        raise ValueError(f"Unknown wsd_decay_type: {cfg.wsd_decay_type!r}")
-                milestones.append(warmup_steps + stable_steps)
-            case _:
-                raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
-        return SequentialLR(optimizer, phases, milestones)
-
-    # One scheduler per optimizer, identical shape -> same LR curve for all.
-    ctx.schedulers = tuple(build(opt) for opt in ctx.optimizers)
-
-
 @contextmanager
 def training_context(cfg: object, ctx: object) -> Generator[TrainingCtx, None, None]:
     """Context manager for training."""
@@ -501,8 +517,8 @@ def training_context(cfg: object, ctx: object) -> Generator[TrainingCtx, None, N
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
     setup_model(cfg.training, ctx.training, cfg.distributed, ctx.distributed)
-    setup_optimizer(cfg.training, ctx.training)
-    setup_scheduler(cfg.training, ctx.training)
+    ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
+    ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
     try:
         gc.disable()
         yield ctx.training

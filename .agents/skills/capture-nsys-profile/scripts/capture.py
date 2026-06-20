@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
+from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 MODELS = {
@@ -50,11 +51,9 @@ distributed.context_parallel_size = cp_size
 
 training = cfg.training
 training.model = Path(specs["config"])
-training.optimizer = "Adam"
-training.scheduler = "Constant"
-training.max_lr = 1e-6
-training.min_lr = 1e-6
-training.warmup_steps = 0
+training.optimizer = make_adamw_optimizer
+training.scheduler = make_constant_scheduler
+training.lr = 1e-6
 training.max_steps = 6
 training.micro_batch_size = 1
 training.global_batch_size = global_batch_size

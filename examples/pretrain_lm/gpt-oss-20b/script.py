@@ -1,6 +1,8 @@
+from functools import partial
 from pathlib import Path
 
 from pithtrain.modules.logging import LoggingWandbCfg  # noqa: F401
+from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
@@ -10,11 +12,10 @@ cfg.distributed.pipeline_parallel_size = 1
 cfg.distributed.expert_parallel_size = 8
 
 cfg.training.model = Path("examples/pretrain_lm/gpt-oss-20b/config.json")
-cfg.training.optimizer = "Adam"
-cfg.training.scheduler = "CosineAnnealing"
-cfg.training.max_lr = 3.0e-4
-cfg.training.min_lr = 1.0e-5
-cfg.training.warmup_steps = 128
+cfg.training.optimizer = make_muon_optimizer
+kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.03, final_lr=1.0e-5)
+cfg.training.scheduler = partial(make_wsd_scheduler, **kwargs)
+cfg.training.lr = 3.0e-4
 cfg.training.max_steps = 4096
 cfg.training.micro_batch_size = 1
 cfg.training.global_batch_size = 1024

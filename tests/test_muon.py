@@ -6,13 +6,8 @@ import torch.nn as nn
 from torch.optim import AdamW
 
 from pithtrain.modules.checkpoint import to_canonical_optim, to_localized_optim
-from pithtrain.modules.optimizer import (
-    Muon,
-    is_muon_param,
-    muon_scale_factor,
-    partition_muon_params,
-    zeropower_via_newtonschulz5,
-)
+from pithtrain.modules.optimizer import Muon, muon_scale_factor, zeropower_via_newtonschulz5
+from pithtrain.modules.training import is_muon_param
 
 # ---------------------------------------------------------------------------
 # Newton-Schulz orthogonalization
@@ -89,20 +84,20 @@ def test_is_muon_param_classification():
         ("model.layers.0.mlp.experts.gate_proj.weight", 3, True),
         ("model.layers.0.mlp.experts.down_proj.weight", 3, True),
         ("model.layers.0.mlp.experts.gate_up_proj.weight", 3, True),
-        # biases (1D and 2D-stacked) -> aux
+        # biases (1D and 2D-stacked) -> adamw
         ("model.layers.0.self_attn.q_proj.bias", 1, False),
         ("model.layers.0.mlp.experts.gate_up_proj_bias", 2, False),
         ("model.layers.0.mlp.experts.down_proj_bias", 2, False),
-        # norms / sinks (1D) -> aux
+        # norms / sinks (1D) -> adamw
         ("model.layers.0.input_layernorm.weight", 1, False),
         ("model.layers.0.self_attn.q_norm.weight", 1, False),
         ("model.layers.0.self_attn.kv_a_layernorm.weight", 1, False),
         ("model.layers.0.self_attn.sinks", 1, False),
-        # router / gate (2D but a classifier) -> aux
+        # router / gate (2D but a classifier) -> adamw
         ("model.layers.0.mlp.gate.weight", 2, False),
         ("model.layers.0.mlp.router.weight", 2, False),
         ("model.layers.0.mlp.router.bias", 1, False),
-        # embeddings / head (2D) -> aux
+        # embeddings / head (2D) -> adamw
         ("model.embed_tokens.weight", 2, False),
         ("model.lm_head.weight", 2, False),
     ]
@@ -116,23 +111,10 @@ class _TinyModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.q_proj = nn.Linear(8, 8, bias=True)  # weight -> Muon, bias -> aux
+        self.q_proj = nn.Linear(8, 8, bias=True)  # weight -> Muon, bias -> adamw
         self.o_proj = nn.Linear(8, 8, bias=False)  # weight -> Muon
-        self.norm = nn.LayerNorm(8)  # weight + bias (1D) -> aux
-        self.embed_tokens = nn.Embedding(16, 8)  # 2D, name-excluded -> aux
-
-
-def test_partition_muon_params():
-    model = _TinyModel()
-    muon_params, aux_params = partition_muon_params(model)
-
-    muon_ids = {id(p) for p in muon_params}
-    aux_ids = {id(p) for p in aux_params}
-    all_ids = {id(p) for p in model.parameters() if p.requires_grad}
-
-    assert muon_ids.isdisjoint(aux_ids)  # exactly one group each
-    assert muon_ids | aux_ids == all_ids  # full coverage
-    assert muon_ids == {id(model.q_proj.weight), id(model.o_proj.weight)}
+        self.norm = nn.LayerNorm(8)  # weight + bias (1D) -> adamw
+        self.embed_tokens = nn.Embedding(16, 8)  # 2D, name-excluded -> adamw
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +147,7 @@ def test_step_accepts_bf16_grad():
     # bf16 params/grads (as under FSDP param_dtype=bf16) vs the fp32 momentum
     # buffer, composed as in training: Muon for the weight, AdamW for the bias.
     w = nn.Parameter(torch.randn(16, 24, dtype=torch.bfloat16))  # 2D -> Muon
-    b = nn.Parameter(torch.randn(24, dtype=torch.bfloat16))  # 1D -> aux
+    b = nn.Parameter(torch.randn(24, dtype=torch.bfloat16))  # 1D -> adamw
     w.grad = torch.randn(16, 24, dtype=torch.bfloat16)
     b.grad = torch.randn(24, dtype=torch.bfloat16)
 
@@ -183,12 +165,14 @@ def test_checkpoint_param_groups_preserve_membership():
     """A composed [Muon, AdamW] state dict round-trips: each group keeps its own
     membership and hyperparameters (no leakage), as DCP does for optimizers."""
     model = _TinyModel()
-    muon_params, aux_params = partition_muon_params(model)
-    optimizers = (Muon(muon_params, lr=0.01), AdamW(aux_params, lr=0.01, weight_decay=0.0))
+    muon_params, adamw_params = [], []
+    for n, p in model.named_parameters():
+        (muon_params if is_muon_param(n, p) else adamw_params).append(p)
+    optimizers = (Muon(muon_params, lr=0.01), AdamW(adamw_params, lr=0.01, weight_decay=0.0))
 
     name_of = {p: n for n, p in model.named_parameters()}
     muon_fqns = [name_of[p] for p in muon_params]
-    aux_fqns = [name_of[p] for p in aux_params]
+    adamw_fqns = [name_of[p] for p in adamw_params]
 
     # Combined (Muon, AdamW) state dict as DCP returns it: FQN-keyed state,
     # param_groups in optimizer order.
@@ -196,12 +180,12 @@ def test_checkpoint_param_groups_preserve_membership():
         "state": {n: {"momentum_buffer": torch.zeros(1)} for n in muon_fqns}
         | {
             n: {"exp_avg": torch.zeros(1), "exp_avg_sq": torch.zeros(1), "step": 1}
-            for n in aux_fqns
+            for n in adamw_fqns
         },
         "param_groups": [
             {"params": list(muon_fqns), "lr": 0.01, "momentum": 0.95, "weight_decay": 0.0},
             {
-                "params": list(aux_fqns),
+                "params": list(adamw_fqns),
                 "lr": 0.01,
                 "betas": (0.9, 0.999),
                 "eps": 1e-8,
@@ -212,11 +196,11 @@ def test_checkpoint_param_groups_preserve_membership():
     }
 
     localized = to_localized_optim(to_canonical_optim(optim_state, model), model, optimizers)
-    muon_group, aux_group = localized["param_groups"]
+    muon_group, adamw_group = localized["param_groups"]
 
     assert set(muon_group["params"]) == set(muon_fqns)
-    assert set(aux_group["params"]) == set(aux_fqns)
-    assert set(muon_group["params"]).isdisjoint(aux_group["params"])
+    assert set(adamw_group["params"]) == set(adamw_fqns)
+    assert set(muon_group["params"]).isdisjoint(adamw_group["params"])
     # Per-group hyperparameters stay with the right group (no leakage).
     assert "momentum" in muon_group and "betas" not in muon_group
-    assert "betas" in aux_group and "momentum" not in aux_group
+    assert "betas" in adamw_group and "momentum" not in adamw_group
