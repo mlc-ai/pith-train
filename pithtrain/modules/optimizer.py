@@ -157,7 +157,7 @@ class Muon(torch.optim.Optimizer):
     ``momentum_buffer`` per param; each step is momentum -> Newton-Schulz ->
     scale. Pass only Muon-eligible params (the 2D hidden weights)."""
 
-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.0):
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.1):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
