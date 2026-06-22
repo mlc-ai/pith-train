@@ -1,15 +1,9 @@
-"""Qwen/Qwen3.5-35B-A3B (text tower of the qwen35_moe architecture).
+"""
+Qwen3.5-MoE (text tower).
 
-A hybrid Mixture-of-Experts language model. Each decoder layer is a token
-mixer followed by a shared-expert MoE block. The token mixer is either:
-
-* **Gated DeltaNet** (linear attention) — a short causal depthwise conv
-  followed by FLA's fused chunked gated delta rule. Most layers use this.
-* **Full softmax attention** (GQA) — with a per-head sigmoid output gate and
-  partial rotary embeddings. Used every ``full_attention_interval`` layers.
-
-Context parallelism is not implemented (linear attention needs a bespoke
-sequence-sharded recurrence); a non-trivial ``cp_group`` is rejected.
+A hybrid MoE: each decoder layer is a token mixer followed by a shared-expert
+MoE block. The mixer is Gated DeltaNet (linear attention) on most layers and
+full softmax attention (GQA) on the rest. Context parallelism is not supported.
 """
 
 from dataclasses import fields
@@ -40,6 +34,8 @@ from pithtrain.operators.token_scatter import (
     scatter_for_grouped_gemm,
 )
 
+# fmt: off
+
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
 
@@ -49,7 +45,8 @@ torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
 
 class Qwen35MoeRMSNorm(nn.Module):
-    """RMSNorm with a ``(1 + weight)`` scale and zero-initialised weight.
+    """
+    RMSNorm with a ``(1 + weight)`` scale and zero-initialised weight.
 
     This is the GLM-style parameterisation Qwen3.5 ships: the released
     checkpoint stores ``weight`` centered at 0, and the effective scale is
@@ -69,7 +66,8 @@ class Qwen35MoeRMSNorm(nn.Module):
 
 
 class Qwen35MoeRMSNormGated(nn.Module):
-    """RMSNorm (standard ``weight`` scale, ones-init) gated by ``silu(gate)``.
+    """
+    RMSNorm (standard ``weight`` scale, ones-init) gated by ``silu(gate)``.
 
     Used on the Gated DeltaNet output: ``rmsnorm(x) * silu(gate)``.
     """
@@ -94,7 +92,8 @@ class Qwen35MoeRMSNormGated(nn.Module):
 
 
 class Qwen35MoeRotaryEmbedding(nn.Module):
-    """Partial rotary embedding.
+    """
+    Partial rotary embedding.
 
     Only the first ``int(head_dim * partial_rotary_factor)`` dims of each head
     are rotated. For text-only inputs the model's interleaved MRoPE reduces to
@@ -102,26 +101,13 @@ class Qwen35MoeRotaryEmbedding(nn.Module):
     a single position grid is sufficient here.
     """
 
-    def __init__(
-        self,
-        head_dim: int,
-        partial_rotary_factor: float,
-        max_position_embeddings: int,
-        base: float,
-        device: Optional[torch.device] = None,
-    ):
+    def __init__(self, head_dim: int, partial_rotary_factor: float, max_position_embeddings: int, base: float, device: Optional[torch.device] = None):
         super().__init__()
         self.rotary_dim = int(head_dim * partial_rotary_factor)
         self.max_position_embeddings = max_position_embeddings
         self.base = base
 
-        inv_freq = 1.0 / (
-            self.base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32, device=device)
-                / self.rotary_dim
-            )
-        )
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32, device=device) / self.rotary_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._set_cos_sin_cache(max_position_embeddings, device, torch.get_default_dtype())
 
@@ -136,32 +122,23 @@ class Qwen35MoeRotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len, x.device, x.dtype)
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
+        return self.cos_cached[:seq_len].to(dtype=x.dtype), self.sin_cached[:seq_len].to(dtype=x.dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply partial rotary embedding to BSHD query/key tensors.
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply partial rotary embedding to BSHD query/key tensors.
 
     ``cos``/``sin`` have shape ``[batch, seq, rotary_dim]`` (``rotary_dim`` may
     be smaller than ``head_dim``); only the leading ``rotary_dim`` channels of
     each head are rotated, the rest pass through unchanged.
     """
-    cos = cos.unsqueeze(2)
-    sin = sin.unsqueeze(2)
+    cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
     rotary_dim = cos.shape[-1]
 
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
@@ -178,67 +155,49 @@ def apply_rotary_pos_emb(
 
 
 class Qwen35MoeGatedDeltaNet(nn.Module):
-    """Gated DeltaNet linear-attention token mixer."""
+    """
+    Gated DeltaNet linear-attention token mixer.
+    """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-        conv_kernel_size: int,
-        rms_norm_eps: float,
-        layer_idx: int,
-    ):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
-        self.head_k_dim = head_k_dim
-        self.head_v_dim = head_v_dim
-        self.key_dim = head_k_dim * num_k_heads
-        self.value_dim = head_v_dim * num_v_heads
-        self.conv_kernel_size = conv_kernel_size
+        self.hidden_size = config.hidden_size
+        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = config.linear_num_value_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim,
-            out_channels=self.conv_dim,
-            bias=False,
-            kernel_size=conv_kernel_size,
-            groups=self.conv_dim,
-            padding=conv_kernel_size - 1,
-        )
+        self.conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_kernel_size, groups=self.conv_dim, padding=self.conv_kernel_size - 1)
 
-        self.dt_bias = nn.Parameter(torch.ones(num_v_heads))
-        self.A_log = nn.Parameter(torch.log(torch.empty(num_v_heads).uniform_(0, 16)))
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.A_log = nn.Parameter(torch.log(torch.empty(self.num_v_heads).uniform_(0, 16)))
 
-        self.norm = Qwen35MoeRMSNormGated(head_v_dim, eps=rms_norm_eps)
+        self.norm = Qwen35MoeRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
         LinearCls = get_linear_cls()
-        self.in_proj_qkv = LinearCls(hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = LinearCls(hidden_size, self.value_dim, bias=False)
+        self.in_proj_qkv = LinearCls(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+        self.in_proj_z = LinearCls(self.hidden_size, self.value_dim, bias=False)
         # in_proj_a / in_proj_b have num_v_heads (=32) outputs: too small for the
         # 128-element FP8 block scaling, so keep them as plain bf16 Linear.
-        self.in_proj_b = nn.Linear(hidden_size, num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(hidden_size, num_v_heads, bias=False)
-        self.out_proj = LinearCls(self.value_dim, hidden_size, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.out_proj = LinearCls(self.value_dim, self.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)  # [b, conv_dim, seq]
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        b, a = self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
 
         # Causal depthwise conv + SiLU, truncated back to seq_len (padding=k-1).
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[..., :seq_len]).transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-        )
+        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = F.normalize(query.reshape(batch_size, seq_len, -1, self.head_k_dim), dim=-1)
         key = F.normalize(key.reshape(batch_size, seq_len, -1, self.head_k_dim), dim=-1)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -249,13 +208,11 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
         if self.num_v_heads // self.num_k_heads > 1:
             repeats = self.num_v_heads // self.num_k_heads
-            query = query.repeat_interleave(repeats, dim=2)
-            key = key.repeat_interleave(repeats, dim=2)
+            query, key = query.repeat_interleave(repeats, dim=2), key.repeat_interleave(repeats, dim=2)
 
         core_attn_out = gated_delta_rule(query, key, value, g, beta)
 
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out, z = core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
         return self.out_proj(core_attn_out)
@@ -267,73 +224,46 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
 
 class Qwen35MoeAttention(nn.Module):
-    """Grouped-query attention with a per-head sigmoid output gate.
+    """
+    Grouped-query attention with a per-head sigmoid output gate.
 
     ``q_proj`` emits twice the query width: the first half is the query, the
     second half is the gate applied (after ``sigmoid``) to the attention
     output before ``o_proj``.
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        rms_norm_eps: float,
-        attention_bias: bool,
-        cp_group: Optional[dist.ProcessGroup] = None,
-    ):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.scaling = head_dim**-0.5
-        # CP is rejected at the model level; this module only runs non-CP.
-        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.scaling = self.head_dim**-0.5
 
+        attention_bias = getattr(config, "attention_bias", False)
         LinearCls = get_linear_cls()
-        self.q_proj = LinearCls(
-            hidden_size, num_attention_heads * head_dim * 2, bias=attention_bias
-        )
-        self.k_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
+        self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias)
+        self.k_proj = LinearCls(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = LinearCls(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.o_proj = LinearCls(self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias)
 
-        self.q_norm = Qwen35MoeRMSNorm(head_dim, eps=rms_norm_eps)
-        self.k_norm = Qwen35MoeRMSNorm(head_dim, eps=rms_norm_eps)
+        self.q_norm = Qwen35MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen35MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.size()
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(bsz, seq_len, -1, self.head_dim * 2), 2, dim=-1
-        )
+        query_states, gate = torch.chunk(self.q_proj(hidden_states).view(bsz, seq_len, -1, self.head_dim * 2), 2, dim=-1)
         gate = gate.reshape(bsz, seq_len, -1)
 
         query_states = self.q_norm(query_states)
-        key_states = self.k_norm(
-            self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-        )
-        value_states = self.v_proj(hidden_states).view(
-            bsz, seq_len, self.num_kv_heads, self.head_dim
-        )
+        key_states = self.k_norm(self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim))
+        value_states = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output = flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            softmax_scale=self.scaling,
-            causal=True,
-        )
+        attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
 
         attn_output = attn_output.reshape(bsz, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
@@ -346,7 +276,9 @@ class Qwen35MoeAttention(nn.Module):
 
 
 class Qwen35MoeMLP(nn.Module):
-    """Dense SwiGLU MLP (used for the shared expert)."""
+    """
+    Dense SwiGLU MLP (used for the shared expert).
+    """
 
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
@@ -360,7 +292,8 @@ class Qwen35MoeMLP(nn.Module):
 
 
 class Qwen35MoeExperts(nn.Module):
-    """Routed experts as fused ``[E, out, in]`` raw Parameters + grouped GEMM.
+    """
+    Routed experts as fused ``[E, out, in]`` raw Parameters + grouped GEMM.
 
     Mirrors HF's storage: ``gate_up_proj`` is ``[E, 2*inter, hidden]`` and
     ``down_proj`` is ``[E, hidden, inter]``. The fused gate/up is split
@@ -372,9 +305,7 @@ class Qwen35MoeExperts(nn.Module):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size)
-        )
+        self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size))
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, moe_intermediate_size))
 
         # FP8 path: raw nn.Parameter experts can't use the FP8GroupLinear module
@@ -402,59 +333,38 @@ class Qwen35MoeExperts(nn.Module):
                 cache[name] = result
         return result
 
-    def _group_linear(
-        self,
-        x: torch.Tensor,
-        weight: nn.Parameter,
-        name: str,
-        offs: torch.Tensor,
-        ks: list | None,
-        ks_tensor: torch.Tensor | None,
-        group_indices: torch.Tensor | None,
-    ) -> torch.Tensor:
+    def _group_linear(self, x: torch.Tensor, weight: nn.Parameter, name: str, offs: torch.Tensor, ks: list | None, ks_tensor: torch.Tensor | None, group_indices: torch.Tensor | None) -> torch.Tensor:
         if x.shape[0] == 0:
             return x @ weight[0].transpose(-2, -1)
         if self._fp8:
-            return FP8GroupLinearFunc.apply(
-                x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices
-            )
+            return FP8GroupLinearFunc.apply(x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices)
         return GroupLinearFunc.apply(x, weight, offs)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grouped_mm_offs: torch.Tensor,
-        ks: list | None = None,
-        ks_tensor: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0]) if self._fp8 else None
-        gate_up = self._group_linear(
-            x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi
-        )
+        gate_up = self._group_linear(x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi)
         # Non-interleaved fused gate/up: column slices are non-contiguous, and
         # silu_mul requires contiguous inputs.
         gate = gate_up[:, : self.moe_intermediate_size].contiguous()
         up = gate_up[:, self.moe_intermediate_size :].contiguous()
         activated = silu_mul(gate, up)
-        return self._group_linear(
-            activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi
-        )
+        return self._group_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi)
 
 
 class Qwen35MoeTopKRouter(nn.Module):
-    """Softmax-then-top-k router with sum-normalised weights."""
+    """
+    Softmax-then-top-k router with sum-normalised weights.
+    """
 
-    def __init__(self, hidden_size: int, num_experts: int, num_experts_per_tok: int):
+    def __init__(self, config):
         super().__init__()
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
         self.load_balance_loss_fn = None
-        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
+        self.weight = nn.Parameter(torch.empty((config.num_experts, config.hidden_size)), requires_grad=True)
 
     @torch.compile(fullgraph=True)
-    def compute(
-        self, hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def compute(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states, self.weight, None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
@@ -462,9 +372,7 @@ class Qwen35MoeTopKRouter(nn.Module):
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
 
         if self.training and self.load_balance_loss_fn is not None:
-            lb_loss = self.load_balance_loss_fn(
-                scores, topk_idx, self.num_experts, self.num_experts_per_tok
-            )
+            lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.num_experts, self.num_experts_per_tok)
             topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
         else:
             lb_loss = None
@@ -479,40 +387,37 @@ class Qwen35MoeTopKRouter(nn.Module):
 
 
 class Qwen35MoeSparseMoeBlock(nn.Module):
-    """Routed experts + a sigmoid-gated shared expert."""
+    """
+    Routed experts + a sigmoid-gated shared expert.
+    """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        moe_intermediate_size: int,
-        shared_expert_intermediate_size: int,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
-    ):
+    def __init__(self, config, ep_size: int = 1, ep_group: Optional[dist.ProcessGroup] = None):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
 
         self.ep_size = ep_size
         self.ep_group = ep_group
         self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = num_experts // ep_size
+        self.experts_per_rank = self.num_experts // ep_size
 
-        self.gate = Qwen35MoeTopKRouter(hidden_size, num_experts, num_experts_per_tok)
-        self.experts = Qwen35MoeExperts(self.experts_per_rank, hidden_size, moe_intermediate_size)
-        self.shared_expert = Qwen35MoeMLP(hidden_size, shared_expert_intermediate_size)
-        self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
+        self.gate = Qwen35MoeTopKRouter(config)
+        self.experts = Qwen35MoeExperts(self.experts_per_rank, self.hidden_size, config.moe_intermediate_size)
+        self.shared_expert = Qwen35MoeMLP(self.hidden_size, config.shared_expert_intermediate_size)
+        self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
 
     def shared_out(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Sigmoid-gated shared-expert output (per-token scalar gate)."""
+        """
+        Sigmoid-gated shared-expert output (per-token scalar gate).
+        """
         shared = self.shared_expert(hidden_states)
         return torch.sigmoid(self.shared_expert_gate(hidden_states)) * shared
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Reference (non-pipelined, ep_size==1) full MoE forward."""
+        """
+        Reference (non-pipelined, ep_size==1) full MoE forward.
+        """
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
@@ -520,24 +425,14 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         return y + self.shared_out(identity)
 
-    def moe_infer(
-        self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
-    ) -> torch.Tensor:
+    def moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
         assert self.ep_size == 1, "Reference implementation only supports ep_size=1"
         expert_idxs = topk_ids.view(-1)
-        sorted_tokens = (
-            x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
-        )
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
-            scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
-        )
+        sorted_tokens = x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
         outs = self.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = outs[reverse_shuffle_idxs]
-        final_out = (
-            (outs.view(*topk_ids.shape, -1) * topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .to(outs.dtype)
-        )
+        final_out = (outs.view(*topk_ids.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)
         return final_out
 
 
@@ -547,20 +442,14 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
 
 
 class Qwen35MoeDecoderLayer(nn.Module):
-    """A single hybrid decoder layer split into the 5 DualPipeV stages.
+    """
+    A single hybrid decoder layer split into the 5 DualPipeV stages.
 
     Every layer is MoE. The token mixer is either ``linear_attn`` (Gated
     DeltaNet) or ``self_attn`` (full attention), selected by ``layer_type``.
     """
 
-    def __init__(
-        self,
-        config,
-        layer_idx: int,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        cp_group: Optional[dist.ProcessGroup] = None,
-    ):
+    def __init__(self, config, layer_idx: int, ep_size: int = 1, ep_group: Optional[dist.ProcessGroup] = None):
         super().__init__()
         self.idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -568,61 +457,23 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self.is_linear = self.layer_type == "linear_attention"
 
         if self.is_linear:
-            self.linear_attn = Qwen35MoeGatedDeltaNet(
-                hidden_size=config.hidden_size,
-                num_k_heads=config.linear_num_key_heads,
-                num_v_heads=config.linear_num_value_heads,
-                head_k_dim=config.linear_key_head_dim,
-                head_v_dim=config.linear_value_head_dim,
-                conv_kernel_size=config.linear_conv_kernel_dim,
-                rms_norm_eps=config.rms_norm_eps,
-                layer_idx=layer_idx,
-            )
+            self.linear_attn = Qwen35MoeGatedDeltaNet(config, layer_idx)
         else:
-            self.self_attn = Qwen35MoeAttention(
-                hidden_size=config.hidden_size,
-                num_attention_heads=config.num_attention_heads,
-                num_key_value_heads=config.num_key_value_heads,
-                head_dim=config.head_dim,
-                rms_norm_eps=config.rms_norm_eps,
-                attention_bias=getattr(config, "attention_bias", False),
-                cp_group=cp_group,
-            )
+            self.self_attn = Qwen35MoeAttention(config)
 
-        self.mlp = Qwen35MoeSparseMoeBlock(
-            hidden_size=config.hidden_size,
-            num_experts=config.num_experts,
-            num_experts_per_tok=config.num_experts_per_tok,
-            moe_intermediate_size=config.moe_intermediate_size,
-            shared_expert_intermediate_size=config.shared_expert_intermediate_size,
-            ep_size=ep_size,
-            ep_group=ep_group,
-        )
+        self.mlp = Qwen35MoeSparseMoeBlock(config, ep_size=ep_size, ep_group=ep_group)
 
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen35MoeRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-        # Both linear- and full-attention layers keep the compiled
-        # `_forward_attn_compute`. The Gated DeltaNet kernel is wrapped as a
-        # torch.library custom op (pithtrain.operators.gated_delta_rule), so it
-        # is an opaque, shape-known graph node instead of a fullgraph-breaking
-        # autograd.Function — no per-layer unwrap needed.
-
-    def _mix(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.is_linear:
-            return self.linear_attn(hidden_states)
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
-        return self.self_attn(hidden_states, position_embeddings=position_embeddings)
+        self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
     def _forward_attn_compute(self, hidden_states: torch.Tensor):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._mix(hidden_states)
+        if self.is_linear:
+            hidden_states = self.linear_attn(hidden_states)
+        else:
+            hidden_states = self.self_attn(hidden_states, position_embeddings=self._position_embeddings)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -634,67 +485,33 @@ class Qwen35MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
     def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
-        """Stage 1: LN + mixer + LN + shared expert + routing/dispatch prep."""
+        """
+        Stage 1: LN + mixer + LN + shared expert + routing/dispatch prep.
+        """
         hidden_states, residual = self._forward_attn_compute(hidden_states)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        (
-            sorted_tokens,
-            idxs,
-            expert_idxs,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-            input_splits,
-            output_splits,
-        ) = moe_ep_prepare_dispatch(
-            hidden_states,
-            topk_ids,
-            self.mlp.num_experts,
-            self.mlp.ep_size,
-            self.mlp.experts_per_rank,
-            self.mlp.ep_group,
-        )
-        return ForwardAttnOutput(
-            sorted_tokens,
-            idxs,
-            topk_weight,
-            output_splits,
-            input_splits,
-            expert_idxs,
-            residual,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-        )
+        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.num_experts, self.mlp.ep_size, self.mlp.experts_per_rank, self.mlp.ep_group)
+        return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
 
-    def forward_mlp(
-        self,
-        gathered_tokens: torch.Tensor,
-        expert_idxs: Optional[torch.Tensor] = None,
-        expand_idx: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Stage 3: scatter-by-expert + grouped GEMM + unshuffle."""
+    def forward_mlp(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Stage 3: scatter-by-expert + grouped GEMM + unshuffle.
+        """
         assert expert_idxs is not None
         if expand_idx is not None:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
-            scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
-        )
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
         del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = padded_index_gather(outs, reverse_shuffle_idxs)
         return outs
 
     @torch.compile(fullgraph=True)
-    def forward_aggregate(
-        self,
-        moe_outs: torch.Tensor,
-        moe_local_idxs: Optional[torch.Tensor],
-        topk_weight: Optional[torch.Tensor],
-        residual: torch.Tensor,
-    ) -> torch.Tensor:
-        """Stage 5: weighted expert sum + residual (shared expert already in residual)."""
+    def forward_aggregate(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor) -> torch.Tensor:
+        """
+        Stage 5: weighted expert sum + residual (shared expert already in residual).
+        """
         if self.mlp.ep_size > 1:
             assert moe_local_idxs is not None
             seq_len, topk = topk_weight.shape
@@ -712,10 +529,15 @@ class Qwen35MoeDecoderLayer(nn.Module):
         return residual + hidden_states
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Non-pipelined eager forward for correctness validation / inference."""
+        """
+        Non-pipelined eager forward for correctness validation / inference.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._mix(hidden_states)
+        if self.is_linear:
+            hidden_states = self.linear_attn(hidden_states)
+        else:
+            hidden_states = self.self_attn(hidden_states, position_embeddings=self._position_embeddings)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -730,22 +552,14 @@ class Qwen35MoeDecoderLayer(nn.Module):
 
 
 class Qwen35MoeModel(nn.Module):
-    """Qwen3.5-MoE text model for DualPipeV pipeline + expert parallelism."""
+    """
+    Qwen3.5-MoE text model for DualPipeV pipeline + expert parallelism.
+    """
 
-    def __init__(
-        self,
-        config,
-        num_stages: int,
-        stage_id: int,
-        cp_group: Optional[dist.ProcessGroup] = None,
-        ep_group: Optional[dist.ProcessGroup] = None,
-    ):
+    def __init__(self, config, num_stages: int, stage_id: int, cp_group: Optional[dist.ProcessGroup] = None, ep_group: Optional[dist.ProcessGroup] = None):
         super().__init__()
         if cp_group is not None and cp_group.size() > 1:
-            raise NotImplementedError(
-                "Qwen35MoeModel does not support context parallelism "
-                "(linear attention needs a bespoke sequence-sharded recurrence)."
-            )
+            raise NotImplementedError("Qwen35MoeModel does not support context parallelism (linear attention needs a bespoke sequence-sharded recurrence).")
         self.config = config
         self.stage_id = stage_id
         self.num_stages = num_stages
@@ -762,18 +576,10 @@ class Qwen35MoeModel(nn.Module):
         layer_id_begin = sum(num_local_layers[:stage_id])
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
 
-        self.layers = nn.ModuleDict(
-            {
-                str(i): Qwen35MoeDecoderLayer(
-                    config,
-                    layer_idx=i,
-                    ep_size=ep_size,
-                    ep_group=ep_group,
-                    cp_group=cp_group,
-                )
-                for i in range(layer_id_begin, layer_id_end)
-            }
-        )
+        self.layers = nn.ModuleDict({
+            str(i): Qwen35MoeDecoderLayer(config, layer_idx=i, ep_size=ep_size, ep_group=ep_group)
+            for i in range(layer_id_begin, layer_id_end)
+        })
 
         if stage_id == num_stages - 1:
             self.norm = Qwen35MoeRMSNorm(hidden_size, eps=config.rms_norm_eps)
@@ -782,17 +588,10 @@ class Qwen35MoeModel(nn.Module):
             self.norm = None
             self.lm_head = None
 
-        self.rotary_emb = Qwen35MoeRotaryEmbedding(
-            head_dim,
-            partial_rotary_factor=rope_params.get("partial_rotary_factor", 1.0),
-            max_position_embeddings=config.max_position_embeddings,
-            base=rope_params["rope_theta"],
-        )
+        self.rotary_emb = Qwen35MoeRotaryEmbedding(head_dim, partial_rotary_factor=rope_params.get("partial_rotary_factor", 1.0), max_position_embeddings=config.max_position_embeddings, base=rope_params["rope_theta"])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        intermediate_tensors: Optional[IntermediateTensors] = getattr(
-            self, "_intermediate_tensors", None
-        )
+        intermediate_tensors: Optional[IntermediateTensors] = getattr(self, "_intermediate_tensors", None)
 
         if self.embed_tokens is not None:
             hidden_states = self.embed_tokens(hidden_states)
@@ -851,12 +650,7 @@ class Qwen35MoeModel(nn.Module):
         return hidden_states
 
     @staticmethod
-    def backward(
-        module: "Qwen35MoeModel",
-        dy: Optional[List[torch.Tensor]],
-        loss: Optional[torch.Tensor],
-        intermediate_tensors: IntermediateTensors,
-    ):
+    def backward(module: "Qwen35MoeModel", dy: Optional[List[torch.Tensor]], loss: Optional[torch.Tensor], intermediate_tensors: IntermediateTensors):
         assert (dy is None) != (loss is None), "Either dy or loss should be provided"
 
         if loss is not None:
@@ -873,9 +667,7 @@ class Qwen35MoeModel(nn.Module):
 
         dx = dy
         layers_list = [layer for _, layer in module.layers.items()]
-        for layer, intermediate_tensors_layer in zip(
-            reversed(layers_list), reversed(intermediate_tensors.layers)
-        ):
+        for layer, intermediate_tensors_layer in zip(reversed(layers_list), reversed(intermediate_tensors.layers)):
             dx = (decoder_layer_backward(layer, dx, loss, intermediate_tensors_layer),)
 
         final_grads = dx
