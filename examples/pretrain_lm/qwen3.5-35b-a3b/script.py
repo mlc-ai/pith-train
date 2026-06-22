@@ -1,10 +1,4 @@
-"""Pretrain Qwen3.5-35B-A3B across two 8-GPU H200/B200 nodes (pp=2, ep=8).
-
-Qwen3.5-35B-A3B is a hybrid Gated-DeltaNet + full-attention MoE. It is far too
-large for a single node, so this uses pipeline parallelism (pp=2) across the
-two nodes on top of 8-way expert parallelism. Context parallelism is not yet
-supported for this model (linear attention).
-"""
+"""Pretrain Qwen3.5-35B-A3B on a single 8-GPU H200/B200 node with 8-way expert parallelism."""
 
 from functools import partial
 from pathlib import Path
@@ -15,10 +9,11 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
-# Two 16-GPU nodes: pp=2 across nodes, ep=8 within. dp is inferred (=1).
+# Fits a single 8-GPU H200/B200 node. On 8xH100 (80GB) this does not fit; use
+# two nodes with pp=2, ep=8 (16 GPUs). Context parallelism isn't supported yet.
 distributed = cfg.distributed
 distributed.context_parallel_size = 1
-distributed.pipeline_parallel_size = 2
+distributed.pipeline_parallel_size = 1
 distributed.expert_parallel_size = 8
 
 training = cfg.training
