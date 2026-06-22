@@ -4,7 +4,7 @@ A hybrid Mixture-of-Experts language model. Each decoder layer is a token
 mixer followed by a shared-expert MoE block. The token mixer is either:
 
 * **Gated DeltaNet** (linear attention) — a short causal depthwise conv
-  followed by the chunked gated delta rule. Most layers use this.
+  followed by FLA's fused chunked gated delta rule. Most layers use this.
 * **Full softmax attention** (GQA) — with a per-head sigmoid output gate and
   partial rotary embeddings. Used every ``full_attention_interval`` layers.
 
@@ -15,9 +15,11 @@ sequence-sharded recurrence); a non-trivial ``cp_group`` is rejected.
 from dataclasses import fields
 from typing import List, Optional, Tuple
 
+import fla.ops.common.chunk_o
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from torch import nn
 
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
@@ -41,10 +43,12 @@ from pithtrain.operators.token_scatter import (
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
-# Gated DeltaNet architectural constants (from the FLA reference kernel that
-# HF's torch fallback mirrors). These are not per-checkpoint knobs.
-DELTA_CHUNK_SIZE = 64
-L2NORM_EPS = 1e-6
+# FLA hard-raises in the gated delta-rule backward on Hopper + Triton>=3.4
+# (fla-org#640). That miscompile is specific to a 64-wide K tile; head_k_dim=128
+# tiles K at 128 and is correct (grads match the torch reference to ~1e-5), so
+# neutralize the over-broad guard instead of depending on the unrelated tilelang
+# backend (which additionally fails to import under Python 3.14 here).
+fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
 
 
 # ---------------------------------------------------------------------------
@@ -181,92 +185,6 @@ def apply_rotary_pos_emb(
 # ---------------------------------------------------------------------------
 
 
-def l2norm(x: torch.Tensor, dim: int = -1, eps: float = L2NORM_EPS) -> torch.Tensor:
-    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-
-
-def chunk_gated_delta_rule(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    chunk_size: int = DELTA_CHUNK_SIZE,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> torch.Tensor:
-    """Chunked gated delta rule (training/prefill, no recurrent state cache).
-
-    Pure-torch port of HF's ``torch_chunk_gated_delta_rule`` reference (the
-    fallback used when the fused FLA kernel is unavailable). Inputs are BSHD
-    ``[batch, seq, heads, dim]``; ``g`` and ``beta`` are ``[batch, seq, heads]``.
-    Returns the mixed values in BSHD layout.
-    """
-    initial_dtype = query.dtype
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=L2NORM_EPS)
-        key = l2norm(key, dim=-1, eps=L2NORM_EPS)
-    # -> [batch, heads, seq, dim] in float32 for the recurrence.
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    total_sequence_length = sequence_length + pad_size
-    scale = 1 / (k_head_dim**0.5)
-    query = query * scale
-
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), 0)
-
-    g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = torch.zeros(
-        batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device
-    )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), 1)
-
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
-
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, v_head_dim
-    )
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out
-
-
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-attention token mixer."""
 
@@ -342,7 +260,21 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(repeats, dim=2)
             key = key.repeat_interleave(repeats, dim=2)
 
-        core_attn_out = chunk_gated_delta_rule(query, key, value, g=g, beta=beta)
+        # Fused Triton kernel. q/k/v are BSHD; g (log-space decay) and beta
+        # (post-sigmoid) are [b, s, num_v_heads]. The kernel applies the q/k
+        # L2-norm (eps 1e-6) and the 1/sqrt(head_k_dim) score scale internally.
+        # It needs contiguous inputs and returns (output, final_recurrent_state);
+        # the state is unused here (no cache during training/prefill).
+        core_attn_out, _ = chunk_gated_delta_rule(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            g=g.contiguous(),
+            beta=beta.contiguous(),
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -694,11 +626,12 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # The chunked gated delta rule unrolls python loops over chunks; that
-        # graph does not fullgraph-compile efficiently, so unwrap the compiled
-        # attn region on linear-attention layers (narrow, like the ring-attn
-        # unwrap). Full-attention layers keep the compiled path. Re-landing the
-        # compile would require a fused (FLA-style) delta-rule kernel.
+        # The linear-attention region runs eagerly: FLA's chunked gated delta
+        # rule is a fused Triton autograd.Function — opaque to Dynamo, so it
+        # breaks a fullgraph compile. Unwrap the compiled attn region on
+        # linear-attention layers (narrow, like the ring-attn unwrap);
+        # full-attention layers keep the compiled path. Re-landing compile would
+        # mean wrapping the FLA op with ``torch._dynamo.allow_in_graph``.
         if self.is_linear:
             self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
                 self, type(self)
