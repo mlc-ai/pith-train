@@ -29,8 +29,8 @@ _DROP_PREFIXES = ("model.visual.", "mtp.")
 _EXPERT_SUFFIXES = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
 
 
-class Qwen3_5MoeConverter:
-    name: str = "qwen3_5_moe"
+class Qwen35MoeConverter:
+    name: str = "qwen35_moe"
 
     def detect_hf(self, load_path: Path) -> bool:
         config_path = Path(load_path, "config.json")

@@ -21,12 +21,12 @@ from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2LiteMoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
-from pithtrain.models.qwen3_5_moe import (
-    Qwen3_5MoeExperts,
-    Qwen3_5MoeModel,
-    Qwen3_5MoeTopKRouter,
-)
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.qwen35_moe import (
+    Qwen35MoeExperts,
+    Qwen35MoeModel,
+    Qwen35MoeTopKRouter,
+)
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 
 
@@ -37,12 +37,12 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, (GptOssExperts, Qwen3_5MoeExperts)):
+    elif isinstance(module, (GptOssExperts, Qwen35MoeExperts)):
         # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
     elif isinstance(
-        module, (DeepseekV2LiteMoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen3_5MoeTopKRouter)
+        module, (DeepseekV2LiteMoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
     ):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
@@ -140,7 +140,7 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(
-            model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen3_5MoeModel)
+            model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
         )
         if model[i].embed_tokens is not None:
             fully_shard(
@@ -218,7 +218,7 @@ def main(ctx: DistributedCtx, model_name: str):
             config.layer_types = config.layer_types[:keep]
         config.num_hidden_layers = keep
     elif config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen3_5MoeModel
+        ModelClass = Qwen35MoeModel
         # Keep the linear/full attention layer pattern when slicing layers.
         keep = min(config.num_hidden_layers, 8)
         if getattr(config, "layer_types", None) is not None:

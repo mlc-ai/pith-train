@@ -1,4 +1,4 @@
-"""Qwen/Qwen3.5-35B-A3B (text tower of the qwen3_5_moe architecture).
+"""Qwen/Qwen3.5-35B-A3B (text tower of the qwen35_moe architecture).
 
 A hybrid Mixture-of-Experts language model. Each decoder layer is a token
 mixer followed by a shared-expert MoE block. The token mixer is either:
@@ -48,7 +48,7 @@ torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeRMSNorm(nn.Module):
+class Qwen35MoeRMSNorm(nn.Module):
     """RMSNorm with a ``(1 + weight)`` scale and zero-initialised weight.
 
     This is the GLM-style parameterisation Qwen3.5 ships: the released
@@ -68,7 +68,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         return output.type_as(x)
 
 
-class Qwen3_5MoeRMSNormGated(nn.Module):
+class Qwen35MoeRMSNormGated(nn.Module):
     """RMSNorm (standard ``weight`` scale, ones-init) gated by ``silu(gate)``.
 
     Used on the Gated DeltaNet output: ``rmsnorm(x) * silu(gate)``.
@@ -93,7 +93,7 @@ class Qwen3_5MoeRMSNormGated(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeRotaryEmbedding(nn.Module):
+class Qwen35MoeRotaryEmbedding(nn.Module):
     """Partial rotary embedding.
 
     Only the first ``int(head_dim * partial_rotary_factor)`` dims of each head
@@ -177,7 +177,7 @@ def apply_rotary_pos_emb(
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeGatedDeltaNet(nn.Module):
+class Qwen35MoeGatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-attention token mixer."""
 
     def __init__(
@@ -215,7 +215,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(num_v_heads))
         self.A_log = nn.Parameter(torch.log(torch.empty(num_v_heads).uniform_(0, 16)))
 
-        self.norm = Qwen3_5MoeRMSNormGated(head_v_dim, eps=rms_norm_eps)
+        self.norm = Qwen35MoeRMSNormGated(head_v_dim, eps=rms_norm_eps)
 
         LinearCls = get_linear_cls()
         self.in_proj_qkv = LinearCls(hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
@@ -266,7 +266,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeAttention(nn.Module):
+class Qwen35MoeAttention(nn.Module):
     """Grouped-query attention with a per-head sigmoid output gate.
 
     ``q_proj`` emits twice the query width: the first half is the query, the
@@ -301,8 +301,8 @@ class Qwen3_5MoeAttention(nn.Module):
         self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
         self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
 
-        self.q_norm = Qwen3_5MoeRMSNorm(head_dim, eps=rms_norm_eps)
-        self.k_norm = Qwen3_5MoeRMSNorm(head_dim, eps=rms_norm_eps)
+        self.q_norm = Qwen35MoeRMSNorm(head_dim, eps=rms_norm_eps)
+        self.k_norm = Qwen35MoeRMSNorm(head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -345,7 +345,7 @@ class Qwen3_5MoeAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeMLP(nn.Module):
+class Qwen35MoeMLP(nn.Module):
     """Dense SwiGLU MLP (used for the shared expert)."""
 
     def __init__(self, hidden_size: int, intermediate_size: int):
@@ -359,7 +359,7 @@ class Qwen3_5MoeMLP(nn.Module):
         return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
 
 
-class Qwen3_5MoeExperts(nn.Module):
+class Qwen35MoeExperts(nn.Module):
     """Routed experts as fused ``[E, out, in]`` raw Parameters + grouped GEMM.
 
     Mirrors HF's storage: ``gate_up_proj`` is ``[E, 2*inter, hidden]`` and
@@ -441,7 +441,7 @@ class Qwen3_5MoeExperts(nn.Module):
         )
 
 
-class Qwen3_5MoeTopKRouter(nn.Module):
+class Qwen35MoeTopKRouter(nn.Module):
     """Softmax-then-top-k router with sum-normalised weights."""
 
     def __init__(self, hidden_size: int, num_experts: int, num_experts_per_tok: int):
@@ -478,7 +478,7 @@ class Qwen3_5MoeTopKRouter(nn.Module):
         return topk_idx, topk_weight
 
 
-class Qwen3_5MoeSparseMoeBlock(nn.Module):
+class Qwen35MoeSparseMoeBlock(nn.Module):
     """Routed experts + a sigmoid-gated shared expert."""
 
     def __init__(
@@ -501,9 +501,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.ep_rank = ep_group.rank() if ep_group is not None else 0
         self.experts_per_rank = num_experts // ep_size
 
-        self.gate = Qwen3_5MoeTopKRouter(hidden_size, num_experts, num_experts_per_tok)
-        self.experts = Qwen3_5MoeExperts(self.experts_per_rank, hidden_size, moe_intermediate_size)
-        self.shared_expert = Qwen3_5MoeMLP(hidden_size, shared_expert_intermediate_size)
+        self.gate = Qwen35MoeTopKRouter(hidden_size, num_experts, num_experts_per_tok)
+        self.experts = Qwen35MoeExperts(self.experts_per_rank, hidden_size, moe_intermediate_size)
+        self.shared_expert = Qwen35MoeMLP(hidden_size, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
 
     def shared_out(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -546,7 +546,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeDecoderLayer(nn.Module):
+class Qwen35MoeDecoderLayer(nn.Module):
     """A single hybrid decoder layer split into the 5 DualPipeV stages.
 
     Every layer is MoE. The token mixer is either ``linear_attn`` (Gated
@@ -568,7 +568,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         self.is_linear = self.layer_type == "linear_attention"
 
         if self.is_linear:
-            self.linear_attn = Qwen3_5MoeGatedDeltaNet(
+            self.linear_attn = Qwen35MoeGatedDeltaNet(
                 hidden_size=config.hidden_size,
                 num_k_heads=config.linear_num_key_heads,
                 num_v_heads=config.linear_num_value_heads,
@@ -579,7 +579,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 layer_idx=layer_idx,
             )
         else:
-            self.self_attn = Qwen3_5MoeAttention(
+            self.self_attn = Qwen35MoeAttention(
                 hidden_size=config.hidden_size,
                 num_attention_heads=config.num_attention_heads,
                 num_key_value_heads=config.num_key_value_heads,
@@ -589,7 +589,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 cp_group=cp_group,
             )
 
-        self.mlp = Qwen3_5MoeSparseMoeBlock(
+        self.mlp = Qwen35MoeSparseMoeBlock(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
             num_experts_per_tok=config.num_experts_per_tok,
@@ -599,8 +599,8 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             ep_group=ep_group,
         )
 
-        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(
+        self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen35MoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -729,7 +729,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5MoeModel(nn.Module):
+class Qwen35MoeModel(nn.Module):
     """Qwen3.5-MoE text model for DualPipeV pipeline + expert parallelism."""
 
     def __init__(
@@ -743,7 +743,7 @@ class Qwen3_5MoeModel(nn.Module):
         super().__init__()
         if cp_group is not None and cp_group.size() > 1:
             raise NotImplementedError(
-                "Qwen3_5MoeModel does not support context parallelism "
+                "Qwen35MoeModel does not support context parallelism "
                 "(linear attention needs a bespoke sequence-sharded recurrence)."
             )
         self.config = config
@@ -764,7 +764,7 @@ class Qwen3_5MoeModel(nn.Module):
 
         self.layers = nn.ModuleDict(
             {
-                str(i): Qwen3_5MoeDecoderLayer(
+                str(i): Qwen35MoeDecoderLayer(
                     config,
                     layer_idx=i,
                     ep_size=ep_size,
@@ -776,13 +776,13 @@ class Qwen3_5MoeModel(nn.Module):
         )
 
         if stage_id == num_stages - 1:
-            self.norm = Qwen3_5MoeRMSNorm(hidden_size, eps=config.rms_norm_eps)
+            self.norm = Qwen35MoeRMSNorm(hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         else:
             self.norm = None
             self.lm_head = None
 
-        self.rotary_emb = Qwen3_5MoeRotaryEmbedding(
+        self.rotary_emb = Qwen35MoeRotaryEmbedding(
             head_dim,
             partial_rotary_factor=rope_params.get("partial_rotary_factor", 1.0),
             max_position_embeddings=config.max_position_embeddings,
@@ -852,7 +852,7 @@ class Qwen3_5MoeModel(nn.Module):
 
     @staticmethod
     def backward(
-        module: "Qwen3_5MoeModel",
+        module: "Qwen35MoeModel",
         dy: Optional[List[torch.Tensor]],
         loss: Optional[torch.Tensor],
         intermediate_tensors: IntermediateTensors,
