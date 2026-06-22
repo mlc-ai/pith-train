@@ -239,8 +239,8 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
         )
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        query = F.normalize(query.reshape(batch_size, seq_len, -1, self.head_k_dim), dim=-1)
+        key = F.normalize(key.reshape(batch_size, seq_len, -1, self.head_k_dim), dim=-1)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
