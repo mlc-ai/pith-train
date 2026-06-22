@@ -15,11 +15,9 @@ sequence-sharded recurrence); a non-trivial ``cp_group`` is rejected.
 from dataclasses import fields
 from typing import List, Optional, Tuple
 
-import fla.ops.common.chunk_o
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from torch import nn
 
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
@@ -34,6 +32,7 @@ from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBa
 from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -42,13 +41,6 @@ from pithtrain.operators.token_scatter import (
 )
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
-
-# FLA hard-raises in the gated delta-rule backward on Hopper + Triton>=3.4
-# (fla-org#640). That miscompile is specific to a 64-wide K tile; head_k_dim=128
-# tiles K at 128 and is correct (grads match the torch reference to ~1e-5), so
-# neutralize the over-broad guard instead of depending on the unrelated tilelang
-# backend (which additionally fails to import under Python 3.14 here).
-fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
 
 
 # ---------------------------------------------------------------------------
@@ -260,21 +252,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(repeats, dim=2)
             key = key.repeat_interleave(repeats, dim=2)
 
-        # Fused Triton kernel. q/k/v are BSHD; g (log-space decay) and beta
-        # (post-sigmoid) are [b, s, num_v_heads]. The kernel applies the q/k
-        # L2-norm (eps 1e-6) and the 1/sqrt(head_k_dim) score scale internally.
-        # It needs contiguous inputs and returns (output, final_recurrent_state);
-        # the state is unused here (no cache during training/prefill).
-        core_attn_out, _ = chunk_gated_delta_rule(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            g=g.contiguous(),
-            beta=beta.contiguous(),
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-        )
+        core_attn_out = gated_delta_rule(query, key, value, g, beta)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -626,16 +604,11 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # The linear-attention region runs eagerly: FLA's chunked gated delta
-        # rule is a fused Triton autograd.Function — opaque to Dynamo, so it
-        # breaks a fullgraph compile. Unwrap the compiled attn region on
-        # linear-attention layers (narrow, like the ring-attn unwrap);
-        # full-attention layers keep the compiled path. Re-landing compile would
-        # mean wrapping the FLA op with ``torch._dynamo.allow_in_graph``.
-        if self.is_linear:
-            self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
-                self, type(self)
-            )
+        # Both linear- and full-attention layers keep the compiled
+        # `_forward_attn_compute`. The Gated DeltaNet kernel is wrapped as a
+        # torch.library custom op (pithtrain.operators.gated_delta_rule), so it
+        # is an opaque, shape-known graph node instead of a fullgraph-breaking
+        # autograd.Function — no per-layer unwrap needed.
 
     def _mix(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.is_linear:
