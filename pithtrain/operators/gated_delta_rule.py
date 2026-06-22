@@ -1,9 +1,9 @@
 """
 Gated DeltaNet chunked delta rule as a torch.library custom op.
 
-FLA's chunk_gated_delta_rule is @torch.compiler.disable'd (a hard Dynamo graph
-break). Wrapping its low-level fwd/bwd in a custom_op + register_fake makes it an
-opaque, shape-known graph node so the linear-attention region stays compatible.
+FLA's chunk_gated_delta_rule is @torch.compiler.disable'd (a hard Dynamo graph break).
+Wrapping its low-level fwd/bwd in a custom_op + register_fake makes it an opaque,
+shape-known graph node so the linear-attention region stays fullgraph-compilable.
 """
 
 from typing import Tuple
@@ -15,12 +15,8 @@ from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd, chunk_gat
 # fmt: off
 # mypy: ignore-errors
 
-# FLA hard-raises in the gated delta backward on Hopper + Triton>=3.4 (fla-org#640),
-# a BK=64 miscompile; head_k_dim=128 tiles K at 128 (immune), so disable the
-# over-broad guard rather than pull in tilelang (which won't import on Python 3.14).
+# Disable FLA's issue#640 guard: the BK=64 backward miscompile doesn't apply at head_k_dim=128.
 fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
-
-_CHUNK = 64  # FLA chunk size (BT); trailing dim of the saved WY matrix A
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_fwd", mutates_args=())
 def _gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -32,7 +28,7 @@ def _gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor):
     b, s, hv, vd = v.shape
     o = torch.empty((b, s, hv, vd), dtype=q.dtype, device=q.device)
-    A = torch.empty((b, s, hv, _CHUNK), dtype=q.dtype, device=q.device)
+    A = torch.empty((b, s, hv, 64), dtype=q.dtype, device=q.device) # 64 = FLA chunk size (BT)
     return o, torch.empty_like(g, dtype=torch.float32), A
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_bwd", mutates_args=())
@@ -43,7 +39,7 @@ def _gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Ten
 
 @_gdr_bwd.register_fake
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor):
-    cf = torch.contiguous_format  # match the .contiguous() grads; empty_like would inherit input strides
+    cf = torch.contiguous_format # match the .contiguous() grads; empty_like would inherit input strides
     return torch.empty_like(q, memory_format=cf), torch.empty_like(k, memory_format=cf), torch.empty_like(v, memory_format=cf), torch.empty_like(g_out, memory_format=cf), torch.empty_like(beta, memory_format=cf)
 
 def _gdr_setup_context(ctx: torch.autograd.function.FunctionCtx, inputs: Tuple, output: Tuple) -> None:
