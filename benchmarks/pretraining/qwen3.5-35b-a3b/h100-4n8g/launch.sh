@@ -15,5 +15,5 @@ SRUN_ARGS+=(--wait=0 --time=00-01:00:00)
 STEP=benchmarks/pretraining/qwen3.5-35b-a3b/setup
 srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.py
 
-STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp1-cp1-ep8-seq4096-bf16
+STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp1-cp1-ep8-seq3072-bf16
 srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
