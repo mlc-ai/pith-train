@@ -5,8 +5,6 @@
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD/benchmarks/pretraining/gpt-oss-120b
-export HF_HOME=$PWD/workspace/hf-home
-export HF_TOKEN_PATH=$HOME/.cache/huggingface/token
 
 SRUN_ARGS=()
 SRUN_ARGS+=(--nodes=8 --gpus-per-node=8)
