@@ -64,4 +64,4 @@ training.max_steps = 25
 training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
-training.save_location = Path("workspace/checkpoints/qwen3.5-35b-a3b")
+training.benchmark = True
