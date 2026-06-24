@@ -17,13 +17,10 @@ from torch import nn
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
-from pithtrain.dualpipe.utils import FP8WeightCacheControl, run_backward
-from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinearFunc
-from pithtrain.layers.factory import ModelImplMode, get_linear_cls
-from pithtrain.layers.group_linear import GroupLinearFunc
+from pithtrain.dualpipe.utils import run_backward
+from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
-from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
@@ -292,11 +289,11 @@ class Qwen35MoeMLP(nn.Module):
 
 class Qwen35MoeExperts(nn.Module):
     """
-    Routed experts as fused ``[E, out, in]`` raw Parameters + grouped GEMM.
+    Routed experts: a fused gate/up grouped linear plus a down grouped linear.
 
-    Mirrors HF's storage: ``gate_up_proj`` is ``[E, 2*inter, hidden]`` and
-    ``down_proj`` is ``[E, hidden, inter]``. The fused gate/up is split
-    non-interleaved (gate = first half, up = second half).
+    ``gate_up_proj`` is one grouped GEMM producing ``[.., 2*inter]``, split
+    non-interleaved (gate = first half, up = second half). FP8 vs BF16 and the
+    quantized-weight cache are handled by ``get_group_linear_cls()``.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, moe_intermediate_size: int):
@@ -304,50 +301,19 @@ class Qwen35MoeExperts(nn.Module):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size))
-        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, moe_intermediate_size))
 
-        # FP8 path: raw nn.Parameter experts can't use the FP8GroupLinear module
-        # wrapper, so dispatch FP8GroupLinearFunc directly and cache quantized
-        # weights here (matching the GPT-OSS expert pattern).
-        self._fp8 = ModelImplMode.fp8_training == "deep-gemm"
-        self._wq_cache: dict[str, tuple] | None = None
-        self._wq_version: int = -1
-
-    def _quantized_weight(self, name: str, weight: torch.Tensor) -> tuple:
-        if torch.compiler.is_compiling():
-            return fused_blockwise_transpose_cast_to_fp8_batched(weight)
-        ver = FP8WeightCacheControl._version
-        cache = self._wq_cache
-        if FP8WeightCacheControl.enabled and self._wq_version == ver and cache is not None:
-            hit = cache.get(name)
-            if hit is not None:
-                return hit
-        result = fused_blockwise_transpose_cast_to_fp8_batched(weight)
-        if FP8WeightCacheControl.enabled:
-            if self._wq_version != ver or cache is None:
-                self._wq_cache = {name: result}
-                self._wq_version = ver
-            else:
-                cache[name] = result
-        return result
-
-    def _group_linear(self, x: torch.Tensor, weight: nn.Parameter, name: str, offs: torch.Tensor, ks: list | None, ks_tensor: torch.Tensor | None, group_indices: torch.Tensor | None) -> torch.Tensor:
-        if x.shape[0] == 0:
-            return x @ weight[0].transpose(-2, -1)
-        if self._fp8:
-            return FP8GroupLinearFunc.apply(x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices)
-        return GroupLinearFunc.apply(x, weight, offs)
+        GroupLinearCls = get_group_linear_cls()
+        self.gate_up_proj = GroupLinearCls(num_experts, hidden_size, 2 * moe_intermediate_size)
+        self.down_proj = GroupLinearCls(num_experts, moe_intermediate_size, hidden_size)
 
     def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
-        gi = precompute_group_indices(grouped_mm_offs, x.shape[0]) if self._fp8 else None
-        gate_up = self._group_linear(x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi)
-        # Non-interleaved fused gate/up: column slices are non-contiguous, and
-        # silu_mul requires contiguous inputs.
+        gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
+        gate_up = self.gate_up_proj(x, **kwargs)
+        # Non-interleaved fused gate/up: column slices are non-contiguous, and silu_mul requires contiguous inputs.
         gate = gate_up[:, : self.moe_intermediate_size].contiguous()
         up = gate_up[:, self.moe_intermediate_size :].contiguous()
-        activated = silu_mul(gate, up)
-        return self._group_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi)
+        return self.down_proj(silu_mul(gate, up), **kwargs)
 
 
 class Qwen35MoeTopKRouter(nn.Module):

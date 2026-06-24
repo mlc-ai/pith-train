@@ -7,8 +7,9 @@ multi-token-prediction head (``mtp.*``) are dropped.
 
 Experts are already stored fused and in the training-framework ``[E, out, in]``
 layout (``gate_up_proj`` is ``[E, 2*inter, hidden]``, ``down_proj`` is
-``[E, hidden, inter]``), so hf2dcp only splits along the expert axis and dcp2hf
-only re-stacks — there is no layout transpose anywhere.
+``[E, hidden, inter]``), so hf2dcp only splits along the expert axis (adding a
+``.weight`` suffix for the runtime ``GroupLinear`` submodules) and dcp2hf
+re-stacks and strips it — there is no layout transpose anywhere.
 """
 
 import json
@@ -80,8 +81,12 @@ class Qwen35MoeConverter:
                     tensor = f.get_tensor(key)
                     if canon.endswith(_EXPERT_SUFFIXES):
                         # Fused [E, out, in] -> per-expert [out, in] (no transpose).
+                        # Experts are GroupLinear submodules at runtime, so the
+                        # canonical key gains a ".weight" suffix vs HF's bare key.
                         for idx in range(tensor.shape[0]):
-                            expert_key = canon.replace(".experts.", ".experts.%d." % idx)
+                            expert_key = (
+                                canon.replace(".experts.", ".experts.%d." % idx) + ".weight"
+                            )
                             model_state_dict[expert_key] = tensor[idx].contiguous()
                     else:
                         model_state_dict[canon] = tensor
@@ -106,7 +111,9 @@ class Qwen35MoeConverter:
         for canon, tensor in canonical.items():
             m = indexed.match(canon)
             if m:
-                prefix, idx_str, suffix = m.group(1), m.group(2), m.group(3)
+                # Strip the runtime GroupLinear ".weight" suffix to recover HF's
+                # bare fused-expert key (inverse of the hf2dcp append).
+                prefix, idx_str, suffix = m.group(1), m.group(2), m.group(3).removesuffix(".weight")
                 stacked_canon = "%s.%s" % (prefix, suffix)
                 to_stack.setdefault(stacked_canon, {})[int(idx_str)] = tensor
             else:

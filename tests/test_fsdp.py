@@ -23,7 +23,6 @@ from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2Lit
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import (
-    Qwen35MoeExperts,
     Qwen35MoeModel,
     Qwen35MoeTopKRouter,
 )
@@ -37,7 +36,7 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, (GptOssExperts, Qwen35MoeExperts)):
+    elif isinstance(module, GptOssExperts):
         # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
