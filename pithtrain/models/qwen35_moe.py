@@ -60,7 +60,8 @@ class Qwen35MoeRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        x_fp32 = x.float()
+        output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
@@ -78,7 +79,8 @@ class Qwen35MoeRMSNormGated(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        output = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        x_fp32 = x.float()
+        output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
         output = output * self.weight.float() * F.silu(gate.float())
         return output.type_as(x)
 
