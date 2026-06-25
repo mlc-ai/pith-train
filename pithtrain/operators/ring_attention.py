@@ -162,12 +162,12 @@ def zigzag_forward(
         if step + 1 < cp_size:
             next_k, next_v, kv_work = post_ring_kv(k, v, cp_group, dst, src)
         if step == 0:
-            partial_out, partial_lse = _flash_attn_fwd(
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
                 q, k, v, softmax_scale=sm_scale, causal=True, return_lse=True
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
         elif step <= cp_rank:
-            partial_out, partial_lse = _flash_attn_fwd(
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
                 q,
                 k[:, :block],
                 v[:, :block],
@@ -177,7 +177,7 @@ def zigzag_forward(
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
         else:
-            partial_out, partial_lse = _flash_attn_fwd(
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
                 q_back, k, v, softmax_scale=sm_scale, causal=False, return_lse=True
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse, start=block)
@@ -498,7 +498,7 @@ def mla_zigzag_forward(
                 normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
             )
             key = torch.cat([k_nope, k_pe.expand(-1, -1, num_heads, -1)], dim=-1)
-            partial_out, partial_lse = _flash_attn_fwd(
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
                 q, key, value, softmax_scale=sm_scale, causal=True, return_lse=True
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
@@ -512,7 +512,7 @@ def mla_zigzag_forward(
                 **_fp8_kw,
             )
             key = torch.cat([k_nope, k_pe[:, :block].expand(-1, -1, num_heads, -1)], dim=-1)
-            partial_out, partial_lse = _flash_attn_fwd(
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
                 q, key, value, softmax_scale=sm_scale, causal=False, return_lse=True
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
@@ -521,7 +521,7 @@ def mla_zigzag_forward(
                 normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
             )
             key = torch.cat([k_nope, k_pe.expand(-1, -1, num_heads, -1)], dim=-1)
-            partial_out, partial_lse = _flash_attn_fwd(
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
                 q_back, key, value, softmax_scale=sm_scale, causal=False, return_lse=True
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse, start=block)
