@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx
-from pithtrain.operators.flash_attn_v4 import flash_attn_func, mla_flash_attn_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.ring_attention import mla_ring_attention_func, ring_attention_func
 from tests.utilities import cosine_error, launch
 
@@ -164,14 +164,13 @@ def record_mla(ctx: DistributedCtx, req: MLARequest):
     w_r = w_full.clone().requires_grad_(True)
     kv = F.linear(normed_kv_r, w_r).view(req.B, req.S, H, nope + vdim)
     k_nope, value = torch.split(kv, [nope, vdim], dim=-1)
-    out_r = mla_flash_attn_func(
-        q_nope_r,
-        q_pe_r,
-        k_nope.contiguous(),
-        k_pe_r,
+    q_r = torch.cat([q_nope_r, q_pe_r], dim=-1)
+    k_r = torch.cat([k_nope, k_pe_r.expand(-1, -1, H, -1)], dim=-1)
+    out_r = flash_attn_func(
+        q_r,
+        k_r,
         value.contiguous(),
         softmax_scale=softmax_scale,
-        qk_nope_head_dim=nope,
         causal=True,
     )
     out_r.sum().backward()
@@ -289,14 +288,13 @@ def record_mla_fp8(ctx: DistributedCtx, req: MLARequest):
     k_pe_r = k_pe_full.clone().requires_grad_(True)
     kv = ref_lin(normed_kv_r).view(req.B, req.S, H, nope + vdim)
     k_nope, value = torch.split(kv, [nope, vdim], dim=-1)
-    out_r = mla_flash_attn_func(
-        q_nope_r,
-        q_pe_r,
-        k_nope.contiguous(),
-        k_pe_r,
+    q_r = torch.cat([q_nope_r, q_pe_r], dim=-1)
+    k_r = torch.cat([k_nope, k_pe_r.expand(-1, -1, H, -1)], dim=-1)
+    out_r = flash_attn_func(
+        q_r,
+        k_r,
         value.contiguous(),
         softmax_scale=softmax_scale,
-        qk_nope_head_dim=nope,
         causal=True,
     )
     out_r.sum().backward()

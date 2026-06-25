@@ -18,7 +18,7 @@ from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_li
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
-from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.ring_attention import mla_ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -426,15 +426,10 @@ class DeepseekV2LiteAttention(nn.Module):
                 bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            attn_output = mla_flash_attn_func(
-                q_nope,
-                q_pe,
-                k_nope,
-                k_pe,
-                value_states,
-                softmax_scale=self.softmax_scale,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                causal=True,
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+            attn_output = flash_attn_func(
+                q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True
             )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)

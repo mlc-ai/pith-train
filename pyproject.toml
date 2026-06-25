@@ -5,7 +5,7 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "deep-gemm",
-    "flash-attn-4[cu13]>=4.0.0b16",
+    "flash-attn-4[cu13]>=4.0.0b19",
     "flash-linear-attention>=0.5.1",
     "torch>=2.12.0",
     "transformers",
