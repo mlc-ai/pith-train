@@ -32,6 +32,9 @@ from pithtrain.modules.optimizer import Muon
 
 from .distributed import DistributedCfg, DistributedCtx
 
+# Pipeline-stage model implementations; grows as models are added.
+PIPELINE_STAGE_MODELS = (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
+
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
     """
@@ -373,9 +376,7 @@ def apply_fsdp(
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(
-            model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
-        )
+        assert isinstance(model[i], PIPELINE_STAGE_MODELS)
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
