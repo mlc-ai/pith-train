@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
@@ -27,133 +27,72 @@ from pithtrain.operators.token_scatter import (
     scatter_for_grouped_gemm,
 )
 
+# fmt: off
+
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
-
 class DeepseekV2LiteRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    """
+    Rotary embedding for DeepSeek-V2-Lite.
+    """
+
+    def __init__(self, config: DeepseekV2Config) -> None:
         super().__init__()
+        inv_freq, attn_scale = self.compute_rope_params(config)
+        self.set_cos_sin(config, inv_freq, attn_scale)
 
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    @staticmethod
+    def yarn_find_correction_range(beta_fast: float, beta_slow: float, dim: int, base: float, max_position_embeddings: int) -> Tuple[int, int]:
+        def correction_dim(num_rotations: float) -> float:
+            log_num = math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+            log_den = math.log(base)
+            return dim * log_num / (2 * log_den)
+        lo = math.floor(correction_dim(beta_fast))
+        hi = math.ceil(correction_dim(beta_slow))
+        return max(lo, 0), min(hi, dim - 1)
 
-        # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings,
-            device=self.inv_freq.device,
-            dtype=torch.get_default_dtype(),
-        )
-        self.max_seq_len_cached = None
+    @staticmethod
+    def yarn_get_mscale(factor: float, mscale: float) -> float:
+        return 1.0 if factor <= 1 else 0.1 * mscale * math.log(factor) + 1.0
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+    @staticmethod
+    def yarn_linear_ramp_mask(lo: float, hi: float, dim: int) -> torch.Tensor:
+        hi = hi + 0.001 if lo == hi else hi
+        linear_func = (torch.arange(dim, dtype=torch.float32) - lo) / (hi - lo)
+        return torch.clamp(linear_func, 0, 1)
 
-        freqs = torch.outer(t, self.inv_freq.to(t.device))
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+    def compute_rope_params(self, config: DeepseekV2Config) -> Tuple[torch.Tensor, float]:
+        rope_scaling = config.rope_scaling
+        base, dim = rope_scaling["rope_theta"], config.qk_rope_head_dim
+        match rope_scaling["rope_type"]:
+            case "yarn":
+                factor = rope_scaling["factor"]
+                original_max_position_embeddings = rope_scaling["original_max_position_embeddings"]
+                beta_fast, beta_slow = rope_scaling["beta_fast"], rope_scaling["beta_slow"]
+                mscale, mscale_all_dim = rope_scaling["mscale"], rope_scaling["mscale_all_dim"]
+                freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                freq_inter = 1.0 / (factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                lo, hi = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings)
+                inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(lo, hi, dim // 2).to(torch.float32)
+                inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+                attn_scale = float(self.yarn_get_mscale(factor, mscale) / self.yarn_get_mscale(factor, mscale_all_dim))
+                return inv_freq, attn_scale
+            case "default":
+                return 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)), 1.0
+            case other:
+                raise ValueError(f"unsupported rope_type: {other!r}")
 
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
-
-
-# Inverse dim formula to find dim based on number of rotations
-def yarn_find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-        2 * math.log(base)
-    )
-
-
-# Find dim range bounds based on rotations
-def yarn_find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
-    low = math.floor(yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
-
-
-def yarn_get_mscale(scale=1, mscale=1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def yarn_linear_ramp_mask(min, max, dim):
-    if min == max:
-        max += 0.001  # Prevent singularity
-
-    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
-    ramp_func = torch.clamp(linear_func, 0, 1)
-    return ramp_func
-
-
-class DeepseekV2LiteYarnRotaryEmbedding(DeepseekV2LiteRotaryEmbedding):
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        device=None,
-        scaling_factor=1.0,
-        original_max_position_embeddings=4096,
-        beta_fast=32,
-        beta_slow=1,
-        mscale=1,
-        mscale_all_dim=0,
-    ):
-        self.scaling_factor = scaling_factor
-        self.original_max_position_embeddings = original_max_position_embeddings
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
-        self.mscale = mscale
-        self.mscale_all_dim = mscale_all_dim
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        dim = self.dim
-
-        freq_extra = 1.0 / (
-            self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
-        freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
-
-        low, high = yarn_find_correction_range(
-            self.beta_fast,
-            self.beta_slow,
-            dim,
-            self.base,
-            self.original_max_position_embeddings,
-        )
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
-            device=device, dtype=torch.float32
-        )
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-
+    def set_cos_sin(self, config: DeepseekV2Config, inv_freq: torch.Tensor, attn_scale: float) -> None:
+        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
-
-        _mscale = float(
-            yarn_get_mscale(self.scaling_factor, self.mscale)
-            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-        )
-
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False)
+        cos = (emb.cos() * attn_scale).to(torch.bfloat16)
+        sin = (emb.sin() * attn_scale).to(torch.bfloat16)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.cos[:seq_len], self.sin[:seq_len]
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
@@ -182,7 +121,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1) -> Tuple[torch.Tensor,
 class DeepseekV2LiteMLP(nn.Module):
     def __init__(
         self,
-        config: DeepseekV3Config,
+        config: DeepseekV2Config,
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
     ):
@@ -202,17 +141,11 @@ class DeepseekV2LiteMLP(nn.Module):
 
 
 class DeepseekV2LiteExperts(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV3Config,
-        num_experts: int,
-        hidden_size: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-    ):
+    def __init__(self, config: DeepseekV2Config, num_experts: int):
         super().__init__()
         self.config = config
-        self.hidden_size = hidden_size or config.hidden_size
-        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
 
         GroupLinearCls = get_group_linear_cls()
         self.gate_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
@@ -288,7 +221,7 @@ class DeepseekV2LiteMoEGate(nn.Module):
 class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
     def __init__(
         self,
-        config: DeepseekV3Config,
+        config: DeepseekV2Config,
         ep_group: Optional[dist.ProcessGroup] = None,
         layer_id: int = 0,
     ):
@@ -301,11 +234,7 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
         self.experts_per_rank = config.n_routed_experts // self.ep_size
         self.n_routed_experts = config.n_routed_experts
 
-        self.experts = DeepseekV2LiteExperts(
-            config,
-            self.experts_per_rank,
-            intermediate_size=config.moe_intermediate_size,
-        )
+        self.experts = DeepseekV2LiteExperts(config, self.experts_per_rank)
         self.gate = DeepseekV2LiteMoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -346,7 +275,7 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
 class DeepseekV2LiteAttention(nn.Module):
     def __init__(
         self,
-        config: DeepseekV3Config,
+        config: DeepseekV2Config,
         layer_id: int = 0,
         cp_group: Optional[dist.ProcessGroup] = None,
     ):
@@ -441,7 +370,7 @@ class DeepseekV2LiteAttention(nn.Module):
 class DeepseekV2LiteDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: DeepseekV3Config,
+        config: DeepseekV2Config,
         layer_id: int,
         ep_group: Optional[dist.ProcessGroup] = None,
         cp_group: Optional[dist.ProcessGroup] = None,
@@ -636,7 +565,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 class DeepseekV2LiteModel(nn.Module):
     def __init__(
         self,
-        config: DeepseekV3Config,
+        config: DeepseekV2Config,
         num_stages: int,
         stage_id: int,
         ep_group: Optional[dist.ProcessGroup] = None,
@@ -679,28 +608,7 @@ class DeepseekV2LiteModel(nn.Module):
             self.norm = None
             self.lm_head = None
 
-        scaling_factor = config.rope_scaling["factor"]
-        rope_kwargs = {
-            key: config.rope_scaling[key]
-            for key in [
-                "original_max_position_embeddings",
-                "beta_fast",
-                "beta_slow",
-                "mscale",
-                "mscale_all_dim",
-            ]
-            if key in config.rope_scaling
-        }
-        rope_theta = getattr(config, "rope_theta", None) or (config.rope_scaling or {}).get(
-            "rope_theta"
-        )
-        self.rotary_emb = DeepseekV2LiteYarnRotaryEmbedding(
-            config.qk_rope_head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            scaling_factor=scaling_factor,
-            base=rope_theta,
-            **rope_kwargs,
-        )
+        self.rotary_emb = DeepseekV2LiteRotaryEmbedding(config)
 
     def forward(
         self,
@@ -728,7 +636,7 @@ class DeepseekV2LiteModel(nn.Module):
                 torch.arange(back_start, back_start + block, device=hidden_states.device),
             ]
         )
-        cos, sin = self.rotary_emb(hidden_states, seq_len=global_seq_len)
+        cos, sin = self.rotary_emb(seq_len=global_seq_len)
         position_embeddings = (
             cos[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype),
             sin[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype),

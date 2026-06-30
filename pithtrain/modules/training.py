@@ -453,6 +453,8 @@ def setup_model(
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
     module_config.ep_size = ep_size
+    module_config.max_position_embeddings = cfg.sequence_length
+
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)
     if cfg.sequence_length % (2 * cp_size) != 0:
@@ -495,6 +497,10 @@ def setup_model(
 
     modules = nn.Sequential(*modules)
     apply_fsdp(modules, device_mesh, distributed_cfg.sharding_strategy)
+
+    # The two V-chunks build identical read-only rotary caches; share one to save memory.
+    if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
+        modules[1].rotary_emb = modules[0].rotary_emb
 
     local_seq_len = cfg.sequence_length // cp_size
     # sequence_length = cfg.sequence_length, TODO this is kept here for stripe context parallelism
