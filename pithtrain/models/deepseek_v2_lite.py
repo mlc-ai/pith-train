@@ -27,8 +27,6 @@ from pithtrain.operators.token_scatter import (
     scatter_for_grouped_gemm,
 )
 
-# fmt: off
-
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
 class DeepseekV2LiteRotaryEmbedding(nn.Module):

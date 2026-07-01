@@ -62,9 +62,11 @@ show_error_context = true
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+force-exclude = true
 
 [tool.ruff.format]
 quote-style = "double"
+exclude = ["pithtrain/models/*.py", "pithtrain/contexts/*.py"]
 
 [tool.ruff.lint]
 ignore = ["E501", "E731"]
