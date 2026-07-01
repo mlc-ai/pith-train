@@ -4,10 +4,10 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
@@ -275,7 +275,6 @@ class Qwen3MoeMoE(nn.Module):
         moe_intermediate_size: int,
         norm_topk_prob: bool = True,
         ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -283,9 +282,9 @@ class Qwen3MoeMoE(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
 
+        # ep_size sizes the local expert weights (per-instance config); the ep_group
+        # collective is read from the distributed context at its point of use.
         self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
         self.experts_per_rank = num_experts // ep_size
 
         self.experts = Qwen3MoeExperts(
@@ -339,7 +338,6 @@ class Qwen3MoeAttention(nn.Module):
         head_dim: int,
         rms_norm_eps: float = 1e-6,
         attention_bias: bool = False,
-        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -348,8 +346,6 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = head_dim
         self.num_key_value_groups = num_attention_heads // num_key_value_heads
         self.scaling = head_dim**-0.5
-        self.cp_group = cp_group
-        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
@@ -396,7 +392,7 @@ class Qwen3MoeAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if not self.use_ring_attn:
+        if distributed.cp_size <= 1:
             attn_output = flash_attn_func(
                 query_states,
                 key_states,
@@ -410,7 +406,7 @@ class Qwen3MoeAttention(nn.Module):
                 key_states,
                 value_states,
                 sm_scale=self.scaling,
-                cp_group=self.cp_group,
+                cp_group=distributed.cp_group,
             )
 
         attn_output = attn_output.reshape(bsz, seq_len, self.num_heads * self.head_dim)
@@ -446,8 +442,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         decoder_sparse_step: int = 1,
         mlp_only_layers: Optional[List[int]] = None,
         ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.idx = layer_idx
@@ -460,7 +454,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
             attention_bias=attention_bias,
-            cp_group=cp_group,
         )
 
         mlp_only_layers = mlp_only_layers or []
@@ -478,7 +471,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 moe_intermediate_size=moe_intermediate_size,
                 norm_topk_prob=norm_topk_prob,
                 ep_size=ep_size,
-                ep_group=ep_group,
             )
         else:
             self.mlp = Qwen3MoeMLP(hidden_size, intermediate_size)
@@ -543,7 +535,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             self.mlp.num_experts,
             self.mlp.ep_size,
             self.mlp.experts_per_rank,
-            self.mlp.ep_group,
+            distributed.ep_group,
         )
 
         return ForwardAttnOutput(
@@ -658,16 +650,11 @@ class Qwen3MoeModel(nn.Module):
         config,
         num_stages: int,
         stage_id: int,
-        cp_group: Optional[dist.ProcessGroup] = None,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.config = config
         self.stage_id = stage_id
         self.num_stages = num_stages
-        self.cp_group = cp_group
-        self.cp_rank = cp_group.rank() if cp_group is not None else 0
-        self.cp_size = cp_group.size() if cp_group is not None else 1
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -712,8 +699,6 @@ class Qwen3MoeModel(nn.Module):
                     decoder_sparse_step=decoder_sparse_step,
                     mlp_only_layers=mlp_only_layers,
                     ep_size=ep_size,
-                    cp_group=cp_group,
-                    ep_group=ep_group,
                 )
                 for i in range(layer_id_begin, layer_id_end)
             }
@@ -764,9 +749,9 @@ class Qwen3MoeModel(nn.Module):
         # global chunks. Build the global position IDs by concatenating the
         # front block and the mirror back block, then gather cos/sin by position.
         block = seq_len // 2
-        global_seq_len = seq_len * self.cp_size
-        front_start = self.cp_rank * block
-        back_start = (2 * self.cp_size - self.cp_rank - 1) * block
+        global_seq_len = seq_len * distributed.cp_size
+        front_start = distributed.cp_rank * block
+        back_start = (2 * distributed.cp_size - distributed.cp_rank - 1) * block
         position_ids = torch.cat(
             [
                 torch.arange(front_start, front_start + block, device=hidden_states.device),

@@ -5,6 +5,7 @@ import torch
 import torch.cuda.nvtx as nvtx
 import torch.distributed
 
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe.execution import (
     IntermediateTensorsLayer,
     Stage1Args,
@@ -103,7 +104,7 @@ def decoder_layer_forward(
     ) = output
 
     has_experts = hasattr(layer.mlp, "experts")
-    ep_group = layer.mlp.ep_group if has_experts else None
+    ep_group = distributed.ep_group if has_experts else None
 
     if has_experts:
         record.outs = Stage1OutsMoe(output.sorted_tokens, output.topk_weight, output.residual)

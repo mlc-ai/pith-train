@@ -26,13 +26,14 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
+from pithtrain.contexts import distributed
 from pithtrain.modules.checkpoint import (
     to_canonical_model,
     to_canonical_optim,
     to_localized_model,
     to_localized_optim,
 )
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, distributed_context
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, LoggingCtx, activate_wandb, logging_context
 from pithtrain.modules.training import TrainingCfg, TrainingCtx, training_context
@@ -60,9 +61,6 @@ class PretrainLMCtx(SlottedDefault):
     logging: LoggingCtx = field(default_factory=LoggingCtx)
     """Active logging context."""
 
-    distributed: DistributedCtx = field(default_factory=DistributedCtx)
-    """Active distributed context."""
-
     training: TrainingCtx = field(default_factory=TrainingCtx)
     """Active training context."""
 
@@ -71,17 +69,17 @@ def get_global_batch(
     cfg: PretrainLMCfg, ctx: PretrainLMCtx, device: torch.device
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Gather this rank's portion of the global batch on pipeline parallel rank 0."""
-    if ctx.distributed.pp_rank != 0:
+    if distributed.pp_rank != 0:
         return None, None
 
     # short-hands
     step = ctx.training.step
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
-    dp_size = ctx.distributed.dp_size
-    dp_rank = ctx.distributed.dp_rank
-    ep_size = ctx.distributed.ep_size
-    ep_rank = ctx.distributed.ep_rank
+    dp_size = distributed.dp_size
+    dp_rank = distributed.dp_rank
+    ep_size = distributed.ep_size
+    ep_rank = distributed.ep_rank
     sequence_length = cfg.training.sequence_length
     dataset = ctx.training.dataset
 
@@ -96,8 +94,8 @@ def get_global_batch(
     # mirror "back" chunk, balancing the causal workload across CP ranks
     # (see pithtrain/operators/ring_attention.py for the matching attention
     # implementation). For cp_size == 1 this reduces to a contiguous read.
-    cp_size = ctx.distributed.cp_size
-    cp_rank = ctx.distributed.cp_rank
+    cp_size = distributed.cp_size
+    cp_rank = distributed.cp_rank
     block = sequence_length // (2 * cp_size)
     local_seq_len = 2 * block
     front_offset = cp_rank * block
@@ -253,7 +251,7 @@ def raise_if_dataset_insufficient(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> Non
             format(global_batch_size, ","),
         )
     )
-    if ctx.distributed.rank == 0:
+    if distributed.rank == 0:
         raise RuntimeError(message)
     raise SystemExit(1)
 
@@ -342,7 +340,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         torch.cuda.cudart().cudaProfilerStart()
         # Pushed right after cudaProfilerStart so it is the earliest in-window NVTX per globalTid
         # (enables pid to mesh-coord lookup); range, not mark, so nsys-ui renders on the thread row.
-        d, t, parts = ctx.distributed, cfg.training, list()
+        d, t, parts = distributed, cfg.training, list()
         parts.append(f"rank={d.rank}")
         parts.append(
             f"pp={d.pp_rank}/{d.pp_size} dp={d.dp_rank}/{d.dp_size} "
@@ -364,8 +362,8 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     schedulers = ctx.training.schedulers
     model.train()
 
-    dp_size = ctx.distributed.dp_size
-    ep_size = ctx.distributed.ep_size
+    dp_size = distributed.dp_size
+    ep_size = distributed.ep_size
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
     assert global_batch_size % (micro_batch_size * dp_size * ep_size) == 0
@@ -384,9 +382,9 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     )
 
     # Average loss across CP ranks for correct logging.
-    cp_size = ctx.distributed.cp_size
+    cp_size = distributed.cp_size
     if loss is not None and cp_size > 1:
-        cp_group = ctx.distributed.device_mesh.get_group("cp")
+        cp_group = distributed.cp_group
         torch.distributed.all_reduce(loss, group=cp_group)
         loss /= cp_size
 
@@ -433,7 +431,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
 
     # Print the loss and learning rate on rank 0.
     logger = ctx.logging.stdout
-    if ctx.distributed.rank == 0:
+    if distributed.rank == 0:
         step = ctx.training.step
         max_steps = cfg.training.max_steps
         loss, lr = torch.mean(loss).item(), schedulers[0].get_last_lr()[0]
@@ -474,7 +472,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         torch.cuda.cudart().cudaProfilerStop()
     stop = cfg.training.memory_profile_stop
     if stop is not None and ctx.training.step == stop:
-        rank = ctx.distributed.rank
+        rank = distributed.rank
         cfg.training.memory_profile_output.mkdir(parents=True, exist_ok=True)
         path = Path(cfg.training.memory_profile_output, "snapshot-rank%05d.pickle" % rank)
         torch.cuda.memory._dump_snapshot(str(path))
@@ -501,7 +499,7 @@ def launch(cfg: PretrainLMCfg) -> None:
     with ExitStack() as stack:
         ctx = PretrainLMCtx()
         stack.enter_context(logging_context(cfg, ctx))
-        stack.enter_context(distributed_context(cfg, ctx))
+        stack.enter_context(distributed_context(cfg))
         stack.enter_context(training_context(cfg, ctx))
         logger = ctx.logging.stdout
         logger.info("launch(cfg=%s)" % cfg)

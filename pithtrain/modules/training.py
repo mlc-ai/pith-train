@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
 from pithtrain.models.gpt_oss import GptOssModel
@@ -30,7 +31,7 @@ from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 
-from .distributed import DistributedCfg, DistributedCtx
+from .distributed import DistributedCfg
 
 # Pipeline-stage model implementations; grows as models are added.
 PIPELINE_STAGE_MODELS = (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
@@ -418,7 +419,6 @@ def setup_model(
     cfg: TrainingCfg,
     ctx: TrainingCtx,
     distributed_cfg: DistributedCfg,
-    distributed: DistributedCtx,
 ) -> None:
     from pithtrain.dualpipe.utils import FP8WeightCacheControl
     from pithtrain.layers.factory import ModelImplMode
@@ -446,9 +446,7 @@ def setup_model(
     ep_size = distributed.ep_size
 
     device_mesh = distributed.device_mesh
-    pp_group = device_mesh.get_group("pp")
-    cp_group = device_mesh.get_group("cp") if cp_size > 1 else None
-    ep_group = device_mesh.get_group("ep")
+    cp_group = distributed.cp_group
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
@@ -466,29 +464,20 @@ def setup_model(
 
     hidden_size = module_config.hidden_size
 
+    # All models read their parallel groups from `distributed` directly.
     if module_config.model_type == "deepseek_v2":
         ModelClass = DeepseekV2LiteModel
-        model_kwargs = {"cp_group": cp_group}
     elif module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
-        model_kwargs = {"cp_group": cp_group}
     elif module_config.model_type == "gpt_oss":
         ModelClass = GptOssModel
-        model_kwargs = {"cp_group": cp_group}
     elif module_config.model_type == "qwen3_5_moe_text":
         ModelClass = Qwen35MoeModel
-        model_kwargs = {"cp_group": cp_group}
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    modules.append(
-        ModelClass(module_config, pp_size * 2, pp_rank, ep_group=ep_group, **model_kwargs)
-    )
-    modules.append(
-        ModelClass(
-            module_config, pp_size * 2, pp_size * 2 - 1 - pp_rank, ep_group=ep_group, **model_kwargs
-        )
-    )
+    modules.append(ModelClass(module_config, pp_size * 2, pp_rank))
+    modules.append(ModelClass(module_config, pp_size * 2, pp_size * 2 - 1 - pp_rank))
 
     # Apply scaled normal weight initialization before FSDP sharding.
     num_layers = module_config.num_hidden_layers
@@ -530,7 +519,7 @@ def setup_model(
             if hasattr(module, "router_replay"):
                 module.router_replay = force_balance(module.num_experts)
 
-    ctx.model = DualPipeV(modules, pp_group=pp_group, ep_group=ep_group)
+    ctx.model = DualPipeV(modules)
     set_p2p_tensor_shapes([(micro_batch_size, local_seq_len, hidden_size)])
     set_p2p_tensor_dtype(torch.bfloat16)
 
@@ -540,14 +529,13 @@ def training_context(cfg: object, ctx: object) -> Generator[TrainingCtx, None, N
     """Context manager for training."""
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     assert hasattr(ctx, "training") and isinstance(ctx.training, TrainingCtx)
-    assert hasattr(ctx, "distributed") and isinstance(ctx.distributed, DistributedCtx)
     ctx.training.step = 0
     setup_dataset(cfg.training, ctx.training)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, ctx.training, cfg.distributed, ctx.distributed)
+    setup_model(cfg.training, ctx.training, cfg.distributed)
     ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
     ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
     try:

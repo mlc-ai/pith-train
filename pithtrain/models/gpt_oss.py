@@ -5,11 +5,11 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from flash_attn.cute.interface import flash_attn_func
 from torch import nn
 
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
@@ -324,16 +324,15 @@ class GptOssMLP(nn.Module):
         intermediate_size: int,
         swiglu_limit: float,
         ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
 
+        # ep_size sizes the local expert weights (per-instance config). The ep_group
+        # collective is read from the distributed context at its point of use.
         self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
         self.experts_per_rank = num_experts // ep_size
 
         self.experts = GptOssExperts(
@@ -480,7 +479,6 @@ class GptOssDecoderLayer(nn.Module):
         is_sliding: bool = False,
         sliding_window: int = 128,
         ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.idx = layer_idx
@@ -503,7 +501,6 @@ class GptOssDecoderLayer(nn.Module):
             intermediate_size=intermediate_size,
             swiglu_limit=swiglu_limit,
             ep_size=ep_size,
-            ep_group=ep_group,
         )
 
         self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -547,7 +544,7 @@ class GptOssDecoderLayer(nn.Module):
             self.mlp.num_experts,
             self.mlp.ep_size,
             self.mlp.experts_per_rank,
-            self.mlp.ep_group,
+            distributed.ep_group,
         )
 
         return ForwardAttnOutput(
@@ -642,11 +639,9 @@ class GptOssModel(nn.Module):
         config,
         num_stages: int,
         stage_id: int,
-        cp_group: Optional[dist.ProcessGroup] = None,
-        ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
-        if cp_group is not None and cp_group.size() > 1:
+        if distributed.cp_size > 1:
             raise NotImplementedError("GptOssModel does not support context parallelism yet.")
 
         self.config = config
@@ -703,7 +698,6 @@ class GptOssModel(nn.Module):
                     is_sliding=(layer_types[i] == "sliding_attention"),
                     sliding_window=sliding_window,
                     ep_size=ep_size,
-                    ep_group=ep_group,
                 )
                 for i in range(layer_id_begin, layer_id_end)
             }

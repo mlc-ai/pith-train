@@ -16,6 +16,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
@@ -26,7 +27,7 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeModel,
     Qwen35MoeTopKRouter,
 )
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, distributed_context
 
 
 def fill_weights(module: nn.Module):
@@ -169,24 +170,21 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     return model
 
 
-def main(ctx: DistributedCtx, model_name: str):
+def main(model_name: str):
     """
     Main testing function.
 
     Parameters
     ----------
-    ctx : DistributedCtx
-        Distributed context.
     model_name : str
         Model name or local config path.
     """
 
-    pp_group = ctx.device_mesh.get_group("pp")
-    ep_group = ctx.device_mesh.get_group("ep")
-    dp_size, pp_size, ep_size = ctx.dp_size, ctx.pp_size, ctx.ep_size
-    pp_rank, ep_rank = ctx.pp_rank, ctx.ep_rank
+    ep_group = distributed.ep_group
+    dp_size, pp_size, ep_size = distributed.dp_size, distributed.pp_size, distributed.ep_size
+    pp_rank, ep_rank = distributed.pp_rank, distributed.ep_rank
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] Testing FSDP x DualPipeV x EP with model: %s" % model_name, flush=True)
         print(
             "[INFO] DP size: %d, PP size: %d, EP size: %d." % (dp_size, pp_size, ep_size),
@@ -262,14 +260,14 @@ def main(ctx: DistributedCtx, model_name: str):
     full_modules.apply(fill_weights)
 
     # Run the reference step.
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
     ModelImplMode.use_reference_fwd = True
     loss_ref, output_ref = reference_step(full_x, full_l, full_modules, num_chunks * ep_size)
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] Completed the reference step.", flush=True)
     torch.distributed.barrier()
 
@@ -303,13 +301,9 @@ def main(ctx: DistributedCtx, model_name: str):
     # Create the local modules with the same weights but zero gradients.
     local_modules = []
 
+    local_modules.append(ModelClass(config, num_stages=num_stages, stage_id=pp_rank))
     local_modules.append(
-        ModelClass(config, num_stages=num_stages, stage_id=pp_rank, ep_group=ep_group)
-    )
-    local_modules.append(
-        ModelClass(
-            config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank, ep_group=ep_group
-        )
+        ModelClass(config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank)
     )
 
     local_modules = nn.Sequential(*local_modules)
@@ -317,13 +311,10 @@ def main(ctx: DistributedCtx, model_name: str):
     local_modules[0].load_state_dict(local_full_modules[0].state_dict())
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
     local_modules.zero_grad()
-    apply_fsdp(local_modules, ctx.device_mesh, dtype)
+    apply_fsdp(local_modules, distributed.device_mesh, dtype)
 
     # Wrap the modules with DualPipeV.
-    kwargs = dict()
-    kwargs["pp_group"] = pp_group
-    kwargs["ep_group"] = ep_group
-    dualpipev_model = DualPipeV(local_modules, **kwargs)
+    dualpipev_model = DualPipeV(local_modules)
 
     # Run the DualPipeV step.
     kwargs = dict()
@@ -334,13 +325,13 @@ def main(ctx: DistributedCtx, model_name: str):
     local_l = None if pp_rank != 0 else local_l
     kwargs["labels"] = (local_l,)
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] Running the DualPipeV step.", flush=True)
     torch.distributed.barrier()
 
     loss, outputs = dualpipev_model.step(local_x, **kwargs)
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] Completed the DualPipeV step.", flush=True)
     torch.distributed.barrier()
 
@@ -348,12 +339,12 @@ def main(ctx: DistributedCtx, model_name: str):
     if pp_rank == 0:
         loss_ref = loss_ref.reshape(ep_size, -1)
         loss_ref = loss_ref[ep_rank]
-        print("[INFO] rank-%d, loss: %s, loss_ref: %s" % (ctx.rank, loss, loss_ref), flush=True)
+        print("[INFO] rank-%d, loss: %s, loss_ref: %s" % (distributed.rank, loss, loss_ref), flush=True)
         assert torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)
     else:
         assert loss is None
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] Loss matches the reference.", flush=True)
     torch.distributed.barrier()
 
@@ -364,7 +355,7 @@ def main(ctx: DistributedCtx, model_name: str):
 
     for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
         if p.grad is None:
-            print("[warn] rank-%d, Parameter %s doesn't have a gradient, skipping." % (ctx.rank, n))
+            print("[warn] rank-%d, Parameter %s doesn't have a gradient, skipping." % (distributed.rank, n))
             continue
         p_grad = p.grad
         if isinstance(p_grad, torch.distributed.tensor.DTensor):
@@ -373,7 +364,7 @@ def main(ctx: DistributedCtx, model_name: str):
             p_grad = p_grad.clone()
             torch.distributed.all_reduce(p_grad, group=ep_group)
         if torch.all(p_grad == 0) and torch.all(p_ref.grad == 0):
-            print("[warn] rank-%d, Parameter %s has all-zero gradient, skipping." % (ctx.rank, n))
+            print("[warn] rank-%d, Parameter %s has all-zero gradient, skipping." % (distributed.rank, n))
             continue
         # Reference accumulates in bf16, DualPipeV in fp32; cosine-diff on
         # noise-floor grads (e.g. gpt-oss router.bias ~1e-8) is meaningless.
@@ -381,7 +372,7 @@ def main(ctx: DistributedCtx, model_name: str):
         if ref_max < 1e-5:
             print(
                 "[warn] rank-%d, Parameter %s grad max=%.2e at bf16 noise floor, skipping."
-                % (ctx.rank, n, ref_max)
+                % (distributed.rank, n, ref_max)
             )
             continue
         diff = calculate_difference(p_grad, p_ref.grad)
@@ -391,19 +382,19 @@ def main(ctx: DistributedCtx, model_name: str):
         if diff > eps:
             print(
                 "[ERROR] rank-%d, Parameter %s grad mismatch: diff=%.6f, eps=%.6f, p_grad:%s..., p_ref.grad:%s..."
-                % (ctx.rank, n, diff, eps, p_grad.flatten()[:5], p_ref.grad.flatten()[:5])
+                % (distributed.rank, n, diff, eps, p_grad.flatten()[:5], p_ref.grad.flatten()[:5])
             )
     assert largest_diff < eps
 
-    for rank in range(ctx.world_size):
-        if rank == ctx.rank:
+    for rank in range(distributed.world_size):
+        if rank == distributed.rank:
             print(
                 "[INFO] rank-%d, Gradient check completed. Largest diff = %.6f for param %s."
-                % (ctx.rank, largest_diff, largest_diff_param)
+                % (distributed.rank, largest_diff, largest_diff_param)
             )
         torch.distributed.barrier()
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print("[INFO] All gradients match the reference.", flush=True)
     torch.distributed.barrier()
 
@@ -415,7 +406,7 @@ def _entry() -> None:
     models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
-    models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
+    models.append("benchmarks/pretraining/qwen3.5-35b-a3b/model.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
@@ -423,14 +414,13 @@ def _entry() -> None:
     parser.add_argument("--model", type=str, choices=models, required=True)
     parsed = parser.parse_args()
 
-    cfg, ctx = SimpleNamespace(), SimpleNamespace()
+    cfg = SimpleNamespace()
     cfg.distributed = DistributedCfg()
     cfg.distributed.pipeline_parallel_size = parsed.pp_size
     cfg.distributed.expert_parallel_size = parsed.ep_size
-    ctx.distributed = DistributedCtx()
 
-    with distributed_context(cfg, ctx):
-        main(ctx.distributed, parsed.model)
+    with distributed_context(cfg):
+        main(parsed.model)
 
 
 if __name__ == "__main__":

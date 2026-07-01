@@ -10,10 +10,10 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
@@ -358,15 +358,15 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
     Routed experts + a sigmoid-gated shared expert.
     """
 
-    def __init__(self, config, ep_size: int = 1, ep_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config, ep_size: int = 1):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
 
+        # ep_size sizes the local expert weights (per-instance config); the ep_group
+        # collective is read from the distributed context at its point of use.
         self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
         self.experts_per_rank = self.num_experts // ep_size
 
         self.gate = Qwen35MoeTopKRouter(config)
@@ -416,7 +416,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
     DeltaNet) or ``self_attn`` (full attention), selected by ``layer_type``.
     """
 
-    def __init__(self, config, layer_idx: int, ep_size: int = 1, ep_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config, layer_idx: int, ep_size: int = 1):
         super().__init__()
         self.idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -428,7 +428,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         else:
             self.self_attn = Qwen35MoeAttention(config)
 
-        self.mlp = Qwen35MoeSparseMoeBlock(config, ep_size=ep_size, ep_group=ep_group)
+        self.mlp = Qwen35MoeSparseMoeBlock(config, ep_size=ep_size)
 
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -458,7 +458,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         hidden_states, residual = self._forward_attn_compute(hidden_states)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.num_experts, self.mlp.ep_size, self.mlp.experts_per_rank, self.mlp.ep_group)
+        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.num_experts, self.mlp.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
 
     def forward_mlp(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -523,9 +523,9 @@ class Qwen35MoeModel(nn.Module):
     Qwen3.5-MoE text model for DualPipeV pipeline + expert parallelism.
     """
 
-    def __init__(self, config, num_stages: int, stage_id: int, cp_group: Optional[dist.ProcessGroup] = None, ep_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config, num_stages: int, stage_id: int):
         super().__init__()
-        if cp_group is not None and cp_group.size() > 1:
+        if distributed.cp_size > 1:
             raise NotImplementedError("Qwen35MoeModel does not support context parallelism (linear attention needs a bespoke sequence-sharded recurrence).")
         self.config = config
         self.stage_id = stage_id
@@ -544,7 +544,7 @@ class Qwen35MoeModel(nn.Module):
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
 
         self.layers = nn.ModuleDict({
-            str(i): Qwen35MoeDecoderLayer(config, layer_idx=i, ep_size=ep_size, ep_group=ep_group)
+            str(i): Qwen35MoeDecoderLayer(config, layer_idx=i, ep_size=ep_size)
             for i in range(layer_id_begin, layer_id_end)
         })
 

@@ -5,11 +5,11 @@ from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
+from pithtrain.contexts import distributed
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
@@ -220,15 +220,16 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
     def __init__(
         self,
         config: DeepseekV2Config,
-        ep_group: Optional[dist.ProcessGroup] = None,
         layer_id: int = 0,
     ):
         super().__init__()
         self.config = config
-        self.ep_group = ep_group
         self.num_experts_per_tok = config.num_experts_per_tok
+        # ep_size is the model's expert-sharding degree; it sizes the local expert
+        # weights, so it is a per-instance config property (a reference model may be
+        # built unsharded, ep_size=1, in an ep>1 process). Only the ep_group collective
+        # is read from the distributed context, at its point of use.
         self.ep_size = getattr(config, "ep_size", 1)
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
         self.experts_per_rank = config.n_routed_experts // self.ep_size
         self.n_routed_experts = config.n_routed_experts
 
@@ -275,7 +276,6 @@ class DeepseekV2LiteAttention(nn.Module):
         self,
         config: DeepseekV2Config,
         layer_id: int = 0,
-        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.config = config
@@ -286,9 +286,6 @@ class DeepseekV2LiteAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-
-        self.cp_group = cp_group
-        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
@@ -330,7 +327,7 @@ class DeepseekV2LiteAttention(nn.Module):
         cos, sin = position_embeddings
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
-        if self.use_ring_attn:
+        if distributed.cp_size > 1:
             # MLA context parallelism: rotate the compressed latent (normed_kv + shared
             # k_pe) around the ring and decompress on each rank via kv_b, instead of
             # decompressing to full per-head K/V before rotating. ~9x less ring traffic
@@ -345,7 +342,7 @@ class DeepseekV2LiteAttention(nn.Module):
                 sm_scale=self.softmax_scale,
                 qk_nope_head_dim=self.qk_nope_head_dim,
                 v_head_dim=self.v_head_dim,
-                cp_group=self.cp_group,
+                cp_group=distributed.cp_group,
                 kv_b_quant=kv_b_quant,
             )
         else:
@@ -370,17 +367,13 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         self,
         config: DeepseekV2Config,
         layer_id: int,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.idx = layer_id
-        self.self_attn = DeepseekV2LiteAttention(
-            config=config, layer_id=layer_id, cp_group=cp_group
-        )
+        self.self_attn = DeepseekV2LiteAttention(config=config, layer_id=layer_id)
 
         self.mlp = (
-            DeepseekV2LiteMoEWithGroupGeMM(config, ep_group, layer_id)
+            DeepseekV2LiteMoEWithGroupGeMM(config, layer_id)
             if (
                 config.n_routed_experts is not None
                 and layer_id >= config.first_k_dense_replace
@@ -452,7 +445,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
             self.mlp.n_routed_experts,
             self.mlp.ep_size,
             self.mlp.experts_per_rank,
-            self.mlp.ep_group,
+            distributed.ep_group,
         )
         return ForwardAttnOutput(
             sorted_tokens,
@@ -566,14 +559,9 @@ class DeepseekV2LiteModel(nn.Module):
         config: DeepseekV2Config,
         num_stages: int,
         stage_id: int,
-        ep_group: Optional[dist.ProcessGroup] = None,
-        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.stage_id = stage_id
-        self.cp_group = cp_group
-        self.cp_rank = cp_group.rank() if cp_group is not None else 0
-        self.cp_size = cp_group.size() if cp_group is not None else 1
         self.embed_tokens = (
             nn.Embedding(config.vocab_size, config.hidden_size) if stage_id == 0 else None
         )
@@ -595,7 +583,7 @@ class DeepseekV2LiteModel(nn.Module):
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
         self.layers = nn.ModuleDict(
             {
-                str(i): DeepseekV2LiteDecoderLayer(config, i, ep_group, cp_group=cp_group)
+                str(i): DeepseekV2LiteDecoderLayer(config, i)
                 for i in range(layer_id_begin, layer_id_end)
             }
         )
@@ -625,9 +613,9 @@ class DeepseekV2LiteModel(nn.Module):
         # global chunks. Build the global position IDs by concatenating the
         # front block and the mirror back block, then gather cos/sin by position.
         block = seq_len // 2
-        global_seq_len = seq_len * self.cp_size
-        front_start = self.cp_rank * block
-        back_start = (2 * self.cp_size - self.cp_rank - 1) * block
+        global_seq_len = seq_len * distributed.cp_size
+        front_start = distributed.cp_rank * block
+        back_start = (2 * distributed.cp_size - distributed.cp_rank - 1) * block
         position_ids = torch.cat(
             [
                 torch.arange(front_start, front_start + block, device=hidden_states.device),
