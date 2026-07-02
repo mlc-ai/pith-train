@@ -269,3 +269,6 @@ def force_balance(num_experts: int) -> Callable[[torch.Tensor], torch.Tensor]:
         return (t + j * stride) % num_experts
 
     return replay
+
+
+torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)

@@ -31,9 +31,6 @@ from pithtrain.operators.token_scatter import (
     scatter_for_grouped_gemm,
 )
 
-torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
-
-
 # ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
