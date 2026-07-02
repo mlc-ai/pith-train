@@ -10,7 +10,7 @@ Stage Mapping:
 """
 
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Union
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -76,6 +76,7 @@ def stage1_f(
     ctx: ExecutionCtx,
     layer: DecoderLayerProtocol,
     hidden_states: torch.Tensor,
+    rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
 ):
     """Stage1 forward."""
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
@@ -85,7 +86,7 @@ def stage1_f(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    output = layer.forward_attn(next_hidden_states)
+    output = layer.forward_attn(next_hidden_states, rotary_posemb)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     if hasattr(layer.mlp, "experts"):
@@ -426,6 +427,7 @@ def stage5_and_stage1_f(
     moe_local_idxs,
     topk_weight: torch.Tensor,
     residual: torch.Tensor,
+    rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
 ):
     """
     Merged Stage5 and Stage1 forward.
@@ -444,7 +446,7 @@ def stage5_and_stage1_f(
 
     hidden_states = prev_layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
 
-    output = next_layer.forward_attn(hidden_states)
+    output = next_layer.forward_attn(hidden_states, rotary_posemb)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     if hasattr(next_layer.mlp, "experts"):

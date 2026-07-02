@@ -1,4 +1,4 @@
-from typing import Dict, List, NamedTuple, Optional, Protocol
+from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 import torch.nn as nn
@@ -34,33 +34,16 @@ class DecoderLayerProtocol(Protocol):
     idx: int
     mlp: DecoderLayerMlpProtocol
 
-    def reference_forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         """Reference forward implementation for correctness validation."""
 
-    def forward_attn(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> ForwardAttnOutput:
+    def forward_attn(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
         """LN + Attn + LN + Expert selection."""
 
-    def forward_mlp(
-        self,
-        gathered_tokens: torch.Tensor,
-        expert_idxs: Optional[torch.Tensor] = None,
-        expand_idx: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward_mlp(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """MLP forward."""
 
-    def forward_aggregate(
-        self,
-        moe_outs: torch.Tensor,
-        moe_local_idxs: Optional[torch.Tensor],
-        topk_weight: Optional[torch.Tensor],
-        residual: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward_aggregate(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor) -> torch.Tensor:
         """Weighted expert output + residual connection."""
 
 
@@ -71,3 +54,6 @@ class ModelProtocol(Protocol):
     norm: Optional[nn.Module]
     lm_head: Optional[nn.Module]
     layers: Dict[str, DecoderLayerProtocol]
+
+    def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the (cos, sin) rotary embeddings for this micro-batch's positions."""

@@ -250,7 +250,7 @@ class DeepseekV2LiteAttention(nn.Module):
         k_embed = (k * cos) + (DeepseekV2LiteAttention.rotate_half(k) * sin)
         return q_embed, k_embed
 
-    def forward(self, hidden_states: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
         q = self.q_proj(hidden_states)
@@ -261,7 +261,7 @@ class DeepseekV2LiteAttention(nn.Module):
         compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
-        cos, sin = position_embeddings
+        cos, sin = rotary_posemb
         q_pe, k_pe = self.apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
         if distributed.cp_size > 1:
@@ -291,15 +291,11 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def _forward_attn_compute(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_attn_compute(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
-
-        hidden_states = self.self_attn(hidden_states=hidden_states, position_embeddings=position_embeddings)
+        hidden_states = self.self_attn(hidden_states=hidden_states, rotary_posemb=rotary_posemb)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -309,8 +305,8 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
+    def forward_attn(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
+        hidden_states, residual = self._forward_attn_compute(hidden_states, rotary_posemb)
 
         assert isinstance(self.mlp, (DeepseekV2LiteMLP, DeepseekV2LiteMoEWithGroupGeMM))
         if isinstance(self.mlp, DeepseekV2LiteMLP):
@@ -364,16 +360,12 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling reference_forward")
-
-        hidden_states = self.self_attn(hidden_states=hidden_states, position_embeddings=position_embeddings)
+        hidden_states = self.self_attn(hidden_states=hidden_states, rotary_posemb=rotary_posemb)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -404,29 +396,26 @@ class DeepseekV2LiteModel(nn.Module):
 
         self.rotary_emb = DeepseekV2LiteRotaryEmbedding(config)
 
+    def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_len = hidden_states.shape[1]
+        cp_size = distributed.cp_size
+        block = seq_len // 2
+        front_start, back_start = distributed.cp_rank * block, (2 * cp_size - distributed.cp_rank - 1) * block
+        position_ids = torch.cat([torch.arange(front_start, front_start + block, device=hidden_states.device), torch.arange(back_start, back_start + block, device=hidden_states.device)])
+        cos, sin = self.rotary_emb(seq_len=seq_len * cp_size)
+        return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         intermediate_tensors: Optional[IntermediateTensors] = getattr(self, "_intermediate_tensors", None)
 
         if self.embed_tokens is not None:
             hidden_states = self.embed_tokens(hidden_states)
 
-        seq_len = hidden_states.shape[1]
-        # Zigzag CP layout: the local seq_len tokens come from two non-contiguous
-        # global chunks. Build the global position IDs by concatenating the
-        # front block and the mirror back block, then gather cos/sin by position.
-        block = seq_len // 2
-        global_seq_len = seq_len * distributed.cp_size
-        front_start = distributed.cp_rank * block
-        back_start = (2 * distributed.cp_size - distributed.cp_rank - 1) * block
-        position_ids = torch.cat([torch.arange(front_start, front_start + block, device=hidden_states.device), torch.arange(back_start, back_start + block, device=hidden_states.device)])
-        cos, sin = self.rotary_emb(seq_len=global_seq_len)
-        position_embeddings = (cos[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype), sin[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype))
-        for _, layer in self.layers.items():
-            layer._position_embeddings = position_embeddings
+        rotary_posemb = self.rotary_posemb(hidden_states)
 
         if intermediate_tensors is None:
             for _, layer in self.layers.items():
-                ret = decoder_layer_forward(layer, hidden_states)
+                ret = decoder_layer_forward(layer, hidden_states, rotary_posemb)
                 hidden_states = ret[0] if isinstance(ret, tuple) else ret
             if self.norm is not None:
                 hidden_states = self.norm(hidden_states)
@@ -438,7 +427,7 @@ class DeepseekV2LiteModel(nn.Module):
             intermediate_tensors.prolog.args = PrologArgs()
             intermediate_tensors.prolog.outs = PrologOuts(hidden_states)
         for _, layer in self.layers.items():
-            ret = decoder_layer_forward(layer, hidden_states)
+            ret = decoder_layer_forward(layer, hidden_states, rotary_posemb)
             if len(ret) == 2:
                 hidden_states, layer_record = ret
                 dst = intermediate_tensors.layers[layer_idx]

@@ -1,5 +1,5 @@
 from dataclasses import fields
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -71,12 +71,13 @@ def decoder_layer_forward_combine(
 def decoder_layer_forward(
     layer: DecoderLayerProtocol,
     hidden_states: torch.Tensor,
+    rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
 ):
     """Forward pass for a DualPipeV decoder layer."""
 
     if ModelImplMode.use_reference_fwd:
         return (
-            layer.reference_forward(hidden_states),
+            layer.reference_forward(hidden_states, rotary_posemb),
             [],
         )
 
@@ -89,7 +90,7 @@ def decoder_layer_forward(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    output = layer.forward_attn(next_hidden_states)
+    output = layer.forward_attn(next_hidden_states, rotary_posemb)
     (
         sorted_tokens,
         moe_local_idxs,
