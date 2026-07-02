@@ -440,17 +440,13 @@ def setup_model(
             f"Invalid fp8_training={cfg.fp8_training!r}. Expected one of: 'disabled', 'deep-gemm'."
         )
 
-    pp_size = distributed.pp_size
-    pp_rank = distributed.pp_rank
     cp_size = distributed.cp_size
-    ep_size = distributed.ep_size
 
     device_mesh = distributed.device_mesh
     cp_group = distributed.cp_group
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
-    module_config.ep_size = ep_size
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")
@@ -476,8 +472,8 @@ def setup_model(
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    modules.append(ModelClass(module_config, pp_size * 2, pp_rank))
-    modules.append(ModelClass(module_config, pp_size * 2, pp_size * 2 - 1 - pp_rank))
+    modules.append(ModelClass(module_config, phase=0))
+    modules.append(ModelClass(module_config, phase=1))
 
     # Apply scaled normal weight initialization before FSDP sharding.
     num_layers = module_config.num_hidden_layers

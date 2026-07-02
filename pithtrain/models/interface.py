@@ -23,11 +23,9 @@ class DecoderLayerMlpProtocol(Protocol):
     """
     Protocol for the MLP component of a decoder layer in DualPipeV.
 
-    If the experts attribute is present, we treat the MLP as a MoE layer. The EP process
-    group is read from pithtrain.contexts.distributed, not carried on the layer.
+    A MoE layer is identified by the presence of an ``experts`` attribute. Expert-parallel
+    state (the EP process group and ep_size) lives in pithtrain.contexts.distributed.
     """
-
-    ep_size: int
 
 
 class DecoderLayerProtocol(Protocol):

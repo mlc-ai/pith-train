@@ -92,36 +92,8 @@ class DeepseekV2LiteRotaryEmbedding(nn.Module):
         return self.cos[:seq_len], self.sin[:seq_len]
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    b, h, s, d = q.shape
-    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    b, h, s, d = k.shape
-    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 class DeepseekV2LiteMLP(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV2Config,
-        hidden_size: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-    ):
+    def __init__(self, config: DeepseekV2Config, hidden_size: Optional[int] = None, intermediate_size: Optional[int] = None):
         super().__init__()
         self.hidden_size = hidden_size or config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
@@ -131,7 +103,7 @@ class DeepseekV2LiteMLP(nn.Module):
         self.up_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = LinearCls(self.intermediate_size, self.hidden_size, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         g = self.gate_proj(x)
         u = self.up_proj(x)
         return self.down_proj(silu_mul(g, u))
@@ -149,13 +121,7 @@ class DeepseekV2LiteExperts(nn.Module):
         self.up_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
         self.down_proj = GroupLinearCls(num_experts, self.intermediate_size, self.hidden_size)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grouped_mm_offs: torch.Tensor,
-        ks: list | None = None,
-        ks_tensor: torch.Tensor | None = None,
-    ):
+    def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
         g = self.gate_proj(x, **kwargs)
@@ -164,7 +130,7 @@ class DeepseekV2LiteExperts(nn.Module):
 
 
 class DeepseekV2LiteMoEGate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
@@ -172,22 +138,10 @@ class DeepseekV2LiteMoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.load_balance_loss_fn = None
         self.router_replay = None
-        self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True
-        )
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)
 
     @torch.compile(fullgraph=True)
-    def compute(
-        self, hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Gate math + lb_loss injection (compiled).
-
-        Returns
-        -------
-        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
-            topk_idx, topk_weight, lb_loss (None when not training or no loss fn).
-        """
+    def compute(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         _, _, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
@@ -206,7 +160,7 @@ class DeepseekV2LiteMoEGate(nn.Module):
 
         return topk_idx, topk_weight, lb_loss
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         topk_idx, topk_weight, lb_loss = self.compute(hidden_states)
 
         if lb_loss is not None:
@@ -216,31 +170,20 @@ class DeepseekV2LiteMoEGate(nn.Module):
 
 
 class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV2Config,
-        layer_id: int = 0,
-    ):
+    def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
-        # ep_size is the model's expert-sharding degree; it sizes the local expert
-        # weights, so it is a per-instance config property (a reference model may be
-        # built unsharded, ep_size=1, in an ep>1 process). Only the ep_group collective
-        # is read from the distributed context, at its point of use.
-        self.ep_size = getattr(config, "ep_size", 1)
-        self.experts_per_rank = config.n_routed_experts // self.ep_size
+        self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
 
         self.experts = DeepseekV2LiteExperts(config, self.experts_per_rank)
         self.gate = DeepseekV2LiteMoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV2LiteMLP(
-                config=config, intermediate_size=intermediate_size
-            )
+            self.shared_experts = DeepseekV2LiteMLP(config=config, intermediate_size=intermediate_size)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
@@ -250,32 +193,20 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
             y = y + self.shared_experts(identity)
         return y
 
-    def moe_infer(self, x, topk_ids, topk_weight):
-        assert self.ep_size == 1, "reference implementation only supports ep_size=1"
+    def moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        assert distributed.ep_size == 1, "reference implementation only supports ep_size=1"
         expert_idxs = topk_ids.view(-1)
-        sorted_tokens = (
-            x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
-        )
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
-            scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
-        )
+        sorted_tokens = x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
         outs = self.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = outs[reverse_shuffle_idxs]
 
-        final_out = (
-            (outs.view(*topk_ids.shape, -1) * topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .to(outs.dtype)
-        )
+        final_out = (outs.view(*topk_ids.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)
         return final_out
 
 
 class DeepseekV2LiteAttention(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV2Config,
-        layer_id: int = 0,
-    ):
+    def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -288,17 +219,9 @@ class DeepseekV2LiteAttention(nn.Module):
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = LinearCls(
-            self.hidden_size,
-            config.kv_lora_rank + config.qk_rope_head_dim,
-            bias=False,
-        )
+        self.kv_a_proj_with_mqa = LinearCls(self.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
         self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = LinearCls(
-            config.kv_lora_rank,
-            self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
-        )
+        self.kv_b_proj = LinearCls(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
 
         self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
@@ -306,11 +229,28 @@ class DeepseekV2LiteAttention(nn.Module):
         # the rotated latent via the FP8 deep_gemm path instead of a silent bf16 F.linear.
         self._fp8 = ModelImplMode.fp8_training == "deep-gemm"
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None,
-    ) -> torch.Tensor:
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @staticmethod
+    def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+
+        b, h, s, d = q.shape
+        q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+        b, h, s, d = k.shape
+        k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+        q_embed = (q * cos) + (DeepseekV2LiteAttention.rotate_half(q) * sin)
+        k_embed = (k * cos) + (DeepseekV2LiteAttention.rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    def forward(self, hidden_states: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
         q = self.q_proj(hidden_states)
@@ -318,42 +258,21 @@ class DeepseekV2LiteAttention(nn.Module):
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        compressed_kv, k_pe = torch.split(
-            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
         cos, sin = position_embeddings
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
+        q_pe, k_pe = self.apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
         if distributed.cp_size > 1:
-            # MLA context parallelism: rotate the compressed latent (normed_kv + shared
-            # k_pe) around the ring and decompress on each rank via kv_b, instead of
-            # decompressing to full per-head K/V before rotating. ~9x less ring traffic
-            # for DeepSeek-V2-Lite.
             kv_b_quant = self.kv_b_proj._get_quantized_weight() if self._fp8 else None
-            attn_output = mla_ring_attention_func(
-                q_nope,
-                q_pe,
-                normed_kv.contiguous(),
-                k_pe.contiguous(),
-                self.kv_b_proj.weight,
-                sm_scale=self.softmax_scale,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                v_head_dim=self.v_head_dim,
-                cp_group=distributed.cp_group,
-                kv_b_quant=kv_b_quant,
-            )
+            attn_output = mla_ring_attention_func(q_nope, q_pe, normed_kv.contiguous(), k_pe.contiguous(), self.kv_b_proj.weight, sm_scale=self.softmax_scale, qk_nope_head_dim=self.qk_nope_head_dim, v_head_dim=self.v_head_dim, cp_group=distributed.cp_group, kv_b_quant=kv_b_quant)
         else:
-            kv = self.kv_b_proj(normed_kv).view(
-                bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
+            kv = self.kv_b_proj(normed_kv).view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             q = torch.cat([q_nope, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
-            attn_output = flash_attn_func(
-                q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True
-            )
+            attn_output = flash_attn_func(q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True)
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
@@ -362,32 +281,17 @@ class DeepseekV2LiteAttention(nn.Module):
 
 
 class DeepseekV2LiteDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV2Config,
-        layer_id: int,
-    ):
+    def __init__(self, config: DeepseekV2Config, layer_id: int):
         super().__init__()
         self.idx = layer_id
-        self.self_attn = DeepseekV2LiteAttention(config=config, layer_id=layer_id)
+        self.self_attn = DeepseekV2LiteAttention(config=config)
 
-        self.mlp = (
-            DeepseekV2LiteMoEWithGroupGeMM(config, layer_id)
-            if (
-                config.n_routed_experts is not None
-                and layer_id >= config.first_k_dense_replace
-                and layer_id % config.moe_layer_freq == 0
-            )
-            else DeepseekV2LiteMLP(config)
-        )
+        self.mlp = DeepseekV2LiteMoEWithGroupGeMM(config) if config.n_routed_experts is not None and layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepseekV2LiteMLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def _forward_attn_compute(
-        self,
-        hidden_states: torch.Tensor,
-    ):
+    def _forward_attn_compute(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -395,12 +299,8 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         if position_embeddings is None:
             raise RuntimeError("Position embeddings must be set before calling forward_attn")
 
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-        )
+        hidden_states = self.self_attn(hidden_states=hidden_states, position_embeddings=position_embeddings)
         hidden_states = residual + hidden_states
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -409,63 +309,18 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_attn(
-        self,
-        hidden_states: torch.Tensor,
-    ):
-        """LN + Attn + LN + Expert selection"""
+    def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
         hidden_states, residual = self._forward_attn_compute(hidden_states)
 
         assert isinstance(self.mlp, (DeepseekV2LiteMLP, DeepseekV2LiteMoEWithGroupGeMM))
         if isinstance(self.mlp, DeepseekV2LiteMLP):
-            return ForwardAttnOutput(
-                hidden_states,  # sorted_tokens
-                None,  # idxs
-                None,  # topk_weight
-                None,  # output_splits
-                None,  # input_splits
-                None,  # expert_idxs
-                residual,
-            )
+            return ForwardAttnOutput(hidden_states, None, None, None, None, None, residual)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        (
-            sorted_tokens,
-            idxs,
-            expert_idxs,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-            input_splits,
-            output_splits,
-        ) = moe_ep_prepare_dispatch(
-            hidden_states,
-            topk_ids,
-            self.mlp.n_routed_experts,
-            self.mlp.ep_size,
-            self.mlp.experts_per_rank,
-            distributed.ep_group,
-        )
-        return ForwardAttnOutput(
-            sorted_tokens,
-            idxs,
-            topk_weight,
-            output_splits,
-            input_splits,
-            expert_idxs,
-            residual,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-        )
+        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
+        return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
 
-    def forward_mlp(
-        self,
-        gathered_tokens: torch.Tensor,
-        expert_idxs: Optional[torch.Tensor] = None,
-        expand_idx: Optional[torch.Tensor] = None,
-    ):
-        """MLP forward"""
+    def forward_mlp(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if isinstance(self.mlp, DeepseekV2LiteMLP):
             assert expert_idxs is None
             return self.mlp(gathered_tokens)
@@ -473,33 +328,19 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         assert expert_idxs is not None
         if expand_idx is not None:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
-            scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
-        )
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
         del gathered_tokens  # free expanded tokens; no longer needed after scatter
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = padded_index_gather(outs, reverse_shuffle_idxs)
         return outs
 
     @torch.compile(fullgraph=True)
-    def forward_aggregate(
-        self,
-        moe_outs: torch.Tensor,
-        moe_local_idxs: Optional[torch.Tensor],
-        topk_weight: Optional[torch.Tensor],
-        residual: torch.Tensor,
-    ):
-        """
-        Weighted expert output + residual connection.
-        Shared expert output is already folded into residual by forward_attn.
-        """
+    def forward_aggregate(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor):
 
-        def moe_finalize(moe_outs, moe_local_idxs, topk_weight) -> torch.Tensor:
-            if self.mlp.ep_size > 1:
+        def moe_finalize(moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor]) -> torch.Tensor:
+            if distributed.ep_size > 1:
                 assert moe_local_idxs is not None
                 seq_len, topk = topk_weight.shape
-                # Memory-efficient equivalent of
-                # new_x[moe_local_idxs] = moe_outs followed by weighted sum.
                 permuted_probs = topk_weight.view(-1)[moe_local_idxs]
                 token_indices = moe_local_idxs // topk
                 weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
@@ -514,9 +355,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
                 return final_out
 
         if isinstance(self.mlp, DeepseekV2LiteMoEWithGroupGeMM):
-            hidden_states = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(
-                *residual.shape
-            )
+            hidden_states = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(*residual.shape)
         else:
             assert moe_local_idxs is None
             assert topk_weight is None
@@ -525,10 +364,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
-    def reference_forward(
-        self,
-        hidden_states: torch.Tensor,
-    ):
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -537,13 +373,9 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         if position_embeddings is None:
             raise RuntimeError("Position embeddings must be set before calling reference_forward")
 
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-        )
+        hidden_states = self.self_attn(hidden_states=hidden_states, position_embeddings=position_embeddings)
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -553,39 +385,16 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
 
 class DeepseekV2LiteModel(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV2Config,
-        num_stages: int,
-        stage_id: int,
-    ):
+    def __init__(self, config: DeepseekV2Config, phase: int):
         super().__init__()
+        num_stages = distributed.pp_size * 2
+        stage_id = distributed.pp_rank if phase == 0 else num_stages - 1 - distributed.pp_rank
         self.stage_id = stage_id
-        self.embed_tokens = (
-            nn.Embedding(config.vocab_size, config.hidden_size) if stage_id == 0 else None
-        )
-        # Compute the local layer range for this stage
-        # We first equally distribute the layers to each stage.
-        # For the remaining layers,
-        # - when i is even, the i-th remaining layer goes to the (i // 2)-th layer
-        # counting from the beginning.
-        # - when i is odd, the i-th remaining layer goes to the (num_stages - 1 - i // 2)-th layer
-        # counting from the beginning.
-        #
-        # The main reason of this partition is because stage 0 may have layers that
-        # do not use MoE, which already computes less than other stages.
-        # Naive layer partition may cause stage -1 to have fewer layers than other stages,
-        # which further leads to imbalance. So we use this partition, trying to achieve
-        # a more balanced partition.
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size) if stage_id == 0 else None
         num_local_layers = layer_partition(config.num_hidden_layers, num_stages)
         layer_id_begin = sum(num_local_layers[:stage_id])
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
-        self.layers = nn.ModuleDict(
-            {
-                str(i): DeepseekV2LiteDecoderLayer(config, i)
-                for i in range(layer_id_begin, layer_id_end)
-            }
-        )
+        self.layers = nn.ModuleDict({str(i): DeepseekV2LiteDecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
         if stage_id == num_stages - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -595,14 +404,8 @@ class DeepseekV2LiteModel(nn.Module):
 
         self.rotary_emb = DeepseekV2LiteRotaryEmbedding(config)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ):
-        # Get pre-allocated intermediate_tensors from module attribute (set by DualPipeV)
-        intermediate_tensors: Optional[IntermediateTensors] = getattr(
-            self, "_intermediate_tensors", None
-        )
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        intermediate_tensors: Optional[IntermediateTensors] = getattr(self, "_intermediate_tensors", None)
 
         if self.embed_tokens is not None:
             hidden_states = self.embed_tokens(hidden_states)
@@ -615,17 +418,9 @@ class DeepseekV2LiteModel(nn.Module):
         global_seq_len = seq_len * distributed.cp_size
         front_start = distributed.cp_rank * block
         back_start = (2 * distributed.cp_size - distributed.cp_rank - 1) * block
-        position_ids = torch.cat(
-            [
-                torch.arange(front_start, front_start + block, device=hidden_states.device),
-                torch.arange(back_start, back_start + block, device=hidden_states.device),
-            ]
-        )
+        position_ids = torch.cat([torch.arange(front_start, front_start + block, device=hidden_states.device), torch.arange(back_start, back_start + block, device=hidden_states.device)])
         cos, sin = self.rotary_emb(seq_len=global_seq_len)
-        position_embeddings = (
-            cos[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype),
-            sin[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype),
-        )
+        position_embeddings = (cos[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype), sin[position_ids].unsqueeze(0).to(dtype=hidden_states.dtype))
         for _, layer in self.layers.items():
             layer._position_embeddings = position_embeddings
 
@@ -646,7 +441,6 @@ class DeepseekV2LiteModel(nn.Module):
             ret = decoder_layer_forward(layer, hidden_states)
             if len(ret) == 2:
                 hidden_states, layer_record = ret
-                # Copy into pre-allocated slot
                 dst = intermediate_tensors.layers[layer_idx]
                 for field in fields(layer_record):
                     src_rec = getattr(layer_record, field.name)
@@ -656,7 +450,6 @@ class DeepseekV2LiteModel(nn.Module):
                             setattr(dst_rec, rf.name, getattr(src_rec, rf.name))
             else:
                 hidden_states = ret[0]
-                # Clear pre-allocated slot (layer didn't produce intermediate)
                 dst = intermediate_tensors.layers[layer_idx]
                 for field in fields(dst):
                     record = getattr(dst, field.name)
@@ -675,12 +468,7 @@ class DeepseekV2LiteModel(nn.Module):
         return hidden_states
 
     @staticmethod
-    def backward(
-        module: "DeepseekV2LiteModel",
-        dy: Optional[List[torch.Tensor]],
-        loss: Optional[torch.Tensor],
-        intermediate_tensors: IntermediateTensors,
-    ):
+    def backward(module: "DeepseekV2LiteModel", dy: Optional[List[torch.Tensor]], loss: Optional[torch.Tensor], intermediate_tensors: IntermediateTensors):
         assert (dy is None) != (loss is None), "Either dy or loss should be provided"
         if loss is not None:
             assert module.norm is not None
@@ -688,7 +476,6 @@ class DeepseekV2LiteModel(nn.Module):
             loss.backward()
             loss.detach_()
             dy = (intermediate_tensors.epilog.args.hidden_states.grad,)
-            # Clear tensor refs but keep pre-allocated record
             intermediate_tensors.epilog.args = None
             loss = None
         else:
@@ -697,16 +484,13 @@ class DeepseekV2LiteModel(nn.Module):
 
         dx = dy
         layers_list = [layer for _, layer in module.layers.items()]
-        for layer, intermediate_tensors_layer in zip(
-            reversed(layers_list), reversed(intermediate_tensors.layers)
-        ):
+        for layer, intermediate_tensors_layer in zip(reversed(layers_list), reversed(intermediate_tensors.layers)):
             dx = (decoder_layer_backward(layer, dx, loss, intermediate_tensors_layer),)
 
         final_grads = dx
         if module.embed_tokens is not None:
             record = intermediate_tensors.prolog
             run_backward(record.outs, dx)
-            # Clear tensor refs but keep pre-allocated record
             record.args = None
             record.outs = None
             final_grads = (None,)
