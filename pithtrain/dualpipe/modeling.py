@@ -90,7 +90,7 @@ def decoder_layer_forward(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    output = layer.forward_attn(next_hidden_states, rotary_posemb)
+    output = layer.forward_stage1(next_hidden_states, rotary_posemb)
     (
         sorted_tokens,
         moe_local_idxs,
@@ -140,7 +140,7 @@ def decoder_layer_forward(
     if has_experts and fwd_comm_work is not None:
         sorted_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx)
 
     record.outs = Stage3Outs(moe_outs)
     # Free args storage - values no longer needed, only .grad is read after backward.
@@ -176,7 +176,7 @@ def decoder_layer_forward(
     # Stage 4 all-to-all has completed - Stage 3 output is no longer read.
     if has_experts and fwd_comm_work is not None:
         intermediate_tensors.stage3.outs.moe_outs.untyped_storage().resize_(0)
-    hidden_states = layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 
     record.outs = Stage5Outs(hidden_states)
     intermediate_tensors.stage5 = record

@@ -86,7 +86,7 @@ def stage1_f(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    output = layer.forward_attn(next_hidden_states, rotary_posemb)
+    output = layer.forward_stage1(next_hidden_states, rotary_posemb)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     if hasattr(layer.mlp, "experts"):
@@ -232,7 +232,7 @@ def stage3_f(
         ctx.fwd_comm_work.wait()
     _drain_deferred_free(ctx)
 
-    moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx)
     record.outs = Stage3Outs(moe_outs)
     # Free the args storage - only safe for MoE layers with EP where
     # padded_index_gather is the first consumer and doesn't save the input.
@@ -386,7 +386,7 @@ def stage5_f(
         ctx.fwd_comm_work.wait()
     _drain_deferred_free(ctx)
 
-    hidden_states = layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
     record.outs = Stage5Outs(hidden_states)
 
     nvtx.range_pop()
@@ -444,9 +444,9 @@ def stage5_and_stage1_f(
         ctx.fwd_comm_work.wait()
     _drain_deferred_free(ctx)
 
-    hidden_states = prev_layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 
-    output = next_layer.forward_attn(hidden_states, rotary_posemb)
+    output = next_layer.forward_stage1(hidden_states, rotary_posemb)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     if hasattr(next_layer.mlp, "experts"):

@@ -163,9 +163,9 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
                     layer.mlp.experts, mesh=moe_fsdp_mesh, reshard_after_forward=False, mp_policy=mp
                 )
             fully_shard(layer, mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_attn")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_mlp")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_aggregate")
+            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
+            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
+            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
         fully_shard(model[i], mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
     return model
 
