@@ -20,7 +20,7 @@ from pithtrain.contexts import distributed
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
-from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2LiteMoEGate
+from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import (
@@ -42,7 +42,7 @@ def fill_weights(module: nn.Module):
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
     elif isinstance(
-        module, (DeepseekV2LiteMoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
+        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
     ):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
@@ -66,7 +66,7 @@ def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def reference_step(
     x: torch.Tensor,
     l: torch.Tensor,  # noqa: E741
-    model: Union[DeepseekV2LiteModel, Qwen3MoeModel],
+    model: Union[DeepSeekV2Model, Qwen3MoeModel],
     chunks: int,
 ):
     ys, ls = [], []
@@ -140,7 +140,7 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(
-            model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
+            model[i], (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
         )
         if model[i].embed_tokens is not None:
             fully_shard(
@@ -202,7 +202,7 @@ def main(model_name: str):
     config = AutoConfig.from_pretrained(config_path)
 
     if config.model_type == "deepseek_v2":
-        ModelClass = DeepseekV2LiteModel
+        ModelClass = DeepSeekV2Model
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel

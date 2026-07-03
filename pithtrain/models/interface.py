@@ -24,8 +24,6 @@ class ForwardAttnOutput(NamedTuple):
 class MlpProtocol(Protocol):
     """
     Protocol for the MLP component of a DualPipeV-compatible decoder layer.
-
-    A MoE layer is identified by the presence of an experts attribute.
     """
 
 

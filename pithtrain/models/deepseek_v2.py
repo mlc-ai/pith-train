@@ -1,4 +1,4 @@
-"""deepseek-ai/DeepSeek-V2-Lite."""
+"""deepseek-ai/DeepSeek-V2."""
 
 import math
 from dataclasses import fields
@@ -28,7 +28,7 @@ from pithtrain.operators.token_scatter import (
 )
 
 
-class DeepseekV2LiteRotaryEmbedding(nn.Module):
+class DeepSeekV2RotaryEmbedding(nn.Module):
     """
     Rotary embedding for DeepSeek-V2-Lite.
     """
@@ -92,7 +92,7 @@ class DeepseekV2LiteRotaryEmbedding(nn.Module):
         return self.cos[:seq_len], self.sin[:seq_len]
 
 
-class DeepseekV2LiteMLP(nn.Module):
+class DeepSeekV2MLP(nn.Module):
     def __init__(self, config: DeepseekV2Config, hidden_size: Optional[int] = None, intermediate_size: Optional[int] = None):
         super().__init__()
         self.hidden_size = hidden_size or config.hidden_size
@@ -109,7 +109,7 @@ class DeepseekV2LiteMLP(nn.Module):
         return self.down_proj(silu_mul(g, u))
 
 
-class DeepseekV2LiteExperts(nn.Module):
+class DeepSeekV2Experts(nn.Module):
     def __init__(self, config: DeepseekV2Config, num_experts: int):
         super().__init__()
         self.config = config
@@ -129,7 +129,7 @@ class DeepseekV2LiteExperts(nn.Module):
         return self.down_proj(silu_mul(g, u), **kwargs)
 
 
-class DeepseekV2LiteMoEGate(nn.Module):
+class DeepSeekV2MoEGate(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.top_k = config.num_experts_per_tok
@@ -169,7 +169,7 @@ class DeepseekV2LiteMoEGate(nn.Module):
         return topk_idx, topk_weight
 
 
-class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
+class DeepSeekV2MoEWithGroupGeMM(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.config = config
@@ -177,11 +177,11 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
         self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
 
-        self.experts = DeepseekV2LiteExperts(config, self.experts_per_rank)
-        self.gate = DeepseekV2LiteMoEGate(config)
+        self.experts = DeepSeekV2Experts(config, self.experts_per_rank)
+        self.gate = DeepSeekV2MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV2LiteMLP(config=config, intermediate_size=intermediate_size)
+            self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
@@ -205,7 +205,7 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
         return final_out
 
 
-class DeepseekV2LiteAttention(nn.Module):
+class DeepSeekV2Attention(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.config = config
@@ -246,8 +246,8 @@ class DeepseekV2LiteAttention(nn.Module):
         b, h, s, d = k.shape
         k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
 
-        q_embed = (q * cos) + (DeepseekV2LiteAttention.rotate_half(q) * sin)
-        k_embed = (k * cos) + (DeepseekV2LiteAttention.rotate_half(k) * sin)
+        q_embed = (q * cos) + (DeepSeekV2Attention.rotate_half(q) * sin)
+        k_embed = (k * cos) + (DeepSeekV2Attention.rotate_half(k) * sin)
         return q_embed, k_embed
 
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -280,13 +280,13 @@ class DeepseekV2LiteAttention(nn.Module):
         return attn_output
 
 
-class DeepseekV2LiteDecoderLayer(nn.Module):
+class DeepSeekV2DecoderLayer(nn.Module):
     def __init__(self, config: DeepseekV2Config, layer_id: int):
         super().__init__()
         self.idx = layer_id
-        self.self_attn = DeepseekV2LiteAttention(config=config)
+        self.self_attn = DeepSeekV2Attention(config=config)
 
-        self.mlp = DeepseekV2LiteMoEWithGroupGeMM(config) if config.n_routed_experts is not None and layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepseekV2LiteMLP(config)
+        self.mlp = DeepSeekV2MoEWithGroupGeMM(config) if config.n_routed_experts is not None and layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepSeekV2MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -308,8 +308,8 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
     def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
         hidden_states, residual = self._forward_stage1_compute(hidden_states, rotary_posemb)
 
-        assert isinstance(self.mlp, (DeepseekV2LiteMLP, DeepseekV2LiteMoEWithGroupGeMM))
-        if isinstance(self.mlp, DeepseekV2LiteMLP):
+        assert isinstance(self.mlp, (DeepSeekV2MLP, DeepSeekV2MoEWithGroupGeMM))
+        if isinstance(self.mlp, DeepSeekV2MLP):
             return ForwardAttnOutput(hidden_states, None, None, None, None, None, residual)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
@@ -317,7 +317,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
 
     def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if isinstance(self.mlp, DeepseekV2LiteMLP):
+        if isinstance(self.mlp, DeepSeekV2MLP):
             assert expert_idxs is None
             return self.mlp(gathered_tokens)
 
@@ -350,7 +350,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
                 final_out = final_out.sum(dim=1).to(new_x.dtype)
                 return final_out
 
-        if isinstance(self.mlp, DeepseekV2LiteMoEWithGroupGeMM):
+        if isinstance(self.mlp, DeepSeekV2MoEWithGroupGeMM):
             hidden_states = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(*residual.shape)
         else:
             assert moe_local_idxs is None
@@ -376,7 +376,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         return hidden_states
 
 
-class DeepseekV2LiteModel(nn.Module):
+class DeepSeekV2Model(nn.Module):
     def __init__(self, config: DeepseekV2Config, phase: int):
         super().__init__()
         num_stages = distributed.pp_size * 2
@@ -386,7 +386,7 @@ class DeepseekV2LiteModel(nn.Module):
         num_local_layers = layer_partition(config.num_hidden_layers, num_stages)
         layer_id_begin = sum(num_local_layers[:stage_id])
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
-        self.layers = nn.ModuleDict({str(i): DeepseekV2LiteDecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
+        self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
         if stage_id == num_stages - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -394,7 +394,7 @@ class DeepseekV2LiteModel(nn.Module):
             self.norm = None
             self.lm_head = None
 
-        self.rotary_emb = DeepseekV2LiteRotaryEmbedding(config)
+        self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
 
     def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = hidden_states.shape[1]
@@ -457,7 +457,7 @@ class DeepseekV2LiteModel(nn.Module):
         return hidden_states
 
     @staticmethod
-    def backward(module: "DeepseekV2LiteModel", dy: Optional[List[torch.Tensor]], loss: Optional[torch.Tensor], intermediate_tensors: IntermediateTensors):
+    def backward(module: "DeepSeekV2Model", dy: Optional[List[torch.Tensor]], loss: Optional[torch.Tensor], intermediate_tensors: IntermediateTensors):
         assert (dy is None) != (loss is None), "Either dy or loss should be provided"
         if loss is not None:
             assert module.norm is not None

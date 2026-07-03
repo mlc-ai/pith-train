@@ -23,7 +23,7 @@ from transformers import AutoConfig
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
+from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
@@ -34,7 +34,7 @@ from pithtrain.modules.optimizer import Muon
 from .distributed import DistributedCfg
 
 # Pipeline-stage model implementations; grows as models are added.
-PIPELINE_STAGE_MODELS = (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
+PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -330,7 +330,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
     Parameters
     ----------
     model : nn.Module
-        A single pipeline-stage module (e.g. ``DeepseekV2LiteModel``).
+        A single pipeline-stage module (e.g. ``DeepSeekV2Model``).
     num_layers : int
         Total number of transformer layers in the *full* model (not just this
         stage).  Used to compute the output-layer scaling factor.
@@ -462,7 +462,7 @@ def setup_model(
 
     # All models read their parallel groups from `distributed` directly.
     if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepseekV2LiteModel
+        ModelClass = DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
     elif module_config.model_type == "gpt_oss":

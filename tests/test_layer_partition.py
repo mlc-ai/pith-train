@@ -64,7 +64,7 @@ def test_qwen3_30b_a3b_pp4():
     assert layer_partition(48, 8) == [6, 6, 6, 6, 6, 6, 6, 6]
 
 
-def test_deepseek_v2_lite_pp4():
+def test_deepseek_v2_pp4():
     """DeepSeek-V2-Lite: 27 layers, pp=4 (8 stages)."""
     assert layer_partition(27, 8) == [3, 4, 4, 4, 3, 3, 3, 3]
 
