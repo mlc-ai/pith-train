@@ -136,6 +136,9 @@ class DeepSeekV2MoEGate(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.num_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.topk_method = config.topk_method
+        self.num_group = config.n_group
+        self.topk_group = config.topk_group
         self.load_balance_loss_fn = None
         self.router_replay = None
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)
@@ -146,6 +149,14 @@ class DeepSeekV2MoEGate(nn.Module):
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
+        if self.topk_method == "group_limited_greedy":
+            n_tokens = scores.shape[0]
+            group_scores = scores.view(n_tokens, self.num_group, -1).max(dim=-1).values
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand(n_tokens, self.num_group, self.num_experts // self.num_group).reshape(n_tokens, -1)
+            scores = scores.masked_fill(~score_mask.bool(), 0.0)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         if self.router_replay is not None:
             topk_idx = self.router_replay(topk_idx)
@@ -216,9 +227,15 @@ class DeepSeekV2Attention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.q_lora_rank = config.q_lora_rank
 
         LinearCls = get_linear_cls()
-        self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
+        if self.q_lora_rank is None:
+            self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
+        else:
+            self.q_a_proj = LinearCls(self.hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = LinearCls(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
         self.kv_a_proj_with_mqa = LinearCls(self.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
         self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = LinearCls(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
@@ -253,7 +270,10 @@ class DeepSeekV2Attention(nn.Module):
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        q = self.q_proj(hidden_states)
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
