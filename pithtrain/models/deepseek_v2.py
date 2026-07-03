@@ -29,10 +29,6 @@ from pithtrain.operators.token_scatter import (
 
 
 class DeepSeekV2RotaryEmbedding(nn.Module):
-    """
-    Rotary embedding for DeepSeek-V2-Lite.
-    """
-
     def __init__(self, config: DeepseekV2Config) -> None:
         super().__init__()
         inv_freq, attn_scale = self.compute_rope_params(config)
@@ -190,9 +186,8 @@ class DeepSeekV2MoEWithGroupGeMM(nn.Module):
 
         self.experts = DeepSeekV2Experts(config, self.experts_per_rank)
         self.gate = DeepSeekV2MoEGate(config)
-        if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
+        intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+        self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
@@ -200,8 +195,7 @@ class DeepSeekV2MoEWithGroupGeMM(nn.Module):
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
+        y = y + self.shared_experts(identity)
         return y
 
     def moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
@@ -306,7 +300,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.idx = layer_id
         self.self_attn = DeepSeekV2Attention(config=config)
 
-        self.mlp = DeepSeekV2MoEWithGroupGeMM(config) if config.n_routed_experts is not None and layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepSeekV2MLP(config)
+        self.mlp = DeepSeekV2MoEWithGroupGeMM(config) if layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepSeekV2MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -314,24 +308,17 @@ class DeepSeekV2DecoderLayer(nn.Module):
     def _forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
-        hidden_states = self.self_attn(hidden_states=hidden_states, rotary_posemb=rotary_posemb)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
-        if hasattr(self.mlp, "shared_experts"):
-            residual = residual + self.mlp.shared_experts(hidden_states)
-
         return hidden_states, residual
 
     def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
         hidden_states, residual = self._forward_stage1_compute(hidden_states, rotary_posemb)
-
-        assert isinstance(self.mlp, (DeepSeekV2MLP, DeepSeekV2MoEWithGroupGeMM))
         if isinstance(self.mlp, DeepSeekV2MLP):
             return ForwardAttnOutput(hidden_states, None, None, None, None, None, residual)
-
+        residual = residual + self.mlp.shared_experts(hidden_states)
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
         sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
@@ -382,17 +369,13 @@ class DeepSeekV2DecoderLayer(nn.Module):
 
     def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
-
-        hidden_states = self.self_attn(hidden_states=hidden_states, rotary_posemb=rotary_posemb)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb)
         hidden_states = residual + hidden_states
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
         return hidden_states
 
 
