@@ -23,7 +23,7 @@ from pithtrain.dualpipe.execution import (
 )
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode
-from pithtrain.models.interface import DecoderLayerProtocol
+from pithtrain.models.interface import LayerProtocol
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 
@@ -69,7 +69,7 @@ def decoder_layer_forward_combine(
 
 
 def decoder_layer_forward(
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     hidden_states: torch.Tensor,
     rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
 ):
@@ -186,7 +186,7 @@ def decoder_layer_forward(
 
 
 def decoder_layer_backward(
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     dy: Optional[List[torch.Tensor]],
     loss: Optional[torch.Tensor],
     intermediate_tensors_layer: IntermediateTensorsLayer,

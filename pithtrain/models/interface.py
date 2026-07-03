@@ -5,7 +5,9 @@ import torch.nn as nn
 
 
 class ForwardAttnOutput(NamedTuple):
-    """Output from the forward_stage1 method of a decoder layer."""
+    """
+    Output from the forward_stage1 method of a decoder layer.
+    """
 
     sorted_tokens: torch.Tensor
     moe_local_idxs: torch.Tensor
@@ -19,18 +21,17 @@ class ForwardAttnOutput(NamedTuple):
     dedup_output_splits: Optional[List[int]] = None
 
 
-class DecoderLayerMlpProtocol(Protocol):
+class MlpProtocol(Protocol):
     """
-    Protocol for the MLP component of a decoder layer in DualPipeV.
+    Protocol for the MLP component of a DualPipeV-compatible decoder layer.
 
-    A MoE layer is identified by the presence of an experts attribute. Expert-parallel state
-    (the EP process group and ep_size) lives in pithtrain.contexts.distributed.
+    A MoE layer is identified by the presence of an experts attribute.
     """
 
 
-class DecoderLayerProtocol(Protocol):
+class LayerProtocol(Protocol):
     """
-    Protocol for a decoder layer in DualPipeV.
+    Protocol for a DualPipeV-compatible decoder layer.
 
     Each layer is split into five stages so the pipeline scheduler can interleave different
     micro-batches and overlap the compute of one with the communication of another.
@@ -43,10 +44,12 @@ class DecoderLayerProtocol(Protocol):
     """
 
     idx: int
-    mlp: DecoderLayerMlpProtocol
+    mlp: MlpProtocol
 
     def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        """Reference forward implementation for correctness validation."""
+        """
+        Reference forward implementation for correctness validation.
+        """
 
     def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
         """
@@ -68,12 +71,16 @@ class DecoderLayerProtocol(Protocol):
 
 
 class ModelProtocol(Protocol):
-    """Protocol for the DualPipeV model."""
+    """
+    Protocol for a DualPipeV-compatible transformer language model.
+    """
 
     embed_tokens: Optional[nn.Module]
     norm: Optional[nn.Module]
     lm_head: Optional[nn.Module]
-    layers: Dict[str, DecoderLayerProtocol]
+    layers: Dict[str, LayerProtocol]
 
     def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the (cos, sin) rotary embeddings for this micro-batch's positions."""
+        """
+        Compute the (cos, sin) rotary embeddings for the tokens in this micro-batch.
+        """

@@ -16,7 +16,7 @@ import torch
 import torch.cuda.nvtx as nvtx
 
 from pithtrain.dualpipe.utils import WeightGradStore, run_backward
-from pithtrain.models.interface import DecoderLayerProtocol, ModelProtocol
+from pithtrain.models.interface import LayerProtocol, ModelProtocol
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 
@@ -74,7 +74,7 @@ class Stage1Record:
 
 def stage1_f(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     hidden_states: torch.Tensor,
     rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
 ):
@@ -100,7 +100,7 @@ def stage1_f(
 
 def stage1_b(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     record: Stage1Record,
     grad_tensors: Union[Stage1OutsMoe, Stage1OutsMlp],
 ):
@@ -131,7 +131,7 @@ class Stage2Record:
 
 def stage2_f(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     sorted_tokens: torch.Tensor,
     output_splits: Optional[List[int]],
     input_splits: Optional[List[int]],
@@ -163,7 +163,7 @@ def stage2_f(
 
 def stage2_b(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     record: Stage2Record,
     grad_tensors: tuple,
 ):
@@ -216,7 +216,7 @@ def _drain_deferred_free(ctx: ExecutionCtx) -> None:
 
 def stage3_f(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     gathered_tokens: torch.Tensor,
     expert_idxs: Optional[torch.Tensor],
     expand_idx: Optional[torch.Tensor] = None,
@@ -248,7 +248,7 @@ def stage3_f(
 
 def stage3_b(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     record: Stage3Record,
     grad_tensors: Stage3Outs,
 ):
@@ -270,7 +270,7 @@ def stage3_b(
     return gathered_tokens_grad
 
 
-def stage3_w(ctx: ExecutionCtx, layer: DecoderLayerProtocol):
+def stage3_w(ctx: ExecutionCtx, layer: LayerProtocol):
     """Stage3 backward for weight."""
     nvtx.range_push("layer%02d.stage3_w" % layer.idx)
 
@@ -292,7 +292,7 @@ class Stage4Record:
 
 def stage4_f(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     moe_outs: torch.Tensor,
     input_splits: Optional[List[int]],
     output_splits: Optional[List[int]],
@@ -321,7 +321,7 @@ def stage4_f(
 
 def stage4_b(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     record: Stage4Record,
     grad_tensors: tuple,
 ):
@@ -367,7 +367,7 @@ class Stage5Record:
 
 def stage5_f(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     moe_outs: torch.Tensor,
     moe_local_idxs,
     topk_weight: torch.Tensor,
@@ -395,7 +395,7 @@ def stage5_f(
 
 def stage5_b(
     ctx: ExecutionCtx,
-    layer: DecoderLayerProtocol,
+    layer: LayerProtocol,
     record: Stage5Record,
     grad_tensors: Stage5Outs,
 ):
@@ -421,8 +421,8 @@ def stage5_b(
 
 def stage5_and_stage1_f(
     ctx: ExecutionCtx,
-    prev_layer: DecoderLayerProtocol,
-    next_layer: DecoderLayerProtocol,
+    prev_layer: LayerProtocol,
+    next_layer: LayerProtocol,
     moe_outs: torch.Tensor,
     moe_local_idxs,
     topk_weight: torch.Tensor,
@@ -460,8 +460,8 @@ def stage5_and_stage1_f(
 
 def stage5_and_stage1_b(
     ctx: ExecutionCtx,
-    next_layer: DecoderLayerProtocol,
-    prev_layer: DecoderLayerProtocol,
+    next_layer: LayerProtocol,
+    prev_layer: LayerProtocol,
     stage1_outs: Union[Stage1OutsMoe, Stage1OutsMlp],
     stage5_args: Stage5Args,
     grad_tensors: Union[Stage1OutsMoe, Stage1OutsMlp],
