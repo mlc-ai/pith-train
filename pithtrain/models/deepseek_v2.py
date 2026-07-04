@@ -104,6 +104,9 @@ class DeepSeekV2MLP(nn.Module):
         u = self.up_proj(x)
         return self.down_proj(silu_mul(g, u))
 
+    def reference_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)
+
 
 class DeepSeekV2Experts(nn.Module):
     def __init__(self, config: DeepseekV2Config, num_experts: int):
@@ -166,7 +169,7 @@ class DeepSeekV2MoEGate(nn.Module):
         return topk_idx, topk_weight, lb_loss
 
 
-class DeepSeekV2MoEWithGroupGeMM(nn.Module):
+class DeepSeekV2MoE(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -178,8 +181,7 @@ class DeepSeekV2MoEWithGroupGeMM(nn.Module):
         intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert distributed.ep_size == 1, "reference implementation only supports ep_size=1"
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight, lb_loss = self.gate(hidden_states)
@@ -287,7 +289,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.idx = layer_id
         self.self_attn = DeepSeekV2Attention(config=config)
 
-        self.mlp = DeepSeekV2MoEWithGroupGeMM(config) if layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepSeekV2MLP(config)
+        self.mlp = DeepSeekV2MoE(config) if layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepSeekV2MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -348,7 +350,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
                 final_out = final_out.sum(dim=1).to(new_x.dtype)
                 return final_out
 
-        if isinstance(self.mlp, DeepSeekV2MoEWithGroupGeMM):
+        if isinstance(self.mlp, DeepSeekV2MoE):
             hidden_states = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(*residual.shape)
         else:
             assert moe_local_idxs is None
@@ -365,7 +367,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp.reference_forward(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
