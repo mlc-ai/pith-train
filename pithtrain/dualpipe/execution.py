@@ -198,7 +198,7 @@ def stage3_f(ctx: ExecutionCtx, layer: LayerProtocol, gathered_tokens: torch.Ten
     # Free the args storage - only safe for MoE layers with EP where
     # padded_index_gather is the first consumer and doesn't save the input.
     # When ep_size==1, gathered_tokens shares storage with dispatch_tokens.
-    if hasattr(layer.mlp, "experts") and ctx.fwd_comm_work is not None:
+    if expert_idxs is not None and ctx.fwd_comm_work is not None:
         gathered_tokens.untyped_storage().resize_(0)
 
     ctx.comp_stream.record_event(ctx.fwd_event)

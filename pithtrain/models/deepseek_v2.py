@@ -385,19 +385,21 @@ class DeepSeekV2Model(nn.Module):
                 stage_count = 1
                 stage_index = 0
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size) if stage_index == 0 else None
+        self.stage_count = stage_count
+        self.stage_index = stage_index
+
+        self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
+        self.embed_tokens, self.norm, self.lm_head = None, None, None
+        if stage_index == 0:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if stage_index == stage_count - 1:
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
         num_local_layers = layer_partition(config.num_hidden_layers, stage_count)
         layer_id_begin = sum(num_local_layers[:stage_index])
         layer_id_end = layer_id_begin + num_local_layers[stage_index]
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
-        if stage_index == stage_count - 1:
-            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        else:
-            self.norm = None
-            self.lm_head = None
-
-        self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
 
     def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = hidden_states.shape[1]
@@ -411,7 +413,7 @@ class DeepSeekV2Model(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         intermediate_tensors: Optional[IntermediateTensors] = getattr(self, "_intermediate_tensors", None)
 
-        if self.embed_tokens is not None:
+        if self.stage_index == 0:
             hidden_states = self.embed_tokens(hidden_states)
 
         rotary_posemb = self.rotary_posemb(hidden_states)
@@ -420,13 +422,13 @@ class DeepSeekV2Model(nn.Module):
             for _, layer in self.layers.items():
                 ret = decoder_layer_forward(layer, hidden_states, rotary_posemb)
                 hidden_states = ret[0] if isinstance(ret, tuple) else ret
-            if self.norm is not None:
+            if self.stage_index == self.stage_count - 1:  # last stage
                 hidden_states = self.norm(hidden_states)
                 hidden_states = self.lm_head(hidden_states)
             return hidden_states
 
         layer_idx = 0
-        if self.embed_tokens is not None:
+        if self.stage_index == 0:  # first stage
             intermediate_tensors.prolog.args = PrologArgs()
             intermediate_tensors.prolog.outs = PrologOuts(hidden_states)
         for _, layer in self.layers.items():
@@ -449,8 +451,7 @@ class DeepSeekV2Model(nn.Module):
                         setattr(record, rf.name, None)
             layer_idx += 1
 
-        if self.norm is not None:
-            assert self.lm_head is not None
+        if self.stage_index == self.stage_count - 1:
             if not ModelImplMode.use_reference_fwd:
                 hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
@@ -463,16 +464,11 @@ class DeepSeekV2Model(nn.Module):
     def backward(module: "DeepSeekV2Model", dy: Optional[List[torch.Tensor]], loss: Optional[torch.Tensor], intermediate_tensors: IntermediateTensors):
         assert (dy is None) != (loss is None), "Either dy or loss should be provided"
         if loss is not None:
-            assert module.norm is not None
-            assert module.lm_head is not None
             loss.backward()
             loss.detach_()
             dy = (intermediate_tensors.epilog.args.hidden_states.grad,)
             intermediate_tensors.epilog.args = None
             loss = None
-        else:
-            assert module.norm is None
-            assert module.lm_head is None
 
         dx = dy
         layers_list = [layer for _, layer in module.layers.items()]
@@ -480,7 +476,7 @@ class DeepSeekV2Model(nn.Module):
             dx = (decoder_layer_backward(layer, dx, loss, intermediate_tensors_layer),)
 
         final_grads = dx
-        if module.embed_tokens is not None:
+        if module.stage_index == 0:
             record = intermediate_tensors.prolog
             run_backward(record.outs, dx)
             record.args = None
