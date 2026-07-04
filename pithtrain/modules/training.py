@@ -378,27 +378,11 @@ def apply_fsdp(
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
-        if model[i].embed_tokens is not None:
-            fully_shard(
-                model[i].embed_tokens,
-                mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
-                mp_policy=mp,
-            )
-        if model[i].norm is not None:
-            assert model[i].lm_head is not None
-            fully_shard(
-                model[i].norm,
-                mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
-                mp_policy=mp,
-            )
-            fully_shard(
-                model[i].lm_head,
-                mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
-                mp_policy=mp,
-            )
+        # Stage-edge modules (embed / norm / lm_head): every non-"layers" child that
+        # owns parameters. reshard_after_forward=True since each runs once per step.
+        for name, child in model[i].named_children():
+            if name != "layers" and next(child.parameters(), None) is not None:
+                fully_shard(child, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(

@@ -426,7 +426,7 @@ def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor):
     record = PrologRecord()
 
     record.args = PrologArgs()
-    hidden_states = module.embed_tokens(hidden_states)
+    hidden_states = module.forward_prolog(hidden_states)
     record.outs = PrologOuts(hidden_states)
 
     nvtx.range_pop()
@@ -470,8 +470,7 @@ def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor):
 
     hidden_states = hidden_states.detach().requires_grad_()
     record.args = EpilogArgs(hidden_states)
-    hidden_states = module.norm(hidden_states)
-    logits = module.lm_head(hidden_states)
+    logits = module.forward_epilog(hidden_states)
 
     nvtx.range_pop()
     return record, logits

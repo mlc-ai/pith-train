@@ -1,7 +1,6 @@
 from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
-import torch.nn as nn
 
 
 class AllToAllSplits(NamedTuple):
@@ -70,12 +69,21 @@ class ModelProtocol(Protocol):
     Protocol for a DualPipeV-compatible transformer language model.
     """
 
-    embed_tokens: Optional[nn.Module]
-    norm: Optional[nn.Module]
-    lm_head: Optional[nn.Module]
+    stage_index: int
+    stage_count: int
     layers: Dict[str, LayerProtocol]
 
-    def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the (cos, sin) rotary embeddings for the tokens in this micro-batch.
+        """
+
+    def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Prolog compute (first stage only): embed the input token ids.
+        """
+
+    def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Epilog compute (last stage only): final norm + lm_head projection to logits.
         """

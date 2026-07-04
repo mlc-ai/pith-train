@@ -401,7 +401,7 @@ class DeepSeekV2Model(nn.Module):
         layer_id_end = layer_id_begin + num_local_layers[stage_index]
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
 
-    def rotary_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = hidden_states.shape[1]
         cp_size = distributed.cp_size
         block = seq_len // 2
@@ -410,21 +410,27 @@ class DeepSeekV2Model(nn.Module):
         cos, sin = self.rotary_emb(seq_len=seq_len * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
+    def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(hidden_states)
+
+    def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.norm(hidden_states)
+        return self.lm_head(hidden_states)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         intermediate_tensors: Optional[IntermediateTensors] = getattr(self, "_intermediate_tensors", None)
 
         if self.stage_index == 0:
-            hidden_states = self.embed_tokens(hidden_states)
+            hidden_states = self.forward_prolog(hidden_states)
 
-        rotary_posemb = self.rotary_posemb(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states)
 
         if intermediate_tensors is None:
             for _, layer in self.layers.items():
                 ret = decoder_layer_forward(layer, hidden_states, rotary_posemb)
                 hidden_states = ret[0] if isinstance(ret, tuple) else ret
             if self.stage_index == self.stage_count - 1:  # last stage
-                hidden_states = self.norm(hidden_states)
-                hidden_states = self.lm_head(hidden_states)
+                hidden_states = self.forward_epilog(hidden_states)
             return hidden_states
 
         layer_idx = 0
@@ -455,8 +461,7 @@ class DeepSeekV2Model(nn.Module):
             if not ModelImplMode.use_reference_fwd:
                 hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
-            hidden_states = self.norm(hidden_states)
-            hidden_states = self.lm_head(hidden_states)
+            hidden_states = self.forward_epilog(hidden_states)
 
         return hidden_states
 

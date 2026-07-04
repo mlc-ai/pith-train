@@ -119,12 +119,12 @@ def overlapped_forward_backward(
     moe_outs_grad = stage4_b(ctx, module1_layers[-1], record, (moe_outs_grad,))
 
     # Module 0 layer 0 stage 1 forward
-    if module0.embed_tokens is not None:
+    if module0.stage_index == 0:
         record, hidden_states = prolog_f(module0, hidden_states)
         intermediate_tensors0.prolog.args = record.args
         intermediate_tensors0.prolog.outs = record.outs
 
-    rotary_posemb = module0.rotary_posemb(hidden_states)
+    rotary_posemb = module0.forward_posemb(hidden_states)
 
     record, dispatch_tokens, residual, routing = stage1_f(
         ctx, module0_layers[0], hidden_states, rotary_posemb
@@ -321,14 +321,14 @@ def overlapped_forward_backward(
         assert len(module0.layers) == len(module1.layers)
 
     final_grads = (hidden_states_grad,)
-    if module1.embed_tokens is not None:
+    if module1.stage_index == 0:
         record = intermediate_tensors1.prolog
         prolog_b(module1, record, (hidden_states_grad,))
         final_grads = (None,)
         # Clear tensor refs but keep pre-allocated record
         record.args = None
         record.outs = None
-    if module0.norm is not None:
+    if module0.stage_index == module0.stage_count - 1:
         record, hidden_states = epilog_f(module0, hidden_states)
         intermediate_tensors0.epilog.args = record.args
 

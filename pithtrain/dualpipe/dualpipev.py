@@ -94,16 +94,16 @@ class DualPipeV(nn.Module):
             [
                 create_intermediate_tensors(
                     len(self.module[0].layers),
-                    self.module[0].embed_tokens is not None,
-                    self.module[0].norm is not None,
+                    self.module[0].stage_index == 0,
+                    self.module[0].stage_index == self.module[0].stage_count - 1,
                 )
                 for _ in range(num_chunks)
             ],
             [
                 create_intermediate_tensors(
                     len(self.module[1].layers),
-                    self.module[1].embed_tokens is not None,
-                    self.module[1].norm is not None,
+                    self.module[1].stage_index == 0,
+                    self.module[1].stage_index == self.module[1].stage_count - 1,
                 )
                 for _ in range(num_chunks)
             ],
