@@ -6,7 +6,6 @@ The loss and gradients are compared with a reference implementation.
 import argparse
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Union
 
 import torch
 import torch.distributed.fsdp
@@ -21,12 +20,14 @@ from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_s
 from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
-from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
-from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
-from pithtrain.models.qwen35_moe import (
-    Qwen35MoeModel,
-    Qwen35MoeTopKRouter,
-)
+
+# dsv2-only for now; restore once the siblings are migrated to the new contract.
+# from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
+# from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
+# from pithtrain.models.qwen35_moe import (
+#     Qwen35MoeModel,
+#     Qwen35MoeTopKRouter,
+# )
 from pithtrain.modules.distributed import DistributedCfg, distributed_context
 
 
@@ -37,13 +38,12 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, GptOssExperts):
-        # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
-        nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
-        nn.init.xavier_uniform_(module.down_proj, gain=1.0)
-    elif isinstance(
-        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
-    ):
+    # dsv2-only for now; restore once the siblings are migrated.
+    # elif isinstance(module, GptOssExperts):
+    #     # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
+    #     nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
+    #     nn.init.xavier_uniform_(module.down_proj, gain=1.0)
+    elif isinstance(module, DeepSeekV2MoEGate):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
@@ -66,7 +66,7 @@ def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def reference_step(
     x: torch.Tensor,
     l: torch.Tensor,  # noqa: E741
-    model: Union[DeepSeekV2Model, Qwen3MoeModel],
+    model: DeepSeekV2Model,
     chunks: int,
 ):
     ys, ls = [], []
@@ -139,9 +139,7 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(
-            model[i], (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
-        )
+        assert isinstance(model[i], DeepSeekV2Model)
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
@@ -204,29 +202,24 @@ def main(model_name: str):
     if config.model_type == "deepseek_v2":
         ModelClass = DeepSeekV2Model
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
-    elif config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
-        config.num_hidden_layers = min(config.num_hidden_layers, 8)
-    elif config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
-        # Keep alternating sliding/full pattern when slicing layers.
-        keep = min(config.num_hidden_layers, 8)
-        if getattr(config, "layer_types", None) is not None:
-            config.layer_types = config.layer_types[:keep]
-        config.num_hidden_layers = keep
-    elif config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen35MoeModel
-        # Keep the linear/full attention layer pattern when slicing layers.
-        keep = min(config.num_hidden_layers, 8)
-        if getattr(config, "layer_types", None) is not None:
-            config.layer_types = config.layer_types[:keep]
-        config.num_hidden_layers = keep
-        # The released config (256 experts, 248320-token vocab) cannot be
-        # instantiated in fp32 on a single GPU for the reference model. Shrink
-        # the memory drivers — correctness of the 5-stage / EP / PP paths is
-        # independent of the exact expert count and vocabulary size.
-        config.num_experts = 32
-        config.vocab_size = 8192
+    # dsv2-only for now; restore sibling branches once they're migrated.
+    # elif config.model_type == "qwen3_moe":
+    #     ModelClass = Qwen3MoeModel
+    #     config.num_hidden_layers = min(config.num_hidden_layers, 8)
+    # elif config.model_type == "gpt_oss":
+    #     ModelClass = GptOssModel
+    #     keep = min(config.num_hidden_layers, 8)
+    #     if getattr(config, "layer_types", None) is not None:
+    #         config.layer_types = config.layer_types[:keep]
+    #     config.num_hidden_layers = keep
+    # elif config.model_type == "qwen3_5_moe_text":
+    #     ModelClass = Qwen35MoeModel
+    #     keep = min(config.num_hidden_layers, 8)
+    #     if getattr(config, "layer_types", None) is not None:
+    #         config.layer_types = config.layer_types[:keep]
+    #     config.num_hidden_layers = keep
+    #     config.num_experts = 32
+    #     config.vocab_size = 8192
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
@@ -250,13 +243,10 @@ def main(model_name: str):
         ep_rank
     ]
 
-    # Create the reference full model.
-    config.ep_size = 1
-
-    full_modules = ModelClass(config, num_stages=1, stage_id=0)
-
+    # Reference runs single-device (pp=ep=1); restore the real mesh before DualPipeV.
+    distributed.pp_size = distributed.ep_size = 1
+    full_modules = ModelClass(config, phase=-1)
     full_modules.to(dtype=dtype)
-    config.ep_size = ep_size
     full_modules.apply(fill_weights)
 
     # Run the reference step.
@@ -266,13 +256,14 @@ def main(model_name: str):
 
     ModelImplMode.use_reference_fwd = True
     loss_ref, output_ref = reference_step(full_x, full_l, full_modules, num_chunks * ep_size)
+    ModelImplMode.use_reference_fwd = False
+    distributed.pp_size, distributed.ep_size = pp_size, ep_size
 
     if distributed.rank == 0:
         print("[INFO] Completed the reference step.", flush=True)
     torch.distributed.barrier()
 
     # Setup DualPipeV.
-    ModelImplMode.use_reference_fwd = False
     set_p2p_tensor_shapes([(micro_batch_size, sequence_length, hidden_size)])
     set_p2p_tensor_dtype(dtype)
 
@@ -280,10 +271,8 @@ def main(model_name: str):
     num_stages = pp_size * 2
     local_full_modules = []
 
-    local_full_modules.append(ModelClass(config, num_stages=num_stages, stage_id=pp_rank))
-    local_full_modules.append(
-        ModelClass(config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank)
-    )
+    local_full_modules.append(ModelClass(config, phase=0))
+    local_full_modules.append(ModelClass(config, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
     if pp_rank == 0:
@@ -301,10 +290,8 @@ def main(model_name: str):
     # Create the local modules with the same weights but zero gradients.
     local_modules = []
 
-    local_modules.append(ModelClass(config, num_stages=num_stages, stage_id=pp_rank))
-    local_modules.append(
-        ModelClass(config, num_stages=num_stages, stage_id=num_stages - 1 - pp_rank)
-    )
+    local_modules.append(ModelClass(config, phase=0))
+    local_modules.append(ModelClass(config, phase=1))
 
     local_modules = nn.Sequential(*local_modules)
     local_modules.to(dtype=dtype)

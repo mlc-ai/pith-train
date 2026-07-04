@@ -379,15 +379,24 @@ class DeepSeekV2DecoderLayer(nn.Module):
 class DeepSeekV2Model(nn.Module):
     def __init__(self, config: DeepseekV2Config, phase: int):
         super().__init__()
-        num_stages = distributed.pp_size * 2
-        stage_id = distributed.pp_rank if phase == 0 else num_stages - 1 - distributed.pp_rank
-        self.stage_id = stage_id
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size) if stage_id == 0 else None
-        num_local_layers = layer_partition(config.num_hidden_layers, num_stages)
-        layer_id_begin = sum(num_local_layers[:stage_id])
-        layer_id_end = layer_id_begin + num_local_layers[stage_id]
+
+        match phase:
+            case 0:
+                stage_count = distributed.pp_size * 2
+                stage_index = distributed.pp_rank
+            case 1:
+                stage_count = distributed.pp_size * 2
+                stage_index = stage_count - 1 - distributed.pp_rank
+            case _:
+                stage_count = 1
+                stage_index = 0
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size) if stage_index == 0 else None
+        num_local_layers = layer_partition(config.num_hidden_layers, stage_count)
+        layer_id_begin = sum(num_local_layers[:stage_index])
+        layer_id_end = layer_id_begin + num_local_layers[stage_index]
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
-        if stage_id == num_stages - 1:
+        if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         else:

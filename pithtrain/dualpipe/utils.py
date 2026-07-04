@@ -87,7 +87,7 @@ def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) 
     pairs = [(t, g) for t, g in zip(tensors, grad_tensors) if t is not None]
     if not pairs:
         return
-    tensors, grad_tensors = map(list, zip(*pairs))
+    tensors, grad_tensors = map(tuple, zip(*pairs))
     kwargs = dict(
         keep_graph=False,
         create_graph=False,
