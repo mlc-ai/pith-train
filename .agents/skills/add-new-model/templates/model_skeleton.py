@@ -519,7 +519,7 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
 
     # ----- Reference (non-pipelined) ---------------------------------------
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Plain forward — used by single-GPU test and the reference model in test_fsdp."""
+        """Plain forward — used by single-GPU test and the reference model in test_dualpipev."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 

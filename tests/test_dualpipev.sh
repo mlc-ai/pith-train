@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test FSDP with DualPipeV.
+# Test DualPipeV against a single-device reference.
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ MAIN_ARGS=()
 MAIN_ARGS+=(--pp-size 2 --ep-size 2)
 MAIN_ARGS+=(--model "examples/pretrain_lm/deepseek-v2-lite/config.json")
 
-SCRIPT=tests/test_fsdp.py
-OUTPUT=$PWD/logs/test_fsdp.log; mkdir -p $(dirname $OUTPUT)
+SCRIPT=tests/test_dualpipev.py
+OUTPUT=$PWD/logs/test_dualpipev.log; mkdir -p $(dirname $OUTPUT)
 
 torchrun ${TRUN_ARGS[@]} $SCRIPT ${MAIN_ARGS[@]} 2>&1 | tee $OUTPUT
