@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 # -- Shared async D-to-H copy infrastructure --
-# Used by both ScatterForGroupedGemm and moe_ep_prepare_dispatch to avoid
+# Used by both ScatterForGroupedGemm and prepare_dispatch to avoid
 # per-call cudaStreamSynchronize overhead from .tolist() / .item().
 #
 # These are process-global, not per-thread, which is fine because the MoE ops only ever run

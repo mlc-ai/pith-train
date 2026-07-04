@@ -2,7 +2,7 @@
 Fused Triton kernels for expert-parallel dispatch with token deduplication.
 
 Replaces ~22 small PyTorch kernel launches (scatter, argsort, nonzero,
-searchsorted, etc.) in moe_ep_prepare_dispatch with three Triton kernels:
+searchsorted, etc.) in prepare_dispatch with three Triton kernels:
 
   Kernel 1 (_dedup_bincount_kernel):
     Atomic-free parallel bincount using per-CTA private histograms
@@ -577,7 +577,7 @@ def adjust_expand_idx(
 
 
 @torch.compiler.disable
-def moe_ep_prepare_dispatch(
+def prepare_dispatch(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weight: torch.Tensor,

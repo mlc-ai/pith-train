@@ -17,7 +17,7 @@ from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
-from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
+from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.ring_attention import mla_ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
@@ -314,7 +314,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
-        dispatch_tokens, routing = moe_ep_prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
+        dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return dispatch_tokens, residual, routing
 
     def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:

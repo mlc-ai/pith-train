@@ -4,7 +4,7 @@ Correctness tests for the IndexedBiasAdd autograd Function.
 The Function computes the same output as ``x + bias[group_ids]``; the
 custom backward swaps PyTorch's bf16 atomic-add bias-grad path for a
 Triton segmented-sum.  Tokens are required to be sorted by group, which
-is always the case post moe_ep_prepare_dispatch.
+is always the case post prepare_dispatch.
 
 Each test compares against an fp32 ground truth rather than the bf16
 autograd reference, because the bf16 atomic-add path is itself lossy
