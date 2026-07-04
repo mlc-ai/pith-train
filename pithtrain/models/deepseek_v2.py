@@ -234,7 +234,7 @@ class DeepSeekV2Attention(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     @staticmethod
-    def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         cos = cos.unsqueeze(unsqueeze_dim)
         sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -263,7 +263,7 @@ class DeepSeekV2Attention(nn.Module):
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
         cos, sin = rotary_posemb
-        q_pe, k_pe = self.apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
+        q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
         if distributed.cp_size > 1:
             kv_b_quant = self.kv_b_proj._get_quantized_weight() if self._fp8 else None
