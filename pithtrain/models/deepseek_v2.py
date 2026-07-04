@@ -89,15 +89,15 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
 
 
 class DeepSeekV2MLP(nn.Module):
-    def __init__(self, config: DeepseekV2Config, hidden_size: Optional[int] = None, intermediate_size: Optional[int] = None):
+    def __init__(self, config: DeepseekV2Config, intermediate_size: Optional[int] = None):
         super().__init__()
-        self.hidden_size = hidden_size or config.hidden_size
-        self.intermediate_size = intermediate_size or config.intermediate_size
+        hidden_size = config.hidden_size
+        intermediate_size = intermediate_size or config.intermediate_size
 
         LinearCls = get_linear_cls()
-        self.gate_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = LinearCls(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = LinearCls(hidden_size, intermediate_size, bias=False)
+        self.up_proj = LinearCls(hidden_size, intermediate_size, bias=False)
+        self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         g = self.gate_proj(x)
@@ -108,14 +108,13 @@ class DeepSeekV2MLP(nn.Module):
 class DeepSeekV2Experts(nn.Module):
     def __init__(self, config: DeepseekV2Config, num_experts: int):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.moe_intermediate_size
+        hidden_size = config.hidden_size
+        intermediate_size = config.moe_intermediate_size
 
         GroupLinearCls = get_group_linear_cls()
-        self.gate_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
-        self.up_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
-        self.down_proj = GroupLinearCls(num_experts, self.intermediate_size, self.hidden_size)
+        self.gate_proj = GroupLinearCls(num_experts, hidden_size, intermediate_size)
+        self.up_proj = GroupLinearCls(num_experts, hidden_size, intermediate_size)
+        self.down_proj = GroupLinearCls(num_experts, intermediate_size, hidden_size)
 
     def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
@@ -170,7 +169,6 @@ class DeepSeekV2MoEGate(nn.Module):
 class DeepSeekV2MoEWithGroupGeMM(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
-        self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
@@ -203,8 +201,7 @@ class DeepSeekV2MoEWithGroupGeMM(nn.Module):
 class DeepSeekV2Attention(nn.Module):
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
+        hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.kv_lora_rank = config.kv_lora_rank
@@ -215,16 +212,16 @@ class DeepSeekV2Attention(nn.Module):
 
         LinearCls = get_linear_cls()
         if self.q_lora_rank is None:
-            self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
+            self.q_proj = LinearCls(hidden_size, self.num_heads * self.q_head_dim, bias=False)
         else:
-            self.q_a_proj = LinearCls(self.hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_proj = LinearCls(hidden_size, self.q_lora_rank, bias=False)
             self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = LinearCls(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = LinearCls(self.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
+        self.kv_a_proj_with_mqa = LinearCls(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
         self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = LinearCls(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
 
-        self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
+        self.o_proj = LinearCls(self.num_heads * self.v_head_dim, hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
         # When fp8 training is on, kv_b_proj is an FP8Linear; the pass-latent ring decompresses
         # the rotated latent via the FP8 deep_gemm path instead of a silent bf16 F.linear.
