@@ -139,8 +139,7 @@ class DeepSeekV2MoEGate(nn.Module):
         self.router_replay = None
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)
 
-    @torch.compile(fullgraph=True)
-    def compute(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         _, _, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
@@ -167,14 +166,6 @@ class DeepSeekV2MoEGate(nn.Module):
 
         return topk_idx, topk_weight, lb_loss
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        topk_idx, topk_weight, lb_loss = self.compute(hidden_states)
-
-        if lb_loss is not None:
-            MoELoadBalanceLossTracker.add(lb_loss)
-
-        return topk_idx, topk_weight
-
 
 class DeepSeekV2MoEWithGroupGeMM(nn.Module):
     def __init__(self, config: DeepseekV2Config):
@@ -193,7 +184,9 @@ class DeepSeekV2MoEWithGroupGeMM(nn.Module):
         assert distributed.ep_size == 1, "reference implementation only supports ep_size=1"
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.gate(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.gate(hidden_states)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         expert_idxs = topk_idx.view(-1)
@@ -302,22 +295,26 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def _forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, rotary_posemb)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        return hidden_states, residual
+        if isinstance(self.mlp, DeepSeekV2MLP):
+            return hidden_states, residual, None, None, None
+        residual = residual + self.mlp.shared_experts(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+        return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
     def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[MoERouting]]:
-        hidden_states, residual = self._forward_stage1_compute(hidden_states, rotary_posemb)
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb)
         if isinstance(self.mlp, DeepSeekV2MLP):
             return hidden_states, residual, None
-        residual = residual + self.mlp.shared_experts(hidden_states)
-        topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        dispatch_tokens, routing = moe_ep_prepare_dispatch(hidden_states, topk_ids, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
+        dispatch_tokens, routing = moe_ep_prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return dispatch_tokens, residual, routing
 
     def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
