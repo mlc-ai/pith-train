@@ -30,6 +30,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from pithtrain.models.interface import AllToAllSplits, MoERouting
 from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
 
 
@@ -579,23 +580,19 @@ def adjust_expand_idx(
 def moe_ep_prepare_dispatch(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
+    topk_weight: torch.Tensor,
     num_experts: int,
     ep_size: int,
     experts_per_rank: int,
     ep_group: dist.ProcessGroup,
-) -> tuple:
+) -> tuple[torch.Tensor, MoERouting]:
     """
     Expert-parallel dispatch with token deduplication.
 
-    When ep_size > 1, deduplicates tokens that are routed to the same EP rank
-    via multiple experts, reducing all-to-all communication volume. Computes
-    expand_idx to reconstruct the full expert-token mapping on the receiver side.
-
-    When ep_size == 1, simply replicates each token k times (one per selected expert).
-
-    Returns:
-        (dedup_sorted_tokens, idxs, expert_idxs, expand_idx,
-         dedup_input_splits, dedup_output_splits, input_splits, output_splits)
+    When ep_size > 1, deduplicates tokens routed to the same EP rank via
+    multiple experts to cut all-to-all volume, and computes expand_idx to
+    reconstruct the full mapping on the receiver side. When ep_size == 1,
+    replicates each token once per selected expert.
     """
 
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -603,10 +600,10 @@ def moe_ep_prepare_dispatch(
     expert_idxs = topk_ids.view(-1)
 
     if ep_size == 1:
-        dedup_sorted_tokens = (
+        dispatch_tokens = (
             hidden_states.unsqueeze(1).expand(-1, k, -1).reshape(-1, hidden_states.shape[-1])
         )
-        return (dedup_sorted_tokens, None, expert_idxs, None, None, None, None, None)
+        return dispatch_tokens, MoERouting(topk_weight, expert_idxs)
 
     (
         tokens_per_ep_rank,
@@ -667,15 +664,13 @@ def moe_ep_prepare_dispatch(
 
     # Trim + gather dedup tokens for dispatch
     total_dedup = sum(dedup_input_splits)
-    dedup_sorted_tokens = padded_index_gather(hidden_states, dispatch_token_idxs[:total_dedup])
+    dispatch_tokens = padded_index_gather(hidden_states, dispatch_token_idxs[:total_dedup])
 
-    return (
-        dedup_sorted_tokens,
-        idxs,
+    return dispatch_tokens, MoERouting(
+        topk_weight,
         expert_idxs,
+        idxs,
         expand_idx,
-        dedup_input_splits,
-        dedup_output_splits,
-        input_splits,
-        output_splits,
+        AllToAllSplits(dedup_input_splits, dedup_output_splits),
+        AllToAllSplits(input_splits, output_splits),
     )

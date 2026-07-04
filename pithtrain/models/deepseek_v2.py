@@ -15,7 +15,7 @@ from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
-from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
@@ -190,24 +190,21 @@ class DeepSeekV2MoEWithGroupGeMM(nn.Module):
         self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert distributed.ep_size == 1, "reference implementation only supports ep_size=1"
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-        y = y + self.shared_experts(identity)
-        return y
 
-    def moe_infer(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
-        assert distributed.ep_size == 1, "reference implementation only supports ep_size=1"
-        expert_idxs = topk_ids.view(-1)
-        sorted_tokens = x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
+        expert_idxs = topk_idx.view(-1)
+        replicated_tokens = hidden_states.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, hidden_states.shape[-1])
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(replicated_tokens, expert_idxs, self.experts_per_rank)
         outs = self.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = outs[reverse_shuffle_idxs]
+        y = (outs.view(*topk_idx.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)
 
-        final_out = (outs.view(*topk_ids.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)
-        return final_out
+        y = y.view(*orig_shape) + self.shared_experts(identity)
+        return y
 
 
 class DeepSeekV2Attention(nn.Module):
@@ -314,14 +311,14 @@ class DeepSeekV2DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         return hidden_states, residual
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[MoERouting]]:
         hidden_states, residual = self._forward_stage1_compute(hidden_states, rotary_posemb)
         if isinstance(self.mlp, DeepSeekV2MLP):
-            return ForwardAttnOutput(hidden_states, None, None, None, None, None, residual)
+            return hidden_states, residual, None
         residual = residual + self.mlp.shared_experts(hidden_states)
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
-        return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
+        dispatch_tokens, routing = moe_ep_prepare_dispatch(hidden_states, topk_ids, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
+        return dispatch_tokens, residual, routing
 
     def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if isinstance(self.mlp, DeepSeekV2MLP):

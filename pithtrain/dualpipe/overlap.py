@@ -126,21 +126,11 @@ def overlapped_forward_backward(
 
     rotary_posemb = module0.rotary_posemb(hidden_states)
 
-    record, output = stage1_f(ctx, module0_layers[0], hidden_states, rotary_posemb)
+    record, dispatch_tokens, residual, routing = stage1_f(
+        ctx, module0_layers[0], hidden_states, rotary_posemb
+    )
     intermediate_tensors0.layers[layer_idx0].stage1.args = record.args
     intermediate_tensors0.layers[layer_idx0].stage1.outs = record.outs
-    (
-        sorted_tokens,
-        moe_local_idxs,
-        topk_weight,
-        output_splits,
-        input_splits,
-        expert_idxs,
-        residual,
-        expand_idx,
-        dedup_input_splits,
-        dedup_output_splits,
-    ) = output
 
     for l in range(num_layers):  # noqa: E741
         if l != 0:
@@ -159,14 +149,7 @@ def overlapped_forward_backward(
                 next_layer, prev_layer = module1_layers[-l], module1_layers[-l - 1]
                 stage1_outs = stage1_record.outs
                 stage5_args = intermediate_tensors1.layers[-l - 1].stage5.args
-                if hasattr(next_layer.mlp, "experts"):
-                    grad_tensors = (
-                        sorted_tokens_grad,  # noqa: F821
-                        topk_weight_grad,
-                        residual_grad,
-                    )
-                else:
-                    grad_tensors = (sorted_tokens_grad, residual_grad)  # noqa: F821
+                grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)  # noqa: F821
                 moe_outs_grad, topk_weight_grad, residual_grad = stage5_and_stage1_b(
                     ctx, next_layer, prev_layer, stage1_outs, stage5_args, grad_tensors
                 )
@@ -175,14 +158,7 @@ def overlapped_forward_backward(
             else:
                 # Module 1 layer L-l stage 1 backward
                 record = intermediate_tensors1.layers[-l].stage1
-                if hasattr(module1_layers[-l].mlp, "experts"):
-                    grad_tensors = (
-                        sorted_tokens_grad,  # noqa: F821
-                        topk_weight_grad,
-                        residual_grad,
-                    )
-                else:
-                    grad_tensors = (sorted_tokens_grad, residual_grad)  # noqa: F821
+                grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)  # noqa: F821
                 hidden_states_grad = stage1_b(ctx, module1_layers[-l], record, grad_tensors)
                 # Module 1 layer L-l-1 stage 5 backward
                 record = intermediate_tensors1.layers[-l - 1].stage5
@@ -197,12 +173,11 @@ def overlapped_forward_backward(
                 ctx,
                 module0_layers[l - 1],
                 moe_outs,  # noqa: F821
-                input_splits,
-                output_splits,
+                routing.combine_splits if routing is not None else None,
                 ep_group,
             )
             intermediate_tensors0.layers[layer_idx0].stage4.ctx = record.ctx
-            if hasattr(module0_layers[l - 1].mlp, "experts") and ctx.fwd_comm_work is not None:
+            if routing is not None and ctx.fwd_comm_work is not None:
                 ctx.fwd_comm_deferred_free.append(
                     intermediate_tensors0.layers[layer_idx0].stage3.outs.moe_outs
                 )  # freed after Stage 5 waits
@@ -220,13 +195,12 @@ def overlapped_forward_backward(
                 # - Store stage5.args at prev layer (no outs)
                 # - Store stage1.outs at next layer (no args)
                 prev_layer, next_layer = module0_layers[l - 1], module0_layers[l]
-                stage5_args, stage1_outs, output = stage5_and_stage1_f(
+                stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_and_stage1_f(
                     ctx,
                     prev_layer,
                     next_layer,
                     moe_outs,
-                    moe_local_idxs,
-                    topk_weight,
+                    routing,
                     residual,
                     rotary_posemb,
                 )
@@ -237,47 +211,24 @@ def overlapped_forward_backward(
                 # Store stage1.outs at next layer (no args -> merged indicator)
                 # stage1.args stays None
                 intermediate_tensors0.layers[layer_idx0].stage1.outs = stage1_outs
-                (
-                    sorted_tokens,
-                    moe_local_idxs,
-                    topk_weight,
-                    output_splits,
-                    input_splits,
-                    expert_idxs,
-                    residual,
-                    expand_idx,
-                    dedup_input_splits,
-                    dedup_output_splits,
-                ) = output
             else:
                 # Module 0 layer l-1 stage 5 forward
                 record, hidden_states = stage5_f(
                     ctx,
                     module0_layers[l - 1],
                     moe_outs,
-                    moe_local_idxs,
-                    topk_weight,
+                    routing,
                     residual,
                 )
                 intermediate_tensors0.layers[layer_idx0].stage5.args = record.args
                 intermediate_tensors0.layers[layer_idx0].stage5.outs = record.outs
                 layer_idx0 += 1
                 # Module 0 layer l stage 1 forward
-                record, output = stage1_f(ctx, module0_layers[l], hidden_states, rotary_posemb)
+                record, dispatch_tokens, residual, routing = stage1_f(
+                    ctx, module0_layers[l], hidden_states, rotary_posemb
+                )
                 intermediate_tensors0.layers[layer_idx0].stage1.args = record.args
                 intermediate_tensors0.layers[layer_idx0].stage1.outs = record.outs
-                (
-                    sorted_tokens,
-                    moe_local_idxs,
-                    topk_weight,
-                    output_splits,
-                    input_splits,
-                    expert_idxs,
-                    residual,
-                    expand_idx,
-                    dedup_input_splits,
-                    dedup_output_splits,
-                ) = output
 
         # Module 1 layer L-l-1 stage 3 backward
         record = intermediate_tensors1.layers[-l - 1].stage3
@@ -287,18 +238,19 @@ def overlapped_forward_backward(
         record, gathered_tokens = stage2_f(
             ctx,
             module0_layers[l],
-            sorted_tokens,
-            dedup_output_splits,
-            dedup_input_splits,
+            dispatch_tokens,
+            routing.dispatch_splits if routing is not None else None,
             ep_group,
         )
         intermediate_tensors0.layers[layer_idx0].stage2.ctx = record.ctx
-        if hasattr(module0_layers[l].mlp, "experts") and ctx.fwd_comm_work is not None:
-            ctx.fwd_comm_deferred_free.append(sorted_tokens)  # freed after Stage 3 waits
+        if routing is not None and ctx.fwd_comm_work is not None:
+            ctx.fwd_comm_deferred_free.append(dispatch_tokens)  # freed after Stage 3 waits
 
         # Module 1 layer L-l-1 stage 2 backward
         record = intermediate_tensors1.layers[-l - 1].stage2
-        sorted_tokens_grad = stage2_b(ctx, module1_layers[-l - 1], record, (gathered_tokens_grad,))
+        dispatch_tokens_grad = stage2_b(
+            ctx, module1_layers[-l - 1], record, (gathered_tokens_grad,)
+        )
 
         # Module 1 layer L-l-1 stage 3 weight backward
         stage3_w(ctx, module1_layers[-l - 1])
@@ -308,18 +260,22 @@ def overlapped_forward_backward(
             ctx,
             module0_layers[l],
             gathered_tokens,
-            expert_idxs,
-            expand_idx,
+            routing.expert_idxs if routing is not None else None,
+            routing.expand_idx if routing is not None else None,
         )
         intermediate_tensors0.layers[layer_idx0].stage3.args = record.args
         intermediate_tensors0.layers[layer_idx0].stage3.outs = record.outs
 
     # Module 0 layer L-1 stage 4 forward
     record, moe_outs = stage4_f(
-        ctx, module0_layers[num_layers - 1], moe_outs, input_splits, output_splits, ep_group
+        ctx,
+        module0_layers[num_layers - 1],
+        moe_outs,
+        routing.combine_splits if routing is not None else None,
+        ep_group,
     )
     intermediate_tensors0.layers[layer_idx0].stage4.ctx = record.ctx
-    if hasattr(module0_layers[num_layers - 1].mlp, "experts") and ctx.fwd_comm_work is not None:
+    if routing is not None and ctx.fwd_comm_work is not None:
         ctx.fwd_comm_deferred_free.append(
             intermediate_tensors0.layers[layer_idx0].stage3.outs.moe_outs
         )  # freed after Stage 5 waits
@@ -327,11 +283,7 @@ def overlapped_forward_backward(
     # Module 1 layer 0 stage 1 backward
     record = intermediate_tensors1.layers[-num_layers].stage1
 
-    if hasattr(module1_layers[-num_layers].mlp, "experts"):
-        grad_tensors = (sorted_tokens_grad, topk_weight_grad, residual_grad)
-    else:
-        grad_tensors = (sorted_tokens_grad, residual_grad)
-
+    grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)
     hidden_states_grad = stage1_b(ctx, module1_layers[-num_layers], record, grad_tensors)
 
     # Clear tensor refs but keep pre-allocated records
@@ -342,8 +294,7 @@ def overlapped_forward_backward(
         ctx,
         module0_layers[num_layers - 1],
         moe_outs,
-        moe_local_idxs,
-        topk_weight,
+        routing,
         residual,
     )
     intermediate_tensors0.layers[layer_idx0].stage5.args = record.args
@@ -352,7 +303,9 @@ def overlapped_forward_backward(
 
     if len(module0.layers) == len(module1.layers) + 1:
         # There is an extra layer in module0 for forward
-        hidden_states, extra_layer = decoder_layer_forward(module0_layers[-1], hidden_states, rotary_posemb)
+        hidden_states, extra_layer = decoder_layer_forward(
+            module0_layers[-1], hidden_states, rotary_posemb
+        )
         # Copy into pre-allocated slot
         _copy_layer_records(extra_layer, intermediate_tensors0.layers[layer_idx0])
         layer_idx0 += 1

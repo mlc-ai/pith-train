@@ -66,7 +66,7 @@ force-exclude = true
 
 [tool.ruff.format]
 quote-style = "double"
-exclude = ["pithtrain/models/*.py", "pithtrain/contexts/*.py"]
+exclude = ["pithtrain/models/*.py", "pithtrain/contexts/*.py", "pithtrain/dualpipe/execution.py"]
 
 [tool.ruff.lint]
 ignore = ["E501", "E731"]

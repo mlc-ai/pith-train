@@ -9,8 +9,7 @@ from pithtrain.contexts import distributed
 from pithtrain.dualpipe.execution import (
     IntermediateTensorsLayer,
     Stage1Args,
-    Stage1OutsMlp,
-    Stage1OutsMoe,
+    Stage1Outs,
     Stage1Record,
     Stage2Record,
     Stage3Args,
@@ -23,46 +22,44 @@ from pithtrain.dualpipe.execution import (
 )
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode
-from pithtrain.models.interface import LayerProtocol
+from pithtrain.models.interface import AllToAllSplits, LayerProtocol
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 
 def decoder_layer_forward_dispatch(
-    sorted_tokens: torch.Tensor,
-    output_splits: Optional[List[int]],
-    input_splits: Optional[List[int]],
+    dispatch_tokens: torch.Tensor,
+    dispatch_splits: Optional[AllToAllSplits],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """All-to-all dispatch."""
-    if output_splits is not None:
+    if dispatch_splits is not None:
         gathered_tokens = direct_all_to_all(
-            sorted_tokens,
-            output_splits,
-            input_splits,
+            dispatch_tokens,
+            dispatch_splits.output_splits,
+            dispatch_splits.input_splits,
             ep_group,
         )
-        a2a_ctx = (output_splits, input_splits, ep_group)
+        a2a_ctx = (dispatch_splits, ep_group)
     else:
-        gathered_tokens = sorted_tokens
+        gathered_tokens = dispatch_tokens
         a2a_ctx = None
     return gathered_tokens, a2a_ctx
 
 
 def decoder_layer_forward_combine(
     outs: torch.Tensor,
-    input_splits: Optional[List[int]],
-    output_splits: Optional[List[int]],
+    combine_splits: Optional[AllToAllSplits],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """All-to-all combine."""
-    if output_splits is not None:
+    if combine_splits is not None:
         outs = direct_all_to_all(
             outs,
-            input_splits,
-            output_splits,
+            combine_splits.input_splits,
+            combine_splits.output_splits,
             ep_group,
         )
-        a2a_ctx = (input_splits, output_splits, ep_group)
+        a2a_ctx = (combine_splits, ep_group)
     else:
         a2a_ctx = None
     return outs, a2a_ctx
@@ -90,27 +87,14 @@ def decoder_layer_forward(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    output = layer.forward_stage1(next_hidden_states, rotary_posemb)
-    (
-        sorted_tokens,
-        moe_local_idxs,
-        topk_weight,
-        output_splits,
-        input_splits,
-        expert_idxs,
-        residual,
-        expand_idx,
-        dedup_input_splits,
-        dedup_output_splits,
-    ) = output
+    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb)
 
-    has_experts = hasattr(layer.mlp, "experts")
+    has_experts = routing is not None
     ep_group = distributed.ep_group if has_experts else None
 
-    if has_experts:
-        record.outs = Stage1OutsMoe(output.sorted_tokens, output.topk_weight, output.residual)
-    else:
-        record.outs = Stage1OutsMlp(output.sorted_tokens, output.residual)
+    record.outs = Stage1Outs(
+        dispatch_tokens, residual, routing.topk_weight if has_experts else None
+    )
     intermediate_tensors.stage1 = record
     nvtx.range_pop()
 
@@ -118,7 +102,7 @@ def decoder_layer_forward(
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
     gathered_tokens, record.ctx = decoder_layer_forward_dispatch(
-        sorted_tokens.detach(), dedup_output_splits, dedup_input_splits, ep_group
+        dispatch_tokens.detach(), routing.dispatch_splits if has_experts else None, ep_group
     )
     fwd_comm_work = getattr(gathered_tokens, "comm_work", None)
     setattr(gathered_tokens, "comm_work", None)
@@ -133,20 +117,24 @@ def decoder_layer_forward(
 
     if fwd_comm_work is not None:
         fwd_comm_work.wait()
-    # Stage 2 all-to-all has completed - sorted_tokens storage is no longer read.
+    # Stage 2 all-to-all has completed - dispatch_tokens storage is no longer read.
     # Free it now; run_backward only needs the grad_fn chain, not the values.
-    # Guard: only when a2a actually occurred (ep_size > 1); otherwise sorted_tokens
+    # Guard: only when a2a actually occurred (ep_size > 1); otherwise dispatch_tokens
     # and gathered_tokens share storage.
     if has_experts and fwd_comm_work is not None:
-        sorted_tokens.untyped_storage().resize_(0)
+        dispatch_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_stage3(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = layer.forward_stage3(
+        gathered_tokens,
+        routing.expert_idxs if has_experts else None,
+        routing.expand_idx if has_experts else None,
+    )
 
     record.outs = Stage3Outs(moe_outs)
     # Free args storage - values no longer needed, only .grad is read after backward.
     # Only safe for MoE layers with EP: padded_index_gather is the first consumer and
     # doesn't save the input.  For dense layers or ep_size==1, gate_proj/up_proj may
-    # save gathered_tokens directly, or it shares storage with sorted_tokens.
+    # save gathered_tokens directly, or it shares storage with dispatch_tokens.
     if has_experts and fwd_comm_work is not None:
         gathered_tokens.untyped_storage().resize_(0)
     intermediate_tensors.stage3 = record
@@ -156,7 +144,7 @@ def decoder_layer_forward(
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
     moe_outs, record.ctx = decoder_layer_forward_combine(
-        moe_outs.detach(), input_splits, output_splits, ep_group
+        moe_outs.detach(), routing.combine_splits if has_experts else None, ep_group
     )
     fwd_comm_work = getattr(moe_outs, "comm_work", None)
     setattr(moe_outs, "comm_work", None)
@@ -167,6 +155,7 @@ def decoder_layer_forward(
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
     moe_outs = moe_outs.detach().requires_grad_()
+    topk_weight = routing.topk_weight if has_experts else None
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
     record.args = Stage5Args(moe_outs, topk_weight, residual)
@@ -176,6 +165,7 @@ def decoder_layer_forward(
     # Stage 4 all-to-all has completed - Stage 3 output is no longer read.
     if has_experts and fwd_comm_work is not None:
         intermediate_tensors.stage3.outs.moe_outs.untyped_storage().resize_(0)
+    moe_local_idxs = routing.moe_local_idxs if has_experts else None
     hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 
     record.outs = Stage5Outs(hidden_states)
@@ -244,8 +234,10 @@ def decoder_layer_backward(
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
     record = intermediate_tensors_layer.stage4
     if record.ctx is not None:
-        output_splits, input_splits, group = record.ctx
-        moe_outs_grad = direct_all_to_all(moe_outs_grad, input_splits, output_splits, group)
+        combine_splits, group = record.ctx
+        moe_outs_grad = direct_all_to_all(
+            moe_outs_grad, combine_splits.output_splits, combine_splits.input_splits, group
+        )
         bwd_comm_work = moe_outs_grad.comm_work
         moe_outs_grad.comm_work = None
     else:
@@ -267,14 +259,14 @@ def decoder_layer_backward(
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
     record = intermediate_tensors_layer.stage2
     if record.ctx is not None:
-        output_splits, input_splits, group = record.ctx
-        sorted_tokens_grad = direct_all_to_all(
-            gathered_tokens_grad, input_splits, output_splits, group
+        dispatch_splits, group = record.ctx
+        dispatch_tokens_grad = direct_all_to_all(
+            gathered_tokens_grad, dispatch_splits.input_splits, dispatch_splits.output_splits, group
         )
-        bwd_comm_work = sorted_tokens_grad.comm_work
-        sorted_tokens_grad.comm_work = None
+        bwd_comm_work = dispatch_tokens_grad.comm_work
+        dispatch_tokens_grad.comm_work = None
     else:
-        sorted_tokens_grad = gathered_tokens_grad
+        dispatch_tokens_grad = gathered_tokens_grad
         bwd_comm_work = None
     nvtx.range_pop()
 
@@ -283,10 +275,7 @@ def decoder_layer_backward(
     if bwd_comm_work is not None:
         bwd_comm_work.wait()
 
-    if hasattr(layer.mlp, "experts"):
-        grad_tensors = (sorted_tokens_grad, topk_weight_grad, residual_grad)
-    else:
-        grad_tensors = (sorted_tokens_grad, residual_grad)
+    grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)
 
     if stage1_is_merged:
         # Merged case: this layer's stage1 + previous layer's stage5

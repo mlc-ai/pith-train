@@ -4,21 +4,18 @@ import torch
 import torch.nn as nn
 
 
-class ForwardAttnOutput(NamedTuple):
-    """
-    Output from the forward_stage1 method of a decoder layer.
-    """
-
-    sorted_tokens: torch.Tensor
-    moe_local_idxs: torch.Tensor
-    topk_weight: torch.Tensor
-    output_splits: List[int]
+class AllToAllSplits(NamedTuple):
     input_splits: List[int]
+    output_splits: List[int]
+
+
+class MoERouting(NamedTuple):
+    topk_weight: torch.Tensor
     expert_idxs: torch.Tensor
-    residual: torch.Tensor
+    moe_local_idxs: Optional[torch.Tensor] = None
     expand_idx: Optional[torch.Tensor] = None
-    dedup_input_splits: Optional[List[int]] = None
-    dedup_output_splits: Optional[List[int]] = None
+    dispatch_splits: Optional[AllToAllSplits] = None
+    combine_splits: Optional[AllToAllSplits] = None
 
 
 class MlpProtocol(Protocol):
@@ -49,7 +46,7 @@ class LayerProtocol(Protocol):
         Reference forward implementation for correctness validation.
         """
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> ForwardAttnOutput:
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[MoERouting]]:
         """
         Stage 1, the pre-dispatch compute (runs before the stage-2 dispatch).
         Run the attention sublayer and shared experts, then route tokens to experts and prepare the dispatch (MoE layers).
