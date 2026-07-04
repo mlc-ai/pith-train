@@ -21,8 +21,8 @@ torchruns in sequence, reset the chosen GPU set each time.
 ## Timeouts (keep them short)
 
 - Single-GPU sanity: 120s
-- `test_fsdp.py` at pp=1/ep=1: 120s
-- `test_fsdp.py` at pp≥2 or ep≥2: 180s
+- `test_dualpipev.py` at pp=1/ep=1: 120s
+- `test_dualpipev.py` at pp≥2 or ep≥2: 180s
 - Inference autoregressive decode: 180s
 
 If the test exceeds the timeout, it is **hanging**, not slow. The
@@ -110,7 +110,7 @@ numerical tolerance. Do not tighten it based on a single passing run.
 
 ## Tier 2 — FSDP pp/ep scaling ladder
 
-Run `tests/test_fsdp.py` in 4 configurations, in this order:
+Run `tests/test_dualpipev.py` in 4 configurations, in this order:
 
 | Config | GPUs | What it adds | Catches |
 |--------|------|-------------|---------|
@@ -132,19 +132,19 @@ RDZV="--rdzv-backend=c10d --rdzv-endpoint=localhost:15213"
 
 # 1. pp=1, ep=1 (one GPU)
 CUDA_VISIBLE_DEVICES=<g0> timeout 180 torchrun --nproc-per-node=1 $RDZV \
-  tests/test_fsdp.py --pp-size 1 --ep-size 1 --model $CFG
+  tests/test_dualpipev.py --pp-size 1 --ep-size 1 --model $CFG
 
 # 2. pp=2, ep=1 (two GPUs)
 CUDA_VISIBLE_DEVICES=<g0>,<g1> timeout 180 torchrun --nproc-per-node=2 $RDZV \
-  tests/test_fsdp.py --pp-size 2 --ep-size 1 --model $CFG
+  tests/test_dualpipev.py --pp-size 2 --ep-size 1 --model $CFG
 
 # 3. pp=1, ep=2 (two GPUs — re-check nvidia-smi, pick fresh)
 CUDA_VISIBLE_DEVICES=<g0>,<g1> timeout 180 torchrun --nproc-per-node=2 $RDZV \
-  tests/test_fsdp.py --pp-size 1 --ep-size 2 --model $CFG
+  tests/test_dualpipev.py --pp-size 1 --ep-size 2 --model $CFG
 
 # 4. pp=2, ep=2 (four GPUs)
 CUDA_VISIBLE_DEVICES=<g0>,<g1>,<g2>,<g3> timeout 180 torchrun --nproc-per-node=4 $RDZV \
-  tests/test_fsdp.py --pp-size 2 --ep-size 2 --model $CFG
+  tests/test_dualpipev.py --pp-size 2 --ep-size 2 --model $CFG
 ```
 
 ### What the test validates
@@ -156,7 +156,7 @@ CUDA_VISIBLE_DEVICES=<g0>,<g1>,<g2>,<g3> timeout 180 torchrun --nproc-per-node=4
 Loss matches, grads don't → issue in backward. Loss doesn't match →
 issue in forward.
 
-### What to change in `tests/test_fsdp.py` when adding a new model
+### What to change in `tests/test_dualpipev.py` when adding a new model
 
 1. Add the model config path to the `models` list at the bottom.
 2. Import the new `<Model>Model`, router/gate class, and Experts class
@@ -219,7 +219,7 @@ distinctive expert-weight Parameter name*.
 
 ## The label-scaling gotcha
 
-`test_fsdp.py` scales labels by `label_scale = 10.0`:
+`test_dualpipev.py` scales labels by `label_scale = 10.0`:
 
 ```python
 full_l = label_scale * torch.randn(
@@ -260,7 +260,7 @@ Only when the user wants real-weight inference. Base on
 CUDA_VISIBLE_DEVICES=<g0> timeout 180 torchrun --nproc-per-node=1 $RDZV \
   tests/test_<model>_inference.py --pp-size 1 --ep-size 1
 
-# Then 2/1, 1/2, 2/2 — same structure as test_fsdp
+# Then 2/1, 1/2, 2/2 — same structure as test_dualpipev
 ```
 
 Check: all four configurations produce *coherent* text (human-judged),

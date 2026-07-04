@@ -101,7 +101,7 @@ engine (the scheduler, parallelism, checkpointing) should also go through the
 multi-GPU integration test, which boots DualPipeV with FSDP:
 
 ```bash
-bash tests/test_fsdp.sh    # multi-GPU integration (torchrun); boots DualPipeV + FSDP
+bash tests/test_dualpipev.sh    # multi-GPU integration (torchrun); boots DualPipeV + FSDP
 ```
 
 Tests skip gracefully when their dependencies aren't met (no CUDA, an optional
@@ -114,7 +114,7 @@ hardware that can actually exercise them.
   Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 correctness uses normalized squared error (`calc_diff`), typically with a
   `< 1e-3` threshold — not exact equality.
-- Multi-GPU tests need `torchrun` (see `tests/test_fsdp.sh`).
+- Multi-GPU tests need `torchrun` (see `tests/test_dualpipev.sh`).
 
 ### Validating training correctness
 
@@ -146,7 +146,7 @@ tests. The shape of the work:
    `examples/pretrain_lm/<model>/` (`script.py` + `config.json`).
 3. **Checkpoint conversion** (optional) — a converter under
    `tasks/convert_checkpoint/` if you want HuggingFace import/export.
-4. **Tests** — add the model to `tests/test_fsdp.sh` and bring it up from
+4. **Tests** — add the model to `tests/test_dualpipev.sh` and bring it up from
    pp=1/ep=1 to pp=2/ep=2, plus a single-GPU inference test.
 
 ### Add a new operator / kernel
@@ -177,7 +177,7 @@ Keep new knobs documented with field docstrings (as in `DistributedCfg`).
 These live in `pithtrain/dualpipe/` and `pithtrain/modules/distributed.py` and
 touch correctness and performance broadly. Expect to:
 
-- run `bash tests/test_fsdp.sh`,
+- run `bash tests/test_dualpipev.sh`,
 - validate loss-curve parity (`validate-correctness`), and
 - ideally capture an nsys profile (`capture-nsys-profile` /
   `analyze-nsys-profile`) to confirm overlap didn't regress.
@@ -189,7 +189,7 @@ touch correctness and performance broadly. Expect to:
 - [ ] Change is the smallest that solves the problem; avoids unnecessary new implicit indirection.
 - [ ] `ruff check` and `ruff format` pass (or `pre-commit run --all-files`).
 - [ ] Relevant unit tests added/updated and passing.
-- [ ] Multi-GPU path exercised (`tests/test_fsdp.sh`) if you touched the engine.
+- [ ] Multi-GPU path exercised (`tests/test_dualpipev.sh`) if you touched the engine.
 - [ ] Numerical changes validated for loss-curve parity (`validate-correctness`).
 - [ ] New config knobs have field docstrings; user-facing changes noted in the PR.
 - [ ] New recurring workflow shipped as a skill, if applicable.

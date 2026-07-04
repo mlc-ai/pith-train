@@ -81,7 +81,7 @@ entire bug class.
 
 When experts are stored as raw `nn.Parameter` on the module itself
 (GPT-OSS pattern — used to control `[E, out, in]` layout directly),
-`tests/test_fsdp.py`'s `fill_weights` doesn't reach them unless there
+`tests/test_dualpipev.py`'s `fill_weights` doesn't reach them unless there
 is an `isinstance(module, <Model>Experts)` branch. The parameter stays
 at its `torch.empty()` state, which on our system is literally zero
 (not random garbage, not NaN — zero).
@@ -119,7 +119,7 @@ hours of chasing the wrong lead.
 
 ## `shard_experts` fallback misclassifies the router
 
-`shard_experts` in `tests/test_fsdp.py` detects the experts module
+`shard_experts` in `tests/test_dualpipev.py` detects the experts module
 via `GroupLinear` children. When experts are raw `nn.Parameter`, there's
 a fallback. **The fallback must be gated on a distinctive weight name,
 not `num_experts` alone.** The router has `num_experts`,

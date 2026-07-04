@@ -39,7 +39,7 @@ pytest tests/operators/test_ring_attention.py tests/test_layer_partition.py -v
 pytest tests/test_fp8_quantize_kernels.py::test_name -v
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
-bash tests/test_fsdp.sh
+bash tests/test_dualpipev.sh
 ```
 
 ### Benchmarks
@@ -139,7 +139,7 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 - `F.grouped_mm` may write NaN to padding rows (beyond `grouped_mm_offs[-1]`). Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 quantization tests use normalized squared-error (`calc_diff`), threshold typically `< 1e-3`.
 - Tests skip gracefully when `deep_gemm` is not installed or CUDA is unavailable.
-- Multi-GPU tests require `torchrun` (see `tests/test_fsdp.sh`).
+- Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`).
 
 ## Config Base Classes
 

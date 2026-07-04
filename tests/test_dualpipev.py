@@ -1,6 +1,6 @@
 """
-Testing script for DualPipe with FSDP.
-The loss and gradients are compared with a reference implementation.
+Test DualPipeV against a single-device reference.
+The loss and gradients are compared with the reference implementation.
 """
 
 import argparse

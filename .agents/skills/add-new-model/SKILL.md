@@ -1,6 +1,6 @@
 ---
 name: add-new-model
-description: Adds support for a new MoE language model to PithTrain. Use when the user asks to "add support for model X", "implement model Y in pithtrain", "port model Z", or otherwise integrate a new MoE architecture. Scope covers the model file, all framework wiring (setup_model, apply_fsdp, test_fsdp), optional checkpoint conversion, and running training + inference tests from pp=1/ep=1 up to pp=2/ep=2.
+description: Adds support for a new MoE language model to PithTrain. Use when the user asks to "add support for model X", "implement model Y in pithtrain", "port model Z", or otherwise integrate a new MoE architecture. Scope covers the model file, all framework wiring (setup_model, apply_fsdp, test_dualpipev), optional checkpoint conversion, and running training + inference tests from pp=1/ep=1 up to pp=2/ep=2.
 argument-hint: <hf-id-or-snapshot-path> [model-short-name]
 ---
 
@@ -84,7 +84,7 @@ from scratch.
 |-------|------|-------------------|
 | 0 | Analyze HF's reference implementation | Have class/attribute/shape/config inventory |
 | 1 | Write `pithtrain/models/<model>.py` | Imports cleanly; `reference_forward` runs |
-| 2 | Wire into `pithtrain/modules/training.py` + `tests/test_fsdp.py` + example config | Example config mirrors upstream; imports clean |
+| 2 | Wire into `pithtrain/modules/training.py` + `tests/test_dualpipev.py` + example config | Example config mirrors upstream; imports clean |
 | 3 | Single-GPU sanity test | `reference_forward == 5-stage path` (rel < 0.8) |
 | 4 | FSDP scaling (pp=1/ep=1 → 2/2) | All 4 configs pass |
 | 5 | *(If needed)* Checkpoint converter + round-trip | `hf → dcp → hf → transformers.load` succeeds |
@@ -196,7 +196,7 @@ No new reference file needed — the changes are small and mechanical.
    - Add the HF ID to the `TrainingCfg.model` `Literal[...]` union (if
      the user wants the HF ID to be an accepted value; config-path
      usage doesn't require this).
-2. `tests/test_fsdp.py`:
+2. `tests/test_dualpipev.py`:
    - Import the new model + router/gate class (+ Experts class if it
      stores raw `nn.Parameter` expert weights — see
      `reference/pitfalls.md`).
@@ -216,14 +216,14 @@ No new reference file needed — the changes are small and mechanical.
      — gate on the distinctive weight name, *not* on `num_experts` alone
      (the router has `num_experts` too and must not be sharded).
 3. Add the model config and HF ID to the `models` list at the bottom of
-   `tests/test_fsdp.py`.
+   `tests/test_dualpipev.py`.
 4. Write `examples/pretrain_lm/<model>/config.json`. Mirror
    upstream HF's `config.json` field-by-field — including every nested
    block (`rope_scaling`, `quantization_config`, etc.). See
    `reference/conventions.md` §example-config for the diff command and
    the three layered defaults you need to reconcile.
 
-**Gate:** `python -c "import tests.test_fsdp"` imports cleanly AND the
+**Gate:** `python -c "import tests.test_dualpipev"` imports cleanly AND the
 example-config diff is either empty or has a documented reason for each
 remaining difference.
 
@@ -306,7 +306,7 @@ scratch file.
    autoregressive harness, parameterized for any `<Model>Model`. Fill
    in the model-class import and HF ID default.
 2. Run the same pp/ep scaling ladder as phase 4 (same torchrun form,
-   replace `tests/test_fsdp.py` with `tests/test_<model>_inference.py`
+   replace `tests/test_dualpipev.py` with `tests/test_<model>_inference.py`
    and drop `--model <cfg>`). Each config should print coherent
    continuations.
 3. Compare outputs across configurations — they should produce
@@ -355,7 +355,7 @@ high-signal self-reviews that save a review round-trip:
 - `reference/conventions.md` — naming, tensor layout, canonical keys
 - `reference/compile.md` — three `@torch.compile(fullgraph=True)` hot regions, unwrap patterns
 - `reference/checkpoint.md` — hf2dcp/dcp2hf recipes, when to add, round-trip validation
-- `reference/testing.md` — pp/ep scaling ladder, test_fsdp wiring, label scaling
+- `reference/testing.md` — pp/ep scaling ladder, test_dualpipev wiring, label scaling
 - `reference/pitfalls.md` — NaN padding, `.view()` vs `.transpose()`, silent-zero experts, etc.
 
 ## Templates
