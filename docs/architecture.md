@@ -229,7 +229,7 @@ class, switching a whole model between BF16 and FP8 is one config flag
 ([`layers/deepgemm_fp8_linear.py`](../pithtrain/layers/deepgemm_fp8_linear.py))
 uses 128-element block scaling backed by DeepGEMM, with custom Triton
 quantization kernels in
-[`operators/deepgemm_fp8_quantize.py`](../pithtrain/operators/deepgemm_fp8_quantize.py)
+[`operators/deepgemm_quantize.py`](../pithtrain/operators/deepgemm_quantize.py)
 (E8M0/MXFP8 scales on Blackwell, float32 scales on Hopper).
 
 `torch.compile(fullgraph=True)` is applied to all transformer computation
@@ -271,7 +271,7 @@ roughly in order:
    dispatch with deduplication; central to MoE routing and the all-to-all overlap.
 2. **`ring_attention.py`** — zigzag, causal-balanced ring attention for context
    parallelism (standard + MLA-aware variants).
-3. **`deepgemm_fp8_quantize.py`** — fused block-scaled FP8 quantization behind
+3. **`deepgemm_quantize.py`** — fused block-scaled FP8 quantization behind
    the FP8 training path.
 4. **`token_scatter.py`** — groups tokens per expert ahead of the grouped GEMM.
 

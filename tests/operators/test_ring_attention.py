@@ -243,7 +243,7 @@ def test_mla_ring_attention_vs_dense(cp_size: int, req: MLARequest) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FP8 in-ring kv_b decompression (pass-latent CP with fp8_training="deep-gemm").
+# FP8 in-ring kv_b decompression (pass-latent CP with training.fp8 enabled).
 # ---------------------------------------------------------------------------
 
 # deep_gemm is a required dependency (GPU-only project), so no import guard; gate only on the

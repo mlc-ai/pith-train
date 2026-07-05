@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore
-from pithtrain.operators.deepgemm_fp8_quantize import (
+from pithtrain.operators.deepgemm_quantize import (
     fused_blockwise_transpose_cast_to_fp8,
     fused_blockwise_transpose_cast_to_fp8_batched,
     fused_rowwise_blockwise_transpose_cast_to_fp8,

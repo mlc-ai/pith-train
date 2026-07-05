@@ -8,11 +8,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import IntermediateTensors
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import record_forward
-from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
@@ -92,7 +91,7 @@ class DeepSeekV2MLP(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.linear_cls
         self.gate_proj = LinearCls(hidden_size, intermediate_size, bias=False)
         self.up_proj = LinearCls(hidden_size, intermediate_size, bias=False)
         self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
@@ -112,7 +111,7 @@ class DeepSeekV2Experts(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = config.moe_intermediate_size
 
-        GroupLinearCls = get_group_linear_cls()
+        GroupLinearCls = training.group_linear_cls
         self.gate_proj = GroupLinearCls(num_experts, hidden_size, intermediate_size)
         self.up_proj = GroupLinearCls(num_experts, hidden_size, intermediate_size)
         self.down_proj = GroupLinearCls(num_experts, intermediate_size, hidden_size)
@@ -210,7 +209,7 @@ class DeepSeekV2Attention(nn.Module):
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.q_lora_rank = config.q_lora_rank
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.linear_cls
         if self.q_lora_rank is None:
             self.q_proj = LinearCls(hidden_size, self.num_heads * self.q_head_dim, bias=False)
         else:
@@ -223,9 +222,6 @@ class DeepSeekV2Attention(nn.Module):
 
         self.o_proj = LinearCls(self.num_heads * self.v_head_dim, hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
-        # When fp8 training is on, kv_b_proj is an FP8Linear; the pass-latent ring decompresses
-        # the rotated latent via the FP8 deep_gemm path instead of a silent bf16 F.linear.
-        self._fp8 = ModelImplMode.fp8_training == "deep-gemm"
 
     @staticmethod
     def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -266,7 +262,7 @@ class DeepSeekV2Attention(nn.Module):
         q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
         if distributed.cp_size > 1:
-            kv_b_quant = self.kv_b_proj._get_quantized_weight() if self._fp8 else None
+            kv_b_quant = self.kv_b_proj._get_quantized_weight() if training.fp8 else None
             attn_output = mla_ring_attention_func(q_nope, q_pe, normed_kv.contiguous(), k_pe.contiguous(), self.kv_b_proj.weight, sm_scale=self.softmax_scale, qk_nope_head_dim=self.qk_nope_head_dim, v_head_dim=self.v_head_dim, cp_group=distributed.cp_group, kv_b_quant=kv_b_quant)
         else:
             kv = self.kv_b_proj(normed_kv).view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)

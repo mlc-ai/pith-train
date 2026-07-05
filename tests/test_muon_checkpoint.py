@@ -27,6 +27,7 @@ from pathlib import Path
 import torch
 from torch.distributed.tensor import DTensor
 
+from pithtrain.contexts import training
 from pithtrain.modules.distributed import distributed_context
 from pithtrain.modules.logging import logging_context
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
@@ -71,8 +72,8 @@ def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
         if rank == 0:
             print(*a, flush=True)
 
-    model = ctx.training.model
-    optimizers = ctx.training.optimizers
+    model = training.model
+    optimizers = training.optimizers
     n_muon = sum(len(g["params"]) for g in optimizers[0].param_groups)
     n_aux = sum(len(g["params"]) for g in optimizers[1].param_groups)
     rprint(f"[INFO] composed optimizers: Muon over {n_muon} params, AdamW over {n_aux} params")
@@ -97,15 +98,15 @@ def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
     assert not bad, ("non-finite params after step", bad[:3])
 
     # Snapshot, save, rebuild fresh optimizers, load, compare.
-    ctx.training.step = 1
+    training.step = 1
     before = opt_state_snapshot(optimizers, model)
     save_checkpoint(cfg, ctx)
 
     # fresh, empty-state optimizers + schedulers
-    ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
-    ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
+    training.optimizers = cfg.training.optimizer(cfg.training)
+    training.schedulers = cfg.training.scheduler(cfg.training)
     load_checkpoint(cfg, ctx)
-    after = opt_state_snapshot(ctx.training.optimizers, model)
+    after = opt_state_snapshot(training.optimizers, model)
 
     assert set(before) == set(after), "param FQN set changed across the round-trip"
     max_diff, worst = 0.0, None
@@ -154,7 +155,7 @@ def _entry():
     t.sequence_length = 2048
     t.moe_load_balance_type = "sequence"
     t.moe_load_balance_coef = 3e-3
-    t.fp8_training = "disabled"
+    t.fp8 = False
 
     ctx = PretrainLMCtx()
     with ExitStack() as stack:
@@ -181,11 +182,11 @@ def _entry():
         t.save_location = scratch / "checkpoint"
 
         # Build model + optimizers + schedulers directly (no dataset needed).
-        ctx.training.step = 0
+        training.step = 0
         torch.manual_seed(0)
-        setup_model(cfg.training, ctx.training, cfg.distributed, ctx.distributed)
-        ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
-        ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
+        setup_model(cfg.training, cfg.distributed)
+        training.optimizers = cfg.training.optimizer(cfg.training)
+        training.schedulers = cfg.training.scheduler(cfg.training)
         main(cfg, ctx)
 
 

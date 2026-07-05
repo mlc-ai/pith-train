@@ -18,13 +18,14 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 @requires_cuda
 def test_muon_step_on_fp8_gradients():
     pytest.importorskip("deep_gemm")
-    from pithtrain.layers.factory import ModelImplMode, get_linear_cls
+    from pithtrain.contexts import training
+    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
 
-    prev = ModelImplMode.fp8_training
-    ModelImplMode.fp8_training = "deep-gemm"
+    prev = training.fp8
+    training.fp8 = True
     try:
         torch.manual_seed(0)
-        linear_cls = get_linear_cls()
+        linear_cls = FP8Linear
         # Dims are multiples of 128 for DeepGEMM block scaling.
         net = nn.Sequential(
             linear_cls(256, 512, bias=False),
@@ -46,4 +47,4 @@ def test_muon_step_on_fp8_gradients():
         for name, p in net.named_parameters():
             assert torch.isfinite(p).all(), name
     finally:
-        ModelImplMode.fp8_training = prev
+        training.fp8 = prev

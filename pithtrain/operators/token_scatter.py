@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+from pithtrain.contexts import training
+from pithtrain.layers.deepgemm_fp8_linear import ARCH_MAJOR
+
 # -- Shared async D-to-H copy infrastructure --
 # Used by both ScatterForGroupedGemm and prepare_dispatch to avoid
 # per-call cudaStreamSynchronize overhead from .tolist() / .item().
@@ -373,14 +376,9 @@ def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[
 
     Only needed on Hopper with the DeepGEMM backend; returns None otherwise.
     """
-    from pithtrain.layers.factory import ModelImplMode
-
-    if ModelImplMode.fp8_training == "deep-gemm":
-        from pithtrain.layers.deepgemm_fp8_linear import ARCH_MAJOR
-
-        if ARCH_MAJOR < 10:
-            row_indices = torch.arange(M, device=grouped_mm_offs.device)
-            gi = torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
-            gi.clamp_(max=grouped_mm_offs.shape[0] - 1)
-            return gi
+    if training.fp8 and ARCH_MAJOR < 10:
+        row_indices = torch.arange(M, device=grouped_mm_offs.device)
+        gi = torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
+        gi.clamp_(max=grouped_mm_offs.shape[0] - 1)
+        return gi
     return None

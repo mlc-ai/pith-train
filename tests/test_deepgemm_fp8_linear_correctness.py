@@ -369,38 +369,3 @@ def test_fp8_group_linear_empty_input():
     ks_tensor = torch.zeros(8, device="cuda", dtype=torch.int32)
     out = fp8_gl(x, offs, ks=ks, ks_tensor=ks_tensor)
     assert out.shape == (0, 256)
-
-
-# ---------------------------------------------------------------------------
-# Factory function test
-# ---------------------------------------------------------------------------
-
-
-def test_factory_functions_bf16_mode():
-    """get_linear_cls / get_group_linear_cls return BF16 classes by default."""
-    from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
-    from pithtrain.layers.group_linear import GroupLinear
-
-    # Ensure default mode
-    prev = ModelImplMode.fp8_training
-    try:
-        ModelImplMode.fp8_training = "disabled"
-        assert get_linear_cls() is nn.Linear
-        assert get_group_linear_cls() is GroupLinear
-    finally:
-        ModelImplMode.fp8_training = prev
-
-
-@requires_deep_gemm
-def test_factory_functions_deepgemm_mode():
-    """get_linear_cls / get_group_linear_cls return DeepGEMM FP8 classes."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear, FP8Linear
-    from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
-
-    prev = ModelImplMode.fp8_training
-    try:
-        ModelImplMode.fp8_training = "deep-gemm"
-        assert get_linear_cls() is FP8Linear
-        assert get_group_linear_cls() is FP8GroupLinear
-    finally:
-        ModelImplMode.fp8_training = prev
