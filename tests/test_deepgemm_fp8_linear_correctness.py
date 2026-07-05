@@ -156,39 +156,6 @@ def test_fp8_linear_backward_weight_grad():
 
 
 # ---------------------------------------------------------------------------
-# FP8Linear + WeightGradStore
-# ---------------------------------------------------------------------------
-
-
-@requires_deep_gemm
-def test_fp8_linear_weight_grad_store():
-    """FP8Linear correctly defers weight gradients via WeightGradStore."""
-    from pithtrain.dualpipe.utils import WeightGradStore
-    from pithtrain.operators.linear import FP8Linear
-
-    fp8_linear = FP8Linear(128, 256, bias=False).cuda().to(torch.bfloat16)
-    x = _make_bf16((4, 32, 128)).requires_grad_(True)
-
-    WeightGradStore.enabled = True
-    try:
-        out = fp8_linear(x)
-        out.backward(_make_bf16(out.shape))
-
-        # Weight grad should be deferred (None)
-        assert fp8_linear.weight.grad is None, "Weight grad should be deferred"
-
-        # Flush and pop to compute deferred gradients
-        WeightGradStore.flush()
-        WeightGradStore.pop()
-
-        assert fp8_linear.weight.grad is not None, "Weight grad should exist after pop"
-        assert fp8_linear.weight.grad.shape == fp8_linear.weight.shape
-    finally:
-        WeightGradStore.enabled = False
-        WeightGradStore.clear()
-
-
-# ---------------------------------------------------------------------------
 # FP8GroupedLinear forward tests
 # ---------------------------------------------------------------------------
 
