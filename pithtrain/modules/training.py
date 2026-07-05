@@ -380,15 +380,12 @@ def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
 ) -> None:
-    from pithtrain.dualpipe.utils import FP8WeightCacheControl
     from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear, FP8Linear
     from pithtrain.layers.group_linear import GroupLinear
 
     training.fp8 = cfg.fp8
     training.linear_cls = FP8Linear if cfg.fp8 else nn.Linear
     training.group_linear_cls = FP8GroupLinear if cfg.fp8 else GroupLinear
-    if cfg.fp8:
-        FP8WeightCacheControl.enabled = True
 
     cp_size = distributed.cp_size
 

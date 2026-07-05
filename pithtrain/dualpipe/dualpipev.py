@@ -466,8 +466,7 @@ class DualPipeV(nn.Module):
             assert criterion is not None
 
         self._reset_states()
-        if FP8WeightCacheControl.enabled:
-            FP8WeightCacheControl.step()
+        FP8WeightCacheControl.step()
         self._ensure_intermediate_tensors_allocated(num_chunks)
 
         if self.is_first_pp_rank:
@@ -558,8 +557,7 @@ class DualPipeV(nn.Module):
 
         # Release FP8 weight caches so the memory is available for optimizer.step().
         # They will be regenerated on the next forward pass.
-        if FP8WeightCacheControl.enabled:
-            FP8WeightCacheControl.clear_caches(*self.module)
+        FP8WeightCacheControl.clear_caches(*self.module)
 
         # Manually call post backward for FSDP
         def run_post_backward(fsdp_module: FSDPModule) -> None:

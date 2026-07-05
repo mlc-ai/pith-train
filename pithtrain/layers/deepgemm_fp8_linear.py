@@ -190,8 +190,7 @@ class FP8Linear(nn.Linear):
     Drop-in replacement for ``nn.Linear`` using FP8 GEMM via DeepGEMM.
 
     Weights are stored in BF16 and quantized to MXFP8 on-the-fly each forward pass.
-    When ``FP8WeightCacheControl.enabled`` is True, quantized weights are cached
-    and reused across micro-batches within a single pipeline step.
+    Quantized weights are cached and reused across micro-batches within a single pipeline step.
     """
 
     def __init__(self, *args, **kwargs):
@@ -205,12 +204,11 @@ class FP8Linear(nn.Linear):
         if torch.compiler.is_compiling():
             return fused_blockwise_transpose_cast_to_fp8(self.weight)
         ver = FP8WeightCacheControl._version
-        if FP8WeightCacheControl.enabled and self._wq_version == ver:
+        if self._wq_version == ver:
             return self._wq_cache
         result = fused_blockwise_transpose_cast_to_fp8(self.weight)
-        if FP8WeightCacheControl.enabled:
-            self._wq_cache = result
-            self._wq_version = ver
+        self._wq_cache = result
+        self._wq_version = ver
         return result
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -373,8 +371,7 @@ class FP8GroupLinear(nn.Module):
 
     Drop-in replacement for ``GroupLinear`` using FP8 GEMM via DeepGEMM.
     Weight shape: ``(num_groups, out_features, in_features)``.
-    When ``FP8WeightCacheControl.enabled`` is True, quantized weights are cached
-    and reused across micro-batches within a single pipeline step.
+    Quantized weights are cached and reused across micro-batches within a single pipeline step.
     """
 
     def __init__(self, num_groups: int, in_features: int, out_features: int):
@@ -392,12 +389,11 @@ class FP8GroupLinear(nn.Module):
         if torch.compiler.is_compiling():
             return fused_blockwise_transpose_cast_to_fp8_batched(self.weight)
         ver = FP8WeightCacheControl._version
-        if FP8WeightCacheControl.enabled and self._wq_version == ver:
+        if self._wq_version == ver:
             return self._wq_cache
         result = fused_blockwise_transpose_cast_to_fp8_batched(self.weight)
-        if FP8WeightCacheControl.enabled:
-            self._wq_cache = result
-            self._wq_version = ver
+        self._wq_cache = result
+        self._wq_version = ver
         return result
 
     def forward(
