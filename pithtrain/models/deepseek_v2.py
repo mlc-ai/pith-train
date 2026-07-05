@@ -81,8 +81,8 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.cos[:seq_len], self.sin[:seq_len]
+    def forward(self, S: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.cos[:S], self.sin[:S]
 
 
 class DeepSeekV2MLP(nn.Module):
@@ -139,8 +139,7 @@ class DeepSeekV2MoEGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        _, _, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         if self.topk_method == "group_limited_greedy":
@@ -233,30 +232,27 @@ class DeepSeekV2Attention(nn.Module):
     def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         cos = cos.unsqueeze(unsqueeze_dim)
         sin = sin.unsqueeze(unsqueeze_dim)
-
-        b, h, s, d = q.shape
-        q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-        b, h, s, d = k.shape
-        k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
+        B, S, H, D = q.shape
+        q = q.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
+        B, S, H, D = k.shape
+        k = k.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
         q_embed = (q * cos) + (DeepSeekV2Attention.rotate_half(q) * sin)
         k_embed = (k * cos) + (DeepSeekV2Attention.rotate_half(k) * sin)
         return q_embed, k_embed
 
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        bsz, q_len, _ = hidden_states.size()
+        B, S, _ = hidden_states.size()
 
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim)
+        q = q.view(B, S, self.num_heads, self.q_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
+        k_pe = k_pe.view(B, S, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
         cos, sin = rotary_posemb
         q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
@@ -265,13 +261,13 @@ class DeepSeekV2Attention(nn.Module):
             kv_b_quant = self.kv_b_proj._get_quantized_weight() if training.fp8 else None
             attn_output = mla_ring_attention_func(q_nope, q_pe, normed_kv.contiguous(), k_pe.contiguous(), self.kv_b_proj.weight, sm_scale=self.softmax_scale, qk_nope_head_dim=self.qk_nope_head_dim, v_head_dim=self.v_head_dim, cp_group=distributed.cp_group, kv_b_quant=kv_b_quant)
         else:
-            kv = self.kv_b_proj(normed_kv).view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            kv = self.kv_b_proj(normed_kv).view(B, S, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             q = torch.cat([q_nope, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
             attn_output = flash_attn_func(q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True)
 
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+        attn_output = attn_output.reshape(B, S, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -399,12 +395,12 @@ class DeepSeekV2Model(nn.Module):
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_len = hidden_states.shape[1]
+        S = hidden_states.shape[1]
         cp_size = distributed.cp_size
-        block = seq_len // 2
+        block = S // 2
         front_start, back_start = distributed.cp_rank * block, (2 * cp_size - distributed.cp_rank - 1) * block
         position_ids = torch.cat([torch.arange(front_start, front_start + block, device=hidden_states.device), torch.arange(back_start, back_start + block, device=hidden_states.device)])
-        cos, sin = self.rotary_emb(seq_len=seq_len * cp_size)
+        cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
     def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
