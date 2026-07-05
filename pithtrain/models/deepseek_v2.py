@@ -1,8 +1,7 @@
 """deepseek-ai/DeepSeek-V2."""
 
 import math
-from dataclasses import fields
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -10,10 +9,9 @@ from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
 from pithtrain.contexts import distributed
-from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
+from pithtrain.dualpipe.execution import IntermediateTensors
 from pithtrain.dualpipe.layer_partition import layer_partition
-from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
-from pithtrain.dualpipe.utils import run_backward
+from pithtrain.dualpipe.modeling import record_forward
 from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
@@ -389,6 +387,7 @@ class DeepSeekV2Model(nn.Module):
 
         self.stage_count = stage_count
         self.stage_index = stage_index
+        self._intermediate_tensors: Optional[IntermediateTensors] = None
 
         self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
@@ -420,73 +419,14 @@ class DeepSeekV2Model(nn.Module):
         return self.lm_head(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        intermediate_tensors: Optional[IntermediateTensors] = getattr(self, "_intermediate_tensors", None)
+        return record_forward(self, hidden_states, self._intermediate_tensors)
 
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.stage_index == 0:
             hidden_states = self.forward_prolog(hidden_states)
-
         rotary_posemb = self.forward_posemb(hidden_states)
-
-        if intermediate_tensors is None:
-            for _, layer in self.layers.items():
-                ret = decoder_layer_forward(layer, hidden_states, rotary_posemb)
-                hidden_states = ret[0] if isinstance(ret, tuple) else ret
-            if self.stage_index == self.stage_count - 1:  # last stage
-                hidden_states = self.forward_epilog(hidden_states)
-            return hidden_states
-
-        layer_idx = 0
-        if self.stage_index == 0:  # first stage
-            intermediate_tensors.prolog.args = PrologArgs()
-            intermediate_tensors.prolog.outs = PrologOuts(hidden_states)
         for _, layer in self.layers.items():
-            ret = decoder_layer_forward(layer, hidden_states, rotary_posemb)
-            if len(ret) == 2:
-                hidden_states, layer_record = ret
-                dst = intermediate_tensors.layers[layer_idx]
-                for field in fields(layer_record):
-                    src_rec = getattr(layer_record, field.name)
-                    dst_rec = getattr(dst, field.name)
-                    for rf in fields(src_rec):
-                        if hasattr(src_rec, rf.name):
-                            setattr(dst_rec, rf.name, getattr(src_rec, rf.name))
-            else:
-                hidden_states = ret[0]
-                dst = intermediate_tensors.layers[layer_idx]
-                for field in fields(dst):
-                    record = getattr(dst, field.name)
-                    for rf in fields(record):
-                        setattr(record, rf.name, None)
-            layer_idx += 1
-
+            hidden_states = layer.reference_forward(hidden_states, rotary_posemb)
         if self.stage_index == self.stage_count - 1:
-            if not ModelImplMode.use_reference_fwd:
-                hidden_states = hidden_states.detach().requires_grad_()
-            intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.forward_epilog(hidden_states)
-
         return hidden_states
-
-    @staticmethod
-    def backward(module: "DeepSeekV2Model", dy: Optional[List[torch.Tensor]], loss: Optional[torch.Tensor], intermediate_tensors: IntermediateTensors):
-        assert (dy is None) != (loss is None), "Either dy or loss should be provided"
-        if loss is not None:
-            loss.backward()
-            loss.detach_()
-            dy = (intermediate_tensors.epilog.args.hidden_states.grad,)
-            intermediate_tensors.epilog.args = None
-            loss = None
-
-        dx = dy
-        layers_list = [layer for _, layer in module.layers.items()]
-        for layer, intermediate_tensors_layer in zip(reversed(layers_list), reversed(intermediate_tensors.layers)):
-            dx = (decoder_layer_backward(layer, dx, loss, intermediate_tensors_layer),)
-
-        final_grads = dx
-        if module.stage_index == 0:
-            record = intermediate_tensors.prolog
-            run_backward(record.outs, dx)
-            record.args = None
-            record.outs = None
-            final_grads = (None,)
-        return final_grads

@@ -4,12 +4,8 @@ import torch.nn as nn
 
 
 class ModelImplMode:
-    """
-    Model Implementation Mode. Turn on the reference implementation to validate
-    the correctness of the optimized, possibly distributed implementation.
-    """
+    """Global model-implementation switches (currently the FP8 training backend)."""
 
-    use_reference_fwd = False
     fp8_training: Literal["deep-gemm", "disabled"] = "disabled"
 
 

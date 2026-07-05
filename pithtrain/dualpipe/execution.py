@@ -420,17 +420,14 @@ class PrologRecord:
     outs: PrologOuts
 
 
-def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor):
-    """Prolog forward."""
+def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:
+    """Prolog forward: embed the input tokens, recording into ``record`` for the backward."""
     nvtx.range_push("prolog_f")
-    record = PrologRecord()
-
     record.args = PrologArgs()
     hidden_states = module.forward_prolog(hidden_states)
     record.outs = PrologOuts(hidden_states)
-
     nvtx.range_pop()
-    return record, hidden_states
+    return hidden_states
 
 
 def prolog_b(module: ModelProtocol, record: PrologRecord, grad_tensors: PrologOuts):
@@ -457,23 +454,20 @@ class EpilogRecord:
     args: EpilogArgs
 
 
-def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor):
+def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogRecord) -> torch.Tensor:
     """
-    Epilog forward: norm + lm_head.
+    Epilog forward: norm + lm_head, recording its input activation into ``record``.
 
     The backward is handled by ``loss.backward()`` which traverses the autograd
     graph through norm -> lm_head -> criterion.  The only thing the caller needs
     from the record is ``args.hidden_states.grad`` (populated by autograd).
     """
     nvtx.range_push("epilog_f")
-    record = EpilogRecord()
-
     hidden_states = hidden_states.detach().requires_grad_()
     record.args = EpilogArgs(hidden_states)
     logits = module.forward_epilog(hidden_states)
-
     nvtx.range_pop()
-    return record, logits
+    return logits
 
 
 # ------------------------------------------------------------

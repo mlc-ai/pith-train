@@ -33,6 +33,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe import comm
 from pithtrain.dualpipe.execution import IntermediateTensors, create_intermediate_tensors
+from pithtrain.dualpipe.modeling import record_backward
 from pithtrain.dualpipe.overlap import overlapped_forward_backward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
 
@@ -178,7 +179,7 @@ class DualPipeV(nn.Module):
         WeightGradStore.enabled = enable_zb
         if is_last_stage:
             loss = self.loss_chunks[chunk_id]
-            input_grads = self.module[phase].__class__.backward(
+            input_grads = record_backward(
                 self.module[phase],
                 None,
                 loss,
@@ -194,7 +195,7 @@ class DualPipeV(nn.Module):
             non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
             outputs, output_grads = list(zip(*non_empty))
             if len(outputs) > 0:
-                input_grads = self.module[phase].__class__.backward(
+                input_grads = record_backward(
                     self.module[phase],
                     output_grads,
                     None,

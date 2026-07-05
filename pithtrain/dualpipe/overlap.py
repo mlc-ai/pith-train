@@ -46,24 +46,6 @@ def _clear_layer_records(layer: IntermediateTensorsLayer) -> None:
             setattr(record, rf.name, None)
 
 
-def _copy_layer_records(src: IntermediateTensorsLayer, dst: IntermediateTensorsLayer) -> None:
-    """
-    Copy record fields from src to dst (pre-allocated).
-    Skip records that have no populated fields.
-    """
-    for field in fields(src):
-        if not hasattr(src, field.name):
-            continue
-        src_record = getattr(src, field.name)
-        # Skip if the record has no populated fields at all
-        if not any(hasattr(src_record, rf.name) for rf in fields(src_record)):
-            continue
-        dst_record = getattr(dst, field.name)
-        for rf in fields(src_record):
-            if hasattr(src_record, rf.name):
-                setattr(dst_record, rf.name, getattr(src_record, rf.name))
-
-
 def overlapped_forward_backward(
     module0: ModelProtocol,
     inputs0: List[torch.Tensor],
@@ -120,9 +102,7 @@ def overlapped_forward_backward(
 
     # Module 0 layer 0 stage 1 forward
     if module0.stage_index == 0:
-        record, hidden_states = prolog_f(module0, hidden_states)
-        intermediate_tensors0.prolog.args = record.args
-        intermediate_tensors0.prolog.outs = record.outs
+        hidden_states = prolog_f(module0, hidden_states, intermediate_tensors0.prolog)
 
     rotary_posemb = module0.forward_posemb(hidden_states)
 
@@ -303,11 +283,9 @@ def overlapped_forward_backward(
 
     if len(module0.layers) == len(module1.layers) + 1:
         # There is an extra layer in module0 for forward
-        hidden_states, extra_layer = decoder_layer_forward(
-            module0_layers[-1], hidden_states, rotary_posemb
+        hidden_states = decoder_layer_forward(
+            module0_layers[-1], hidden_states, rotary_posemb, intermediate_tensors0.layers[layer_idx0]
         )
-        # Copy into pre-allocated slot
-        _copy_layer_records(extra_layer, intermediate_tensors0.layers[layer_idx0])
         layer_idx0 += 1
     elif len(module0.layers) + 1 == len(module1.layers):
         # There is an extra layer in module1 for backward
@@ -329,8 +307,7 @@ def overlapped_forward_backward(
         record.args = None
         record.outs = None
     if module0.stage_index == module0.stage_count - 1:
-        record, hidden_states = epilog_f(module0, hidden_states)
-        intermediate_tensors0.epilog.args = record.args
+        hidden_states = epilog_f(module0, hidden_states, intermediate_tensors0.epilog)
 
     # Run criterion if needed
     outputs0 = [hidden_states]

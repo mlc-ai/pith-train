@@ -17,7 +17,6 @@ from transformers import AutoConfig
 
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 
@@ -71,7 +70,7 @@ def reference_step(
 ):
     ys, ls = [], []
     for micro_x, micro_l in zip(x.chunk(chunks), l.chunk(chunks)):
-        micro_y = model(micro_x)
+        micro_y = model.reference_forward(micro_x)
         loss = criterion(micro_y, micro_l)
         loss.backward()
         ys.append(micro_y)
@@ -254,9 +253,7 @@ def main(model_name: str):
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
-    ModelImplMode.use_reference_fwd = True
     loss_ref, output_ref = reference_step(full_x, full_l, full_modules, num_chunks * ep_size)
-    ModelImplMode.use_reference_fwd = False
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
 
     if distributed.rank == 0:
