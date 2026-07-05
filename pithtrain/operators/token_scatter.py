@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from pithtrain.contexts import training
-from pithtrain.layers.deepgemm_fp8_linear import ARCH_MAJOR
+from pithtrain.operators.linear import ARCH_MAJOR
 
 # -- Shared async D-to-H copy infrastructure --
 # Used by both ScatterForGroupedGemm and prepare_dispatch to avoid

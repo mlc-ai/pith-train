@@ -23,8 +23,6 @@ from transformers import AutoConfig
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear, FP8Linear
-from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
@@ -32,6 +30,8 @@ from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
+from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
+from pithtrain.operators.linear import FP8Linear
 
 from .distributed import DistributedCfg
 
@@ -384,7 +384,7 @@ def setup_model(
 ) -> None:
     training.fp8 = cfg.fp8
     training.linear_cls = FP8Linear if cfg.fp8 else nn.Linear
-    training.group_linear_cls = FP8GroupLinear if cfg.fp8 else GroupLinear
+    training.grouped_linear_cls = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
     cp_size = distributed.cp_size
 

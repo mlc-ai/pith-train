@@ -262,7 +262,7 @@ def record_mla_fp8(ctx: DistributedCtx, req: MLARequest):
     via ``kv_b_quant``. Comparing fp8-vs-fp8 isolates the in-ring math from the (large) e4m3
     quantization error, so a tight tolerance is meaningful.
     """
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     cp_group = ctx.device_mesh.get_group("cp")
     cp_rank, cp_size = cp_group.rank(), cp_group.size()

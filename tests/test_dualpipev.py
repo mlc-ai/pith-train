@@ -17,7 +17,6 @@ from transformers import AutoConfig
 
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 
 # dsv2-only for now; restore once the siblings are migrated to the new contract.
@@ -28,6 +27,7 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 #     Qwen35MoeTopKRouter,
 # )
 from pithtrain.modules.distributed import DistributedCfg, distributed_context
+from pithtrain.operators.grouped_linear import GroupedLinear
 
 
 def fill_weights(module: nn.Module):
@@ -35,11 +35,11 @@ def fill_weights(module: nn.Module):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-    elif isinstance(module, GroupLinear):
+    elif isinstance(module, GroupedLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
     # dsv2-only for now; restore once the siblings are migrated.
     # elif isinstance(module, GptOssExperts):
-    #     # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
+    #     # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
     #     nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
     #     nn.init.xavier_uniform_(module.down_proj, gain=1.0)
     elif isinstance(module, DeepSeekV2MoEGate):
@@ -91,7 +91,7 @@ def shard_layers(layers: nn.ModuleDict, stage_id: int, num_stages: int, config):
 def shard_experts(model, ep_rank, ep_size):
     num_experts = None
     for child in model.children():
-        if isinstance(child, GroupLinear):
+        if isinstance(child, GroupedLinear):
             num_experts = child.num_groups
             break
     if num_experts is None:
@@ -113,9 +113,9 @@ def shard_experts(model, ep_rank, ep_size):
                 setattr(model, pname, new_param)
 
     for name, child in model.named_children():
-        if isinstance(child, GroupLinear):
+        if isinstance(child, GroupedLinear):
             experts_per_ep_rank = child.num_groups // ep_size
-            new_mod = GroupLinear(experts_per_ep_rank, child.in_features, child.out_features)
+            new_mod = GroupedLinear(experts_per_ep_rank, child.in_features, child.out_features)
             expert_begin = ep_rank * experts_per_ep_rank
             expert_end = (ep_rank + 1) * experts_per_ep_rank
             new_mod.weight.data = child.weight.data[expert_begin:expert_end]

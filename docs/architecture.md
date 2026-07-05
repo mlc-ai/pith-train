@@ -220,13 +220,13 @@ layer factory ([`layers/factory.py`](../pithtrain/layers/factory.py)):
 
 ```python
 get_linear_cls()        # -> FP8Linear      if "deep-gemm", else nn.Linear
-get_group_linear_cls()  # -> FP8GroupLinear if "deep-gemm", else GroupLinear (BF16)
+get_grouped_linear_cls()  # -> FP8GroupedLinear if "deep-gemm", else GroupedLinear (BF16)
 ```
 
 Because models build their linears through the factory rather than hard-coding a
 class, switching a whole model between BF16 and FP8 is one config flag
 (`training.fp8_training`). The FP8 path
-([`layers/deepgemm_fp8_linear.py`](../pithtrain/layers/deepgemm_fp8_linear.py))
+([`operators/linear.py`](../pithtrain/operators/linear.py))
 uses 128-element block scaling backed by DeepGEMM, with custom Triton
 quantization kernels in
 [`operators/deepgemm_quantize.py`](../pithtrain/operators/deepgemm_quantize.py)

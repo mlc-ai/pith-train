@@ -111,10 +111,10 @@ class DeepSeekV2Experts(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = config.moe_intermediate_size
 
-        GroupLinearCls = training.group_linear_cls
-        self.gate_proj = GroupLinearCls(num_experts, hidden_size, intermediate_size)
-        self.up_proj = GroupLinearCls(num_experts, hidden_size, intermediate_size)
-        self.down_proj = GroupLinearCls(num_experts, intermediate_size, hidden_size)
+        GroupedLinearCls = training.grouped_linear_cls
+        self.gate_proj = GroupedLinearCls(num_experts, hidden_size, intermediate_size)
+        self.up_proj = GroupedLinearCls(num_experts, hidden_size, intermediate_size)
+        self.down_proj = GroupedLinearCls(num_experts, intermediate_size, hidden_size)
 
     def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])

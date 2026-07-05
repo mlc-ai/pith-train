@@ -1,5 +1,5 @@
 """
-Correctness test for DeepGEMM FP8Linear and FP8GroupLinear.
+Correctness test for DeepGEMM FP8Linear and FP8GroupedLinear.
 
 Tests compare DeepGEMM FP8 implementations against BF16 reference with
 appropriate tolerances for FP8 precision loss.  All tests are skipped
@@ -73,7 +73,7 @@ def _copy_weights(src, dst):
 )
 def test_fp8_linear_forward(in_features, out_features):
     """FP8Linear forward output is close to BF16 Linear."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     bf16_linear = nn.Linear(in_features, out_features, bias=False).cuda().to(torch.bfloat16)
     fp8_linear = FP8Linear(in_features, out_features, bias=False).cuda().to(torch.bfloat16)
@@ -91,7 +91,7 @@ def test_fp8_linear_forward(in_features, out_features):
 @requires_deep_gemm
 def test_fp8_linear_forward_with_bias():
     """FP8Linear forward with bias produces correct shape and reasonable values."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     bf16_linear = nn.Linear(128, 256, bias=True).cuda().to(torch.bfloat16)
     fp8_linear = FP8Linear(128, 256, bias=True).cuda().to(torch.bfloat16)
@@ -114,7 +114,7 @@ def test_fp8_linear_forward_with_bias():
 @requires_deep_gemm
 def test_fp8_linear_backward_input_grad():
     """FP8Linear backward produces input gradients close to BF16."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     in_f, out_f = 256, 512
     bf16_linear = nn.Linear(in_f, out_f, bias=False).cuda().to(torch.bfloat16)
@@ -136,7 +136,7 @@ def test_fp8_linear_backward_input_grad():
 @requires_deep_gemm
 def test_fp8_linear_backward_weight_grad():
     """FP8Linear backward produces weight gradients close to BF16."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     in_f, out_f = 256, 512
     bf16_linear = nn.Linear(in_f, out_f, bias=False).cuda().to(torch.bfloat16)
@@ -164,7 +164,7 @@ def test_fp8_linear_backward_weight_grad():
 def test_fp8_linear_weight_grad_store():
     """FP8Linear correctly defers weight gradients via WeightGradStore."""
     from pithtrain.dualpipe.utils import WeightGradStore
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     fp8_linear = FP8Linear(128, 256, bias=False).cuda().to(torch.bfloat16)
     x = _make_bf16((4, 32, 128)).requires_grad_(True)
@@ -189,7 +189,7 @@ def test_fp8_linear_weight_grad_store():
 
 
 # ---------------------------------------------------------------------------
-# FP8GroupLinear forward tests
+# FP8GroupedLinear forward tests
 # ---------------------------------------------------------------------------
 
 
@@ -198,15 +198,14 @@ def test_fp8_linear_weight_grad_store():
     "num_groups,in_features,out_features",
     [(4, 128, 256), (8, 256, 512), (2, 256, 128)],
 )
-def test_fp8_group_linear_forward(num_groups, in_features, out_features):
-    """FP8GroupLinear forward output is close to BF16 GroupLinear."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
-    from pithtrain.layers.group_linear import GroupLinear
+def test_fp8_grouped_linear_forward(num_groups, in_features, out_features):
+    """FP8GroupedLinear forward output is close to BF16 GroupedLinear."""
+    from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
-    bf16_gl = GroupLinear(num_groups, in_features, out_features).cuda().to(torch.bfloat16)
+    bf16_gl = GroupedLinear(num_groups, in_features, out_features).cuda().to(torch.bfloat16)
     nn.init.normal_(bf16_gl.weight, std=0.02)
-    fp8_gl = FP8GroupLinear(num_groups, in_features, out_features).cuda().to(torch.bfloat16)
+    fp8_gl = FP8GroupedLinear(num_groups, in_features, out_features).cuda().to(torch.bfloat16)
     fp8_gl.weight.data.copy_(bf16_gl.weight.data)
 
     # Create tokens with known group assignments
@@ -233,21 +232,20 @@ def test_fp8_group_linear_forward(num_groups, in_features, out_features):
 
 
 # ---------------------------------------------------------------------------
-# FP8GroupLinear backward tests
+# FP8GroupedLinear backward tests
 # ---------------------------------------------------------------------------
 
 
 @requires_deep_gemm
-def test_fp8_group_linear_backward():
-    """FP8GroupLinear backward produces gradients close to BF16."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
-    from pithtrain.layers.group_linear import GroupLinear
+def test_fp8_grouped_linear_backward():
+    """FP8GroupedLinear backward produces gradients close to BF16."""
+    from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
     num_groups, in_f, out_f = 4, 128, 256
-    bf16_gl = GroupLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
+    bf16_gl = GroupedLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
     nn.init.normal_(bf16_gl.weight, std=0.02)
-    fp8_gl = FP8GroupLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
+    fp8_gl = FP8GroupedLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
     fp8_gl.weight.data.copy_(bf16_gl.weight.data)
 
     tokens_per_group = 16
@@ -282,15 +280,15 @@ def test_fp8_group_linear_backward():
 
 
 # ---------------------------------------------------------------------------
-# FP8GroupLinear + WeightGradStore
+# FP8GroupedLinear + WeightGradStore
 # ---------------------------------------------------------------------------
 
 
 @requires_deep_gemm
-def test_fp8_group_linear_weight_grad_store():
-    """FP8GroupLinear correctly defers weight gradients via WeightGradStore."""
+def test_fp8_grouped_linear_weight_grad_store():
+    """FP8GroupedLinear correctly defers weight gradients via WeightGradStore."""
     from pithtrain.dualpipe.utils import WeightGradStore
-    from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
+    from pithtrain.operators.grouped_linear import FP8GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
     num_groups, in_f, out_f = 4, 128, 256
@@ -298,7 +296,7 @@ def test_fp8_group_linear_weight_grad_store():
     M_total = num_groups * tokens_per_group
 
     # --- Run without WeightGradStore (reference) ---
-    fp8_gl_ref = FP8GroupLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
+    fp8_gl_ref = FP8GroupedLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
     nn.init.normal_(fp8_gl_ref.weight, std=0.02)
 
     x_raw = _make_bf16((M_total, in_f))
@@ -314,7 +312,7 @@ def test_fp8_group_linear_weight_grad_store():
     ref_weight_grad = fp8_gl_ref.weight.grad.clone()
 
     # --- Run with WeightGradStore (deferred) ---
-    fp8_gl = FP8GroupLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
+    fp8_gl = FP8GroupedLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
     fp8_gl.weight.data.copy_(fp8_gl_ref.weight.data)
 
     x_def = output_tokens.detach().clone().requires_grad_(True)
@@ -349,7 +347,7 @@ def test_fp8_group_linear_weight_grad_store():
 @requires_deep_gemm
 def test_fp8_linear_empty_input():
     """FP8Linear handles zero-length input gracefully."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     fp8_linear = FP8Linear(128, 256, bias=False).cuda().to(torch.bfloat16)
     x = torch.randn(0, 128, device="cuda", dtype=torch.bfloat16)
@@ -358,11 +356,11 @@ def test_fp8_linear_empty_input():
 
 
 @requires_deep_gemm
-def test_fp8_group_linear_empty_input():
-    """FP8GroupLinear handles zero tokens gracefully."""
-    from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
+def test_fp8_grouped_linear_empty_input():
+    """FP8GroupedLinear handles zero tokens gracefully."""
+    from pithtrain.operators.grouped_linear import FP8GroupedLinear
 
-    fp8_gl = FP8GroupLinear(8, 128, 256).cuda().to(torch.bfloat16)
+    fp8_gl = FP8GroupedLinear(8, 128, 256).cuda().to(torch.bfloat16)
     x = torch.randn(0, 128, device="cuda", dtype=torch.bfloat16)
     offs = torch.zeros(8, device="cuda", dtype=torch.int32)
     ks = [0] * 8

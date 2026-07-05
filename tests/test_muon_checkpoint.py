@@ -41,7 +41,7 @@ from pithtrain.tasks.pretrain_lm import (
 NUM_LAYERS = 4  # a few MoE layers; small enough to build quickly
 
 MODELS = {
-    "deepseek-v2-lite": "examples/pretrain_lm/deepseek-v2-lite/config.json",  # MLA, GroupLinear experts
+    "deepseek-v2-lite": "examples/pretrain_lm/deepseek-v2-lite/config.json",  # MLA, GroupedLinear experts
     "qwen3-30b-a3b": "examples/pretrain_lm/qwen3-30b-a3b/config.json",  # GQA + q/k_norm
     "gpt-oss-20b": "examples/pretrain_lm/gpt-oss-20b/config.json",  # sinks, fused gate_up, expert biases
 }

@@ -1,5 +1,5 @@
 """
-Correctness test for F.grouped_mm and GroupLinear.
+Correctness test for F.grouped_mm and GroupedLinear.
 
 This test compares the F.grouped_mm implementation against a reference
 for-loop based matmul implementation to ensure correctness.
@@ -10,7 +10,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from pithtrain.layers.group_linear import GroupLinear
+from pithtrain.operators.grouped_linear import GroupedLinear
 from pithtrain.operators.token_scatter import _GEMM_ALLOC_ALIGNMENT, scatter_for_grouped_gemm
 
 
@@ -207,8 +207,8 @@ def test_grouped_linear_backward():
         )
 
 
-def test_group_linear_module():
-    """Test GroupLinear module (wrapper around F.grouped_mm)."""
+def test_grouped_linear_module():
+    """Test GroupedLinear module (wrapper around F.grouped_mm)."""
     device = torch.device("cuda")
     dtype = torch.float32
 
@@ -219,7 +219,7 @@ def test_group_linear_module():
     out_features = 256
 
     # Create module
-    module = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    module = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
 
     # Create packed input
     M_total = sum(group_sizes)
@@ -589,8 +589,8 @@ def test_scatter_then_grouped_mm_end_to_end():
         )
 
 
-def test_group_linear_weight_grad_store():
-    """GroupLinear correctly defers weight gradients via WeightGradStore."""
+def test_grouped_linear_weight_grad_store():
+    """GroupedLinear correctly defers weight gradients via WeightGradStore."""
     from pithtrain.dualpipe.utils import WeightGradStore
 
     device = torch.device("cuda")
@@ -601,7 +601,7 @@ def test_group_linear_weight_grad_store():
     M_total = sum(group_sizes)
     grouped_mm_offs = torch.tensor(group_sizes, device=device).cumsum(0).to(torch.int32)
 
-    gl_ref = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    gl_ref = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
     torch.nn.init.normal_(gl_ref.weight, std=0.02)
 
     x_raw = torch.randn(M_total, in_features, device=device, dtype=dtype)
@@ -614,7 +614,7 @@ def test_group_linear_weight_grad_store():
     ref_input_grad = x_ref.grad.clone()
 
     # Deferred path.
-    gl = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    gl = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
     gl.weight.data.copy_(gl_ref.weight.data)
     x_def = x_raw.detach().clone().requires_grad_(True)
 
@@ -646,12 +646,12 @@ def test_group_linear_weight_grad_store():
 
 def test_gpt_oss_experts_weight_grad_store_matches_direct():
     """
-    End-to-end sanity check: GptOssExperts (now backed by GroupLinearFunc for
+    End-to-end sanity check: GptOssExperts (now backed by GroupedLinearFunc for
     the expert GEMMs) produces the same input / weight / bias gradients whether
     WeightGradStore is enabled or disabled.
 
     Only the expert-weight wgrad is routed through WeightGradStore; the bias
-    add lives outside GroupLinearFunc so its grad is computed eagerly via
+    add lives outside GroupedLinearFunc so its grad is computed eagerly via
     autograd on both paths.
     """
     from pithtrain.dualpipe.utils import WeightGradStore
@@ -705,14 +705,14 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
 
         out_def.backward(grad)
 
-        # Expert weights go through GroupLinearFunc's deferred wgrad path.
+        # Expert weights go through GroupedLinearFunc's deferred wgrad path.
         for p_def, name in [
             (experts_def.gate_up_proj, "gate_up_proj"),
             (experts_def.down_proj, "down_proj"),
         ]:
             assert p_def.grad is None, f"[deferred] {name} grad should be deferred"
 
-        # Biases are added outside GroupLinearFunc; autograd populates them eagerly.
+        # Biases are added outside GroupedLinearFunc; autograd populates them eagerly.
         for p_def, name in [
             (experts_def.gate_up_proj_bias, "gate_up_proj_bias"),
             (experts_def.down_proj_bias, "down_proj_bias"),

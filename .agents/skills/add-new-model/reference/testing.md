@@ -60,7 +60,7 @@ config.num_hidden_layers = keep
 config.ep_size = 1
 
 model = <Model>Model(config, num_stages=1, stage_id=0)
-# Init any raw-Parameter experts (needed when not using GroupLinear)
+# Init any raw-Parameter experts (needed when not using GroupedLinear)
 for p in model.parameters():
     if p.dim() >= 2:
         torch.nn.init.normal_(p, mean=0.0, std=0.02)
@@ -173,13 +173,13 @@ issue in forward.
 
 `fill_weights` is class-dispatched: it relies on
 `isinstance(module, <SomeClass>)` to know what to initialise. The
-existing branches are `nn.Linear`, `GroupLinear`, `GptOssExperts`,
+existing branches are `nn.Linear`, `GroupedLinear`, `GptOssExperts`,
 `DeepseekV2LiteMoEGate`/`Qwen3MoeGate`/`GptOssTopKRouter`, and
 `nn.Embedding`.
 
 Add a branch when:
 
-- **Raw-Parameter experts** — the `GroupLinear` branch won't reach
+- **Raw-Parameter experts** — the `GroupedLinear` branch won't reach
   them, and they'll stay at their `torch.empty()` state, which on our
   system is zero. Symptom: every MoE layer emits
   `[warn] Parameter ... has all-zero gradient`. Without this branch,
@@ -201,7 +201,7 @@ elif isinstance(module, (<...existing gates>, <Model>Router)):
 
 ### `shard_experts` fallback
 
-`shard_experts` walks the module tree. For each `GroupLinear` child, it
+`shard_experts` walks the module tree. For each `GroupedLinear` child, it
 slices by expert and replaces with a smaller module. For raw-Parameter
 experts, there's a fallback that detects them by a distinctive weight
 name (not just `num_experts`):

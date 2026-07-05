@@ -19,7 +19,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 def test_muon_step_on_fp8_gradients():
     pytest.importorskip("deep_gemm")
     from pithtrain.contexts import training
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
     prev = training.fp8
     training.fp8 = True
