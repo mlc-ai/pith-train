@@ -334,7 +334,7 @@ class DeepSeekV2Model(nn.Module):
                 stage_count = 1
                 stage_index = 0
         self.stage_index, self.stage_count = stage_index, stage_count
-        self._chunk_record: ChunkRecord | None = None
+        self.chunk_record: ChunkRecord | None = None
 
         self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
@@ -362,7 +362,7 @@ class DeepSeekV2Model(nn.Module):
         return self.lm_head(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return record_forward(self, hidden_states, self._chunk_record)
+        return record_forward(self, hidden_states, self.chunk_record)
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.stage_index == 0:

@@ -172,9 +172,9 @@ class DualPipeV(nn.Module):
         nvtx.range_push(f"forward chunk {chunk_id} (phase{phase})")
         # Set pre-allocated chunk_record on module to avoid FSDP kwarg handling issues
         chunk_record = self.chunk_records[phase][chunk_id]
-        self.module[phase]._chunk_record = chunk_record
+        self.module[phase].chunk_record = chunk_record
         outputs = self.module[phase](*inputs)
-        self.module[phase]._chunk_record = None
+        self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage and self.criterion is not None:
             labels = self.labels[chunk_id]
