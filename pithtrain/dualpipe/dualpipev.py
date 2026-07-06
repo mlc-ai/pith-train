@@ -579,7 +579,7 @@ class DualPipeV(nn.Module):
 
         # Release FP8 weight caches so the memory is available for optimizer.step().
         # They will be regenerated on the next forward pass.
-        FP8WeightCacheControl.clear_caches(*self.module)
+        FP8WeightCacheControl.clear(*self.module)
 
         # Manually call post backward for FSDP
         def run_post_backward(fsdp_module: FSDPModule) -> None:

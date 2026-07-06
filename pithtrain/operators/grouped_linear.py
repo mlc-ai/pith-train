@@ -263,7 +263,7 @@ class FP8GroupedLinear(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if torch.compiler.is_compiling():
             return fused_blockwise_transpose_cast_to_fp8_batched(self.weight)
-        ver = FP8WeightCacheControl._version
+        ver = FP8WeightCacheControl.version
         if self._wq_version == ver:
             return self._wq_cache
         result = fused_blockwise_transpose_cast_to_fp8_batched(self.weight)

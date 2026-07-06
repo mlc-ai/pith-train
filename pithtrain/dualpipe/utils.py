@@ -32,15 +32,15 @@ class FP8WeightCacheControl:
     caches from the previous training step.
     """
 
-    _version: int = 0
+    version: int = 0
 
     @classmethod
     def step(cls):
         """Increment version to invalidate all module caches."""
-        cls._version += 1
+        cls.version += 1
 
     @classmethod
-    def clear_caches(cls, *modules: nn.Module) -> None:
+    def clear(cls, *modules: nn.Module) -> None:
         """Release all cached FP8 weight tensors from modules to free GPU memory.
 
         Should be called after the pipeline step completes and before
