@@ -4,7 +4,6 @@ import math
 
 import torch
 import torch.nn.functional as F
-from flash_attn.cute.interface import flash_attn_func
 from torch import nn
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
@@ -17,6 +16,7 @@ from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBa
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
+from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
 from pithtrain.operators.token_scatter import (
@@ -213,7 +213,7 @@ class GptOssAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
         window_size: tuple[int | None, int | None] = (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
-        attn_output, _ = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=self.sinks.to(query_states.dtype))
+        attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=self.sinks.to(query_states.dtype))
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -229,8 +229,7 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    # Not @torch.compile'd (unlike the other models): the FA-4 flash_attn_func kernel breaks a
-    # fullgraph trace, so routing is compiled in GptOssTopKRouter.forward and stage 5 separately.
+    @torch.compile(fullgraph=True)
     def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
