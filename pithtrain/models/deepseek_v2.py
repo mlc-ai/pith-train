@@ -91,10 +91,9 @@ class DeepSeekV2MLP(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
 
-        LinearCls = training.linear_cls
-        self.gate_proj = LinearCls(hidden_size, intermediate_size, bias=False)
-        self.up_proj = LinearCls(hidden_size, intermediate_size, bias=False)
-        self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = training.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = training.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = training.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         g = self.gate_proj(x)
@@ -111,10 +110,9 @@ class DeepSeekV2Experts(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = config.moe_intermediate_size
 
-        GroupedLinearCls = training.grouped_linear_cls
-        self.gate_proj = GroupedLinearCls(num_experts, hidden_size, intermediate_size)
-        self.up_proj = GroupedLinearCls(num_experts, hidden_size, intermediate_size)
-        self.down_proj = GroupedLinearCls(num_experts, intermediate_size, hidden_size)
+        self.gate_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
+        self.up_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
+        self.down_proj = training.GroupedLinear(num_experts, intermediate_size, hidden_size)
 
     def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
@@ -208,18 +206,17 @@ class DeepSeekV2Attention(nn.Module):
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.q_lora_rank = config.q_lora_rank
 
-        LinearCls = training.linear_cls
         if self.q_lora_rank is None:
-            self.q_proj = LinearCls(hidden_size, self.num_heads * self.q_head_dim, bias=False)
+            self.q_proj = training.Linear(hidden_size, self.num_heads * self.q_head_dim, bias=False)
         else:
-            self.q_a_proj = LinearCls(hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_proj = training.Linear(hidden_size, self.q_lora_rank, bias=False)
             self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = LinearCls(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = LinearCls(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
+            self.q_b_proj = training.Linear(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
+        self.kv_a_proj_with_mqa = training.Linear(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
         self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = LinearCls(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
+        self.kv_b_proj = training.Linear(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
 
-        self.o_proj = LinearCls(self.num_heads * self.v_head_dim, hidden_size, bias=False)
+        self.o_proj = training.Linear(self.num_heads * self.v_head_dim, hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
     @staticmethod

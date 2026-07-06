@@ -381,8 +381,8 @@ def setup_model(
     distributed_cfg: DistributedCfg,
 ) -> None:
     training.fp8 = cfg.fp8
-    training.linear_cls = FP8Linear if cfg.fp8 else nn.Linear
-    training.grouped_linear_cls = FP8GroupedLinear if cfg.fp8 else GroupedLinear
+    training.Linear = FP8Linear if cfg.fp8 else nn.Linear
+    training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
     cp_size = distributed.cp_size
 
