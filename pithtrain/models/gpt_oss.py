@@ -60,7 +60,7 @@ class GptOssRotaryEmbedding(nn.Module):
         low, high = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, config.initial_context_length, truncate)
         inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(low, high, dim // 2).to(torch.float32)
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        attn_scale = 0.1 * math.log(scaling_factor) + 1.0  # YaRN concentration factor (mscale).
+        attn_scale = 0.1 * math.log(scaling_factor) + 1.0
         return inv_freq, attn_scale
 
     def set_cos_sin(self, config: GptOssConfig, inv_freq: torch.Tensor, attn_scale: float) -> None:
@@ -82,19 +82,13 @@ class GptOssExperts(nn.Module):
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
         self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
         self.swiglu_limit = float(config.swiglu_limit)
         self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * intermediate_size, hidden_size))
         self.gate_up_proj_bias = nn.Parameter(torch.zeros(num_experts, 2 * intermediate_size))
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
         self.down_proj_bias = nn.Parameter(torch.zeros(num_experts, hidden_size))
-
-        # gpt-oss stores expert projections as raw nn.Parameter (HF layout with fused gate_up),
-        # so the training.GroupedLinear module wrapper does not apply. FP8GroupedLinearFunc is
-        # dispatched directly on these parameters and the quantized-weight cache is hosted here,
-        # keyed by projection name since one module owns two weights. Version-keyed like
-        # grouped_linear._get_quantized_weight; FP8WeightCacheControl.clear resets _wq_cache=None.
+        # Raw nn.Parameter (fused gate_up) so training.GroupedLinear can't wrap it; the fp8
+        # quantized-weight cache lives here, keyed by projection name + version (clear() nulls it).
         self._wq_cache: dict[str, tuple] | None = None
         self._wq_version: int = -1
 
@@ -110,39 +104,19 @@ class GptOssExperts(nn.Module):
             cache[name] = fused_blockwise_transpose_cast_to_fp8_batched(weight)
         return cache[name]
 
-    def _group_linear(
-        self,
-        x: torch.Tensor,
-        weight: nn.Parameter,
-        name: str,
-        offs: torch.Tensor,
-        ks: list | None,
-        ks_tensor: torch.Tensor | None,
-        group_indices: torch.Tensor | None,
-    ) -> torch.Tensor:
+    def _group_linear(self, x: torch.Tensor, weight: nn.Parameter, name: str, offs: torch.Tensor, ks: list | None, ks_tensor: torch.Tensor | None, group_indices: torch.Tensor | None) -> torch.Tensor:
         if x.shape[0] == 0:
             return x @ weight[0].transpose(-2, -1)
         if training.fp8:
             return FP8GroupedLinearFunc.apply(x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices)
         return GroupedLinearFunc.apply(x, weight, offs)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grouped_mm_offs: torch.Tensor,
-        ks: list | None = None,
-        ks_tensor: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, grouped_mm_offs: torch.Tensor, ks: list | None = None, ks_tensor: torch.Tensor | None = None) -> torch.Tensor:
         group_ids = torch.searchsorted(grouped_mm_offs.to(torch.int64), torch.arange(x.shape[0], device=x.device, dtype=torch.int64), right=True).clamp_(max=self.num_experts - 1)
-
-        # Hopper SM90 needs explicit per-row group indices for m_grouped FP8 GEMM;
-        # Blackwell ignores it. Computed once and shared across both projections.
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0]) if training.fp8 else None
-
         gate_up = self._group_linear(x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi)
         gate_up = indexed_bias_add(gate_up, self.gate_up_proj_bias, group_ids, grouped_mm_offs)
         activated = clamped_swiglu(gate_up, 1.702, self.swiglu_limit)
-
         out = self._group_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi)
         out = indexed_bias_add(out, self.down_proj_bias, group_ids, grouped_mm_offs)
         return out
@@ -161,34 +135,23 @@ class GptOssTopKRouter(nn.Module):
         self.bias = nn.Parameter(torch.zeros(num_experts))
 
     @torch.compile(fullgraph=True)
-    def compute(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-
         logits = F.linear(hidden_states, self.weight, self.bias)
-
         topk_logits, topk_idx = torch.topk(logits, k=self.num_experts_per_tok, dim=-1, sorted=True)
         if self.router_replay is not None:
             topk_idx = self.router_replay(topk_idx)
             topk_logits = logits.gather(-1, topk_idx)
         topk_weight = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
-
-        if self.training and self.load_balance_loss_fn is not None:
-            scores = logits.softmax(dim=-1, dtype=torch.float32)
-            lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.num_experts, self.num_experts_per_tok)
-            topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
-        else:
-            lb_loss = None
-
+        if self.load_balance_loss_fn is None:
+            return topk_idx, topk_weight, None
+        scores = logits.softmax(dim=-1, dtype=torch.float32)
+        lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.num_experts, self.num_experts_per_tok)
+        topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
         return topk_idx, topk_weight, lb_loss
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_idx, topk_weight, lb_loss = self.compute(hidden_states)
-        if lb_loss is not None:
-            MoELoadBalanceLossTracker.add(lb_loss)
-        return topk_idx, topk_weight
 
-
-class GptOssMLP(nn.Module):
+class GptOssMoE(nn.Module):
     def __init__(self, config: GptOssConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -200,7 +163,9 @@ class GptOssMLP(nn.Module):
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.router(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.router(hidden_states)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         expert_idxs = topk_idx.view(-1)
         replicated_tokens = hidden_states.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, hidden_states.shape[-1])
@@ -221,13 +186,10 @@ class GptOssAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.is_sliding = is_sliding
         self.sliding_window = config.sliding_window
-
         self.q_proj = training.Linear(hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = training.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = training.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = training.Linear(self.num_heads * self.head_dim, hidden_size, bias=config.attention_bias)
-
-        # learnable per-head attention sink, fused into the softmax denominator so a head can attend to ~nothing.
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
 
     @staticmethod
@@ -246,24 +208,15 @@ class GptOssAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-
         query_states = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
         key_states = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
-
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-
-        # FA-4 expects (B, S, H, D); GQA is auto-detected from H_q vs H_kv.
-        # Sliding window: (W-1, 0) means each query attends to W tokens (self + W-1 prior).
-        window_size: tuple[int | None, int | None] = (
-            (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
-        )
-        # FA-4 requires learnable_sink to match q/k/v dtype; the parameter itself stays in
-        # fp32 for optimizer numerical stability. flash_attn_func returns (out, lse).
+        window_size: tuple[int | None, int | None] = (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
         attn_output, _ = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=self.sinks.to(query_states.dtype))
-
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
-        return self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -272,10 +225,12 @@ class GptOssDecoderLayer(nn.Module):
         self.idx = layer_idx
         is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.self_attn = GptOssAttention(config, is_sliding)
-        self.mlp = GptOssMLP(config)
+        self.mlp = GptOssMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    # Not @torch.compile'd (unlike the other models): the FA-4 flash_attn_func kernel breaks a
+    # fullgraph trace, so routing is compiled in GptOssTopKRouter.forward and stage 5 separately.
     def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -287,7 +242,9 @@ class GptOssDecoderLayer(nn.Module):
 
     def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
         hidden_states, residual = self.forward_stage1_compute(hidden_states, rotary_posemb)
-        topk_idx, topk_weight = self.mlp.router(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return dispatch_tokens, residual, routing
 
@@ -349,7 +306,6 @@ class GptOssModel(nn.Module):
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
         self.layers = nn.ModuleDict({str(i): GptOssDecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
