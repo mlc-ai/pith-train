@@ -305,17 +305,13 @@ class DeepSeekV2DecoderLayer(nn.Module):
 
     def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if isinstance(self.mlp, DeepSeekV2MLP):
-            assert expert_idxs is None
             return self.mlp(gathered_tokens)
-
-        assert expert_idxs is not None
-        if expand_idx is not None:
+        if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
-        del gathered_tokens  # free expanded tokens; no longer needed after scatter
+        del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
-        outs = padded_index_gather(outs, reverse_shuffle_idxs)
-        return outs
+        return padded_index_gather(outs, reverse_shuffle_idxs)
 
     @torch.compile(fullgraph=True)
     def forward_stage5(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor):
