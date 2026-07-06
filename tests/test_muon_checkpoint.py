@@ -20,7 +20,6 @@ import argparse
 import json
 import shutil
 import tempfile
-from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 
@@ -28,8 +27,8 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from pithtrain.contexts import training
-from pithtrain.modules.distributed import distributed_context
-from pithtrain.modules.logging import logging_context
+from pithtrain.modules.distributed import setup_distributed
+from pithtrain.modules.logging import setup_logging
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
 from pithtrain.tasks.pretrain_lm import (
     PretrainLMCfg,
@@ -156,36 +155,35 @@ def _entry():
     t.moe_load_balance_coef = 3e-3
     t.fp8 = False
 
-    with ExitStack() as stack:
-        stack.enter_context(logging_context(cfg))
-        stack.enter_context(distributed_context(cfg))
+    setup_logging(cfg)
+    setup_distributed(cfg)
 
-        # Reduced config + checkpoint dir on local scratch (rank 0 writes).
-        scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True
-            )
-            shutil.rmtree(scratch, ignore_errors=True)
-            scratch.mkdir(parents=True)
-            src = Path(__file__).resolve().parent.parent / MODELS[parsed.model]
-            config = json.loads(src.read_text())
-            config["num_hidden_layers"] = NUM_LAYERS
-            if "layer_types" in config:  # gpt-oss alternates sliding/full attention per layer
-                config["layer_types"] = config["layer_types"][:NUM_LAYERS]
-            (scratch / "config.json").write_text(json.dumps(config))
-        torch.distributed.barrier()
-        t.model = scratch / "config.json"
-        t.dataset = scratch  # unused; set to satisfy the config
-        t.save_location = scratch / "checkpoint"
+    # Reduced config + checkpoint dir on local scratch (rank 0 writes).
+    scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
+    if torch.distributed.get_rank() == 0:
+        print(
+            f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True
+        )
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+        src = Path(__file__).resolve().parent.parent / MODELS[parsed.model]
+        config = json.loads(src.read_text())
+        config["num_hidden_layers"] = NUM_LAYERS
+        if "layer_types" in config:  # gpt-oss alternates sliding/full attention per layer
+            config["layer_types"] = config["layer_types"][:NUM_LAYERS]
+        (scratch / "config.json").write_text(json.dumps(config))
+    torch.distributed.barrier()
+    t.model = scratch / "config.json"
+    t.dataset = scratch  # unused; set to satisfy the config
+    t.save_location = scratch / "checkpoint"
 
-        # Build model + optimizers + schedulers directly (no dataset needed).
-        training.step = 0
-        torch.manual_seed(0)
-        setup_model(cfg.training, cfg.distributed)
-        training.optimizers = cfg.training.optimizer(cfg.training)
-        training.schedulers = cfg.training.scheduler(cfg.training)
-        main(cfg)
+    # Build model + optimizers + schedulers directly (no dataset needed).
+    training.step = 0
+    torch.manual_seed(0)
+    setup_model(cfg.training, cfg.distributed)
+    training.optimizers = cfg.training.optimizer(cfg.training)
+    training.schedulers = cfg.training.scheduler(cfg.training)
+    main(cfg)
 
 
 if __name__ == "__main__":

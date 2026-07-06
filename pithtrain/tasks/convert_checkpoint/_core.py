@@ -7,7 +7,6 @@ un-transposed HF checkpoints (Qwen3, DeepSeek-V2).
 """
 
 import json
-from contextlib import ExitStack
 from dataclasses import dataclass, field
 from logging import Logger
 from pathlib import Path
@@ -21,7 +20,7 @@ from torch.distributed.checkpoint import FileSystemReader
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import logging
-from pithtrain.modules.logging import LoggingCfg, logging_context
+from pithtrain.modules.logging import LoggingCfg, setup_logging
 
 from ._registry import CONVERTERS
 
@@ -135,11 +134,10 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 
 def launch(cfg: ConvertCheckpointCfg) -> None:
     """Launch checkpoint conversion."""
-    with ExitStack() as stack:
-        stack.enter_context(logging_context(cfg))
-        logging.stdout.info("launch(cfg=%s)" % cfg)
-        match cfg.operation:
-            case "hf2dcp":
-                hf2dcp(cfg, logging.stdout)
-            case "dcp2hf":
-                dcp2hf(cfg, logging.stdout)
+    setup_logging(cfg)
+    logging.stdout.info("launch(cfg=%s)" % cfg)
+    match cfg.operation:
+        case "hf2dcp":
+            hf2dcp(cfg, logging.stdout)
+        case "dcp2hf":
+            dcp2hf(cfg, logging.stdout)

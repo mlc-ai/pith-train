@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import gc
 import math
 import random
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Generator, Literal, Optional, Union
+from typing import Callable, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -466,9 +464,8 @@ def setup_model(
     set_p2p_tensor_dtype(torch.bfloat16)
 
 
-@contextmanager
-def training_context(cfg: object) -> Generator[None, None, None]:
-    """Context manager for training."""
+def setup_training(cfg: object) -> None:
+    """Populate the training runtime state: dataset, model, optimizers, schedulers."""
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     training.step = 0
     setup_dataset(cfg.training)
@@ -479,8 +476,3 @@ def training_context(cfg: object) -> Generator[None, None, None]:
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
-    try:
-        gc.disable()
-        yield
-    finally:
-        gc.enable()

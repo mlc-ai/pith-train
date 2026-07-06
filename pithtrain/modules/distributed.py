@@ -4,10 +4,9 @@ import atexit
 import os
 import sys
 import threading
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Generator, Literal
+from typing import Literal
 
 import torch
 
@@ -161,12 +160,10 @@ def setup_device_mesh(cfg: DistributedCfg) -> None:
     distributed.ep_group = distributed.device_mesh.get_group("ep")
 
 
-@contextmanager
-def distributed_context(cfg: object) -> Generator[None, None, None]:
-    """Context manager for distributed runtime; initializes the process group + device mesh."""
+def setup_distributed(cfg: object) -> None:
+    """Initialize the distributed runtime: process group and device mesh."""
     assert hasattr(cfg, "distributed") and isinstance(cfg.distributed, DistributedCfg)
     setup_torch_runtime()
     setup_default_process_group(cfg.distributed)
     setup_failfast_excepthook()
     setup_device_mesh(cfg.distributed)
-    yield

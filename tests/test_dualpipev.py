@@ -26,7 +26,7 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 #     Qwen35MoeModel,
 #     Qwen35MoeTopKRouter,
 # )
-from pithtrain.modules.distributed import DistributedCfg, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.grouped_linear import GroupedLinear
 
 
@@ -403,8 +403,8 @@ def _entry() -> None:
     cfg.distributed.pipeline_parallel_size = parsed.pp_size
     cfg.distributed.expert_parallel_size = parsed.ep_size
 
-    with distributed_context(cfg):
-        main(parsed.model)
+    setup_distributed(cfg)
+    main(parsed.model)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,9 @@
 
 import os
 import sys
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from logging import INFO, Formatter, Logger, StreamHandler
-from typing import Generator, Optional
+from typing import Optional
 
 import wandb
 
@@ -112,9 +111,7 @@ def activate_wandb(cfg: object) -> None:
         logging.wandb.config.update(config)
 
 
-@contextmanager
-def logging_context(cfg: object) -> Generator[None, None, None]:
-    """Context manager for logging."""
+def setup_logging(cfg: object) -> None:
+    """Initialize the logging runtime: the stdout logger."""
     assert hasattr(cfg, "logging") and isinstance(cfg.logging, LoggingCfg)
     setup_stdout()
-    yield

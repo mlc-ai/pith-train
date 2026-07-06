@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import torch
 
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.contexts import distributed
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.ring_attention import ring_attention_func
 
 
@@ -22,13 +23,13 @@ def parse_scenario(scenario: str) -> tuple[dict, int, int]:
     return config, int(m.group(2)), int(m.group(3)) * 1024
 
 
-def run(ctx: DistributedCtx, scenario: str, config: dict, cp_size: int, S: int) -> None:
+def run(scenario: str, config: dict, cp_size: int, S: int) -> None:
     B = 1
     WARMUP, NITERS = 25, 100
     HQ, HK = config["num_attention_heads"], config["num_key_value_heads"]
     D = config["head_dim"]
 
-    cp_group = ctx.device_mesh.get_group("cp")
+    cp_group = distributed.device_mesh.get_group("cp")
     device = torch.cuda.current_device()
     softmax_scale = D**-0.5
     S_local = S // cp_size
@@ -69,7 +70,7 @@ def run(ctx: DistributedCtx, scenario: str, config: dict, cp_size: int, S: int) 
     fwd_avg = fwd_total_ms / NITERS
     bwd_avg = bwd_total_ms / NITERS
 
-    if ctx.rank == 0:
+    if distributed.rank == 0:
         print(f"{scenario} | fwd: {fwd_avg:7.3f} ms , bwd: {bwd_avg:7.3f} ms", flush=True)
     torch.distributed.barrier()
 
@@ -88,6 +89,5 @@ if __name__ == "__main__":
     cfg = DistributedCfg()
     cfg.context_parallel_size = cp_size
     parent_cfg = SimpleNamespace(distributed=cfg)
-    parent_ctx = SimpleNamespace(distributed=DistributedCtx())
-    with distributed_context(parent_cfg, parent_ctx) as ctx:
-        run(ctx, scenario, config, cp_size, S)
+    setup_distributed(parent_cfg)
+    run(scenario, config, cp_size, S)

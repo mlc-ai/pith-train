@@ -2,7 +2,6 @@
 
 import gc
 import time
-from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
@@ -33,10 +32,10 @@ from pithtrain.modules.checkpoint import (
     to_localized_model,
     to_localized_optim,
 )
-from pithtrain.modules.distributed import DistributedCfg, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
-from pithtrain.modules.logging import LoggingCfg, activate_wandb, logging_context
-from pithtrain.modules.training import TrainingCfg, training_context
+from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
+from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cross_entropy import cross_entropy
 
 
@@ -485,13 +484,15 @@ def train_step(cfg: PretrainLMCfg) -> None:
 @record
 def launch(cfg: PretrainLMCfg) -> None:
     """Launch the pretraining of a language model."""
-    with ExitStack() as stack:
-        stack.enter_context(logging_context(cfg))
-        stack.enter_context(distributed_context(cfg))
-        stack.enter_context(training_context(cfg))
-        logger = logging.stdout
-        logger.info("launch(cfg=%s)" % cfg)
-        load_checkpoint(cfg)
-        raise_if_dataset_insufficient(cfg)
-        while training.step < cfg.training.max_steps:
-            train_step(cfg)
+    setup_logging(cfg)
+    setup_distributed(cfg)
+    setup_training(cfg)
+    logger = logging.stdout
+    logger.info("launch(cfg=%s)" % cfg)
+    load_checkpoint(cfg)
+    raise_if_dataset_insufficient(cfg)
+    # Keep cyclic GC off the pipeline critical path; train_step collects manually per step.
+    gc.disable()
+    while training.step < cfg.training.max_steps:
+        train_step(cfg)
+    gc.enable()

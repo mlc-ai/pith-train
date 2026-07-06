@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch.multiprocessing.spawn import spawn
 
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 
 # Snapshot launcher-provided values at module load. Within a single pytest
 # session, multiple launch calls would otherwise pollute each other's env via
@@ -33,14 +33,13 @@ def entrypoint(i: int, cfg: DistributedCfg, worker: Callable, *args) -> None:
     os.environ["LOCAL_RANK"] = str(i)
 
     parent_cfg = SimpleNamespace(distributed=cfg)
-    parent_ctx = SimpleNamespace(distributed=DistributedCtx())
-    with distributed_context(parent_cfg, parent_ctx) as ctx:
-        worker(ctx, *args)
+    setup_distributed(parent_cfg)
+    worker(*args)
 
 
 def launch(cfg: DistributedCfg, worker: Callable, *args) -> None:
     """
-    Spawn workers and call worker(ctx, *args) inside each. Skip the test if
+    Spawn workers and call worker(*args) inside each. Skip the test if
     the distributed runtime cannot provide pp * cp * ep ranks.
     """
     mesh_extent = 1
