@@ -226,9 +226,9 @@ class DeepSeekV2Attention(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     @staticmethod
-    def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
+    def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = rotary_posemb
+        cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
         B, S, H, D = q.shape
         q = q.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
         B, S, H, D = k.shape
@@ -251,8 +251,7 @@ class DeepSeekV2Attention(nn.Module):
         compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(B, S, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
-        cos, sin = rotary_posemb
-        q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
+        q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, rotary_posemb)
 
         if distributed.cp_size > 1:
             kv_b_quant = self.kv_b_proj._get_quantized_weight() if training.fp8 else None
@@ -266,7 +265,6 @@ class DeepSeekV2Attention(nn.Module):
 
         attn_output = attn_output.reshape(B, S, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
-
         return attn_output
 
 
@@ -342,7 +340,6 @@ class DeepSeekV2DecoderLayer(nn.Module):
 class DeepSeekV2Model(nn.Module):
     def __init__(self, config: DeepseekV2Config, phase: int):
         super().__init__()
-
         match phase:
             case 0:
                 stage_count = distributed.pp_size * 2
@@ -353,7 +350,6 @@ class DeepSeekV2Model(nn.Module):
             case _:
                 stage_count = 1
                 stage_index = 0
-
         self.stage_count = stage_count
         self.stage_index = stage_index
         self._intermediate_tensors: Optional[IntermediateTensors] = None
@@ -373,10 +369,9 @@ class DeepSeekV2Model(nn.Module):
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         S = hidden_states.shape[1]
-        cp_size = distributed.cp_size
-        block = S // 2
-        front_start, back_start = distributed.cp_rank * block, (2 * cp_size - distributed.cp_rank - 1) * block
-        position_ids = torch.cat([torch.arange(front_start, front_start + block, device=hidden_states.device), torch.arange(back_start, back_start + block, device=hidden_states.device)])
+        cp_size, block_size = distributed.cp_size, S // 2
+        front_start, back_start = distributed.cp_rank * block_size, (2 * cp_size - distributed.cp_rank - 1) * block_size
+        position_ids = torch.cat([torch.arange(front_start, front_start + block_size, device=hidden_states.device), torch.arange(back_start, back_start + block_size, device=hidden_states.device)])
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
