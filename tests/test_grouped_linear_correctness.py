@@ -5,6 +5,7 @@ This test compares the F.grouped_mm implementation against a reference
 for-loop based matmul implementation to ensure correctness.
 """
 
+from types import SimpleNamespace
 from typing import Tuple
 
 import torch
@@ -664,6 +665,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     hidden_size = 128
     intermediate_size = 256
     swiglu_limit = 7.0
+    config = SimpleNamespace(hidden_size=hidden_size, intermediate_size=intermediate_size, swiglu_limit=swiglu_limit)
 
     # Random routing with one empty group to exercise the zero-token branch.
     group_sizes = [8, 0, 12, 4]
@@ -674,7 +676,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     torch.manual_seed(123)
     x_raw = torch.randn(M_total, hidden_size, device=device, dtype=dtype)
 
-    experts_ref = GptOssExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
+    experts_ref = GptOssExperts(config, num_experts)
     experts_ref = experts_ref.to(device=device, dtype=dtype)
     with torch.no_grad():
         experts_ref.gate_up_proj.normal_(std=0.02)
@@ -682,7 +684,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
         experts_ref.gate_up_proj_bias.normal_(std=0.02)
         experts_ref.down_proj_bias.normal_(std=0.02)
 
-    experts_def = GptOssExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
+    experts_def = GptOssExperts(config, num_experts)
     experts_def = experts_def.to(device=device, dtype=dtype)
     experts_def.load_state_dict(experts_ref.state_dict())
 

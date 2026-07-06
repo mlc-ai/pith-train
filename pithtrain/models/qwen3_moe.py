@@ -22,33 +22,24 @@ from pithtrain.operators.token_scatter import (
 
 
 class Qwen3MoeRotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        max_position_embeddings: int = 40960,
-        base: float = 1000000.0,
-        device: torch.device | None = None,
-    ):
+    def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings, device, torch.get_default_dtype())
+        inv_freq = self.compute_rope_params(config)
+        self.set_cos_sin(config, inv_freq)
 
-    def _set_cos_sin_cache(self, seq_len: int, device: torch.device | None, dtype: torch.dtype) -> None:
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)
+    def compute_rope_params(self, config: Qwen3MoeConfig) -> torch.Tensor:
+        base, dim = config.rope_scaling["rope_theta"], config.head_dim
+        return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+    def set_cos_sin(self, config: Qwen3MoeConfig, inv_freq: torch.Tensor) -> None:
+        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.register_buffer("cos", emb.cos().to(torch.bfloat16), persistent=False)
+        self.register_buffer("sin", emb.sin().to(torch.bfloat16), persistent=False)
 
-    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
-        return self.cos_cached[:seq_len].to(dtype=x.dtype), self.sin_cached[:seq_len].to(dtype=x.dtype)
+    def forward(self, S: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos[:S], self.sin[:S]
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -89,7 +80,7 @@ class Qwen3MoeGate(nn.Module):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        self.norm_topk_prob = config.norm_topk_prob
         self.load_balance_loss_fn = None
         self.router_replay = None
         self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size)), requires_grad=True)
@@ -141,10 +132,10 @@ class Qwen3MoeAttention(nn.Module):
         hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        attention_bias = getattr(config, "attention_bias", False)
+        attention_bias = config.attention_bias
         self.q_proj = training.Linear(hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
         self.k_proj = training.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
         self.v_proj = training.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
@@ -167,10 +158,10 @@ class Qwen3MoeAttention(nn.Module):
         return q_embed, k_embed
 
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        bsz, seq_len, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
-        key_states = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-        value_states = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        B, S, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
@@ -178,7 +169,7 @@ class Qwen3MoeAttention(nn.Module):
             attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
         else:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)
-        attn_output = attn_output.reshape(bsz, seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
 
@@ -188,7 +179,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.idx = layer_id
         self.self_attn = Qwen3MoeAttention(config)
         mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
-        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        decoder_sparse_step = config.decoder_sparse_step
         use_moe = config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0 and layer_id not in mlp_only_layers
         self.mlp = Qwen3MoeMoE(config) if use_moe else Qwen3MoeMLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -268,9 +259,7 @@ class Qwen3MoeModel(nn.Module):
         self.stage_index, self.stage_count = stage_index, stage_count
         self.chunk_record: ChunkRecord | None = None
 
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.rotary_emb = Qwen3MoeRotaryEmbedding(head_dim, max_position_embeddings=config.max_position_embeddings, base=getattr(config, "rope_theta", 1000000.0))
-
+        self.rotary_emb = Qwen3MoeRotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -285,7 +274,7 @@ class Qwen3MoeModel(nn.Module):
         front_start, back_start = distributed.cp_rank * block_size, (2 * cp_size - distributed.cp_rank - 1) * block_size
         front_end, back_end = front_start + block_size, back_start + block_size
         position_ids = torch.cat([torch.arange(front_start, front_end, device=device), torch.arange(back_start, back_end, device=device)])
-        cos, sin = self.rotary_emb(hidden_states, S * cp_size)
+        cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
     def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
