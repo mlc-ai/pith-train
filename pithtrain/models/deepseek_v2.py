@@ -1,7 +1,6 @@
 """deepseek-ai/DeepSeek-V2."""
 
 import math
-from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -32,7 +31,7 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
         self.set_cos_sin(config, inv_freq, attn_scale)
 
     @staticmethod
-    def yarn_find_correction_range(beta_fast: float, beta_slow: float, dim: int, base: float, max_position_embeddings: int) -> Tuple[int, int]:
+    def yarn_find_correction_range(beta_fast: float, beta_slow: float, dim: int, base: float, max_position_embeddings: int) -> tuple[int, int]:
         def correction_dim(num_rotations: float) -> float:
             log_num = math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
             log_den = math.log(base)
@@ -51,7 +50,7 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
         linear_func = (torch.arange(dim, dtype=torch.float32) - lo) / (hi - lo)
         return torch.clamp(linear_func, 0, 1)
 
-    def compute_rope_params(self, config: DeepseekV2Config) -> Tuple[torch.Tensor, float]:
+    def compute_rope_params(self, config: DeepseekV2Config) -> tuple[torch.Tensor, float]:
         rope_scaling = config.rope_scaling
         base, dim = rope_scaling["rope_theta"], config.qk_rope_head_dim
         match rope_scaling["rope_type"]:
@@ -81,12 +80,12 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, S: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, S: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.cos[:S], self.sin[:S]
 
 
 class DeepSeekV2MLP(nn.Module):
-    def __init__(self, config: DeepseekV2Config, intermediate_size: Optional[int] = None):
+    def __init__(self, config: DeepseekV2Config, intermediate_size: int | None = None):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
@@ -134,7 +133,7 @@ class DeepSeekV2MoEGate(nn.Module):
         self.router_replay = None
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
@@ -216,7 +215,7 @@ class DeepSeekV2Attention(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     @staticmethod
-    def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         cos, sin = rotary_posemb
         cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
         B, S, H, D = q.shape
@@ -227,7 +226,7 @@ class DeepSeekV2Attention(nn.Module):
         k_embed = (k * cos) + (DeepSeekV2Attention.rotate_half(k) * sin)
         return q_embed, k_embed
 
-    def forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, S, _ = hidden_states.size()
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
@@ -264,7 +263,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]):
+    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, rotary_posemb)
@@ -277,7 +276,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[MoERouting]]:
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
         hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb)
         if isinstance(self.mlp, DeepSeekV2MLP):
             return hidden_states, residual, None
@@ -286,7 +285,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return dispatch_tokens, residual, routing
 
-    def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: torch.Tensor | None = None, expand_idx: torch.Tensor | None = None) -> torch.Tensor:
         if isinstance(self.mlp, DeepSeekV2MLP):
             return self.mlp(gathered_tokens)
         if distributed.ep_size > 1:
@@ -297,7 +296,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
     @torch.compile(fullgraph=True)
-    def forward_stage5(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor):
+    def forward_stage5(self, moe_outs: torch.Tensor, moe_local_idxs: torch.Tensor | None, topk_weight: torch.Tensor | None, residual: torch.Tensor):
         if not isinstance(self.mlp, DeepSeekV2MoE):
             return residual + moe_outs
         if distributed.ep_size == 1:
@@ -310,7 +309,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + aggregated.view(*residual.shape)
 
-    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, rotary_posemb)
@@ -327,32 +326,30 @@ class DeepSeekV2Model(nn.Module):
         super().__init__()
         match phase:
             case 0:
-                stage_count = distributed.pp_size * 2
-                stage_index = distributed.pp_rank
+                self.stage_count = distributed.pp_size * 2
+                self.stage_index = distributed.pp_rank
             case 1:
-                stage_count = distributed.pp_size * 2
-                stage_index = stage_count - 1 - distributed.pp_rank
+                self.stage_count = distributed.pp_size * 2
+                self.stage_index = self.stage_count - 1 - distributed.pp_rank
             case _:
-                stage_count = 1
-                stage_index = 0
-        self.stage_count = stage_count
-        self.stage_index = stage_index
-        self._intermediate_tensors: Optional[IntermediateTensors] = None
+                self.stage_count = 1
+                self.stage_index = 0
+        self._intermediate_tensors: IntermediateTensors | None = None
 
         self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
-        if stage_index == 0:
+        if self.stage_index == 0:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        if stage_index == stage_count - 1:
+        if self.stage_index == self.stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        num_local_layers = layer_partition(config.num_hidden_layers, stage_count)
-        layer_id_begin = sum(num_local_layers[:stage_index])
-        layer_id_end = layer_id_begin + num_local_layers[stage_index]
+        num_local_layers = layer_partition(config.num_hidden_layers, self.stage_count)
+        layer_id_begin = sum(num_local_layers[:self.stage_index])
+        layer_id_end = layer_id_begin + num_local_layers[self.stage_index]
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
 
-    def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         S, device = hidden_states.shape[1], hidden_states.device
         cp_size, block_size = distributed.cp_size, S // 2
         front_start, back_start = distributed.cp_rank * block_size, (2 * cp_size - distributed.cp_rank - 1) * block_size
