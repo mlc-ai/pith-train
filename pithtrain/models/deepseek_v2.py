@@ -8,8 +8,8 @@ from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
 from pithtrain.contexts import distributed, training
+from pithtrain.dualpipe.dualpipev import layer_partition
 from pithtrain.dualpipe.execution import IntermediateTensors
-from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import record_forward
 from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
@@ -326,28 +326,25 @@ class DeepSeekV2Model(nn.Module):
         super().__init__()
         match phase:
             case 0:
-                self.stage_count = distributed.pp_size * 2
-                self.stage_index = distributed.pp_rank
+                stage_count = distributed.pp_size * 2
+                stage_index = distributed.pp_rank
             case 1:
-                self.stage_count = distributed.pp_size * 2
-                self.stage_index = self.stage_count - 1 - distributed.pp_rank
+                stage_count = distributed.pp_size * 2
+                stage_index = stage_count - 1 - distributed.pp_rank
             case _:
-                self.stage_count = 1
-                self.stage_index = 0
+                stage_count = 1
+                stage_index = 0
+        self.stage_index, self.stage_count = stage_index, stage_count
         self._intermediate_tensors: IntermediateTensors | None = None
 
         self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
-        if self.stage_index == 0:
+        if stage_index == 0:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        if self.stage_index == self.stage_count - 1:
+        if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        num_local_layers = layer_partition(config.num_hidden_layers, self.stage_count)
-        layer_id_begin = sum(num_local_layers[:self.stage_index])
-        layer_id_end = layer_id_begin + num_local_layers[self.stage_index]
-        self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
+        self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         S, device = hidden_states.shape[1], hidden_states.device

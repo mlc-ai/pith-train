@@ -38,6 +38,27 @@ from pithtrain.dualpipe.overlap import overlapped_forward_backward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
 
 
+def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> range:
+    """
+    Return the layer ids that pipeline stage stage_index owns.
+
+    Layers are spread across the stages as evenly as possible, with the two edges
+    kept slightly lighter since they also carry embed_tokens and norm plus lm_head.
+    Each stage owns a contiguous block, and this returns the block for stage_index.
+    """
+    base, remainder = divmod(num_layers, stage_count)
+    layers = [base] * stage_count
+    for _ in range(remainder):
+        min_val = min(layers)
+        best = next((i for i in range(1, stage_count - 1) if layers[i] == min_val), None)
+        if best is None:
+            best = layers.index(min_val)
+        layers[best] += 1
+    begin = sum(layers[:stage_index])
+    end = begin + layers[stage_index]
+    return range(begin, end)
+
+
 class DualPipeV(nn.Module):
     """V-shaped bidirectional pipeline parallelism scheduler.
 

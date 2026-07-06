@@ -33,7 +33,7 @@ pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
-pytest tests/operators/test_ring_attention.py tests/test_layer_partition.py -v
+pytest tests/operators/test_ring_attention.py -v
 
 # Single test function
 pytest tests/test_fp8_quantize_kernels.py::test_name -v
