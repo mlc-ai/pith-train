@@ -118,7 +118,7 @@ norm-only checks miss the whole class of layout bugs.**
 
 ```
 pithtrain/tasks/convert_checkpoint/
-    __init__.py     # public API: ConvertCheckpointCfg, ConvertCheckpointCtx, launch
+    __init__.py     # public API: ConvertCheckpointCfg, launch
     _core.py        # generic hf2dcp / dcp2hf + dispatcher + launch
     _registry.py    # ModelConverter Protocol + explicit CONVERTERS list
     gpt_oss.py      # GptOssConverter (MXFP4 dequant + stacked-expert transpose)

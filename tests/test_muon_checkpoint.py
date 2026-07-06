@@ -33,7 +33,6 @@ from pithtrain.modules.logging import logging_context
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
 from pithtrain.tasks.pretrain_lm import (
     PretrainLMCfg,
-    PretrainLMCtx,
     load_checkpoint,
     save_checkpoint,
 )
@@ -65,7 +64,7 @@ def opt_state_snapshot(optimizers, model):
     return snap
 
 
-def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
+def main(cfg: PretrainLMCfg):
     rank = torch.distributed.get_rank()
 
     def rprint(*a):
@@ -100,12 +99,12 @@ def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
     # Snapshot, save, rebuild fresh optimizers, load, compare.
     training.step = 1
     before = opt_state_snapshot(optimizers, model)
-    save_checkpoint(cfg, ctx)
+    save_checkpoint(cfg)
 
     # fresh, empty-state optimizers + schedulers
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
-    load_checkpoint(cfg, ctx)
+    load_checkpoint(cfg)
     after = opt_state_snapshot(training.optimizers, model)
 
     assert set(before) == set(after), "param FQN set changed across the round-trip"
@@ -157,10 +156,9 @@ def _entry():
     t.moe_load_balance_coef = 3e-3
     t.fp8 = False
 
-    ctx = PretrainLMCtx()
     with ExitStack() as stack:
-        stack.enter_context(logging_context(cfg, ctx))
-        stack.enter_context(distributed_context(cfg, ctx))
+        stack.enter_context(logging_context(cfg))
+        stack.enter_context(distributed_context(cfg))
 
         # Reduced config + checkpoint dir on local scratch (rank 0 writes).
         scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
@@ -187,7 +185,7 @@ def _entry():
         setup_model(cfg.training, cfg.distributed)
         training.optimizers = cfg.training.optimizer(cfg.training)
         training.schedulers = cfg.training.scheduler(cfg.training)
-        main(cfg, ctx)
+        main(cfg)
 
 
 if __name__ == "__main__":

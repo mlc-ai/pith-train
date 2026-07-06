@@ -1,13 +1,11 @@
 """
 Training runtime state, populated once at startup.
 
-Import the module and read fields in-line, not the names. The runtime fields
-(``dataset``/``model``/``optimizers``/``schedulers``/``step``) do not exist until setup assigns
-them, so reading them early raises AttributeError. The linear backend defaults to BF16 and is
-switched to FP8 by ``setup_model``.
+Import the module and read fields in-line, not the names: a field does not exist until setup
+assigns it, so importing it up front fails and reading it early raises AttributeError.
 
-    from pithtrain.contexts import training
-    self.gate_proj = training.linear_cls(hidden_size, intermediate_size, bias=False)
+from pithtrain.contexts import training
+self.gate_proj = training.linear_cls(hidden_size, intermediate_size, bias=False)
 """
 
 import torch.nn as nn

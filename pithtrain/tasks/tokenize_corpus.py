@@ -20,7 +20,6 @@ without a leftover lock are skipped on restart.
 
 import atexit
 import json
-import logging
 import multiprocessing
 import os
 import shutil
@@ -28,6 +27,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from logging import INFO
 from multiprocessing import Pool, Process, Queue
 from pathlib import Path
 from typing import List, Tuple
@@ -37,7 +37,8 @@ import zstandard as zstd
 from transformers import AutoTokenizer
 
 from pithtrain.config import SlottedDefault
-from pithtrain.modules.logging import LoggingCfg, LoggingCtx, StdoutLogger, logging_context
+from pithtrain.contexts import logging
+from pithtrain.modules.logging import LoggingCfg, StdoutLogger, logging_context
 
 
 @dataclass(init=False, slots=True)
@@ -58,14 +59,6 @@ class TokenizeCorpusCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
-
-
-@dataclass(init=False, slots=True)
-class TokenizeCorpusCtx(SlottedDefault):
-    """Runtime context for tokenize_corpus."""
-
-    logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """Active logging context."""
 
 
 def read_file(path: Path):
@@ -153,7 +146,7 @@ def leader(queue: Queue, psize: int, cfg: TokenizeCorpusCfg, npath: int):
     Leader for a file group. Pulls files from the shared queue and tokenizes
     each file using a dedicated pool of wf workers.
     """
-    stdout = StdoutLogger("pithtrain", logging.INFO)
+    stdout = StdoutLogger("pithtrain", INFO)
     pool = Pool(psize, Worker, (cfg.tokenizer_name,))
     atexit.register(pool.terminate)
     try:
@@ -195,9 +188,8 @@ def leader(queue: Queue, psize: int, cfg: TokenizeCorpusCfg, npath: int):
 def launch(cfg: TokenizeCorpusCfg):
     """Launch the tokenization process."""
     with ExitStack() as stack:
-        ctx = TokenizeCorpusCtx()
-        stack.enter_context(logging_context(cfg, ctx))
-        stdout = ctx.logging.stdout
+        stack.enter_context(logging_context(cfg))
+        stdout = logging.stdout
         stdout.info("launch(cfg=%s)" % cfg)
         # Get all the files to tokenize, with hidden folders ignored.
         files: List[Path] = []

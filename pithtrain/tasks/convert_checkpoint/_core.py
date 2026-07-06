@@ -20,7 +20,8 @@ from safetensors.torch import save_file
 from torch.distributed.checkpoint import FileSystemReader
 
 from pithtrain.config import SlottedDefault
-from pithtrain.modules.logging import LoggingCfg, LoggingCtx, logging_context
+from pithtrain.contexts import logging
+from pithtrain.modules.logging import LoggingCfg, logging_context
 
 from ._registry import CONVERTERS
 
@@ -43,14 +44,6 @@ class ConvertCheckpointCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
-
-
-@dataclass(init=False, slots=True)
-class ConvertCheckpointCtx(SlottedDefault):
-    """Context for checkpoint conversion."""
-
-    logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """Active logging context."""
 
 
 def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
@@ -143,11 +136,10 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 def launch(cfg: ConvertCheckpointCfg) -> None:
     """Launch checkpoint conversion."""
     with ExitStack() as stack:
-        ctx = ConvertCheckpointCtx()
-        stack.enter_context(logging_context(cfg, ctx))
-        ctx.logging.stdout.info("launch(cfg=%s)" % cfg)
+        stack.enter_context(logging_context(cfg))
+        logging.stdout.info("launch(cfg=%s)" % cfg)
         match cfg.operation:
             case "hf2dcp":
-                hf2dcp(cfg, ctx.logging.stdout)
+                hf2dcp(cfg, logging.stdout)
             case "dcp2hf":
-                dcp2hf(cfg, ctx.logging.stdout)
+                dcp2hf(cfg, logging.stdout)

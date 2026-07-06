@@ -26,7 +26,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
-from pithtrain.contexts import distributed, training
+from pithtrain.contexts import distributed, logging, training
 from pithtrain.modules.checkpoint import (
     to_canonical_model,
     to_canonical_optim,
@@ -35,7 +35,7 @@ from pithtrain.modules.checkpoint import (
 )
 from pithtrain.modules.distributed import DistributedCfg, distributed_context
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
-from pithtrain.modules.logging import LoggingCfg, LoggingCtx, activate_wandb, logging_context
+from pithtrain.modules.logging import LoggingCfg, activate_wandb, logging_context
 from pithtrain.modules.training import TrainingCfg, training_context
 from pithtrain.operators.cross_entropy import cross_entropy
 
@@ -54,16 +54,8 @@ class PretrainLMCfg(SlottedDefault):
     """Logging configuration."""
 
 
-@dataclass(init=False, slots=True)
-class PretrainLMCtx(SlottedDefault):
-    """Context for pretraining a language model."""
-
-    logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """Active logging context."""
-
-
 def get_global_batch(
-    cfg: PretrainLMCfg, ctx: PretrainLMCtx, device: torch.device
+    cfg: PretrainLMCfg, device: torch.device
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Gather this rank's portion of the global batch on pipeline parallel rank 0."""
     if distributed.pp_rank != 0:
@@ -225,7 +217,7 @@ class AppState(Stateful):
                 scheduler.load_state_dict(st)
 
 
-def raise_if_dataset_insufficient(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
+def raise_if_dataset_insufficient(cfg: PretrainLMCfg) -> None:
     """Raise if configured run requires more samples than available in dataset."""
     global_batch_size = cfg.training.global_batch_size
     max_steps = cfg.training.max_steps
@@ -253,7 +245,7 @@ def raise_if_dataset_insufficient(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> Non
     raise SystemExit(1)
 
 
-def save_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
+def save_checkpoint(cfg: PretrainLMCfg) -> None:
     """
     Save the checkpoint at the current step.
 
@@ -264,7 +256,7 @@ def save_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     so each rank writes only the expert keys it owns.  Non-expert
     DTensors are kept as CPU DTensors and DCP saves each rank's shard.
     """
-    stdout = ctx.logging.stdout
+    stdout = logging.stdout
     assert cfg.training.save_location is not None
     save_location = Path(cfg.training.save_location, "torch-dcp", "step-%08d" % training.step)
     model = training.model
@@ -294,9 +286,9 @@ def save_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     stdout.info("Save checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def load_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
+def load_checkpoint(cfg: PretrainLMCfg) -> None:
     """Load the checkpoint from the latest step."""
-    stdout = ctx.logging.stdout
+    stdout = logging.stdout
     if cfg.training.save_location is None:
         stdout.info("No save_location set; training from scratch.")
         return
@@ -329,7 +321,7 @@ def load_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     stdout.info("Load checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
+def train_step(cfg: PretrainLMCfg) -> None:
     """Execute one step of training."""
     # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
@@ -367,7 +359,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
 
     # Gather the data for this rank's portion of the global batch.
     accumulate_steps = global_batch_size // (micro_batch_size * dp_size * ep_size)
-    global_tokens, global_labels = get_global_batch(cfg, ctx, device)
+    global_tokens, global_labels = get_global_batch(cfg, device)
 
     # Run the forward and backward pass.
     loss, _ = model.step(
@@ -427,7 +419,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         lb_loss = 0.0
 
     # Print the loss and learning rate on rank 0.
-    logger = ctx.logging.stdout
+    logger = logging.stdout
     if distributed.rank == 0:
         step = training.step
         max_steps = cfg.training.max_steps
@@ -445,8 +437,8 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         logger.info(" | ".join(statements))
         # Lazily initialize WandB on the first successful step.
-        activate_wandb(cfg, ctx)
-        if ctx.logging.wandb is not None:
+        activate_wandb(cfg)
+        if logging.wandb is not None:
             metrics = dict()
             metrics["train/step"] = step
             metrics["train/cross-entropy-loss"] = loss
@@ -484,7 +476,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         should_save |= training.step % cfg.training.save_interval == 0
         should_save |= training.step == cfg.training.max_steps
         if should_save:
-            save_checkpoint(cfg, ctx)
+            save_checkpoint(cfg)
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
     gc.collect()
@@ -494,13 +486,12 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
 def launch(cfg: PretrainLMCfg) -> None:
     """Launch the pretraining of a language model."""
     with ExitStack() as stack:
-        ctx = PretrainLMCtx()
-        stack.enter_context(logging_context(cfg, ctx))
+        stack.enter_context(logging_context(cfg))
         stack.enter_context(distributed_context(cfg))
         stack.enter_context(training_context(cfg))
-        logger = ctx.logging.stdout
+        logger = logging.stdout
         logger.info("launch(cfg=%s)" % cfg)
-        load_checkpoint(cfg, ctx)
-        raise_if_dataset_insufficient(cfg, ctx)
+        load_checkpoint(cfg)
+        raise_if_dataset_insufficient(cfg)
         while training.step < cfg.training.max_steps:
-            train_step(cfg, ctx)
+            train_step(cfg)
