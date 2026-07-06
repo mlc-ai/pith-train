@@ -90,7 +90,6 @@ class DeepSeekV2MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
-
         self.gate_proj = training.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = training.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = training.Linear(intermediate_size, hidden_size, bias=False)
@@ -230,20 +229,17 @@ class DeepSeekV2Attention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(B, S, self.num_heads, self.q_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(B, S, 1, self.qk_rope_head_dim)
         normed_kv = self.kv_a_layernorm(compressed_kv)
         q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, rotary_posemb)
-
         if distributed.cp_size > 1:
             kv_b_quant = self.kv_b_proj._get_quantized_weight() if training.fp8 else None
             attn_output = mla_ring_attention_func(q_nope, q_pe, normed_kv.contiguous(), k_pe.contiguous(), self.kv_b_proj.weight, sm_scale=self.softmax_scale, qk_nope_head_dim=self.qk_nope_head_dim, v_head_dim=self.v_head_dim, cp_group=distributed.cp_group, kv_b_quant=kv_b_quant)
@@ -253,7 +249,6 @@ class DeepSeekV2Attention(nn.Module):
             q = torch.cat([q_nope, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
             attn_output = flash_attn_func(q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True)
-
         attn_output = attn_output.reshape(B, S, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -264,8 +259,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         super().__init__()
         self.idx = layer_id
         self.self_attn = DeepSeekV2Attention(config=config)
-
-        self.mlp = DeepSeekV2MoE(config) if layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0 else DeepSeekV2MLP(config)
+        self.mlp = DeepSeekV2MoE(config) if layer_id >= config.first_k_dense_replace else DeepSeekV2MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -359,10 +353,11 @@ class DeepSeekV2Model(nn.Module):
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in range(layer_id_begin, layer_id_end)})
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        S = hidden_states.shape[1]
+        S, device = hidden_states.shape[1], hidden_states.device
         cp_size, block_size = distributed.cp_size, S // 2
         front_start, back_start = distributed.cp_rank * block_size, (2 * cp_size - distributed.cp_rank - 1) * block_size
-        position_ids = torch.cat([torch.arange(front_start, front_start + block_size, device=hidden_states.device), torch.arange(back_start, back_start + block_size, device=hidden_states.device)])
+        front_end, back_end = front_start + block_size, back_start + block_size
+        position_ids = torch.cat([torch.arange(front_start, front_end, device=device), torch.arange(back_start, back_end, device=device)])
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
