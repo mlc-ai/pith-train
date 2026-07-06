@@ -109,7 +109,6 @@ class DeepSeekV2Experts(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.moe_intermediate_size
-
         self.gate_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
         self.up_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
         self.down_proj = training.GroupedLinear(num_experts, intermediate_size, hidden_size)
@@ -153,13 +152,10 @@ class DeepSeekV2MoEGate(nn.Module):
             topk_idx = self.router_replay(topk_idx)
             topk_weight = scores.gather(-1, topk_idx)
         topk_weight = topk_weight * self.routed_scaling_factor
-
-        if self.training and self.load_balance_loss_fn is not None:
-            lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.n_routed_experts, self.top_k)
-            topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
-        else:
-            lb_loss = None
-
+        if self.load_balance_loss_fn is None:
+            return topk_idx, topk_weight, None
+        lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.n_routed_experts, self.top_k)
+        topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
         return topk_idx, topk_weight, lb_loss
 
 
@@ -169,7 +165,6 @@ class DeepSeekV2MoE(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
-
         self.experts = DeepSeekV2Experts(config, self.experts_per_rank)
         self.gate = DeepSeekV2MoEGate(config)
         intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -182,14 +177,12 @@ class DeepSeekV2MoE(nn.Module):
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-
         expert_idxs = topk_idx.view(-1)
         replicated_tokens = hidden_states.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, hidden_states.shape[-1])
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(replicated_tokens, expert_idxs, self.experts_per_rank)
         outs = self.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = outs[reverse_shuffle_idxs]
         y = (outs.view(*topk_idx.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)
-
         y = y.view(*orig_shape) + self.shared_experts(identity)
         return y
 
@@ -205,7 +198,6 @@ class DeepSeekV2Attention(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.q_lora_rank = config.q_lora_rank
-
         if self.q_lora_rank is None:
             self.q_proj = training.Linear(hidden_size, self.num_heads * self.q_head_dim, bias=False)
         else:
@@ -215,7 +207,6 @@ class DeepSeekV2Attention(nn.Module):
         self.kv_a_proj_with_mqa = training.Linear(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
         self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = training.Linear(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)
-
         self.o_proj = training.Linear(self.num_heads * self.v_head_dim, hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
