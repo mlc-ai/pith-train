@@ -478,7 +478,7 @@ def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogR
 
 
 @dataclass(init=False, slots=True)
-class IntermediateTensorsLayer:
+class LayerRecord:
     stage1: Stage1Record
     stage2: Stage2Record
     stage3: Stage3Record
@@ -487,15 +487,15 @@ class IntermediateTensorsLayer:
 
 
 @dataclass(init=False, slots=True)
-class IntermediateTensors:
+class ChunkRecord:
     prolog: Optional[PrologRecord]
     epilog: Optional[EpilogRecord]
-    layers: List[IntermediateTensorsLayer]
+    layers: List[LayerRecord]
 
 
-def create_intermediate_tensors_layer() -> IntermediateTensorsLayer:
-    """Create a pre-allocated IntermediateTensorsLayer with all records."""
-    layer = IntermediateTensorsLayer()
+def create_layer_record() -> LayerRecord:
+    """Create a pre-allocated LayerRecord with all records."""
+    layer = LayerRecord()
     layer.stage1 = Stage1Record()
     layer.stage2 = Stage2Record()
     layer.stage2.ctx = None
@@ -506,12 +506,12 @@ def create_intermediate_tensors_layer() -> IntermediateTensorsLayer:
     return layer
 
 
-def create_intermediate_tensors(num_layers: int, has_prolog: bool, has_epilog: bool) -> IntermediateTensors:
-    """Create a pre-allocated IntermediateTensors structure for reuse across iterations."""
-    tensors = IntermediateTensors()
+def create_chunk_record(num_layers: int, has_prolog: bool, has_epilog: bool) -> ChunkRecord:
+    """Create a pre-allocated ChunkRecord structure for reuse across iterations."""
+    tensors = ChunkRecord()
     tensors.prolog = PrologRecord() if has_prolog else None
     tensors.epilog = EpilogRecord() if has_epilog else None
-    tensors.layers = [create_intermediate_tensors_layer() for _ in range(num_layers)]
+    tensors.layers = [create_layer_record() for _ in range(num_layers)]
     return tensors
 
 
@@ -563,7 +563,7 @@ def decoder_layer_forward(
     layer: LayerProtocol,
     hidden_states: torch.Tensor,
     rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
-    layer_record: IntermediateTensorsLayer,
+    layer_record: LayerRecord,
 ):
     """Forward pass for a DualPipeV decoder layer, recording each stage's tensors into ``layer_record`` for the pipeline backward."""
 
@@ -666,7 +666,7 @@ def decoder_layer_backward(
     layer: LayerProtocol,
     dy: Optional[List[torch.Tensor]],
     loss: Optional[torch.Tensor],
-    intermediate_tensors_layer: IntermediateTensorsLayer,
+    layer_record: LayerRecord,
 ):
     """
     Backward pass for a DualPipeV decoder layer.
@@ -681,7 +681,7 @@ def decoder_layer_backward(
 
     # Check if this layer's stage5 was merged with the NEXT layer's stage1.
     # Detection: stage5.args is set, stage5.outs is None
-    stage5_record = intermediate_tensors_layer.stage5
+    stage5_record = layer_record.stage5
     stage5_was_merged = (
         hasattr(stage5_record, "args")
         and stage5_record.args is not None
@@ -690,7 +690,7 @@ def decoder_layer_backward(
 
     # Check if this layer's stage1 is merged with the PREVIOUS layer's stage5.
     # Detection: stage1.outs is set, stage1.args is None
-    stage1_record = intermediate_tensors_layer.stage1
+    stage1_record = layer_record.stage1
     stage1_is_merged = (
         hasattr(stage1_record, "outs")
         and stage1_record.outs is not None
@@ -719,7 +719,7 @@ def decoder_layer_backward(
 
     # Stage 4.
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
-    record = intermediate_tensors_layer.stage4
+    record = layer_record.stage4
     if record.ctx is not None:
         combine_splits, group = record.ctx
         moe_outs_grad = direct_all_to_all(
@@ -733,7 +733,7 @@ def decoder_layer_backward(
 
     # Stage 3.
     nvtx.range_push("layer%02d.stage3_b" % layer.idx)
-    record = intermediate_tensors_layer.stage3
+    record = layer_record.stage3
 
     if bwd_comm_work is not None:
         bwd_comm_work.wait()
@@ -744,7 +744,7 @@ def decoder_layer_backward(
 
     # Stage 2.
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
-    record = intermediate_tensors_layer.stage2
+    record = layer_record.stage2
     if record.ctx is not None:
         dispatch_splits, group = record.ctx
         dispatch_tokens_grad = direct_all_to_all(
@@ -771,8 +771,8 @@ def decoder_layer_backward(
         nvtx.range_pop()
 
         # Clear tensor refs but keep pre-allocated records
-        for field in fields(intermediate_tensors_layer):
-            record = getattr(intermediate_tensors_layer, field.name)
+        for field in fields(layer_record):
+            record = getattr(layer_record, field.name)
             for rf in fields(record):
                 setattr(record, rf.name, None)
 
@@ -787,8 +787,8 @@ def decoder_layer_backward(
         nvtx.range_pop()
 
         # Clear tensor refs but keep pre-allocated records
-        for field in fields(intermediate_tensors_layer):
-            record = getattr(intermediate_tensors_layer, field.name)
+        for field in fields(layer_record):
+            record = getattr(layer_record, field.name)
             for rf in fields(record):
                 setattr(record, rf.name, None)
 
@@ -798,22 +798,22 @@ def decoder_layer_backward(
 def record_forward(
     module: ModelProtocol,
     hidden_states: torch.Tensor,
-    intermediate_tensors: IntermediateTensors,
+    chunk_record: ChunkRecord,
 ) -> torch.Tensor:
     """
     Sequential (non-overlapped) forward for one pipeline chunk: prolog -> layers -> epilog.
 
-    Records each stage's tensors into ``intermediate_tensors`` for the pipeline backward.
+    Records each stage's tensors into ``chunk_record`` for the pipeline backward.
     """
     if module.stage_index == 0:
-        hidden_states = prolog_f(module, hidden_states, intermediate_tensors.prolog)
+        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog)
 
     rotary_posemb = module.forward_posemb(hidden_states)
-    for (_, layer), layer_record in zip(module.layers.items(), intermediate_tensors.layers):
+    for (_, layer), layer_record in zip(module.layers.items(), chunk_record.layers):
         hidden_states = decoder_layer_forward(layer, hidden_states, rotary_posemb, layer_record)
 
     if module.stage_index == module.stage_count - 1:
-        hidden_states = epilog_f(module, hidden_states, intermediate_tensors.epilog)
+        hidden_states = epilog_f(module, hidden_states, chunk_record.epilog)
 
     return hidden_states
 
@@ -822,29 +822,29 @@ def record_backward(
     module: ModelProtocol,
     dy: Optional[List[torch.Tensor]],
     loss: Optional[torch.Tensor],
-    intermediate_tensors: IntermediateTensors,
+    chunk_record: ChunkRecord,
 ):
     """
     Sequential (non-overlapped) backward for one pipeline chunk: epilog -> layers -> prolog.
 
-    Backprops through the tensors ``record_forward`` saved in ``intermediate_tensors`` and
+    Backprops through the tensors ``record_forward`` saved in ``chunk_record`` and
     returns the input gradients to hand back to the previous pipeline stage.
     """
     if loss is not None:
         loss.backward()
         loss.detach_()
-        dy = (intermediate_tensors.epilog.args.hidden_states.grad,)
-        intermediate_tensors.epilog.args = None
+        dy = (chunk_record.epilog.args.hidden_states.grad,)
+        chunk_record.epilog.args = None
         loss = None
 
     dx = dy
     layers = [layer for _, layer in module.layers.items()]
-    for layer, layer_record in zip(reversed(layers), reversed(intermediate_tensors.layers)):
+    for layer, layer_record in zip(reversed(layers), reversed(chunk_record.layers)):
         dx = (decoder_layer_backward(layer, dx, loss, layer_record),)
 
     final_grads = dx
     if module.stage_index == 0:
-        record = intermediate_tensors.prolog
+        record = chunk_record.prolog
         run_backward(record.outs, dx)
         record.args = None
         record.outs = None

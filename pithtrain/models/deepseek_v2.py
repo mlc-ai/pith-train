@@ -9,7 +9,7 @@ from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2
 
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.dualpipev import layer_partition
-from pithtrain.dualpipe.execution import IntermediateTensors, record_forward
+from pithtrain.dualpipe.execution import ChunkRecord, record_forward
 from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
@@ -334,7 +334,7 @@ class DeepSeekV2Model(nn.Module):
                 stage_count = 1
                 stage_index = 0
         self.stage_index, self.stage_count = stage_index, stage_count
-        self._intermediate_tensors: IntermediateTensors | None = None
+        self._chunk_record: ChunkRecord | None = None
 
         self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
@@ -362,7 +362,7 @@ class DeepSeekV2Model(nn.Module):
         return self.lm_head(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return record_forward(self, hidden_states, self._intermediate_tensors)
+        return record_forward(self, hidden_states, self._chunk_record)
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.stage_index == 0:
