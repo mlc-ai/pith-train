@@ -17,6 +17,8 @@ from pithtrain.dualpipe.execution import (
     ExecutionCtx,
     IntermediateTensors,
     IntermediateTensorsLayer,
+    decoder_layer_backward,
+    decoder_layer_forward,
     epilog_f,
     prolog_b,
     prolog_f,
@@ -34,7 +36,6 @@ from pithtrain.dualpipe.execution import (
     stage5_b,
     stage5_f,
 )
-from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.models.interface import ModelProtocol
 
 
@@ -284,7 +285,10 @@ def overlapped_forward_backward(
     if len(module0.layers) == len(module1.layers) + 1:
         # There is an extra layer in module0 for forward
         hidden_states = decoder_layer_forward(
-            module0_layers[-1], hidden_states, rotary_posemb, intermediate_tensors0.layers[layer_idx0]
+            module0_layers[-1],
+            hidden_states,
+            rotary_posemb,
+            intermediate_tensors0.layers[layer_idx0],
         )
         layer_idx0 += 1
     elif len(module0.layers) + 1 == len(module1.layers):

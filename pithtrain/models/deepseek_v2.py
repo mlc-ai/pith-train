@@ -9,8 +9,7 @@ from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2
 
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.dualpipev import layer_partition
-from pithtrain.dualpipe.execution import IntermediateTensors
-from pithtrain.dualpipe.modeling import record_forward
+from pithtrain.dualpipe.execution import IntermediateTensors, record_forward
 from pithtrain.models.interface import MoERouting
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
