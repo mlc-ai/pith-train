@@ -25,8 +25,6 @@ from pithtrain.operators.token_scatter import (
     scatter_for_grouped_gemm,
 )
 
-SWIGLU_ALPHA = 1.702  # gpt-oss architectural constant (sigmoid approximation of GELU).
-
 
 class GptOssRotaryEmbedding(nn.Module):
     def __init__(self, config: GptOssConfig) -> None:
@@ -125,9 +123,7 @@ class GptOssExperts(nn.Module):
         if x.shape[0] == 0:
             return x @ weight[0].transpose(-2, -1)
         if training.fp8:
-            return FP8GroupedLinearFunc.apply(
-                x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices
-            )
+            return FP8GroupedLinearFunc.apply(x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices)
         return GroupedLinearFunc.apply(x, weight, offs)
 
     def forward(
@@ -137,11 +133,7 @@ class GptOssExperts(nn.Module):
         ks: list | None = None,
         ks_tensor: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        group_ids = torch.searchsorted(
-            grouped_mm_offs.to(torch.int64),
-            torch.arange(x.shape[0], device=x.device, dtype=torch.int64),
-            right=True,
-        ).clamp_(max=self.num_experts - 1)
+        group_ids = torch.searchsorted(grouped_mm_offs.to(torch.int64), torch.arange(x.shape[0], device=x.device, dtype=torch.int64), right=True).clamp_(max=self.num_experts - 1)
 
         # Hopper SM90 needs explicit per-row group indices for m_grouped FP8 GEMM;
         # Blackwell ignores it. Computed once and shared across both projections.
@@ -149,7 +141,7 @@ class GptOssExperts(nn.Module):
 
         gate_up = self._group_linear(x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi)
         gate_up = indexed_bias_add(gate_up, self.gate_up_proj_bias, group_ids, grouped_mm_offs)
-        activated = clamped_swiglu(gate_up, SWIGLU_ALPHA, self.swiglu_limit)
+        activated = clamped_swiglu(gate_up, 1.702, self.swiglu_limit)
 
         out = self._group_linear(activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi)
         out = indexed_bias_add(out, self.down_proj_bias, group_ids, grouped_mm_offs)
@@ -170,8 +162,7 @@ class GptOssTopKRouter(nn.Module):
 
     @torch.compile(fullgraph=True)
     def compute(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         logits = F.linear(hidden_states, self.weight, self.bias)
 
@@ -269,24 +260,17 @@ class GptOssAttention(nn.Module):
         )
         # FA-4 requires learnable_sink to match q/k/v dtype; the parameter itself stays in
         # fp32 for optimizer numerical stability. flash_attn_func returns (out, lse).
-        attn_output, _ = flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            softmax_scale=self.scaling,
-            causal=True,
-            window_size=window_size,
-            learnable_sink=self.sinks.to(query_states.dtype),
-        )
+        attn_output, _ = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=self.sinks.to(query_states.dtype))
 
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
 
 class GptOssDecoderLayer(nn.Module):
-    def __init__(self, config: GptOssConfig, layer_idx: int, is_sliding: bool):
+    def __init__(self, config: GptOssConfig, layer_idx: int):
         super().__init__()
         self.idx = layer_idx
+        is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.self_attn = GptOssAttention(config, is_sliding)
         self.mlp = GptOssMLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -343,7 +327,8 @@ class GptOssModel(nn.Module):
     def __init__(self, config: GptOssConfig, phase: int):
         super().__init__()
         if distributed.cp_size > 1:
-            raise NotImplementedError("GptOssModel does not support context parallelism yet.")
+            raise NotImplementedError("GptOssModel doesn't support context parallelism.")
+
         match phase:
             case 0:
                 stage_count = distributed.pp_size * 2
@@ -357,13 +342,6 @@ class GptOssModel(nn.Module):
         self.stage_index, self.stage_count = stage_index, stage_count
         self.chunk_record: ChunkRecord | None = None
 
-        layer_types = getattr(config, "layer_types", None)
-        if layer_types is None:
-            layer_types = [
-                "sliding_attention" if i % 2 == 0 else "full_attention"
-                for i in range(config.num_hidden_layers)
-            ]
-
         self.rotary_emb = GptOssRotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
@@ -372,16 +350,7 @@ class GptOssModel(nn.Module):
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        self.layers = nn.ModuleDict(
-            {
-                str(i): GptOssDecoderLayer(
-                    config,
-                    layer_idx=i,
-                    is_sliding=(layer_types[i] == "sliding_attention"),
-                )
-                for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
-            }
-        )
+        self.layers = nn.ModuleDict({str(i): GptOssDecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         S = hidden_states.shape[1]

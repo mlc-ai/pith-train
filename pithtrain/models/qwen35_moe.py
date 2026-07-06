@@ -30,7 +30,6 @@ class Qwen35MoeRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.float()
         output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
-        # GLM-style scale: checkpoint stores weight centered at 0, so scale is (1 + weight).
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
@@ -51,8 +50,6 @@ class Qwen35MoeRMSNormGated(nn.Module):
 class Qwen35MoeRotaryEmbedding(nn.Module):
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         super().__init__()
-        # Partial rotary: only the leading rotary_dim channels of each head are rotated,
-        # so inv_freq and the emitted cos/sin span only rotary_dim.
         rope_params = config.rope_parameters
         rotary_dim = int(config.head_dim * rope_params.get("partial_rotary_factor", 1.0))
         base = rope_params["rope_theta"]
@@ -79,47 +76,35 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
-
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_kernel_size, groups=self.conv_dim, padding=self.conv_kernel_size - 1)
-
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.log(torch.empty(self.num_v_heads).uniform_(0, 16)))
-
         self.norm = Qwen35MoeRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
-
         self.in_proj_qkv = training.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
         self.in_proj_z = training.Linear(self.hidden_size, self.value_dim, bias=False)
-        # in_proj_a / in_proj_b have num_v_heads (=32) outputs: too small for the
-        # 128-element FP8 block scaling, so keep them as plain bf16 Linear.
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.out_proj = training.Linear(self.value_dim, self.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         B, S, _ = hidden_states.shape
-
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)  # [b, conv_dim, seq]
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
         z = self.in_proj_z(hidden_states).reshape(B, S, -1, self.head_v_dim)
         b, a = self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
-
         # Causal depthwise conv + SiLU, truncated back to S (padding=k-1).
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[..., :S]).transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = F.normalize(query.reshape(B, S, -1, self.head_k_dim), dim=-1)
         key = F.normalize(key.reshape(B, S, -1, self.head_k_dim), dim=-1)
         value = value.reshape(B, S, -1, self.head_v_dim)
-
         beta = b.sigmoid()
         # .float() on A_log guards against -inf when loaded in low precision.
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
-
         if self.num_v_heads // self.num_k_heads > 1:
             repeats = self.num_v_heads // self.num_k_heads
             query, key = query.repeat_interleave(repeats, dim=2), key.repeat_interleave(repeats, dim=2)
-
         core_attn_out = gated_delta_rule(query, key, value, g, beta)
-
         core_attn_out, z = core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(B, S, -1)
@@ -134,13 +119,11 @@ class Qwen35MoeAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.scaling = self.head_dim**-0.5
-
         attention_bias = config.attention_bias
         self.q_proj = training.Linear(self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias)
         self.k_proj = training.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
         self.v_proj = training.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
         self.o_proj = training.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias)
-
         self.q_norm = Qwen35MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen35MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -151,8 +134,6 @@ class Qwen35MoeAttention(nn.Module):
 
     @staticmethod
     def apply_rotary_posemb(q: torch.Tensor, k: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        # Partial rotary: cos/sin span only the leading ``rotary_dim`` channels of
-        # each head; the trailing channels pass through unrotated.
         cos, sin = rotary_posemb
         cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
         rotary_dim = cos.shape[-1]
@@ -164,18 +145,13 @@ class Qwen35MoeAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-
         query_states, gate = torch.chunk(self.q_proj(hidden_states).view(B, S, -1, self.head_dim * 2), 2, dim=-1)
         gate = gate.reshape(B, S, -1)
-
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim))
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
-
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-
         attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
-
         attn_output = attn_output.reshape(B, S, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
@@ -200,7 +176,6 @@ class Qwen35MoeExperts(nn.Module):
         self.num_experts = num_experts
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
-
         self.gate_up_proj = training.GroupedLinear(num_experts, self.hidden_size, 2 * self.moe_intermediate_size)
         self.down_proj = training.GroupedLinear(num_experts, self.moe_intermediate_size, self.hidden_size)
 
@@ -208,7 +183,6 @@ class Qwen35MoeExperts(nn.Module):
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
         gate_up = self.gate_up_proj(x, **kwargs)
-        # Non-interleaved fused gate/up: column slices are non-contiguous, and silu_mul requires contiguous inputs.
         gate = gate_up[:, : self.moe_intermediate_size].contiguous()
         up = gate_up[:, self.moe_intermediate_size :].contiguous()
         return self.down_proj(silu_mul(gate, up), **kwargs)
@@ -279,14 +253,11 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
         self.is_linear = self.layer_type == "linear_attention"
-
         if self.is_linear:
             self.linear_attn = Qwen35MoeGatedDeltaNet(config, layer_idx)
         else:
             self.self_attn = Qwen35MoeAttention(config)
-
         self.mlp = Qwen35MoeSparseMoeBlock(config)
-
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -299,12 +270,8 @@ class Qwen35MoeDecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(hidden_states, rotary_posemb)
         hidden_states = residual + hidden_states
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
-        # Shared expert folds into the residual here so it overlaps the stage-2
-        # all-to-all dispatch of the routed tokens.
         residual = residual + self.mlp.shared_out(hidden_states)
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
@@ -344,7 +311,6 @@ class Qwen35MoeDecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(hidden_states, rotary_posemb)
         hidden_states = residual + hidden_states
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp.reference_forward(hidden_states)
@@ -355,7 +321,8 @@ class Qwen35MoeModel(nn.Module):
     def __init__(self, config: Qwen3_5MoeTextConfig, phase: int):
         super().__init__()
         if distributed.cp_size > 1:
-            raise NotImplementedError("Qwen35MoeModel does not support context parallelism (linear attention needs a bespoke sequence-sharded recurrence).")
+            raise NotImplementedError("Qwen35MoeModel doesn't support context parallelism.")
+
         match phase:
             case 0:
                 stage_count = distributed.pp_size * 2
@@ -370,7 +337,6 @@ class Qwen35MoeModel(nn.Module):
         self.chunk_record: ChunkRecord | None = None
 
         self.rotary_emb = Qwen35MoeRotaryEmbedding(config)
-
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -380,8 +346,6 @@ class Qwen35MoeModel(nn.Module):
         self.layers = nn.ModuleDict({str(i): Qwen35MoeDecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
     def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # No CP: a single contiguous position grid. Full-attention layers consume
-        # it; linear-attention layers ignore it.
         S, device = hidden_states.shape[1], hidden_states.device
         position_ids = torch.arange(S, device=device)
         cos, sin = self.rotary_emb(S)

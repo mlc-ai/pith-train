@@ -165,10 +165,10 @@ class Qwen3MoeAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-        if distributed.cp_size <= 1:
-            attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
-        else:
+        if distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)
+        else:
+            attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
