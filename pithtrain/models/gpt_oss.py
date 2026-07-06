@@ -1,4 +1,4 @@
-"""openai/gpt-oss-120b and openai/gpt-oss-20b."""
+"""openai/gpt-oss-20b and openai/gpt-oss-120b."""
 
 import math
 

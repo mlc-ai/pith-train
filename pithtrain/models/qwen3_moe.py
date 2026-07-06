@@ -1,4 +1,4 @@
-"""Qwen/Qwen3-30B-A3B."""
+"""Qwen/Qwen3-30B-A3B and Qwen/Qwen3-235B-A22B."""
 
 import torch
 import torch.nn.functional as F

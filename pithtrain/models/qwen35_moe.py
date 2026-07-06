@@ -1,4 +1,4 @@
-"""Qwen3.5-MoE (text tower)."""
+"""Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-122B-A10B, and Qwen/Qwen3.5-397B-A17B (text tower)."""
 
 import torch
 import torch.nn.functional as F
