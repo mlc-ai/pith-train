@@ -319,33 +319,17 @@ class DeepSeekV2DecoderLayer(nn.Module):
 
     @torch.compile(fullgraph=True)
     def forward_stage5(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor):
-
-        def moe_finalize(moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor]) -> torch.Tensor:
-            if distributed.ep_size > 1:
-                assert moe_local_idxs is not None
-                seq_len, topk = topk_weight.shape
-                permuted_probs = topk_weight.view(-1)[moe_local_idxs]
-                token_indices = moe_local_idxs // topk
-                weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
-                result = moe_outs.new_zeros(seq_len, moe_outs.shape[-1])
-                result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
-                return result
-            else:
-                assert moe_local_idxs is None
-                new_x = moe_outs
-                final_out = new_x.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(dim=-1)
-                final_out = final_out.sum(dim=1).to(new_x.dtype)
-                return final_out
-
-        if isinstance(self.mlp, DeepSeekV2MoE):
-            hidden_states = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(*residual.shape)
-        else:
-            assert moe_local_idxs is None
-            assert topk_weight is None
-            hidden_states = moe_outs
-
-        hidden_states = residual + hidden_states
-        return hidden_states
+        if not isinstance(self.mlp, DeepSeekV2MoE):
+            return residual + moe_outs
+        if distributed.ep_size == 1:
+            weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
+            return residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)
+        permuted_probs = topk_weight.view(-1)[moe_local_idxs]
+        token_indices = moe_local_idxs // topk_weight.shape[1]
+        weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
+        aggregated = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
+        aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
+        return residual + aggregated.view(*residual.shape)
 
     def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         residual = hidden_states
