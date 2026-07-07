@@ -68,7 +68,7 @@ parallelism, batch size, learning rate, etc. (see [Configuring a run](#configuri
 The model architecture is in the sibling `config.json`.
 
 **3. Train.** The launcher auto-detects single-node vs. SLURM and forwards to
-`torchrun`. Logs are written to `logging/pretrain_lm/`.
+`torchrun`. Logs are written to `workspace/logging/pretrain_lm/`.
 
 ```bash
 bash examples/pretrain_lm/launch.sh qwen3-30b-a3b

@@ -40,7 +40,7 @@ If `$SLURM_JOB_ID` is not set, you're not inside an allocation — fall back to 
 
 - **`-N <n>`** — number of nodes to dispatch to. In most training runs this matches the pipeline-parallel degree (PP), but not always: the full parallelism plan and GPUs-per-node determine total nodes (e.g., PP=1 with EP=16 on 8-GPU nodes still needs 2 nodes).
 - **`-W 0`** — wait indefinitely for stragglers after the first task exits. The default behavior terminates remaining tasks shortly after the first one ends, which kills workers that are still cleanly shutting down. Always use `-W 0` for training and evaluation runs.
-- **`-o <file>`** — stdout redirection. Use this instead of piping through `tee`. On multi-node, `tee`ing srun output collapses concurrent writes from all ranks. `-o` is distributed-aware — srun collects output from every rank into the single specified file, preserving the one-command-one-log abstraction. By convention, PithTrain runs log under `workspace/loggings/<descriptive-name>.log`.
+- **`-o <file>`** — stdout redirection. Use this instead of piping through `tee`. On multi-node, `tee`ing srun output collapses concurrent writes from all ranks. `-o` is distributed-aware — srun collects output from every rank into the single specified file, preserving the one-command-one-log abstraction. By convention, PithTrain runs log under `workspace/logging/<descriptive-name>.log`.
 - **`--open-mode=append`** vs **`--open-mode=truncate`** — for resumed training, `append` preserves history across restarts. Use `truncate` for fresh runs where overwriting is intended.
 - **`--nodelist=<hosts>`** — restrict dispatch to specific nodes. Useful for debugging at a smaller scale (e.g., 4 nodes allocated, but debug with 2 specific ones).
 

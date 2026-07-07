@@ -24,7 +24,7 @@ LAUNCH_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=${SLURM_LAUNCH_NODE_IPADDR:-lo
 
 # Launch the training.
 SCRIPT=examples/pretrain_lm/$1/script.py
-OUTPUT=logging/pretrain_lm/${1}_node${SLURM_NODEID:-0}.log
+OUTPUT=workspace/logging/pretrain_lm/${1}_node${SLURM_NODEID:-0}.log
 
 mkdir -p $(dirname $OUTPUT) && exec > >(tee $OUTPUT) 2>&1
 torchrun ${LAUNCH_ARGS[@]} $SCRIPT

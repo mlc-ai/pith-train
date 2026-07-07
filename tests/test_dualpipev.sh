@@ -18,6 +18,6 @@ MAIN_ARGS+=(--model "$MODEL")
 
 SCRIPT=tests/test_dualpipev.py
 TAG=$(basename "$(dirname "$MODEL")")
-OUTPUT=$PWD/logs/test_dualpipev_${TAG}.log; mkdir -p $(dirname $OUTPUT)
+OUTPUT=$PWD/workspace/logging/test_dualpipev_${TAG}.log; mkdir -p $(dirname $OUTPUT)
 
 torchrun ${TRUN_ARGS[@]} $SCRIPT ${MAIN_ARGS[@]} 2>&1 | tee $OUTPUT
