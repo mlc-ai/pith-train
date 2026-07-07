@@ -14,11 +14,11 @@ Setup the minimal artifacts needed to benchmark, profile, or regression-test a M
 ## Usage
 
 ```bash
-mkdir -p workspace/loggings
+mkdir -p workspace/logging
 
 # Single-node (DeepSeek-V2-Lite)
-bash .agents/skills/setup-benchmark-inputs/scripts/launch_setup.sh --model deepseek-v2-lite 2>&1 | tee workspace/loggings/setup-deepseek-v2-lite.log
+bash .agents/skills/setup-benchmark-inputs/scripts/launch_setup.sh --model deepseek-v2-lite 2>&1 | tee workspace/logging/setup-deepseek-v2-lite.log
 
 # Multi-node via SLURM (Qwen3-30B-A3B)
-srun -W 0 -o workspace/loggings/setup-qwen3-30b-a3b.log .agents/skills/setup-benchmark-inputs/scripts/launch_setup.sh --model qwen3-30b-a3b
+srun -W 0 -o workspace/logging/setup-qwen3-30b-a3b.log .agents/skills/setup-benchmark-inputs/scripts/launch_setup.sh --model qwen3-30b-a3b
 ```
