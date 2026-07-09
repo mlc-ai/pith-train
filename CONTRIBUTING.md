@@ -133,14 +133,14 @@ Use the **`add-new-model`** skill — it covers the full scope below and runs th
 tests. The shape of the work:
 
 1. **Model file** — `pithtrain/models/<model>.py`, self-contained, implementing
-   `ModelProtocol` and `DecoderLayerProtocol` from
+   `ModelProtocol` and `LayerProtocol` from
    [`models/interface.py`](pithtrain/models/interface.py). The decoder layer must
-   expose `forward_attn` (stage 1), `forward_mlp` (stage 3), `forward_aggregate`
+   expose `forward_stage1` (stage 1), `forward_stage3` (stage 3), `forward_stage5`
    (stage 5), and `reference_forward` (a plain forward for correctness
-   validation). Build linears via `layers/factory.py` so the model is FP8/BF16
-   agnostic. Copy an existing model (e.g. `qwen3_moe.py`) as a template
-   rather than abstracting a shared base — this is the no-indirection principle
-   in action.
+   validation). Build linears via `training.Linear` / `training.GroupedLinear` so
+   the model is FP8/BF16 agnostic. Copy an existing model (e.g. `qwen3_moe.py`) as
+   a template rather than abstracting a shared base — this is the no-indirection
+   principle in action.
 2. **Wiring** — register the model where models are constructed (`setup_model`),
    add FSDP wrapping (`apply_fsdp`), and a config under
    `examples/pretrain_lm/<model>/` (`script.py` + `config.json`).
@@ -161,14 +161,14 @@ tests. The shape of the work:
 
 ### Add a training feature or subsystem
 
-Follow the **Cfg / Ctx / context-manager** pattern (see
+Follow the **`*Cfg` + `setup_*` + `contexts/`** pattern (see
 [`docs/architecture.md` §10](docs/architecture.md)):
 
 - A `*Cfg` dataclass for the user-facing knobs (`@dataclass(init=False,
   slots=True)`, inheriting `SlottedDefault`).
-- A `*Ctx` for derived runtime state.
-- A `*_context` manager that sets up and tears it down, entered from the task's
-  `ExitStack`.
+- A `setup_*(cfg)` function that builds the runtime and publishes its live state
+  into a `contexts/` module (module-level globals), instead of returning a
+  context object.
 
 Keep new knobs documented with field docstrings (as in `DistributedCfg`).
 
