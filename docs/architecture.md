@@ -23,7 +23,7 @@ The codebase is organized into three layers. The picture (also in the
 [README](../README.md)) is:
 
 <p align="center">
-  <img src="_static/img/PithTrain-arch.svg" width="100%">
+  <img src="images/PithTrain-arch.svg" width="100%">
 </p>
 
 | Layer | Directory | Responsibility |
