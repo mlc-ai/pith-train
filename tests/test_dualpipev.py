@@ -4,6 +4,7 @@ The loss and gradients are compared with the reference implementation.
 """
 
 import argparse
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,10 +64,12 @@ def reference_step(
     l: torch.Tensor,  # noqa: E741
     model: DeepSeekV2Model,
     chunks: int,
+    cu_seqlens: torch.Tensor = None,
 ):
     ys, ls = [], []
-    for micro_x, micro_l in zip(x.chunk(chunks), l.chunk(chunks)):
-        micro_y = model.reference_forward(micro_x)
+    for i, (micro_x, micro_l) in enumerate(zip(x.chunk(chunks), l.chunk(chunks))):
+        cu = cu_seqlens[i] if cu_seqlens is not None else None
+        micro_y = model.reference_forward(micro_x, cu)
         loss = criterion(micro_y, micro_l)
         loss.backward()
         ys.append(micro_y)
@@ -188,7 +191,9 @@ def main(model_name: str):
     torch.set_default_device(torch.cuda.current_device())
     dtype = torch.bfloat16
 
-    num_chunks, micro_batch_size, sequence_length = 20, 3, 128
+    packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
+    micro_batch_size = 1 if packed else 3 # packing pins mbs to 1
+    num_chunks, sequence_length = 20, 128
 
     config_path = Path(__file__).resolve().parent.parent / model_name
     config = AutoConfig.from_pretrained(config_path)
@@ -237,6 +242,16 @@ def main(model_name: str):
         ep_rank
     ]
 
+    # Packed sequences: split each length-S sample into three documents and check the
+    # block-diagonal cu_seqlens path matches the reference (attention only; MSE loss unaffected).
+    full_cu = local_cu = None
+    if packed:
+        bounds = [0, sequence_length // 3, 2 * (sequence_length // 3), sequence_length]
+        full_cu = torch.tensor(bounds, dtype=torch.int32).repeat(
+            ep_size * num_chunks * micro_batch_size, 1
+        )
+        local_cu = full_cu.reshape(ep_size, num_chunks * micro_batch_size, -1)[ep_rank]
+
     # Reference runs single-device (pp=ep=1); restore the real mesh before DualPipeV.
     distributed.pp_size = distributed.ep_size = 1
     full_modules = ModelClass(config, phase=-1)
@@ -248,7 +263,9 @@ def main(model_name: str):
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
-    loss_ref, output_ref = reference_step(full_x, full_l, full_modules, num_chunks * ep_size)
+    loss_ref, output_ref = reference_step(
+        full_x, full_l, full_modules, num_chunks * ep_size, full_cu
+    )
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
 
     if distributed.rank == 0:
@@ -302,7 +319,9 @@ def main(model_name: str):
     kwargs["return_outputs"] = False
     local_x = None if pp_rank != 0 else local_x
     local_l = None if pp_rank != 0 else local_l
+    local_cu = None if pp_rank != 0 else local_cu
     kwargs["labels"] = (local_l,)
+    kwargs["cu_seqlens"] = local_cu
 
     if distributed.rank == 0:
         print("[INFO] Running the DualPipeV step.", flush=True)

@@ -276,7 +276,8 @@ class Qwen35MoeDecoderLayer(nn.Module):
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
+        assert cu_seqlens is None, "qwen3.5 Gated DeltaNet supports pre-training only; packed/SFT sequences are not implemented yet"
         hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
@@ -345,8 +346,9 @@ class Qwen35MoeModel(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict({str(i): Qwen35MoeDecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
-    def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        S, device = hidden_states.shape[1], hidden_states.device
+    def forward_posemb(self, S: int, cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        assert cu_seqlens is None, "qwen3.5 Gated DeltaNet supports pre-training only; packed/SFT sequences are not implemented yet"
+        device = distributed.device
         position_ids = torch.arange(S, device=device)
         cos, sin = self.rotary_emb(S)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
@@ -358,13 +360,14 @@ class Qwen35MoeModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return record_forward(self, hidden_states, self.chunk_record)
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        return record_forward(self, hidden_states, self.chunk_record, cu_seqlens)
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        assert cu_seqlens is None, "qwen3.5 Gated DeltaNet supports pre-training only; packed/SFT sequences are not implemented yet"
         if self.stage_index == 0:
             hidden_states = self.forward_prolog(hidden_states)
-        rotary_posemb = self.forward_posemb(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
         for _, layer in self.layers.items():
             hidden_states = layer.reference_forward(hidden_states, rotary_posemb)
         if self.stage_index == self.stage_count - 1:

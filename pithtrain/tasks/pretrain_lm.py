@@ -113,9 +113,13 @@ def get_global_batch(
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # Return the summed (not mean) loss so the pipeline's per-micro-batch backward accumulates
+    # d(sum loss); the training step divides by the global non-ignored token count for a correct
+    # token-weighted mean.
     output = output.view(-1, output.size(-1))
     target = target.view(-1)
-    return cross_entropy(output, target, ignore_index=-100)
+    n_tokens = (target != -100).sum().clamp_min(1)
+    return cross_entropy(output, target, ignore_index=-100) * n_tokens
 
 
 @torch.no_grad()
@@ -369,19 +373,27 @@ def train_step(cfg: PretrainLMCfg) -> None:
         return_outputs=False,
     )
 
-    # Average loss across CP ranks for correct logging.
-    cp_size = distributed.cp_size
-    if loss is not None and cp_size > 1:
-        cp_group = distributed.cp_group
-        torch.distributed.all_reduce(loss, group=cp_group)
-        loss /= cp_size
+    # Token-weighted reduction. The criterion returns per-micro-batch loss SUMS, so gradients
+    # accumulate d(sum loss); dividing by the total non-ignored token count yields the correct
+    # token-mean regardless of how tokens split across micro-batches. The count lives on pipeline
+    # rank 0 (the only rank with labels), so broadcast it to every stage for the gradient scale.
+    num_tokens = torch.ones(1, device=device)
+    if distributed.pp_rank == 0:
+        num_tokens.fill_((global_labels != -100).sum().clamp_min(1))
+    if distributed.pp_size > 1:
+        torch.distributed.broadcast(num_tokens, group_src=0, group=distributed.pp_group)
 
-    # Scale gradients back so the effective loss is the mean over chunks.
-    if accumulate_steps > 1:
-        scale = 1.0 / accumulate_steps
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(scale)
+    cp_size = distributed.cp_size
+    if loss is not None:
+        loss = loss.sum() / num_tokens
+        if cp_size > 1:
+            torch.distributed.all_reduce(loss, group=distributed.cp_group)
+            loss /= cp_size
+
+    scale = 1.0 / num_tokens
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.mul_(scale)
 
     # Clip the gradients.
     gradient_norm = clip_grad_norm_(model, max_norm=1.0, norm_type=2)
@@ -422,7 +434,7 @@ def train_step(cfg: PretrainLMCfg) -> None:
     if distributed.rank == 0:
         step = training.step
         max_steps = cfg.training.max_steps
-        loss, lr = torch.mean(loss).item(), schedulers[0].get_last_lr()[0]
+        loss, lr = loss.item(), schedulers[0].get_last_lr()[0]
         tokens_per_second = global_batch_size * cfg.training.sequence_length / elapsed
         statements = []
         statements.append("step %08d/%08d" % (step + 1, max_steps))
