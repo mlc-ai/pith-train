@@ -20,19 +20,18 @@ import argparse
 import json
 import shutil
 import tempfile
-from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 
 import torch
 from torch.distributed.tensor import DTensor
 
-from pithtrain.modules.distributed import distributed_context
-from pithtrain.modules.logging import logging_context
+from pithtrain.contexts import training
+from pithtrain.modules.distributed import setup_distributed
+from pithtrain.modules.logging import setup_logging
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler, setup_model
 from pithtrain.tasks.pretrain_lm import (
     PretrainLMCfg,
-    PretrainLMCtx,
     load_checkpoint,
     save_checkpoint,
 )
@@ -40,7 +39,7 @@ from pithtrain.tasks.pretrain_lm import (
 NUM_LAYERS = 4  # a few MoE layers; small enough to build quickly
 
 MODELS = {
-    "deepseek-v2-lite": "examples/pretrain_lm/deepseek-v2-lite/config.json",  # MLA, GroupLinear experts
+    "deepseek-v2-lite": "examples/pretrain_lm/deepseek-v2-lite/config.json",  # MLA, GroupedLinear experts
     "qwen3-30b-a3b": "examples/pretrain_lm/qwen3-30b-a3b/config.json",  # GQA + q/k_norm
     "gpt-oss-20b": "examples/pretrain_lm/gpt-oss-20b/config.json",  # sinks, fused gate_up, expert biases
 }
@@ -64,15 +63,15 @@ def opt_state_snapshot(optimizers, model):
     return snap
 
 
-def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
+def main(cfg: PretrainLMCfg):
     rank = torch.distributed.get_rank()
 
     def rprint(*a):
         if rank == 0:
             print(*a, flush=True)
 
-    model = ctx.training.model
-    optimizers = ctx.training.optimizers
+    model = training.model
+    optimizers = training.optimizers
     n_muon = sum(len(g["params"]) for g in optimizers[0].param_groups)
     n_aux = sum(len(g["params"]) for g in optimizers[1].param_groups)
     rprint(f"[INFO] composed optimizers: Muon over {n_muon} params, AdamW over {n_aux} params")
@@ -97,15 +96,15 @@ def main(cfg: PretrainLMCfg, ctx: PretrainLMCtx):
     assert not bad, ("non-finite params after step", bad[:3])
 
     # Snapshot, save, rebuild fresh optimizers, load, compare.
-    ctx.training.step = 1
+    training.step = 1
     before = opt_state_snapshot(optimizers, model)
-    save_checkpoint(cfg, ctx)
+    save_checkpoint(cfg)
 
     # fresh, empty-state optimizers + schedulers
-    ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
-    ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
-    load_checkpoint(cfg, ctx)
-    after = opt_state_snapshot(ctx.training.optimizers, model)
+    training.optimizers = cfg.training.optimizer(cfg.training)
+    training.schedulers = cfg.training.scheduler(cfg.training)
+    load_checkpoint(cfg)
+    after = opt_state_snapshot(training.optimizers, model)
 
     assert set(before) == set(after), "param FQN set changed across the round-trip"
     max_diff, worst = 0.0, None
@@ -154,39 +153,37 @@ def _entry():
     t.sequence_length = 2048
     t.moe_load_balance_type = "sequence"
     t.moe_load_balance_coef = 3e-3
-    t.fp8_training = "disabled"
+    t.fp8 = False
 
-    ctx = PretrainLMCtx()
-    with ExitStack() as stack:
-        stack.enter_context(logging_context(cfg, ctx))
-        stack.enter_context(distributed_context(cfg, ctx))
+    setup_logging(cfg)
+    setup_distributed(cfg)
 
-        # Reduced config + checkpoint dir on local scratch (rank 0 writes).
-        scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True
-            )
-            shutil.rmtree(scratch, ignore_errors=True)
-            scratch.mkdir(parents=True)
-            src = Path(__file__).resolve().parent.parent / MODELS[parsed.model]
-            config = json.loads(src.read_text())
-            config["num_hidden_layers"] = NUM_LAYERS
-            if "layer_types" in config:  # gpt-oss alternates sliding/full attention per layer
-                config["layer_types"] = config["layer_types"][:NUM_LAYERS]
-            (scratch / "config.json").write_text(json.dumps(config))
-        torch.distributed.barrier()
-        t.model = scratch / "config.json"
-        t.dataset = scratch  # unused; set to satisfy the config
-        t.save_location = scratch / "checkpoint"
+    # Reduced config + checkpoint dir on local scratch (rank 0 writes).
+    scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
+    if torch.distributed.get_rank() == 0:
+        print(
+            f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True
+        )
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+        src = Path(__file__).resolve().parent.parent / MODELS[parsed.model]
+        config = json.loads(src.read_text())
+        config["num_hidden_layers"] = NUM_LAYERS
+        if "layer_types" in config:  # gpt-oss alternates sliding/full attention per layer
+            config["layer_types"] = config["layer_types"][:NUM_LAYERS]
+        (scratch / "config.json").write_text(json.dumps(config))
+    torch.distributed.barrier()
+    t.model = scratch / "config.json"
+    t.dataset = scratch  # unused; set to satisfy the config
+    t.save_location = scratch / "checkpoint"
 
-        # Build model + optimizers + schedulers directly (no dataset needed).
-        ctx.training.step = 0
-        torch.manual_seed(0)
-        setup_model(cfg.training, ctx.training, cfg.distributed, ctx.distributed)
-        ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
-        ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
-        main(cfg, ctx)
+    # Build model + optimizers + schedulers directly (no dataset needed).
+    training.step = 0
+    torch.manual_seed(0)
+    setup_model(cfg.training, cfg.distributed)
+    training.optimizers = cfg.training.optimizer(cfg.training)
+    training.schedulers = cfg.training.scheduler(cfg.training)
+    main(cfg)
 
 
 if __name__ == "__main__":

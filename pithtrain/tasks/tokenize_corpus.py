@@ -20,14 +20,13 @@ without a leftover lock are skipped on restart.
 
 import atexit
 import json
-import logging
 import multiprocessing
 import os
 import shutil
 import tempfile
 import time
-from contextlib import ExitStack
 from dataclasses import dataclass, field
+from logging import INFO
 from multiprocessing import Pool, Process, Queue
 from pathlib import Path
 from typing import List, Tuple
@@ -37,7 +36,8 @@ import zstandard as zstd
 from transformers import AutoTokenizer
 
 from pithtrain.config import SlottedDefault
-from pithtrain.modules.logging import LoggingCfg, LoggingCtx, StdoutLogger, logging_context
+from pithtrain.contexts import logging
+from pithtrain.modules.logging import LoggingCfg, StdoutLogger, setup_logging
 
 
 @dataclass(init=False, slots=True)
@@ -58,14 +58,6 @@ class TokenizeCorpusCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
-
-
-@dataclass(init=False, slots=True)
-class TokenizeCorpusCtx(SlottedDefault):
-    """Runtime context for tokenize_corpus."""
-
-    logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """Active logging context."""
 
 
 def read_file(path: Path):
@@ -153,7 +145,7 @@ def leader(queue: Queue, psize: int, cfg: TokenizeCorpusCfg, npath: int):
     Leader for a file group. Pulls files from the shared queue and tokenizes
     each file using a dedicated pool of wf workers.
     """
-    stdout = StdoutLogger("pithtrain", logging.INFO)
+    stdout = StdoutLogger("pithtrain", INFO)
     pool = Pool(psize, Worker, (cfg.tokenizer_name,))
     atexit.register(pool.terminate)
     try:
@@ -194,42 +186,40 @@ def leader(queue: Queue, psize: int, cfg: TokenizeCorpusCfg, npath: int):
 
 def launch(cfg: TokenizeCorpusCfg):
     """Launch the tokenization process."""
-    with ExitStack() as stack:
-        ctx = TokenizeCorpusCtx()
-        stack.enter_context(logging_context(cfg, ctx))
-        stdout = ctx.logging.stdout
-        stdout.info("launch(cfg=%s)" % cfg)
-        # Get all the files to tokenize, with hidden folders ignored.
-        files: List[Path] = []
-        for f in cfg.source_path.rglob("*"):
-            if not f.is_file():
-                continue
-            if any(p.startswith(".") for p in f.relative_to(cfg.source_path).parts):
-                continue
-            files.append(f)
-        # Assign psize workers per pool, with at least 1 pool.
-        psize = 24
-        npool = max(cfg.num_workers // psize, 1)
-        psize = cfg.num_workers // npool
-        # Feed files into a shared queue; large files first for load balancing.
-        files.sort(key=lambda f: f.stat().st_size, reverse=True)
-        mp = multiprocessing.get_context("spawn")
-        queue = mp.Queue()
-        for i, path in enumerate(files, 1):
-            queue.put((i, path))
-        for _ in range(npool):
-            queue.put(None)
-        # Cache the tokenizer upfront to avoid ratelimit with parallel workers.
-        tokenizer_path = tempfile.mkdtemp()
-        atexit.register(shutil.rmtree, tokenizer_path, ignore_errors=True)
-        tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
-        tokenizer.save_pretrained(tokenizer_path)
-        cfg.tokenizer_name = tokenizer_path
-        leaders: List[Process] = []
-        atexit.register(lambda: [p.terminate() for p in leaders])
-        for _ in range(npool):
-            p = mp.Process(target=leader, args=(queue, psize, cfg, len(files)))
-            p.start()
-            leaders.append(p)
-        for p in leaders:
-            p.join()
+    setup_logging(cfg)
+    stdout = logging.stdout
+    stdout.info("launch(cfg=%s)" % cfg)
+    # Get all the files to tokenize, with hidden folders ignored.
+    files: List[Path] = []
+    for f in cfg.source_path.rglob("*"):
+        if not f.is_file():
+            continue
+        if any(p.startswith(".") for p in f.relative_to(cfg.source_path).parts):
+            continue
+        files.append(f)
+    # Assign psize workers per pool, with at least 1 pool.
+    psize = 24
+    npool = max(cfg.num_workers // psize, 1)
+    psize = cfg.num_workers // npool
+    # Feed files into a shared queue; large files first for load balancing.
+    files.sort(key=lambda f: f.stat().st_size, reverse=True)
+    mp = multiprocessing.get_context("spawn")
+    queue = mp.Queue()
+    for i, path in enumerate(files, 1):
+        queue.put((i, path))
+    for _ in range(npool):
+        queue.put(None)
+    # Cache the tokenizer upfront to avoid ratelimit with parallel workers.
+    tokenizer_path = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, tokenizer_path, ignore_errors=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer.save_pretrained(tokenizer_path)
+    cfg.tokenizer_name = tokenizer_path
+    leaders: List[Process] = []
+    atexit.register(lambda: [p.terminate() for p in leaders])
+    for _ in range(npool):
+        p = mp.Process(target=leader, args=(queue, psize, cfg, len(files)))
+        p.start()
+        leaders.append(p)
+    for p in leaders:
+        p.join()

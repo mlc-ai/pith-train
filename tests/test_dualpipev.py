@@ -27,7 +27,7 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeModel,
     Qwen35MoeTopKRouter,
 )
-from pithtrain.modules.distributed import DistributedCfg, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 
 
 def fill_weights(module: nn.Module):
@@ -419,8 +419,8 @@ def _entry() -> None:
     cfg.distributed.pipeline_parallel_size = parsed.pp_size
     cfg.distributed.expert_parallel_size = parsed.ep_size
 
-    with distributed_context(cfg):
-        main(parsed.model)
+    setup_distributed(cfg)
+    main(parsed.model)
 
 
 if __name__ == "__main__":

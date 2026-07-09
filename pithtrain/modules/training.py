@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import gc
 import math
 import random
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Generator, Literal, Optional, Union
+from typing import Callable, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -21,7 +19,7 @@ from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
 from pithtrain.models.gpt_oss import GptOssModel
@@ -58,7 +56,7 @@ def is_muon_param(name: str, param: torch.Tensor) -> bool:
 
 
 def make_muon_optimizer(
-    cfg: TrainingCfg, ctx: TrainingCtx, *, weight_decay: float = 0.1
+    cfg: TrainingCfg, *, weight_decay: float = 0.1
 ) -> tuple[Optimizer, ...]:
     """
     Muon for the 2D hidden weights, AdamW for the rest (the :func:`is_muon_param`
@@ -66,7 +64,7 @@ def make_muon_optimizer(
     both: decaying the RMSNorm gamma keeps per-layer output RMS from blowing up.
     """
     muon_params, adamw_params = [], []
-    for name, param in ctx.model.named_parameters():
+    for name, param in training.model.named_parameters():
         if not param.requires_grad:
             continue
         if is_muon_param(name, param):
@@ -78,16 +76,15 @@ def make_muon_optimizer(
 
 
 def make_adamw_optimizer(
-    cfg: TrainingCfg, ctx: TrainingCtx, *, weight_decay: float = 0.1
+    cfg: TrainingCfg, *, weight_decay: float = 0.1
 ) -> tuple[Optimizer, ...]:
     """AdamW over all parameters."""
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
-    return (AdamW(ctx.model.parameters(), **kwargs),)
+    return (AdamW(training.model.parameters(), **kwargs),)
 
 
 def make_wsd_scheduler(
     cfg: TrainingCfg,
-    ctx: TrainingCtx,
     *,
     start_lr: float = 0.0,
     warmup_ratio: float = 0.0,
@@ -124,12 +121,12 @@ def make_wsd_scheduler(
             case "linear":
                 return 1.0 + (final_factor - 1.0) * t
 
-    return tuple(LambdaLR(opt, lr_lambda) for opt in ctx.optimizers)
+    return tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers)
 
 
-def make_constant_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> tuple[LRScheduler, ...]:
+def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
     """Hold lr constant for the whole run: no warmup, no decay."""
-    return tuple(LambdaLR(opt, lambda _: 1.0) for opt in ctx.optimizers)
+    return tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers)
 
 
 @dataclass(init=False, slots=True)
@@ -159,7 +156,7 @@ class TrainingCfg(SlottedDefault):
     Gradients will be accumulated over multiple micro-batches to achieve this batch size.
     """
 
-    optimizer: Callable[[TrainingCfg, TrainingCtx], tuple[Optimizer, ...]]
+    optimizer: Callable[[TrainingCfg], tuple[Optimizer, ...]]
     """
     Builder for the optimizer(s). Use a built-in below or make your own:
 
@@ -167,7 +164,7 @@ class TrainingCfg(SlottedDefault):
     * :func:`make_adamw_optimizer`: AdamW over all parameters.
     """
 
-    scheduler: Callable[[TrainingCfg, TrainingCtx], tuple[LRScheduler, ...]]
+    scheduler: Callable[[TrainingCfg], tuple[LRScheduler, ...]]
     """
     Builder for the scheduler(s), one per optimizer. Use a built-in below or make your own:
 
@@ -292,29 +289,11 @@ class TrainingCfg(SlottedDefault):
     """
 
 
-@dataclass(init=False, slots=True)
-class TrainingCtx:
-    dataset: ConcatDataset
-    """The concatenated dataset for training."""
-
-    model: DualPipeV
-    """The model being trained."""
-
-    optimizers: tuple[Optimizer, ...]
-    """Optimizer(s): Muon composes two (Muon + AdamW); AdamW is a 1-tuple."""
-
-    schedulers: tuple[LRScheduler, ...]
-    """Scheduler(s), one per optimizer (same warmup/decay shape)."""
-
-    step: int
-    """The current training step."""
-
-
-def setup_dataset(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
+def setup_dataset(cfg: TrainingCfg) -> None:
     memmap_datasets = []
     for file in sorted(cfg.dataset.rglob("*.bin")):
         memmap_datasets.append(MemmapDataset(file, cfg.sequence_length))
-    ctx.dataset = ConcatDataset(memmap_datasets, cfg.seed)
+    training.dataset = ConcatDataset(memmap_datasets, cfg.seed)
 
 
 def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> None:
@@ -417,7 +396,6 @@ def apply_fsdp(
 
 def setup_model(
     cfg: TrainingCfg,
-    ctx: TrainingCtx,
     distributed_cfg: DistributedCfg,
 ) -> None:
     from pithtrain.dualpipe.utils import FP8WeightCacheControl
@@ -519,27 +497,20 @@ def setup_model(
             if hasattr(module, "router_replay"):
                 module.router_replay = force_balance(module.num_experts)
 
-    ctx.model = DualPipeV(modules)
+    training.model = DualPipeV(modules)
     set_p2p_tensor_shapes([(micro_batch_size, local_seq_len, hidden_size)])
     set_p2p_tensor_dtype(torch.bfloat16)
 
 
-@contextmanager
-def training_context(cfg: object, ctx: object) -> Generator[TrainingCtx, None, None]:
-    """Context manager for training."""
+def setup_training(cfg: object) -> None:
+    """Populate the training runtime state: dataset, model, optimizers, schedulers."""
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
-    assert hasattr(ctx, "training") and isinstance(ctx.training, TrainingCtx)
-    ctx.training.step = 0
-    setup_dataset(cfg.training, ctx.training)
+    training.step = 0
+    setup_dataset(cfg.training)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, ctx.training, cfg.distributed)
-    ctx.training.optimizers = cfg.training.optimizer(cfg.training, ctx.training)
-    ctx.training.schedulers = cfg.training.scheduler(cfg.training, ctx.training)
-    try:
-        gc.disable()
-        yield ctx.training
-    finally:
-        gc.enable()
+    setup_model(cfg.training, cfg.distributed)
+    training.optimizers = cfg.training.optimizer(cfg.training)
+    training.schedulers = cfg.training.scheduler(cfg.training)
