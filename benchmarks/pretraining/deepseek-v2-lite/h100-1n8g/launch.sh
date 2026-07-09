@@ -11,7 +11,7 @@ SRUN_ARGS+=(--nodes=1 --gpus-per-node=8)
 SRUN_ARGS+=(--wait=0 --time=00-01:00:00)
 
 STEP=benchmarks/pretraining/deepseek-v2-lite/setup
-srun ${SRUN_ARGS[@]} --output workspace/logging/$STEP.log $STEP.py
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.py
 
 STEP=benchmarks/pretraining/deepseek-v2-lite/h100-1n8g/pp1-dp1-cp1-ep8-seq2048-bf16
-srun ${SRUN_ARGS[@]} --output workspace/logging/$STEP.log $STEP.sh
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh

@@ -10,7 +10,7 @@ export PYTHONUNBUFFERED=1
 
 # Launch the conversion.
 SCRIPT=examples/convert_checkpoint/$1/script.py
-OUTPUT=workspace/logging/convert_checkpoint/${1}.log
+OUTPUT=logging/convert_checkpoint/${1}.log
 
 mkdir -p $(dirname $OUTPUT) && exec > >(tee $OUTPUT) 2>&1
 python3 $SCRIPT
