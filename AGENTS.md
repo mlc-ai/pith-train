@@ -33,7 +33,7 @@ pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
-pytest tests/operators/test_ring_attention.py tests/test_layer_partition.py -v
+pytest tests/operators/test_ring_attention.py -v
 
 # Single test function
 pytest tests/test_fp8_quantize_kernels.py::test_name -v
@@ -83,6 +83,8 @@ The core pipeline assigns each rank two model chunks in a V-shape (the model is 
 4. **Combine** — All-to-all gather expert outputs (async on comm stream)
 5. **Aggregate** — Weighted expert output + residual connection
 
+Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `DecoderLayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/dualpipe/execution.py`), not layer methods.
+
 Key files:
 - `dualpipev.py` — Main scheduler: `DualPipeV.step()` orchestrates overlapped F/B across modules. Supports `forward_only=True` for inference.
 - `overlap.py` — `overlapped_forward_backward()` interleaved loop for one pair of micro-batches
@@ -94,7 +96,7 @@ Key files:
 
 ### FP8 Training
 
-`ModelImplMode.fp8_training` in `pithtrain/layers/factory.py` selects the linear-layer backend (currently `"deep-gemm"` or BF16 fallback). The DeepGEMM path (`pithtrain/layers/deepgemm_fp8_linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_fp8_quantize.py`. The BF16 grouped linear layer is in `pithtrain/layers/group_linear.py`.
+`TrainingCfg.fp8` selects the linear-layer backend: at training setup it binds `training.Linear` / `training.GroupedLinear` to the FP8 or BF16 classes. The DeepGEMM path (`pithtrain/operators/linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_quantize.py`. The BF16 grouped linear layer is in `pithtrain/operators/grouped_linear.py`.
 
 ### Distributed Parallelism (`pithtrain/modules/distributed.py`)
 
@@ -104,6 +106,18 @@ Four dimensions: Pipeline Parallel (PP), Expert Parallel (EP), Context Parallel 
 
 Models implement `ModelProtocol` with layers that expose `forward_attn`, `forward_mlp`, `forward_aggregate` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2_lite.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
 
+### Tensor Layouts & Sequence Packing
+
+The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through embeddings, norms, attention, MoE, residuals, the P2P activations between pipeline stages, and the loss. Nothing outside attention is aware of packing.
+
+**Packed / variable-length (SFT) training** enforces `micro_batch_size == 1`. A micro-batch is `(1, S, hidden)` where `S` is the total token count and several documents are concatenated along the `S` axis; a per-sample `cu_seqlens` (int32 cumulative document offsets `[0, …, S]`) marks the boundaries. So the residual stream is semantically `TD` (`T = S` tokens × `hidden`) wearing a batch-of-one BSHD coat — kept 3-D on purpose so (a) every BSHD-assuming module (norm, MoE, embed, loss, P2P) is untouched and (b) DualPipeV can still micro-batch by scattering on `batch_dim=0` (the `B=1` is that seam).
+
+**THD is confined to the attention kernel.** Only attention reshapes `(1, S, H, D) → (S, H, D)` (`squeeze(0)`) to hand FlashAttention-4's varlen entry (`operators/flash_attn_v4.py:flash_attn_varlen_func`) a flat `(total_tokens, H, D)` tensor plus `cu_seqlens`, then `unsqueeze(0)` back. Attention dispatches on `cu_seqlens is None` (dense causal) vs set (block-diagonal varlen). `max_seqlen` is passed as `S` — a compile-safe upper bound; FA4 schedules work off `cu_seqlens`, so over-allocating it is free and avoids a per-call device sync.
+
+**Positions**: `forward_posemb(S, cu_seqlens)` builds per-document-reset positions when packed. Because RoPE is relative and the mask is block-diagonal, at `cp_size == 1` this reset is bit-identical to contiguous global positions — it becomes load-bearing only under context parallelism (deferred). **Loss**: boundary/prompt tokens are masked with `-100` (no separate loss-mask tensor) and the loss is token-weighted (the criterion returns the summed loss; the step divides by the global non-ignored token count).
+
+`cu_seqlens` is broadcast along the PP group in `DualPipeV.step` and then threaded through the pipeline as an explicit forward argument (a sibling of `rotary_posemb`, not a module attribute), consumed only by attention and the per-document position reset in `forward_posemb`. The model, engine, and loss support variable-length packing for qwen3, deepseek-v2-lite, and gpt-oss, validated with synthetic `cu_seqlens` via `PACKED_SEQLEN=1 bash tests/test_dualpipev.sh <config>`; qwen3.5 (Gated DeltaNet) is pre-training only and asserts `cu_seqlens is None`. The packed **data pipeline** — turning a tokenized corpus into `cu_seqlens`-bearing samples, and choosing whole-document packing — is a deferred follow-up; no training entrypoint sets `cu_seqlens` yet, so pretraining is the only live data path.
+
 ### Optimized Operators (`pithtrain/operators/`)
 
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
@@ -112,7 +126,7 @@ Models implement `ModelProtocol` with layers that expose `forward_attn`, `forwar
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
-- **FP8 Quantization** (`deepgemm_fp8_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization
+- **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization
 - **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`
 
 Each operator ships a PyTorch reference impl for correctness testing.

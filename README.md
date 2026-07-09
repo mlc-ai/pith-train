@@ -89,11 +89,9 @@ PithTrain is structured in three layers:
   - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
 - **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton).
 
-For a developer-level tour of the system — the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc. — see [`docs/architecture.md`](docs/architecture.md).
-
 ## Contributing
 
-Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc.
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc. For a developer-level tour of the system — the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc. — see [`docs/architecture.md`](docs/architecture.md).
 
 ## Acknowledgement
 
