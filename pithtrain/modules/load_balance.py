@@ -35,6 +35,9 @@ class MoELoadBalanceLossInjector(torch.autograd.Function):
         return grad_output, torch.ones_like(lb_loss)
 
 
+torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
+
+
 class MicroBatchLoadBalanceLoss:
     """
     Micro-batch load balance loss (https://arxiv.org/abs/2101.03961).
