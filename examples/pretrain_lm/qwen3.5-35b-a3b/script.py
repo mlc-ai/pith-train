@@ -3,14 +3,11 @@
 from functools import partial
 from pathlib import Path
 
-from pithtrain.modules.logging import LoggingWandbCfg  # noqa: F401
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
-# Fits a single 8-GPU H200/B200 node. On 8xH100 (80GB) this does not fit; use
-# two nodes with pp=2, ep=8 (16 GPUs). Context parallelism isn't supported yet.
 distributed = cfg.distributed
 distributed.context_parallel_size = 1
 distributed.pipeline_parallel_size = 1
@@ -32,13 +29,6 @@ training.moe_load_balance_coef = 1e-3
 training.fp8 = False
 training.save_interval = 256
 training.save_location = Path("workspace/checkpoints/qwen3.5-35b-a3b")
-
-# Wandb logging configuration. Comment out to disable.
-logging = cfg.logging
-logging.wandb = LoggingWandbCfg()
-logging.wandb.entity = ""  # your wandb entity
-logging.wandb.project = ""  # your wandb project
-logging.wandb.name = "qwen3.5-35b-a3b"
 
 if __name__ == "__main__":
     launch(cfg)

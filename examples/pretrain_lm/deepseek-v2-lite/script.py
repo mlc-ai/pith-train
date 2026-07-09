@@ -3,7 +3,6 @@
 from functools import partial
 from pathlib import Path
 
-from pithtrain.modules.logging import LoggingWandbCfg  # noqa: F401
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
@@ -30,13 +29,6 @@ training.moe_load_balance_coef = 3e-3
 training.fp8 = False
 training.save_interval = 256
 training.save_location = Path("workspace/checkpoints/deepseek-v2-lite")
-
-# Wandb logging configuration. Comment out to disable.
-logging = cfg.logging
-logging.wandb = LoggingWandbCfg()
-logging.wandb.entity = ""  # your wandb entity
-logging.wandb.project = ""  # your wandb project
-logging.wandb.name = "deepseek-v2-lite"
 
 if __name__ == "__main__":
     launch(cfg)

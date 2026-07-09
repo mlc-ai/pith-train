@@ -1,7 +1,6 @@
 from functools import partial
 from pathlib import Path
 
-from pithtrain.modules.logging import LoggingWandbCfg  # noqa: F401
 from pithtrain.modules.training import make_muon_optimizer, make_wsd_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
@@ -25,11 +24,6 @@ cfg.training.moe_load_balance_type = "global-batch"
 cfg.training.moe_load_balance_coef = 1e-3
 cfg.training.save_interval = 256
 cfg.training.save_location = Path("workspace/checkpoints/gpt-oss-120b")
-
-# cfg.logging.wandb = LoggingWandbCfg()
-# cfg.logging.wandb.entity = "your-entity"
-# cfg.logging.wandb.project = "gpt-oss-120b"
-# cfg.logging.wandb.name = "gpt-oss-120b-pretrain"
 
 if __name__ == "__main__":
     launch(cfg)
