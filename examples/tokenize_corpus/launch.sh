@@ -13,7 +13,7 @@ export PYTHONUNBUFFERED=1
 
 # Launch the tokenization.
 SCRIPT=examples/tokenize_corpus/$1/script.py
-OUTPUT=workspace/logging/tokenize_corpus/${1}_node${SLURM_NODEID:-0}.log
+OUTPUT=logging/tokenize_corpus/${1}_node${SLURM_NODEID:-0}.log
 
 mkdir -p $(dirname $OUTPUT) && exec > >(tee $OUTPUT) 2>&1
 python3 $SCRIPT
