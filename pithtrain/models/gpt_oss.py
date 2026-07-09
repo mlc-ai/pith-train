@@ -11,7 +11,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.dualpipev import layer_partition
 from pithtrain.dualpipe.execution import ChunkRecord, record_forward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl
-from pithtrain.models.interface import MoERouting
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fused_blockwise_transpose_cast_to_fp8_batched
@@ -243,7 +243,7 @@ class GptOssDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         return hidden_states, residual
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         hidden_states, residual = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)
         topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states)
         if lb_loss is not None:

@@ -8,7 +8,7 @@ class AllToAllSplits(NamedTuple):
     output_splits: List[int]
 
 
-class MoERouting(NamedTuple):
+class RoutingInfo(NamedTuple):
     topk_weight: torch.Tensor
     expert_idxs: torch.Tensor
     moe_local_idxs: Optional[torch.Tensor] = None
@@ -45,7 +45,7 @@ class LayerProtocol(Protocol):
         Reference forward implementation for correctness validation.
         """
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[MoERouting]]:
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[RoutingInfo]]:
         """
         Stage 1, the pre-dispatch compute (runs before the stage-2 dispatch).
         Run the attention sublayer and shared experts, then route tokens to experts and prepare the dispatch (MoE layers).

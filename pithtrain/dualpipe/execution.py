@@ -18,7 +18,7 @@ import torch.distributed
 
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe.utils import WeightGradStore, run_backward
-from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, MoERouting
+from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 
@@ -311,7 +311,7 @@ class Stage5Record:
     outs: Stage5Outs
 
 
-def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[MoERouting], residual: torch.Tensor):
+def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor):
     """Stage5 forward."""
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
@@ -353,7 +353,7 @@ def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad
 # ------------------------------------------------------------
 
 
-def stage5_and_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[MoERouting], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):
+def stage5_and_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):
     """
     Merged Stage5 and Stage1 forward.
     Returns (stage5_args, stage1_outs, dispatch_tokens, residual, routing) for the next layer.
