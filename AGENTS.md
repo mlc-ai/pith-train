@@ -96,7 +96,7 @@ Key files:
 
 ### FP8 Training
 
-`ModelImplMode.fp8_training` in `pithtrain/layers/factory.py` selects the linear-layer backend (currently `"deep-gemm"` or BF16 fallback). The DeepGEMM path (`pithtrain/operators/linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_quantize.py`. The BF16 grouped linear layer is in `pithtrain/operators/grouped_linear.py`.
+`TrainingCfg.fp8` selects the linear-layer backend: at training setup it binds `training.Linear` / `training.GroupedLinear` to the FP8 or BF16 classes. The DeepGEMM path (`pithtrain/operators/linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_quantize.py`. The BF16 grouped linear layer is in `pithtrain/operators/grouped_linear.py`.
 
 ### Distributed Parallelism (`pithtrain/modules/distributed.py`)
 

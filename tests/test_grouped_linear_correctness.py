@@ -665,7 +665,9 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     hidden_size = 128
     intermediate_size = 256
     swiglu_limit = 7.0
-    config = SimpleNamespace(hidden_size=hidden_size, intermediate_size=intermediate_size, swiglu_limit=swiglu_limit)
+    config = SimpleNamespace(
+        hidden_size=hidden_size, intermediate_size=intermediate_size, swiglu_limit=swiglu_limit
+    )
 
     # Random routing with one empty group to exercise the zero-token branch.
     group_sizes = [8, 0, 12, 4]

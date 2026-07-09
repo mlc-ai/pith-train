@@ -209,7 +209,9 @@ class DualPipeV(nn.Module):
         # Set pre-allocated chunk_record on module to avoid FSDP kwarg handling issues
         chunk_record = self.chunk_records[phase][chunk_id]
         self.module[phase].chunk_record = chunk_record
-        cu_seqlens = self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
+        cu_seqlens = (
+            self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
+        )
         outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
@@ -282,7 +284,9 @@ class DualPipeV(nn.Module):
         self.current_f_chunk_id[phase0] += 1
         module0 = self.module[phase0]
         inputs0 = self.input_chunks[phase0][chunk_id0]
-        cu_seqlens0 = self.cu_seqlens_chunks[chunk_id0] if self.cu_seqlens_chunks is not None else None
+        cu_seqlens0 = (
+            self.cu_seqlens_chunks[chunk_id0] if self.cu_seqlens_chunks is not None else None
+        )
         is_last_stage0 = self.is_first_pp_rank and phase0 == 1
 
         if is_last_stage0 and self.criterion is not None:

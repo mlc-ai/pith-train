@@ -161,9 +161,7 @@ def _entry():
     # Reduced config + checkpoint dir on local scratch (rank 0 writes).
     scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
     if torch.distributed.get_rank() == 0:
-        print(
-            f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True
-        )
+        print(f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True)
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True)
         src = Path(__file__).resolve().parent.parent / MODELS[parsed.model]

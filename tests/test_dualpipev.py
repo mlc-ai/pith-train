@@ -192,7 +192,7 @@ def main(model_name: str):
     dtype = torch.bfloat16
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
-    micro_batch_size = 1 if packed else 3 # packing pins mbs to 1
+    micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
     num_chunks, sequence_length = 20, 128
 
     config_path = Path(__file__).resolve().parent.parent / model_name
