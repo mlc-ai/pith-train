@@ -5,7 +5,7 @@ import torch.nn as nn
 
 
 class ForwardAttnOutput(NamedTuple):
-    """Output from the forward_attn method of a decoder layer."""
+    """Output from the forward_stage1 method of a decoder layer."""
 
     sorted_tokens: torch.Tensor
     moe_local_idxs: torch.Tensor
@@ -42,13 +42,13 @@ class DecoderLayerProtocol(Protocol):
     ) -> torch.Tensor:
         """Reference forward implementation for correctness validation."""
 
-    def forward_attn(
+    def forward_stage1(
         self,
         hidden_states: torch.Tensor,
     ) -> ForwardAttnOutput:
         """LN + Attn + LN + Expert selection."""
 
-    def forward_mlp(
+    def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
@@ -56,7 +56,7 @@ class DecoderLayerProtocol(Protocol):
     ) -> torch.Tensor:
         """MLP forward."""
 
-    def forward_aggregate(
+    def forward_stage5(
         self,
         moe_outs: torch.Tensor,
         moe_local_idxs: Optional[torch.Tensor],

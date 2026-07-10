@@ -384,7 +384,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def _forward_attn_compute(
+    def _forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
     ):
@@ -393,7 +393,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         position_embeddings = getattr(self, "_position_embeddings", None)
         if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
+            raise RuntimeError("Position embeddings must be set before calling forward_stage1")
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -409,12 +409,12 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_attn(
+    def forward_stage1(
         self,
         hidden_states: torch.Tensor,
     ):
         """LN + Attn + LN + Expert selection"""
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
+        hidden_states, residual = self._forward_stage1_compute(hidden_states)
 
         assert isinstance(self.mlp, (DeepseekV2LiteMLP, DeepseekV2LiteMoEWithGroupGeMM))
         if isinstance(self.mlp, DeepseekV2LiteMLP):
@@ -459,7 +459,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
             dedup_output_splits,
         )
 
-    def forward_mlp(
+    def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
@@ -482,7 +482,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         return outs
 
     @torch.compile(fullgraph=True)
-    def forward_aggregate(
+    def forward_stage5(
         self,
         moe_outs: torch.Tensor,
         moe_local_idxs: Optional[torch.Tensor],
@@ -491,7 +491,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
     ):
         """
         Weighted expert output + residual connection.
-        Shared expert output is already folded into residual by forward_attn.
+        Shared expert output is already folded into residual by forward_stage1.
         """
 
         def moe_finalize(moe_outs, moe_local_idxs, topk_weight) -> torch.Tensor:

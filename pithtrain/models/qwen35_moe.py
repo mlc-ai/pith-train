@@ -433,7 +433,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def _forward_attn_compute(self, hidden_states: torch.Tensor):
+    def _forward_stage1_compute(self, hidden_states: torch.Tensor):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear:
@@ -450,17 +450,17 @@ class Qwen35MoeDecoderLayer(nn.Module):
         residual = residual + self.mlp.shared_out(hidden_states)
         return hidden_states, residual
 
-    def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
+    def forward_stage1(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
         """
         Stage 1: LN + mixer + LN + shared expert + routing/dispatch prep.
         """
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
+        hidden_states, residual = self._forward_stage1_compute(hidden_states)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
         sorted_tokens, idxs, expert_idxs, expand_idx, dedup_input_splits, dedup_output_splits, input_splits, output_splits = moe_ep_prepare_dispatch(hidden_states, topk_ids, self.mlp.num_experts, self.mlp.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return ForwardAttnOutput(sorted_tokens, idxs, topk_weight, output_splits, input_splits, expert_idxs, residual, expand_idx, dedup_input_splits, dedup_output_splits)
 
-    def forward_mlp(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_stage3(self, gathered_tokens: torch.Tensor, expert_idxs: Optional[torch.Tensor] = None, expand_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Stage 3: scatter-by-expert + grouped GEMM + unshuffle.
         """
@@ -474,7 +474,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         return outs
 
     @torch.compile(fullgraph=True)
-    def forward_aggregate(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor) -> torch.Tensor:
+    def forward_stage5(self, moe_outs: torch.Tensor, moe_local_idxs: Optional[torch.Tensor], topk_weight: Optional[torch.Tensor], residual: torch.Tensor) -> torch.Tensor:
         """
         Stage 5: weighted expert sum + residual (shared expert already in residual).
         """

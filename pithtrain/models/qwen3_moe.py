@@ -418,9 +418,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
     Decoder layer for Qwen3 MoE model.
 
     Implements the required protocol methods for DualPipeV:
-    - forward_attn: LN + Attn + LN + Expert selection
-    - forward_mlp: MLP/Expert computation
-    - forward_aggregate: Weighted expert output + residual
+    - forward_stage1: LN + Attn + LN + Expert selection
+    - forward_stage3: MLP/Expert computation
+    - forward_stage5: Weighted expert output + residual
     - reference_forward: Standard forward pass
     """
 
@@ -478,7 +478,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def _forward_attn_compute(
+    def _forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
     ):
@@ -487,7 +487,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         position_embeddings = getattr(self, "_position_embeddings", None)
         if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
+            raise RuntimeError("Position embeddings must be set before calling forward_stage1")
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -500,12 +500,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_attn(
+    def forward_stage1(
         self,
         hidden_states: torch.Tensor,
     ) -> ForwardAttnOutput:
         """LN + Attn + LN + Expert selection."""
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
+        hidden_states, residual = self._forward_stage1_compute(hidden_states)
 
         if isinstance(self.mlp, Qwen3MoeMLP):
             return ForwardAttnOutput(
@@ -550,7 +550,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             dedup_output_splits,
         )
 
-    def forward_mlp(
+    def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
@@ -573,7 +573,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return outs
 
     @torch.compile(fullgraph=True)
-    def forward_aggregate(
+    def forward_stage5(
         self,
         moe_outs: torch.Tensor,
         moe_local_idxs: Optional[torch.Tensor],

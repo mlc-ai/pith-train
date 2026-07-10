@@ -504,13 +504,13 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def _forward_attn_compute(self, hidden_states: torch.Tensor):
+    def _forward_stage1_compute(self, hidden_states: torch.Tensor):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         position_embeddings = getattr(self, "_position_embeddings", None)
         if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
+            raise RuntimeError("Position embeddings must be set before calling forward_stage1")
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -523,8 +523,8 @@ class GptOssDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
+    def forward_stage1(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
+        hidden_states, residual = self._forward_stage1_compute(hidden_states)
 
         topk_ids, topk_weight = self.mlp.router(hidden_states)
         (
@@ -558,7 +558,7 @@ class GptOssDecoderLayer(nn.Module):
             dedup_output_splits,
         )
 
-    def forward_mlp(
+    def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
@@ -576,7 +576,7 @@ class GptOssDecoderLayer(nn.Module):
         return outs
 
     @torch.compile(fullgraph=True)
-    def forward_aggregate(
+    def forward_stage5(
         self,
         moe_outs: torch.Tensor,
         moe_local_idxs: Optional[torch.Tensor],
