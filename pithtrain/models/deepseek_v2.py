@@ -1,4 +1,4 @@
-"""deepseek-ai/DeepSeek-V2."""
+"""deepseek-ai/DeepSeek-V2 and deepseek-ai/DeepSeek-V2-Lite."""
 
 import math
 

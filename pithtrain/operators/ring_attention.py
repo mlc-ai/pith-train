@@ -72,7 +72,7 @@ from pithtrain.operators.deepgemm_quantize import (
 
 # FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
 # decompression; reached only when the caller passes a quantized kv_b weight
-# (i.e. fp8=True).
+# (i.e. training.fp8 enabled).
 from pithtrain.operators.linear import fp8_act_weight_gemm, fp8_dgrad_wgrad
 
 
@@ -286,7 +286,7 @@ def zigzag_backward(
 # The ring forward/backward are wrapped as torch.library.custom_op so torch.compile sees
 # the whole ring -- P2P collectives, flash kernels, online-softmax merge -- as one black
 # box, exactly like the FA4 kernels in flash_attn_v4.py. This lets the decoder layer keep
-# `_forward_stage1_compute` under @torch.compile(fullgraph=True) even under context
+# `_forward_attention_compute` under @torch.compile(fullgraph=True) even under context
 # parallelism (Dynamo fuses the surrounding LN/RoPE/residual and emits an opaque call for
 # the ring) instead of falling back to eager. The collectives never enter the Inductor
 # graph; the op body runs eagerly at runtime.
@@ -948,7 +948,7 @@ def mla_ring_attention_func(
         Rotated around the ring alongside normed_kv.
     kv_b_weight : torch.Tensor
         kv_b projection weight, shape [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank].
-        FSDP-gathered (full) inside forward_stage1; its gradient is reduced across CP by FSDP.
+        FSDP-gathered (full) inside forward_attention; its gradient is reduced across CP by FSDP.
     sm_scale : float
         Softmax scale, typically q_head_dim ** -0.5.
     qk_nope_head_dim, v_head_dim : int

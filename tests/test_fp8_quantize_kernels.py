@@ -1,7 +1,7 @@
 """
 Correctness tests for Triton FP8 quantization kernels.
 
-Compares each Triton kernel in ``pithtrain.operators.deepgemm_fp8_quantize``
+Compares each Triton kernel in ``pithtrain.operators.deepgemm_quantize``
 against the reference pure-PyTorch implementation in ``deep_gemm.utils.math``.
 
 Tests are skipped when ``deep_gemm`` is not installed or CUDA is unavailable.
@@ -66,7 +66,7 @@ def _make_bf16(shape, device="cuda"):
 )
 def test_fused_per_token_per_channel(M, N):
     """Fused per_token+per_channel matches calling the two kernels separately."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_rowwise_colwise_cast_to_fp8,
     )
 
@@ -104,7 +104,7 @@ def test_fused_per_token_per_channel(M, N):
 @requires_cuda
 def test_fused_per_token_per_channel_all_zeros():
     """Fused kernel handles all-zero input (scale clamp prevents div-by-zero)."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_rowwise_colwise_cast_to_fp8,
     )
 
@@ -138,7 +138,7 @@ def test_fused_per_token_per_channel_all_zeros():
 )
 def test_fused_per_token_and_transpose(M, N):
     """Fused per_token+transpose matches calling per_token on x and x.T separately."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_rowwise_transpose_cast_to_fp8,
     )
 
@@ -173,7 +173,7 @@ def test_fused_per_token_and_transpose(M, N):
 @requires_cuda
 def test_fused_per_token_and_transpose_all_zeros():
     """Fused transpose kernel handles all-zero input."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_rowwise_transpose_cast_to_fp8,
     )
 
@@ -209,7 +209,7 @@ def test_fused_per_token_and_transpose_all_zeros():
 )
 def test_fused_per_token_and_per_block_transpose(M, K):
     """Fused per_token+per_block_transpose matches separate per_token(x) + per_block(x.T)."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_rowwise_blockwise_transpose_cast_to_fp8,
     )
 
@@ -244,7 +244,7 @@ def test_fused_per_token_and_per_block_transpose(M, K):
 @requires_cuda
 def test_fused_per_token_and_per_block_transpose_all_zeros():
     """Fused per_token+per_block_transpose handles all-zero input."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_rowwise_blockwise_transpose_cast_to_fp8,
     )
 
@@ -279,7 +279,7 @@ def test_fused_per_token_and_per_block_transpose_all_zeros():
 )
 def test_fused_per_block_and_transpose(M, K):
     """Fused per_block+transpose matches separate per_block(x) + per_block(x.T)."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_blockwise_transpose_cast_to_fp8,
     )
 
@@ -313,7 +313,7 @@ def test_fused_per_block_and_transpose(M, K):
 @requires_cuda
 def test_fused_per_block_and_transpose_all_zeros():
     """Fused per_block+transpose handles all-zero input (finite scales)."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_blockwise_transpose_cast_to_fp8,
     )
 
@@ -338,7 +338,7 @@ def test_fused_per_block_and_transpose_all_zeros():
 )
 def test_fused_per_block_and_transpose_scale_symmetry(M, K):
     """Verifies scale == scale_t.T for the fused per_block+transpose kernel."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_blockwise_transpose_cast_to_fp8,
     )
 
@@ -370,7 +370,7 @@ def test_fused_per_block_and_transpose_scale_symmetry(M, K):
 )
 def test_fused_per_block_and_transpose_batched(G, N, K):
     """Fused batched per_block+transpose matches separate per_block calls per group."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_blockwise_transpose_cast_to_fp8_batched,
     )
 
@@ -416,7 +416,7 @@ def test_fused_per_block_and_transpose_batched(G, N, K):
 @requires_cuda
 def test_fused_per_block_and_transpose_batched_all_zeros():
     """Fused batched per_block+transpose handles all-zero input (finite scales)."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_blockwise_transpose_cast_to_fp8_batched,
     )
 
@@ -440,7 +440,7 @@ def test_fused_per_block_and_transpose_batched_all_zeros():
 )
 def test_fused_per_block_and_transpose_batched_scale_symmetry(G, N, K):
     """Verifies scale == scale_t.transpose(1,2) for the batched fused kernel."""
-    from pithtrain.operators.deepgemm_fp8_quantize import (
+    from pithtrain.operators.deepgemm_quantize import (
         fused_blockwise_transpose_cast_to_fp8_batched,
     )
 

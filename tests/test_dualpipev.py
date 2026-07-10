@@ -369,8 +369,9 @@ def main(model_name: str):
             largest_diff = diff
             largest_diff_param = n
         # A_log (gated-delta decay) backprops through exp() over the full linear-attention
-        # recurrence, so its bf16 reference grad diverges from the fp32 pipeline by more than
-        # the softmax-attention eps. Give that one parameter a looser bound.
+        # recurrence; its tiny grad is dominated by the non-deterministic bf16 scatter-add /
+        # all-to-all accumulation, so its cosine-diff vs the reference varies run-to-run
+        # (~0.005-0.016) and can exceed the softmax-attention eps. Give it a looser bound.
         param_eps = 3e-2 if n.endswith("linear_attn.A_log") else eps
         if diff > param_eps:
             failed = True

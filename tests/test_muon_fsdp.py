@@ -27,10 +27,10 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate
 from torch.optim import AdamW
 
-from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.training import is_muon_param
+from pithtrain.operators.grouped_linear import GroupedLinear
 
 NUM_EXPERTS = 8  # divisible by the EP sizes we test (1, 2, 4)
 
@@ -53,10 +53,10 @@ class _Model(nn.Module):
     def __init__(self, num_experts: int):
         super().__init__()
         self.q_proj = nn.Linear(64, 48, bias=False)  # 2D -> Muon
-        self.experts = GroupLinear(num_experts, 64, 32)  # 3D experts -> Muon
+        self.experts = GroupedLinear(num_experts, 64, 32)  # 3D experts -> Muon
         self.norm = nn.LayerNorm(64)  # 1D weight + bias -> Adam
         self.embed_tokens = nn.Embedding(100, 64)  # 2D, name-excluded -> Adam
-        # GroupLinear uses torch.empty (the framework fills it via init_weights
+        # GroupedLinear uses torch.empty (the framework fills it via init_weights
         # before FSDP); init it here so the optimizer steps real values, not
         # uninitialized memory (differs per rank, would break the comparison).
         nn.init.normal_(self.experts.weight, std=0.02)

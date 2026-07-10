@@ -20,9 +20,9 @@ fp8: bool = False
 Linear: type[nn.Linear] = nn.Linear
 GroupedLinear: type[grouped_linear.GroupedLinear | grouped_linear.FP8GroupedLinear] = grouped_linear.GroupedLinear
 
-# Populated once at startup by the training setup.
 model: DualPipeV
 dataset: ConcatDataset
 optimizers: tuple[Optimizer, ...]
 schedulers: tuple[LRScheduler, ...]
+
 step: int

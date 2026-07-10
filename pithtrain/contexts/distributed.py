@@ -1,7 +1,11 @@
 """
-Distributed runtime state.
+Distributed runtime state, populated once at startup.
 
-Device mesh axes are ordered (PP, DP, CP, EP).
+Import the module and read fields in-line, not the names: a field does not exist until setup
+assigns it, so importing it up front fails and reading it early raises AttributeError.
+
+from pithtrain.contexts import distributed
+ep_group, ep_size = distributed.ep_group, distributed.ep_size
 """
 
 import torch

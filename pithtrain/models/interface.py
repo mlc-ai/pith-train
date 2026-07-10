@@ -73,6 +73,11 @@ class ModelProtocol(Protocol):
     stage_count: int
     layers: Dict[str, LayerProtocol]
 
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Reference forward implementation for correctness validation.
+        """
+
     def forward_posemb(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the (cos, sin) rotary embeddings for the tokens in this micro-batch.
@@ -86,9 +91,4 @@ class ModelProtocol(Protocol):
     def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Epilog compute (last stage only): final norm + lm_head projection to logits.
-        """
-
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Reference forward implementation for correctness validation.
         """
