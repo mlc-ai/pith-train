@@ -12,6 +12,7 @@ import torch
 
 rank: int; world_size: int
 local_rank: int; local_world_size: int
+device: torch.device
 
 device_mesh: torch.distributed.DeviceMesh
 pp_group: torch.distributed.ProcessGroup

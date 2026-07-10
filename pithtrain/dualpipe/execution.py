@@ -18,7 +18,7 @@ import torch.distributed
 
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe.utils import WeightGradStore, run_backward
-from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, MoERouting
+from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 
@@ -69,7 +69,7 @@ class Stage1Record:
     outs: Stage1Outs
 
 
-def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]):
+def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):
     """Stage1 forward."""
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
     record = Stage1Record()
@@ -78,7 +78,7 @@ def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tenso
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb)
+    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     topk_weight = routing.topk_weight if routing is not None else None
@@ -311,7 +311,7 @@ class Stage5Record:
     outs: Stage5Outs
 
 
-def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[MoERouting], residual: torch.Tensor):
+def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor):
     """Stage5 forward."""
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
@@ -353,7 +353,7 @@ def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad
 # ------------------------------------------------------------
 
 
-def stage5_and_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[MoERouting], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]):
+def stage5_and_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):
     """
     Merged Stage5 and Stage1 forward.
     Returns (stage5_args, stage1_outs, dispatch_tokens, residual, routing) for the next layer.
@@ -373,7 +373,7 @@ def stage5_and_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 
-    dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb)
+    dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     next_topk_weight = next_routing.topk_weight if next_routing is not None else None
@@ -520,7 +520,7 @@ def create_chunk_record(num_layers: int, has_prolog: bool, has_epilog: bool) -> 
 # ------------------------------------------------------------
 
 
-def decoder_layer_forward_dispatch(
+def layer_forward_dispatch(
     dispatch_tokens: torch.Tensor,
     dispatch_splits: Optional[AllToAllSplits],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -540,7 +540,7 @@ def decoder_layer_forward_dispatch(
     return gathered_tokens, a2a_ctx
 
 
-def decoder_layer_forward_combine(
+def layer_forward_combine(
     outs: torch.Tensor,
     combine_splits: Optional[AllToAllSplits],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -559,11 +559,12 @@ def decoder_layer_forward_combine(
     return outs, a2a_ctx
 
 
-def decoder_layer_forward(
+def layer_forward(
     layer: LayerProtocol,
     hidden_states: torch.Tensor,
     rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
     layer_record: LayerRecord,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ):
     """Forward pass for a DualPipeV decoder layer, recording each stage's tensors into ``layer_record`` for the pipeline backward."""
 
@@ -574,7 +575,7 @@ def decoder_layer_forward(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb)
+    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)
 
     has_experts = routing is not None
     ep_group = distributed.ep_group if has_experts else None
@@ -588,7 +589,7 @@ def decoder_layer_forward(
     # Stage 2.
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
-    gathered_tokens, record.ctx = decoder_layer_forward_dispatch(
+    gathered_tokens, record.ctx = layer_forward_dispatch(
         dispatch_tokens.detach(), routing.dispatch_splits if has_experts else None, ep_group
     )
     fwd_comm_work = getattr(gathered_tokens, "comm_work", None)
@@ -630,7 +631,7 @@ def decoder_layer_forward(
     # Stage 4.
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
-    moe_outs, record.ctx = decoder_layer_forward_combine(
+    moe_outs, record.ctx = layer_forward_combine(
         moe_outs.detach(), routing.combine_splits if has_experts else None, ep_group
     )
     fwd_comm_work = getattr(moe_outs, "comm_work", None)
@@ -662,7 +663,7 @@ def decoder_layer_forward(
     return hidden_states
 
 
-def decoder_layer_backward(
+def layer_backward(
     layer: LayerProtocol,
     dy: Optional[List[torch.Tensor]],
     loss: Optional[torch.Tensor],
@@ -799,6 +800,7 @@ def record_forward(
     module: ModelProtocol,
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Sequential (non-overlapped) forward for one pipeline chunk: prolog -> layers -> epilog.
@@ -808,9 +810,9 @@ def record_forward(
     if module.stage_index == 0:
         hidden_states = prolog_f(module, hidden_states, chunk_record.prolog)
 
-    rotary_posemb = module.forward_posemb(hidden_states)
+    rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens)
     for (_, layer), layer_record in zip(module.layers.items(), chunk_record.layers):
-        hidden_states = decoder_layer_forward(layer, hidden_states, rotary_posemb, layer_record)
+        hidden_states = layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens)
 
     if module.stage_index == module.stage_count - 1:
         hidden_states = epilog_f(module, hidden_states, chunk_record.epilog)
@@ -840,7 +842,7 @@ def record_backward(
     dx = dy
     layers = [layer for _, layer in module.layers.items()]
     for layer, layer_record in zip(reversed(layers), reversed(chunk_record.layers)):
-        dx = (decoder_layer_backward(layer, dx, loss, layer_record),)
+        dx = (layer_backward(layer, dx, loss, layer_record),)
 
     final_grads = dx
     if module.stage_index == 0:

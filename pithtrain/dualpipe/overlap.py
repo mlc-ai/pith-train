@@ -17,9 +17,9 @@ from pithtrain.dualpipe.execution import (
     ChunkRecord,
     ExecutionCtx,
     LayerRecord,
-    decoder_layer_backward,
-    decoder_layer_forward,
     epilog_f,
+    layer_backward,
+    layer_forward,
     prolog_b,
     prolog_f,
     stage1_b,
@@ -53,6 +53,7 @@ def overlapped_forward_backward(
     criterion0: Optional[Callable],
     labels0: Optional[List[torch.Tensor]],
     chunk_record0: ChunkRecord,
+    cu_seqlens0: Optional[torch.Tensor],
     module1: ModelProtocol,
     loss1: Optional[torch.Tensor],
     outputs1: Optional[List[torch.Tensor]],
@@ -68,6 +69,7 @@ def overlapped_forward_backward(
     module1_layers = [layer for _, layer in module1.layers.items()]
 
     (hidden_states,) = inputs0
+    cu_seqlens = cu_seqlens0
     # chunk_record0 is pre-allocated and passed in
     layer_idx0 = 0  # Index into chunk_record0.layers
 
@@ -105,10 +107,10 @@ def overlapped_forward_backward(
     if module0.stage_index == 0:
         hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog)
 
-    rotary_posemb = module0.forward_posemb(hidden_states)
+    rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens)
 
     record, dispatch_tokens, residual, routing = stage1_f(
-        ctx, module0_layers[0], hidden_states, rotary_posemb
+        ctx, module0_layers[0], hidden_states, rotary_posemb, cu_seqlens
     )
     chunk_record0.layers[layer_idx0].stage1.args = record.args
     chunk_record0.layers[layer_idx0].stage1.outs = record.outs
@@ -184,6 +186,7 @@ def overlapped_forward_backward(
                     routing,
                     residual,
                     rotary_posemb,
+                    cu_seqlens,
                 )
                 # Store stage5.args at prev layer (no outs -> merged indicator)
                 chunk_record0.layers[layer_idx0].stage5.args = stage5_args
@@ -206,7 +209,7 @@ def overlapped_forward_backward(
                 layer_idx0 += 1
                 # Module 0 layer l stage 1 forward
                 record, dispatch_tokens, residual, routing = stage1_f(
-                    ctx, module0_layers[l], hidden_states, rotary_posemb
+                    ctx, module0_layers[l], hidden_states, rotary_posemb, cu_seqlens
                 )
                 chunk_record0.layers[layer_idx0].stage1.args = record.args
                 chunk_record0.layers[layer_idx0].stage1.outs = record.outs
@@ -284,16 +287,17 @@ def overlapped_forward_backward(
 
     if len(module0.layers) == len(module1.layers) + 1:
         # There is an extra layer in module0 for forward
-        hidden_states = decoder_layer_forward(
+        hidden_states = layer_forward(
             module0_layers[-1],
             hidden_states,
             rotary_posemb,
             chunk_record0.layers[layer_idx0],
+            cu_seqlens,
         )
         layer_idx0 += 1
     elif len(module0.layers) + 1 == len(module1.layers):
         # There is an extra layer in module1 for backward
-        hidden_states_grad = decoder_layer_backward(
+        hidden_states_grad = layer_backward(
             module1_layers[0],
             (hidden_states_grad,),
             None,

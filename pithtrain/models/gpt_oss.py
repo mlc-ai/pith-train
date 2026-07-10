@@ -11,12 +11,12 @@ from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.dualpipev import layer_partition
 from pithtrain.dualpipe.execution import ChunkRecord, record_forward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl
-from pithtrain.models.interface import MoERouting
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
-from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
 from pithtrain.operators.token_scatter import (
@@ -206,14 +206,18 @@ class GptOssAttention(nn.Module):
         k_embed = (k * cos) + (GptOssAttention.rotate_half(k) * sin)
         return q_embed, k_embed
 
-    def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         B, S, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
         key_states = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
         window_size: tuple[int | None, int | None] = (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
-        attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=self.sinks.to(query_states.dtype))
+        sinks = self.sinks.to(query_states.dtype)
+        if cu_seqlens is not None:
+            attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=sinks).unsqueeze(0)
+        else:
+            attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True, window_size=window_size, learnable_sink=sinks)
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -230,17 +234,17 @@ class GptOssDecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]):
+    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, rotary_posemb)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         return hidden_states, residual
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
-        hidden_states, residual = self.forward_stage1_compute(hidden_states, rotary_posemb)
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+        hidden_states, residual = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)
         topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
@@ -267,10 +271,10 @@ class GptOssDecoderLayer(nn.Module):
         aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + aggregated.view(*residual.shape)
 
-    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, rotary_posemb)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -307,9 +311,14 @@ class GptOssModel(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict({str(i): GptOssDecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
-    def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        S = hidden_states.shape[1]
+    def forward_posemb(self, S: int, cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         cos, sin = self.rotary_emb(S)
+        if cu_seqlens is not None:
+            device = distributed.device
+            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
+            lengths = ends - starts
+            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
+            cos, sin = cos[position_ids], sin[position_ids]
         return cos.unsqueeze(0), sin.unsqueeze(0)
 
     def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -319,15 +328,15 @@ class GptOssModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return record_forward(self, hidden_states, self.chunk_record)
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        return record_forward(self, hidden_states, self.chunk_record, cu_seqlens)
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         if self.stage_index == 0:
             hidden_states = self.forward_prolog(hidden_states)
-        rotary_posemb = self.forward_posemb(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
         for _, layer in self.layers.items():
-            hidden_states = layer.reference_forward(hidden_states, rotary_posemb)
+            hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
         if self.stage_index == self.stage_count - 1:
             hidden_states = self.forward_epilog(hidden_states)
         return hidden_states

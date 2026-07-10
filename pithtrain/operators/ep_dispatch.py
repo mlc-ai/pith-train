@@ -30,7 +30,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from pithtrain.models.interface import AllToAllSplits, MoERouting
+from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
 
 
@@ -585,7 +585,7 @@ def prepare_dispatch(
     ep_size: int,
     experts_per_rank: int,
     ep_group: dist.ProcessGroup,
-) -> tuple[torch.Tensor, MoERouting]:
+) -> tuple[torch.Tensor, RoutingInfo]:
     """
     Expert-parallel dispatch with token deduplication.
 
@@ -603,7 +603,7 @@ def prepare_dispatch(
         dispatch_tokens = (
             hidden_states.unsqueeze(1).expand(-1, k, -1).reshape(-1, hidden_states.shape[-1])
         )
-        return dispatch_tokens, MoERouting(topk_weight, expert_idxs)
+        return dispatch_tokens, RoutingInfo(topk_weight, expert_idxs)
 
     (
         tokens_per_ep_rank,
@@ -666,7 +666,7 @@ def prepare_dispatch(
     total_dedup = sum(dedup_input_splits)
     dispatch_tokens = padded_index_gather(hidden_states, dispatch_token_idxs[:total_dedup])
 
-    return dispatch_tokens, MoERouting(
+    return dispatch_tokens, RoutingInfo(
         topk_weight,
         expert_idxs,
         idxs,

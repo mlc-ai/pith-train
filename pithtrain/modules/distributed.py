@@ -97,6 +97,7 @@ def setup_default_process_group(cfg: DistributedCfg) -> None:
     torch.distributed.init_process_group(**kwargs)
     atexit.register(torch.distributed.destroy_process_group)
     torch.cuda.set_device(distributed.local_rank)
+    distributed.device = torch.device("cuda", distributed.local_rank)
 
 
 def setup_failfast_excepthook() -> None:

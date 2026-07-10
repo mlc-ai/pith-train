@@ -10,10 +10,10 @@ from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.dualpipev import layer_partition
 from pithtrain.dualpipe.execution import ChunkRecord, record_forward
-from pithtrain.models.interface import MoERouting
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
-from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.ring_attention import mla_ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -225,7 +225,7 @@ class DeepSeekV2Attention(nn.Module):
         k_embed = (k * cos) + (DeepSeekV2Attention.rotate_half(k) * sin)
         return q_embed, k_embed
 
-    def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         B, S, _ = hidden_states.size()
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
@@ -246,7 +246,10 @@ class DeepSeekV2Attention(nn.Module):
             k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             q = torch.cat([q_nope, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
-            attn_output = flash_attn_func(q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True)
+            if cu_seqlens is not None:
+                attn_output = flash_attn_varlen_func(q.squeeze(0), k.squeeze(0), value_states.squeeze(0).contiguous(), cu_seqlens, S, softmax_scale=self.softmax_scale, causal=True).unsqueeze(0)
+            else:
+                attn_output = flash_attn_func(q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True)
         attn_output = attn_output.reshape(B, S, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -262,10 +265,10 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @torch.compile(fullgraph=True)
-    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]):
+    def forward_stage1_compute(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, rotary_posemb)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -275,8 +278,8 @@ class DeepSeekV2DecoderLayer(nn.Module):
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
-    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, MoERouting | None]:
-        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb)
+    def forward_stage1(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)
         if isinstance(self.mlp, DeepSeekV2MLP):
             return hidden_states, residual, None
         if lb_loss is not None:
@@ -308,10 +311,10 @@ class DeepSeekV2DecoderLayer(nn.Module):
         aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + aggregated.view(*residual.shape)
 
-    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor], cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, rotary_posemb)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -345,8 +348,14 @@ class DeepSeekV2Model(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict({str(i): DeepSeekV2DecoderLayer(config, i) for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)})
 
-    def forward_posemb(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        S, device = hidden_states.shape[1], hidden_states.device
+    def forward_posemb(self, S: int, cu_seqlens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        device = distributed.device
+        if cu_seqlens is not None:
+            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
+            lengths = ends - starts
+            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
+            cos, sin = self.rotary_emb(S)
+            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
         cp_size, block_size = distributed.cp_size, S // 2
         front_start, back_start = distributed.cp_rank * block_size, (2 * cp_size - distributed.cp_rank - 1) * block_size
         front_end, back_end = front_start + block_size, back_start + block_size
@@ -361,15 +370,15 @@ class DeepSeekV2Model(nn.Module):
         hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return record_forward(self, hidden_states, self.chunk_record)
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        return record_forward(self, hidden_states, self.chunk_record, cu_seqlens)
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def reference_forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         if self.stage_index == 0:
             hidden_states = self.forward_prolog(hidden_states)
-        rotary_posemb = self.forward_posemb(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
         for _, layer in self.layers.items():
-            hidden_states = layer.reference_forward(hidden_states, rotary_posemb)
+            hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
         if self.stage_index == self.stage_count - 1:
             hidden_states = self.forward_epilog(hidden_states)
         return hidden_states

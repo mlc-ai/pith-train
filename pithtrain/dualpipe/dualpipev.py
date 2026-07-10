@@ -108,6 +108,7 @@ class DualPipeV(nn.Module):
         # Pre-allocation tracking
         self._num_chunks_allocated = 0
         self.chunk_records: Tuple[List[ChunkRecord], List[ChunkRecord]] = ([], [])
+        self.cu_seqlens_chunks: Optional[List[torch.Tensor]] = None
 
     def _ensure_chunk_records_allocated(self, num_chunks: int) -> None:
         """Pre-allocate ChunkRecord structures for reuse across iterations."""
@@ -160,6 +161,41 @@ class DualPipeV(nn.Module):
         self.comm_ops: List[dist.P2POp] = []
         self.to_free: List[torch.Tensor] = []
 
+    def setup_cu_seqlens(self, cu_seqlens: Optional[torch.Tensor], num_chunks: int) -> None:
+        """
+        Broadcast per-micro-batch packed-sequence offsets along the pipeline group.
+
+        Expects a rectangular ``(num_chunks, W)`` tensor: the caller pads each micro-batch's
+        ragged document boundaries to a common width ``W`` with trailing zero-length documents
+        (``None`` = dense / non-packed).
+        """
+        # Single rank: no broadcast needed, this rank already holds cu_seqlens.
+        if self.pp_size == 1:
+            self.cu_seqlens_chunks = (
+                None if cu_seqlens is None else [cu_seqlens[i] for i in range(num_chunks)]
+            )
+            return
+
+        # Multiple ranks: broadcast the row width first so every stage learns whether this step is
+        # packed (width > 0) or dense (width == 0) before allocating a receive buffer.
+        device = distributed.device
+        width = torch.zeros(1, device=device, dtype=torch.long)
+        if self.is_first_pp_rank and cu_seqlens is not None:
+            width.fill_(cu_seqlens.shape[1])
+        torch.distributed.broadcast(width, group_src=0, group=self.pp_group)
+        if int(width) == 0:
+            self.cu_seqlens_chunks = None
+            return
+
+        # Packed: broadcast the (num_chunks, width) offsets and split them per micro-batch.
+        buf = (
+            cu_seqlens.to(device=device, dtype=torch.int32)
+            if self.is_first_pp_rank
+            else torch.empty((num_chunks, int(width)), device=device, dtype=torch.int32)
+        )
+        torch.distributed.broadcast(buf, group_src=0, group=self.pp_group)
+        self.cu_seqlens_chunks = [buf[i] for i in range(num_chunks)]
+
     def _forward_compute_chunk(self, phase: int) -> None:
         chunk_id = self.current_f_chunk_id[phase]
         self.current_f_chunk_id[phase] += 1
@@ -173,7 +209,8 @@ class DualPipeV(nn.Module):
         # Set pre-allocated chunk_record on module to avoid FSDP kwarg handling issues
         chunk_record = self.chunk_records[phase][chunk_id]
         self.module[phase].chunk_record = chunk_record
-        outputs = self.module[phase](*inputs)
+        cu_seqlens = self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
+        outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage and self.criterion is not None:
@@ -245,6 +282,7 @@ class DualPipeV(nn.Module):
         self.current_f_chunk_id[phase0] += 1
         module0 = self.module[phase0]
         inputs0 = self.input_chunks[phase0][chunk_id0]
+        cu_seqlens0 = self.cu_seqlens_chunks[chunk_id0] if self.cu_seqlens_chunks is not None else None
         is_last_stage0 = self.is_first_pp_rank and phase0 == 1
 
         if is_last_stage0 and self.criterion is not None:
@@ -284,6 +322,7 @@ class DualPipeV(nn.Module):
             criterion0,
             labels0,
             self.chunk_records[phase0][chunk_id0],
+            cu_seqlens0,
             module1,
             loss1,
             outputs1,
@@ -443,6 +482,7 @@ class DualPipeV(nn.Module):
         num_chunks: int = 0,
         criterion: Optional[Callable] = None,
         labels: List[Optional[torch.Tensor]] = [],
+        cu_seqlens: Optional[torch.Tensor] = None,
         return_outputs: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[Union[torch.Tensor, Tuple[torch.Tensor]]]]:
         """
@@ -495,6 +535,7 @@ class DualPipeV(nn.Module):
             self.input_chunks = (scatter(inputs, num_chunks, self.batch_dim), [])
             self.labels = scatter(labels, num_chunks, self.batch_dim)
             self.criterion = criterion
+        self.setup_cu_seqlens(cu_seqlens, num_chunks)
 
         # Step 1: nF0
         step_1 = (pp_size - pp_rank - 1) * 2
