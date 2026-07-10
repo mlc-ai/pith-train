@@ -7,12 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
@@ -138,7 +137,7 @@ class Qwen3MoeMLP(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.gate_proj = LinearCls(hidden_size, intermediate_size, bias=False)
         self.up_proj = LinearCls(hidden_size, intermediate_size, bias=False)
         self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
@@ -161,7 +160,7 @@ class Qwen3MoeExperts(nn.Module):
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
 
-        GroupLinearCls = get_group_linear_cls()
+        GroupLinearCls = training.GroupedLinear
         self.gate_proj = GroupLinearCls(num_experts, hidden_size, moe_intermediate_size)
         self.up_proj = GroupLinearCls(num_experts, hidden_size, moe_intermediate_size)
         self.down_proj = GroupLinearCls(num_experts, moe_intermediate_size, hidden_size)
@@ -347,7 +346,7 @@ class Qwen3MoeAttention(nn.Module):
         self.num_key_value_groups = num_attention_heads // num_key_value_heads
         self.scaling = head_dim**-0.5
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
         self.k_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
         self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
@@ -801,8 +800,7 @@ class Qwen3MoeModel(nn.Module):
 
         if self.norm is not None:
             assert self.lm_head is not None
-            if not ModelImplMode.use_reference_fwd:
-                hidden_states = hidden_states.detach().requires_grad_()
+            hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.norm(hidden_states)
             hidden_states = self.lm_head(hidden_states)

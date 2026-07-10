@@ -26,7 +26,7 @@ training.sequence_length = 2048
 training.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
-training.fp8_training = "disabled"
+training.fp8 = False
 training.save_interval = 256
 training.save_location = Path("workspace/checkpoints/qwen3.5-35b-a3b")
 

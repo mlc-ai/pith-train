@@ -9,19 +9,17 @@ import torch.nn.functional as F
 from flash_attn.cute.interface import flash_attn_func
 from torch import nn
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, run_backward
-from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinearFunc
-from pithtrain.layers.factory import ModelImplMode, get_linear_cls
-from pithtrain.layers.group_linear import GroupLinearFunc
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
-from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
+from pithtrain.operators.deepgemm_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
+from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -184,11 +182,11 @@ class GptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
         # FP8 path: gpt-oss stores expert projections as raw nn.Parameter (HF layout
-        # with fused gate_up), so we cannot use the FP8GroupLinear module wrapper.
-        # We dispatch FP8GroupLinearFunc directly on these parameters and host the
+        # with fused gate_up), so we cannot use the FP8GroupedLinear module wrapper.
+        # We dispatch FP8GroupedLinearFunc directly on these parameters and host the
         # quantized-weight cache here. Cache is dict-or-None so DualPipeV's
-        # FP8WeightCacheControl.clear_caches (which sets _wq_cache=None) works.
-        self._fp8 = ModelImplMode.fp8_training == "deep-gemm"
+        # FP8WeightCacheControl.clear (which sets _wq_cache=None) works.
+        self._fp8 = training.fp8
         self._wq_cache: dict[str, tuple] | None = None
         self._wq_version: int = -1
 
@@ -223,10 +221,10 @@ class GptOssExperts(nn.Module):
         if x.shape[0] == 0:
             return x @ weight[0].transpose(-2, -1)
         if self._fp8:
-            return FP8GroupLinearFunc.apply(
+            return FP8GroupedLinearFunc.apply(
                 x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices
             )
-        return GroupLinearFunc.apply(x, weight, offs)
+        return GroupedLinearFunc.apply(x, weight, offs)
 
     def forward(
         self,
@@ -407,7 +405,7 @@ class GptOssAttention(nn.Module):
         self.is_sliding = is_sliding
         self.sliding_window = sliding_window
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
         self.k_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
         self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
@@ -778,8 +776,7 @@ class GptOssModel(nn.Module):
 
         if self.norm is not None:
             assert self.lm_head is not None
-            if not ModelImplMode.use_reference_fwd:
-                hidden_states = hidden_states.detach().requires_grad_()
+            hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.norm(hidden_states)
             hidden_states = self.lm_head(hidden_states)

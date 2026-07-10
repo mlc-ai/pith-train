@@ -13,12 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
@@ -173,7 +172,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
         self.norm = Qwen35MoeRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.in_proj_qkv = LinearCls(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
         self.in_proj_z = LinearCls(self.hidden_size, self.value_dim, bias=False)
         # in_proj_a / in_proj_b have num_v_heads (=32) outputs: too small for the
@@ -235,7 +234,7 @@ class Qwen35MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         attention_bias = getattr(config, "attention_bias", False)
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias)
         self.k_proj = LinearCls(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
         self.v_proj = LinearCls(self.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
@@ -276,7 +275,7 @@ class Qwen35MoeMLP(nn.Module):
 
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.gate_proj = LinearCls(hidden_size, intermediate_size, bias=False)
         self.up_proj = LinearCls(hidden_size, intermediate_size, bias=False)
         self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
@@ -291,7 +290,7 @@ class Qwen35MoeExperts(nn.Module):
 
     ``gate_up_proj`` is one grouped GEMM producing ``[.., 2*inter]``, split
     non-interleaved (gate = first half, up = second half). FP8 vs BF16 and the
-    quantized-weight cache are handled by ``get_group_linear_cls()``.
+    quantized-weight cache are handled by ``training.GroupedLinear``.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, moe_intermediate_size: int):
@@ -300,7 +299,7 @@ class Qwen35MoeExperts(nn.Module):
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
 
-        GroupLinearCls = get_group_linear_cls()
+        GroupLinearCls = training.GroupedLinear
         self.gate_up_proj = GroupLinearCls(num_experts, hidden_size, 2 * moe_intermediate_size)
         self.down_proj = GroupLinearCls(num_experts, moe_intermediate_size, hidden_size)
 
@@ -608,8 +607,7 @@ class Qwen35MoeModel(nn.Module):
 
         if self.norm is not None:
             assert self.lm_head is not None
-            if not ModelImplMode.use_reference_fwd:
-                hidden_states = hidden_states.detach().requires_grad_()
+            hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.norm(hidden_states)
             hidden_states = self.lm_head(hidden_states)

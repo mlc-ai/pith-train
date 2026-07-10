@@ -9,12 +9,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
@@ -127,7 +126,7 @@ class DeepseekV2LiteMLP(nn.Module):
         self.hidden_size = hidden_size or config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.gate_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = LinearCls(self.intermediate_size, self.hidden_size, bias=False)
@@ -145,7 +144,7 @@ class DeepseekV2LiteExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
 
-        GroupLinearCls = get_group_linear_cls()
+        GroupLinearCls = training.GroupedLinear
         self.gate_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
         self.up_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
         self.down_proj = GroupLinearCls(num_experts, self.intermediate_size, self.hidden_size)
@@ -287,7 +286,7 @@ class DeepseekV2LiteAttention(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
-        LinearCls = get_linear_cls()
+        LinearCls = training.Linear
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
         self.kv_a_proj_with_mqa = LinearCls(
             self.hidden_size,
@@ -305,7 +304,7 @@ class DeepseekV2LiteAttention(nn.Module):
         self.softmax_scale = self.q_head_dim ** (-0.5)
         # When fp8 training is on, kv_b_proj is an FP8Linear; the pass-latent ring decompresses
         # the rotated latent via the FP8 deep_gemm path instead of a silent bf16 F.linear.
-        self._fp8 = ModelImplMode.fp8_training == "deep-gemm"
+        self._fp8 = training.fp8
 
     def forward(
         self,
@@ -667,8 +666,7 @@ class DeepseekV2LiteModel(nn.Module):
 
         if self.norm is not None:
             assert self.lm_head is not None
-            if not ModelImplMode.use_reference_fwd:
-                hidden_states = hidden_states.detach().requires_grad_()
+            hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.norm(hidden_states)
             hidden_states = self.lm_head(hidden_states)

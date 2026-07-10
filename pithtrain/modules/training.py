@@ -234,10 +234,10 @@ class TrainingCfg(SlottedDefault):
     By default, this flag is False, so normal training is unaffected.
     """
 
-    fp8_training: Literal["deep-gemm", "disabled"] = "disabled"
+    fp8: bool = False
     """
-    FP8 training backend: ``"disabled"`` (BF16 only) or ``"deep-gemm"`` (128-element
-    block scaling via DeepGEMM). Supports SM90 (Hopper) and SM100+ (Blackwell).
+    Enable FP8 training via DeepGEMM (128-element block scaling); ``False`` is BF16.
+    Supports SM90 (Hopper) and SM100+ (Blackwell).
     """
 
     init_std: float = 0.02
@@ -398,25 +398,12 @@ def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
 ) -> None:
-    from pithtrain.dualpipe.utils import FP8WeightCacheControl
-    from pithtrain.layers.factory import ModelImplMode
+    from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
+    from pithtrain.operators.linear import FP8Linear
 
-    ModelImplMode.fp8_training = cfg.fp8_training
-    if cfg.fp8_training != "disabled":
-        FP8WeightCacheControl.enabled = True
-
-    if ModelImplMode.fp8_training == "deep-gemm":
-        try:
-            import deep_gemm  # noqa: F401
-        except ImportError:
-            raise ImportError(
-                "fp8_training='deep-gemm' requires the 'deep-gemm' package. "
-                "Install it by running: uv sync"
-            )
-    elif ModelImplMode.fp8_training != "disabled":
-        raise ValueError(
-            f"Invalid fp8_training={cfg.fp8_training!r}. Expected one of: 'disabled', 'deep-gemm'."
-        )
+    training.fp8 = cfg.fp8
+    training.Linear = FP8Linear if cfg.fp8 else nn.Linear
+    training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
     pp_size = distributed.pp_size
     pp_rank = distributed.pp_rank

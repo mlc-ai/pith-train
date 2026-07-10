@@ -66,13 +66,14 @@ from torch.distributed import (
 )
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-# FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
-# decompression; reached only when the caller passes a quantized kv_b weight
-# (i.e. fp8_training="deep-gemm").
-from pithtrain.layers.deepgemm_fp8_linear import fp8_act_weight_gemm, fp8_dgrad_wgrad
-from pithtrain.operators.deepgemm_fp8_quantize import (
+from pithtrain.operators.deepgemm_quantize import (
     fused_rowwise_blockwise_transpose_cast_to_fp8,
 )
+
+# FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
+# decompression; reached only when the caller passes a quantized kv_b weight
+# (i.e. fp8=True).
+from pithtrain.operators.linear import fp8_act_weight_gemm, fp8_dgrad_wgrad
 
 
 def post_ring_kv(

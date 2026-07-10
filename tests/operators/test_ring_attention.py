@@ -6,7 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx
+from pithtrain.contexts import distributed
+from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.ring_attention import mla_ring_attention_func, ring_attention_func
 from tests.utilities import cosine_error, launch
@@ -41,7 +42,7 @@ def extract_zigzag(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
     return torch.cat([chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]], dim=1).contiguous()
 
 
-def record(ctx: DistributedCtx, req: Request) -> tuple[Result, Result]:
+def record(req: Request) -> tuple[Result, Result]:
     """
     Record the forward output and the input gradients dQ, dK, dV for both the
     baseline and the implementation. The baseline is flash_attn_func run on the
@@ -49,7 +50,7 @@ def record(ctx: DistributedCtx, req: Request) -> tuple[Result, Result]:
     ring_attention_func run on this rank's zigzag-local slice of Q/K/V with K/V
     rotated around the CP ring during the forward and backward passes.
     """
-    cp_group = ctx.device_mesh.get_group("cp")
+    cp_group = distributed.device_mesh.get_group("cp")
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
     softmax_scale = req.D**-0.5
@@ -80,8 +81,8 @@ def record(ctx: DistributedCtx, req: Request) -> tuple[Result, Result]:
     return ref, imp
 
 
-def verify(ctx: DistributedCtx, req: Request) -> None:
-    ref, imp = record(ctx, req)
+def verify(req: Request) -> None:
+    ref, imp = record(req)
     for f in fields(ref):
         error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
         if error >= req.atol:
@@ -133,7 +134,7 @@ class MLAResult:
     d_k_pe: torch.Tensor
 
 
-def record_mla(ctx: DistributedCtx, req: MLARequest):
+def record_mla(req: MLARequest):
     """
     Reference: full-sequence MLA attention (decompress the latent via kv_b, then dense MLA
     flash attention) with no CP. Implementation: rotate the compressed latent around the
@@ -141,7 +142,7 @@ def record_mla(ctx: DistributedCtx, req: MLARequest):
     gradients (dq_nope, dq_pe, d_normed_kv, d_k_pe) on this rank's zigzag slice, plus the
     kv_b weight gradient -- which is global, so the per-rank partials are summed across CP.
     """
-    cp_group = ctx.device_mesh.get_group("cp")
+    cp_group = distributed.device_mesh.get_group("cp")
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
     H, R = req.H, req.kv_lora_rank
@@ -209,8 +210,8 @@ def record_mla(ctx: DistributedCtx, req: MLARequest):
     return ref, imp, dW_ref, dW_imp
 
 
-def verify_mla(ctx: DistributedCtx, req: MLARequest) -> None:
-    ref, imp, dW_ref, dW_imp = record_mla(ctx, req)
+def verify_mla(req: MLARequest) -> None:
+    ref, imp, dW_ref, dW_imp = record_mla(req)
     for f in fields(ref):
         error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
         if error >= req.atol:
@@ -243,7 +244,7 @@ def test_mla_ring_attention_vs_dense(cp_size: int, req: MLARequest) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FP8 in-ring kv_b decompression (pass-latent CP with fp8_training="deep-gemm").
+# FP8 in-ring kv_b decompression (pass-latent CP with training.fp8 enabled).
 # ---------------------------------------------------------------------------
 
 # deep_gemm is a required dependency (GPU-only project), so no import guard; gate only on the
@@ -254,7 +255,7 @@ requires_fp8 = pytest.mark.skipif(
 )
 
 
-def record_mla_fp8(ctx: DistributedCtx, req: MLARequest):
+def record_mla_fp8(req: MLARequest):
     """
     Like record_mla but exercises the FP8 in-ring kv_b path. The reference decompresses the
     latent via an FP8Linear on the *full* sequence (so its kv_b quantization error matches the
@@ -262,9 +263,9 @@ def record_mla_fp8(ctx: DistributedCtx, req: MLARequest):
     via ``kv_b_quant``. Comparing fp8-vs-fp8 isolates the in-ring math from the (large) e4m3
     quantization error, so a tight tolerance is meaningful.
     """
-    from pithtrain.layers.deepgemm_fp8_linear import FP8Linear
+    from pithtrain.operators.linear import FP8Linear
 
-    cp_group = ctx.device_mesh.get_group("cp")
+    cp_group = distributed.device_mesh.get_group("cp")
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
     H, R = req.H, req.kv_lora_rank
@@ -341,8 +342,8 @@ def _relerr(ref: torch.Tensor, imp: torch.Tensor) -> float:
     return ((imp.to(torch.float32) - r).norm() / (r.norm() + 1e-12)).item()
 
 
-def verify_mla_fp8(ctx: DistributedCtx, req: MLARequest) -> None:
-    ref, imp, dW_ref, dW_imp = record_mla_fp8(ctx, req)
+def verify_mla_fp8(req: MLARequest) -> None:
+    ref, imp, dW_ref, dW_imp = record_mla_fp8(req)
     # fp8-vs-fp8 reference: the only differences are the ring vs dense flash recompute order
     # and per-hop vs whole-sequence activation quant blocking -- both small. Check BOTH cosine
     # (direction) AND relative L2 error (magnitude): cosine is scale-invariant and would hide a

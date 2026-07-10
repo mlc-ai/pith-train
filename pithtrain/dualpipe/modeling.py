@@ -22,7 +22,6 @@ from pithtrain.dualpipe.execution import (
     Stage5Record,
 )
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode
 from pithtrain.models.interface import DecoderLayerProtocol
 from pithtrain.operators.all_to_all import direct_all_to_all
 
@@ -73,12 +72,6 @@ def decoder_layer_forward(
     hidden_states: torch.Tensor,
 ):
     """Forward pass for a DualPipeV decoder layer."""
-
-    if ModelImplMode.use_reference_fwd:
-        return (
-            layer.reference_forward(hidden_states),
-            [],
-        )
 
     intermediate_tensors = IntermediateTensorsLayer()
 
