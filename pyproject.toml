@@ -3,15 +3,7 @@ name = "pithtrain"
 version = "0.1.3"
 license = "Apache-2.0"
 requires-python = ">=3.12"
-dependencies = [
-    "deep-gemm",
-    "flash-attn-4[cu13]>=4.0.0b19",
-    "flash-linear-attention>=0.5.1",
-    "torch>=2.12.0",
-    "transformers",
-    "wandb",
-    "zstandard",
-]
+dependencies = ["deep-gemm", "flash-attn-4[cu13]>=4.0.0b20", "flash-linear-attention>=0.5.1", "torch>=2.12.0", "transformers", "wandb", "zstandard"]
 
 [dependency-groups]
 dev = ["pre-commit", "pytest", "ruff"]
@@ -24,14 +16,8 @@ requires = ["setuptools>=61"]
 include = ["pithtrain*"]
 
 [tool.uv]
-# Exclude the redundant `-libs-base` wheel. It and `-libs-cu13` ship the same file
-# paths with different content, so a parallel `uv sync` can race into a broken mix
-# that breaks FA4's cute-dsl JIT (depends on the install filesystem, not the Python
-# version). cu13 is a strict superset of base, so nothing is lost. NVIDIA/cutlass#3259.
-# `override-dependencies` with a never-true marker is uv's idiom for dropping a dep.
-override-dependencies = [
-    "nvidia-cutlass-dsl-libs-base; python_version < '0'",
-]
+prerelease = "allow"
+environments = ["sys_platform == 'linux'"]
 
 [[tool.uv.index]]
 name = "torch-cu130"
@@ -43,12 +29,8 @@ deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", branch = "main" }
 torch = { index = "torch-cu130" }
 
 [tool.uv.extra-build-dependencies]
-deep-gemm = [
-    "torch>=2.12.0",
-    "packaging",
-    "setuptools",
-    "wheel",
-]
+deep-gemm = ["torch>=2.12.0", "packaging", "setuptools", "wheel"]
+
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_FORCE_BUILD = "1", DG_USE_LOCAL_VERSION = "0" }
 
@@ -66,7 +48,7 @@ force-exclude = true
 
 [tool.ruff.format]
 quote-style = "double"
-exclude = ["pithtrain/models/*.py", "pithtrain/contexts/*.py"]
+exclude = ["pithtrain/models/*.py", "pithtrain/contexts/*.py", "pithtrain/dualpipe/execution.py", "pithtrain/operators/flash_attn_v4.py"]
 
 [tool.ruff.lint]
 ignore = ["E501", "E731"]

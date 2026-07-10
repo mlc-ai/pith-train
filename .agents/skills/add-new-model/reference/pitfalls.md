@@ -120,7 +120,7 @@ hours of chasing the wrong lead.
 ## `shard_experts` fallback misclassifies the router
 
 `shard_experts` in `tests/test_dualpipev.py` detects the experts module
-via `GroupLinear` children. When experts are raw `nn.Parameter`, there's
+via `GroupedLinear` children. When experts are raw `nn.Parameter`, there's
 a fallback. **The fallback must be gated on a distinctive weight name,
 not `num_experts` alone.** The router has `num_experts`,
 `weight.shape[0] == num_experts`, and often `bias.shape[0] == num_experts`
@@ -278,7 +278,7 @@ result.
 
 ## The `.weight` suffix depends on storage style
 
-- `nn.Linear` / `nn.Embedding` / `GroupLinear`: state_dict key ends
+- `nn.Linear` / `nn.Embedding` / `GroupedLinear`: state_dict key ends
   in `.weight`.
 - Raw `nn.Parameter` stored on the module itself: state_dict key is
   just the attribute name, **no `.weight`**.

@@ -205,7 +205,7 @@ No new reference file needed — the changes are small and mechanical.
      `num_hidden_layers` down to 8 (and any parallel arrays like
      `layer_types`) to keep the test fast.
    - Add a `fill_weights` branch if:
-     - The expert module stores raw `nn.Parameter` (not `GroupLinear`).
+     - The expert module stores raw `nn.Parameter` (not `GroupedLinear`).
        Without this, expert weights default to zero and the MoE subtree
        silently produces all-zero outputs — see `reference/pitfalls.md`.
      - The router/gate has new Parameters beyond `weight` (e.g. a

@@ -97,7 +97,7 @@ up   = gate_up[:, 1::2]
 
 ### `.weight` suffix: submodule vs raw Parameter
 
-- `nn.Linear` / `nn.Embedding` / `GroupLinear` → state_dict key ends in
+- `nn.Linear` / `nn.Embedding` / `GroupedLinear` → state_dict key ends in
   `.weight`.
 - Raw `nn.Parameter` stored on the module itself → state_dict key is
   just the attribute name, NO `.weight`.
@@ -140,7 +140,7 @@ self.gate_up_proj = nn.Parameter(torch.empty(E, 2*intermediate, hidden))   # [E,
 out = F.grouped_mm(x, self.gate_up_proj.transpose(-2, -1), offs=offs)      # transposed view
 ```
 
-Both `GroupLinear` (in `pithtrain/layers/group_linear.py`) and this
+Both `GroupedLinear` (in `pithtrain/operators/grouped_linear.py`) and this
 raw-Parameter pattern match that convention.
 
 HF's live Parameter is often `[E, in, out]` — the transposed layout —
