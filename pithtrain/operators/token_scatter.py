@@ -4,8 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from pithtrain.contexts import training
+from pithtrain.operators.linear import ARCH_MAJOR
+
 # -- Shared async D-to-H copy infrastructure --
-# Used by both ScatterForGroupedGemm and moe_ep_prepare_dispatch to avoid
+# Used by both ScatterForGroupedGemm and prepare_dispatch to avoid
 # per-call cudaStreamSynchronize overhead from .tolist() / .item().
 #
 # These are process-global, not per-thread, which is fine because the MoE ops only ever run
@@ -70,7 +73,7 @@ def _compute_group_offsets_kernel(
 
 @triton.jit
 def _scatter_for_grouped_gemm_kernel(
-    sorted_tokens_ptr,  # [m, hidden_size]
+    input_tokens_ptr,  # [m, hidden_size]
     expert_idxs_ptr,  # [m] int64
     grouped_mm_offs_ptr,  # [num_groups] int32, padded cumulative offsets
     group_counters_ptr,  # [num_groups] int64, zero-initialized (for atomic positioning)
@@ -78,7 +81,7 @@ def _scatter_for_grouped_gemm_kernel(
     output_tokens_ptr,  # [m_padded, hidden_size]
     reverse_shuffle_idxs_ptr,  # [m] int64
     hidden_size,
-    stride_src_m,  # sorted_tokens.stride(0)
+    stride_src_m,  # input_tokens.stride(0)
     stride_dst_m,  # output_tokens.stride(0)
     m,
     num_groups,
@@ -100,7 +103,7 @@ def _scatter_for_grouped_gemm_kernel(
     for i in tl.static_range(NUM_H_BLOCKS):
         h_offs = i * BLOCK_H + tl.arange(0, BLOCK_H)
         mask = h_offs < hidden_size
-        vals = tl.load(sorted_tokens_ptr + src_base + h_offs, mask=mask)
+        vals = tl.load(input_tokens_ptr + src_base + h_offs, mask=mask)
         tl.store(output_tokens_ptr + dst_base + h_offs, vals, mask=mask)
 
     # --- Zero padding rows for this group (distributed across programs) ---
@@ -123,7 +126,7 @@ def _scatter_for_grouped_gemm_kernel(
                 mask = h_offs < hidden_size
                 tl.store(
                     output_tokens_ptr + row_base + h_offs,
-                    tl.zeros([BLOCK_H], dtype=sorted_tokens_ptr.dtype.element_ty),
+                    tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty),
                     mask=mask,
                 )
 
@@ -145,7 +148,7 @@ def _scatter_for_grouped_gemm_kernel(
                 mask = h_offs < hidden_size
                 tl.store(
                     output_tokens_ptr + row_base + h_offs,
-                    tl.zeros([BLOCK_H], dtype=sorted_tokens_ptr.dtype.element_ty),
+                    tl.zeros([BLOCK_H], dtype=input_tokens_ptr.dtype.element_ty),
                     mask=mask,
                 )
 
@@ -155,7 +158,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
     Custom autograd function wrapping the Triton scatter kernels so the
     scatter operation is differentiable.
 
-    Forward: reorders sorted_tokens by expert assignment with zero-padding.
+    Forward: reorders input_tokens by expert assignment with zero-padding.
     Backward: gathers gradients back using reverse_shuffle_idxs.
     """
 
@@ -170,13 +173,13 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         return ScatterForGroupedGemm._copy_stream, ScatterForGroupedGemm._copy_event
 
     @staticmethod
-    def forward(ctx, sorted_tokens, expert_idxs, num_groups, padding_alignment=128):
-        m = sorted_tokens.shape[0]
-        hidden_size = sorted_tokens.shape[1]
-        device = sorted_tokens.device
+    def forward(ctx, input_tokens, expert_idxs, num_groups, padding_alignment=128):
+        m = input_tokens.shape[0]
+        hidden_size = input_tokens.shape[1]
+        device = input_tokens.device
 
         if m == 0:
-            output_tokens = torch.empty((0, hidden_size), device=device, dtype=sorted_tokens.dtype)
+            output_tokens = torch.empty((0, hidden_size), device=device, dtype=input_tokens.dtype)
             reverse_shuffle_idxs = torch.empty((0,), device=device, dtype=torch.int64)
             grouped_mm_offs = torch.empty((0,), device=device, dtype=torch.int32)
             ks_tensor = torch.empty((0,), device=device, dtype=torch.int32)
@@ -194,7 +197,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         # Over-allocated output - padding rows zeroed inside the scatter kernel
         # `output_tokens` will be zeroed inside the scatter kernel.
         output_tokens = torch.empty(
-            (max_m_padded, hidden_size), device=device, dtype=sorted_tokens.dtype
+            (max_m_padded, hidden_size), device=device, dtype=input_tokens.dtype
         )
         # Small buffers for prep kernel
         reverse_shuffle_idxs = torch.empty((m,), device=device, dtype=torch.int64)
@@ -230,7 +233,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         BLOCK_H = 256
         NUM_H_BLOCKS = triton.cdiv(hidden_size, BLOCK_H)
         _scatter_for_grouped_gemm_kernel[(m,)](
-            sorted_tokens,
+            input_tokens,
             expert_idxs,
             grouped_mm_offs,
             group_counts_2,
@@ -238,7 +241,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
             output_tokens,
             reverse_shuffle_idxs,
             hidden_size,
-            sorted_tokens.stride(0),
+            input_tokens.stride(0),
             output_tokens.stride(0),
             m,
             num_groups,
@@ -275,10 +278,10 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         grad_ks,
     ):
         (reverse_shuffle_idxs,) = ctx.saved_tensors
-        # Forward: output_tokens[reverse_shuffle_idxs[i]] = sorted_tokens[i]
-        # Backward: grad_sorted_tokens[i] = grad_output_tokens[reverse_shuffle_idxs[i]]
-        grad_sorted_tokens = grad_output_tokens[reverse_shuffle_idxs]
-        return grad_sorted_tokens, None, None, None
+        # Forward: output_tokens[reverse_shuffle_idxs[i]] = input_tokens[i]
+        # Backward: grad_input_tokens[i] = grad_output_tokens[reverse_shuffle_idxs[i]]
+        grad_input_tokens = grad_output_tokens[reverse_shuffle_idxs]
+        return grad_input_tokens, None, None, None
 
 
 class _PaddedIndexGather(torch.autograd.Function):
@@ -334,7 +337,7 @@ def padded_index_gather(
 
 
 def scatter_for_grouped_gemm(
-    sorted_tokens: torch.Tensor,  # [m, hidden_size]
+    input_tokens: torch.Tensor,  # [m, hidden_size]
     expert_idxs: torch.Tensor,  # [m] int64, values in [0, num_groups-1]
     num_groups: int,
     padding_alignment: int = 128,
@@ -345,7 +348,7 @@ def scatter_for_grouped_gemm(
     in a single kernel launch.
 
     Args:
-        sorted_tokens: [m, hidden_size] input tokens
+        input_tokens: [m, hidden_size] input tokens
         expert_idxs: [m] expert assignment for each token (int64, values in [0, num_groups-1])
         num_groups: number of expert groups
         padding_alignment: pad each group's row count to this alignment (default 128)
@@ -359,7 +362,7 @@ def scatter_for_grouped_gemm(
         ks_tensor: [num_groups] int32, per-group padded sizes
     """
     output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = (
-        ScatterForGroupedGemm.apply(sorted_tokens, expert_idxs, num_groups, padding_alignment)
+        ScatterForGroupedGemm.apply(input_tokens, expert_idxs, num_groups, padding_alignment)
     )
     return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor
 
@@ -373,9 +376,6 @@ def precompute_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> Optional[
 
     Only needed on Hopper with the DeepGEMM backend; returns None otherwise.
     """
-    from pithtrain.contexts import training
-    from pithtrain.operators.linear import ARCH_MAJOR
-
     if training.fp8 and ARCH_MAJOR < 10:
         row_indices = torch.arange(M, device=grouped_mm_offs.device)
         gi = torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)

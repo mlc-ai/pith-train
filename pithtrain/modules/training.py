@@ -21,18 +21,20 @@ from transformers import AutoConfig
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
+from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
+from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
+from pithtrain.operators.linear import FP8Linear
 
 from .distributed import DistributedCfg
 
 # Pipeline-stage model implementations; grows as models are added.
-PIPELINE_STAGE_MODELS = (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
+PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -55,9 +57,7 @@ def is_muon_param(name: str, param: torch.Tensor) -> bool:
     return True
 
 
-def make_muon_optimizer(
-    cfg: TrainingCfg, *, weight_decay: float = 0.1
-) -> tuple[Optimizer, ...]:
+def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     """
     Muon for the 2D hidden weights, AdamW for the rest (the :func:`is_muon_param`
     split). Weight decay (0.1, per "Muon is Scalable for LLM Training") applies to
@@ -75,9 +75,7 @@ def make_muon_optimizer(
     return Muon(muon_params, **kwargs), AdamW(adamw_params, **kwargs)
 
 
-def make_adamw_optimizer(
-    cfg: TrainingCfg, *, weight_decay: float = 0.1
-) -> tuple[Optimizer, ...]:
+def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     """AdamW over all parameters."""
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
     return (AdamW(training.model.parameters(), **kwargs),)
@@ -309,7 +307,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
     Parameters
     ----------
     model : nn.Module
-        A single pipeline-stage module (e.g. ``DeepseekV2LiteModel``).
+        A single pipeline-stage module (e.g. ``DeepSeekV2Model``).
     num_layers : int
         Total number of transformer layers in the *full* model (not just this
         stage).  Used to compute the output-layer scaling factor.
@@ -357,27 +355,11 @@ def apply_fsdp(
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
-        if model[i].embed_tokens is not None:
-            fully_shard(
-                model[i].embed_tokens,
-                mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
-                mp_policy=mp,
-            )
-        if model[i].norm is not None:
-            assert model[i].lm_head is not None
-            fully_shard(
-                model[i].norm,
-                mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
-                mp_policy=mp,
-            )
-            fully_shard(
-                model[i].lm_head,
-                mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
-                mp_policy=mp,
-            )
+        # Stage-edge modules (embed / norm / lm_head): every non-"layers" child that
+        # owns parameters. reshard_after_forward=True since each runs once per step.
+        for name, child in model[i].named_children():
+            if name != "layers" and next(child.parameters(), None) is not None:
+                fully_shard(child, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
@@ -398,24 +380,17 @@ def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
 ) -> None:
-    from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
-    from pithtrain.operators.linear import FP8Linear
-
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else nn.Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
-    pp_size = distributed.pp_size
-    pp_rank = distributed.pp_rank
     cp_size = distributed.cp_size
-    ep_size = distributed.ep_size
 
     device_mesh = distributed.device_mesh
     cp_group = distributed.cp_group
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
-    module_config.ep_size = ep_size
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")
@@ -431,7 +406,7 @@ def setup_model(
 
     # All models read their parallel groups from `distributed` directly.
     if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepseekV2LiteModel
+        ModelClass = DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
     elif module_config.model_type == "gpt_oss":
@@ -441,8 +416,8 @@ def setup_model(
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    modules.append(ModelClass(module_config, pp_size * 2, pp_rank))
-    modules.append(ModelClass(module_config, pp_size * 2, pp_size * 2 - 1 - pp_rank))
+    modules.append(ModelClass(module_config, phase=0))
+    modules.append(ModelClass(module_config, phase=1))
 
     # Apply scaled normal weight initialization before FSDP sharding.
     num_layers = module_config.num_hidden_layers

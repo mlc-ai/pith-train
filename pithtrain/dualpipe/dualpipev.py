@@ -32,9 +32,34 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 
 from pithtrain.contexts import distributed
 from pithtrain.dualpipe import comm
-from pithtrain.dualpipe.execution import IntermediateTensors, create_intermediate_tensors
+from pithtrain.dualpipe.execution import (
+    ChunkRecord,
+    create_chunk_record,
+    record_backward,
+)
 from pithtrain.dualpipe.overlap import overlapped_forward_backward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
+
+
+def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> range:
+    """
+    Return the layer ids that pipeline stage stage_index owns.
+
+    Layers are spread across the stages as evenly as possible, with the two edges
+    kept slightly lighter since they also carry embed_tokens and norm plus lm_head.
+    Each stage owns a contiguous block, and this returns the block for stage_index.
+    """
+    base, remainder = divmod(num_layers, stage_count)
+    layers = [base] * stage_count
+    for _ in range(remainder):
+        min_val = min(layers)
+        best = next((i for i in range(1, stage_count - 1) if layers[i] == min_val), None)
+        if best is None:
+            best = layers.index(min_val)
+        layers[best] += 1
+    begin = sum(layers[:stage_index])
+    end = begin + layers[stage_index]
+    return range(begin, end)
 
 
 class DualPipeV(nn.Module):
@@ -52,7 +77,7 @@ class DualPipeV(nn.Module):
       - FSDP2 integration (hook suppression during the pipeline loop, manual
         ``post_backward`` invocation after the loop).
       - FP8 weight caching across micro-batches via ``FP8WeightCacheControl``.
-      - Pre-allocated ``IntermediateTensors`` for zero-allocation pipeline execution.
+      - Pre-allocated ``ChunkRecord`` for zero-allocation pipeline execution.
     """
 
     def __init__(
@@ -82,28 +107,26 @@ class DualPipeV(nn.Module):
 
         # Pre-allocation tracking
         self._num_chunks_allocated = 0
-        self.intermediate_tensors_chunks: Tuple[
-            List[IntermediateTensors], List[IntermediateTensors]
-        ] = ([], [])
+        self.chunk_records: Tuple[List[ChunkRecord], List[ChunkRecord]] = ([], [])
 
-    def _ensure_intermediate_tensors_allocated(self, num_chunks: int) -> None:
-        """Pre-allocate IntermediateTensors structures for reuse across iterations."""
+    def _ensure_chunk_records_allocated(self, num_chunks: int) -> None:
+        """Pre-allocate ChunkRecord structures for reuse across iterations."""
         if self._num_chunks_allocated == num_chunks:
             return
-        self.intermediate_tensors_chunks = (
+        self.chunk_records = (
             [
-                create_intermediate_tensors(
+                create_chunk_record(
                     len(self.module[0].layers),
-                    self.module[0].embed_tokens is not None,
-                    self.module[0].norm is not None,
+                    self.module[0].stage_index == 0,
+                    self.module[0].stage_index == self.module[0].stage_count - 1,
                 )
                 for _ in range(num_chunks)
             ],
             [
-                create_intermediate_tensors(
+                create_chunk_record(
                     len(self.module[1].layers),
-                    self.module[1].embed_tokens is not None,
-                    self.module[1].norm is not None,
+                    self.module[1].stage_index == 0,
+                    self.module[1].stage_index == self.module[1].stage_count - 1,
                 )
                 for _ in range(num_chunks)
             ],
@@ -118,7 +141,7 @@ class DualPipeV(nn.Module):
             [],
         )
         self.output_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        # Note: intermediate_tensors_chunks is pre-allocated and reused, not reset here
+        # Note: chunk_records is pre-allocated and reused, not reset here
         self.input_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
         self.output_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = (
             [],
@@ -147,11 +170,11 @@ class DualPipeV(nn.Module):
         is_last_stage = self.is_first_pp_rank and phase == 1
 
         nvtx.range_push(f"forward chunk {chunk_id} (phase{phase})")
-        # Set pre-allocated intermediate_tensors on module to avoid FSDP kwarg handling issues
-        intermediate_tensors = self.intermediate_tensors_chunks[phase][chunk_id]
-        self.module[phase]._intermediate_tensors = intermediate_tensors
+        # Set pre-allocated chunk_record on module to avoid FSDP kwarg handling issues
+        chunk_record = self.chunk_records[phase][chunk_id]
+        self.module[phase].chunk_record = chunk_record
         outputs = self.module[phase](*inputs)
-        self.module[phase]._intermediate_tensors = None
+        self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage and self.criterion is not None:
             labels = self.labels[chunk_id]
@@ -163,7 +186,7 @@ class DualPipeV(nn.Module):
             self.input_chunks[1].append([output.detach().requires_grad_() for output in outputs])
         if (not is_last_stage) or self.return_outputs:
             self.output_chunks[phase].append(outputs)
-        # No need to append - intermediate_tensors is pre-allocated and was modified in place
+        # No need to append - chunk_record is pre-allocated and was modified in place
 
     def _backward_compute_chunk(self, phase: int, enable_zb: bool = False) -> None:
         if self.forward_only:
@@ -178,11 +201,11 @@ class DualPipeV(nn.Module):
         WeightGradStore.enabled = enable_zb
         if is_last_stage:
             loss = self.loss_chunks[chunk_id]
-            input_grads = self.module[phase].__class__.backward(
+            input_grads = record_backward(
                 self.module[phase],
                 None,
                 loss,
-                self.intermediate_tensors_chunks[phase][chunk_id],
+                self.chunk_records[phase][chunk_id],
             )
             loss.detach_()
         else:
@@ -194,13 +217,13 @@ class DualPipeV(nn.Module):
             non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
             outputs, output_grads = list(zip(*non_empty))
             if len(outputs) > 0:
-                input_grads = self.module[phase].__class__.backward(
+                input_grads = record_backward(
                     self.module[phase],
                     output_grads,
                     None,
-                    self.intermediate_tensors_chunks[phase][chunk_id],
+                    self.chunk_records[phase][chunk_id],
                 )
-        # Note: intermediate_tensors is pre-allocated and reused; backward clears tensor refs inside
+        # Note: chunk_record is pre-allocated and reused; backward clears tensor refs inside
         WeightGradStore.enabled = False
         if enable_zb:
             WeightGradStore.flush()
@@ -251,7 +274,7 @@ class DualPipeV(nn.Module):
             non_empty = [(t, g) for t, g in zip(outputs1, output_grads1) if g is not None]
             outputs1, output_grads1 = list(zip(*non_empty))
 
-        # forward & backward (intermediate_tensors0 is modified in place)
+        # forward & backward (chunk_record0 is modified in place)
         nvtx.range_push(
             f"forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
         )
@@ -260,12 +283,12 @@ class DualPipeV(nn.Module):
             inputs0,
             criterion0,
             labels0,
-            self.intermediate_tensors_chunks[phase0][chunk_id0],
+            self.chunk_records[phase0][chunk_id0],
             module1,
             loss1,
             outputs1,
             output_grads1,
-            self.intermediate_tensors_chunks[phase1][chunk_id1],
+            self.chunk_records[phase1][chunk_id1],
             self.comm_stream,
             self.ep_group,
         )
@@ -466,7 +489,7 @@ class DualPipeV(nn.Module):
 
         self._reset_states()
         FP8WeightCacheControl.step()
-        self._ensure_intermediate_tensors_allocated(num_chunks)
+        self._ensure_chunk_records_allocated(num_chunks)
 
         if self.is_first_pp_rank:
             self.input_chunks = (scatter(inputs, num_chunks, self.batch_dim), [])
