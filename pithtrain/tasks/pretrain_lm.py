@@ -377,7 +377,7 @@ def train_step(cfg: PretrainLMCfg) -> None:
     # accumulate d(sum loss); dividing by the total non-ignored token count yields the correct
     # token-mean regardless of how tokens split across micro-batches. The count lives on pipeline
     # rank 0 (the only rank with labels), so broadcast it to every stage for the gradient scale.
-    num_tokens = torch.ones(1, device=device)
+    num_tokens = torch.ones((), device=device)
     if distributed.pp_rank == 0:
         num_tokens.fill_((global_labels != -100).sum().clamp_min(1))
     if distributed.pp_size > 1:
