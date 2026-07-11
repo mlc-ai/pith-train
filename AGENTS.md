@@ -104,7 +104,7 @@ Four dimensions: Pipeline Parallel (PP), Expert Parallel (EP), Context Parallel 
 
 ### Model Layer Protocol (`pithtrain/models/interface.py`)
 
-Models implement `ModelProtocol` with layers that expose `forward_attn`, `forward_mlp`, `forward_aggregate` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2_lite.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
 
 ### Tensor Layouts & Sequence Packing
 
@@ -122,7 +122,7 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
 - **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
-- **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2_lite.py`), with MLA-aware ring attention in `ring_attention.py`
+- **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
