@@ -133,11 +133,11 @@ Each operator ships a PyTorch reference impl for correctness testing.
 
 ### Training Orchestration (`pithtrain/tasks/pretrain_lm.py`)
 
-`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg`, and `LoggingCfg`. The training loop uses context managers (`distributed_context`, `training_context`, `logging_context`) to set up the full environment.
+`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg`, and `LoggingCfg`. `launch(cfg)` calls `setup_logging`, `setup_distributed`, and `setup_training` in turn, each of which populates its runtime context (see Runtime Contexts below).
 
 ### Task Module Convention (`pithtrain/tasks/`)
 
-Each task module (`pretrain_lm`, `tokenize_corpus`, `convert_checkpoint`) exposes a `launch(cfg)` entry point plus a task-level `<Task>Cfg`/`<Task>Ctx` (e.g. `PretrainLMCfg`, `TokenizeCorpusCfg`). Two rules keep this consistent:
+Each task module (`pretrain_lm`, `tokenize_corpus`, `convert_checkpoint`) exposes a `launch(cfg)` entry point plus a task-level `<Task>Cfg` (e.g. `PretrainLMCfg`, `TokenizeCorpusCfg`). Runtime state is not carried on a per-task context object; it lives in the process-global context modules (see Runtime Contexts below). Two rules keep this consistent:
 
 - **Configs/contexts keep unique, descriptive names** (`PretrainLMCfg`, not bare `Cfg`) so they stay one-shot greppable — this repo is agent-native and `grep PretrainLMCfg` must locate every use. Import them by symbol: `from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch`.
 - **`launch` is the generic verb** every task shares. In a single-task file import it directly; in a file that drives several tasks, import the *modules* and qualify the call (`tokenize_corpus.launch(...)`, `convert_checkpoint.launch(...)`) to avoid collisions. The composable building blocks (`DistributedCfg`, `TrainingCfg`, `LoggingCfg`) live in `pithtrain/modules/` and are always referenced by their descriptive names.
@@ -156,6 +156,10 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 ## Config Base Classes
 
 `pithtrain/config.py` defines `SlottedDefault` — all config/context dataclasses inherit from this. Subclasses are declared `@dataclass(init=False, slots=True)`; `SlottedDefault.__init__` auto-applies every field's default (leaving required fields unset), and `to_json_dict()` returns a JSON-serializable representation.
+
+## Runtime Contexts (`pithtrain/contexts/`)
+
+Process-global runtime state, one module per concern (`distributed`, `training`, `logging`). Each holds values that are set once at startup by the matching `setup_*` function and constant thereafter, so code reads them in-line instead of threading them through every constructor and call. Import the module and read fields off it (`distributed.ep_group`), never the bare names — a field does not exist until its `setup_*` runs, so `from ... import ep_group` fails at import and reading it before setup raises `AttributeError`.
 
 ## Agent Skills
 
