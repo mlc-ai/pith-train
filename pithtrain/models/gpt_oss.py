@@ -63,15 +63,21 @@ class GptOssRotaryEmbedding(nn.Module):
     def compute_rope_params(self, config: GptOssConfig) -> tuple[torch.Tensor, float]:
         rope_scaling = config.rope_scaling
         base, dim = rope_scaling["rope_theta"], config.head_dim
-        scaling_factor = rope_scaling["factor"]
-        beta_fast, beta_slow, truncate = rope_scaling["beta_fast"], rope_scaling["beta_slow"], rope_scaling["truncate"]  # fmt: skip
-        freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        freq_inter = 1.0 / (scaling_factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))  # fmt: skip
-        low, high = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, config.initial_context_length, truncate)  # fmt: skip
-        inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(low, high, dim // 2).to(torch.float32)
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        attn_scale = 0.1 * math.log(scaling_factor) + 1.0
-        return inv_freq, attn_scale
+        match rope_scaling["rope_type"]:
+            case "yarn":
+                scaling_factor = rope_scaling["factor"]
+                beta_fast, beta_slow, truncate = rope_scaling["beta_fast"], rope_scaling["beta_slow"], rope_scaling["truncate"]  # fmt: skip
+                freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                freq_inter = 1.0 / (scaling_factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))  # fmt: skip
+                low, high = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, config.initial_context_length, truncate)  # fmt: skip
+                inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(low, high, dim // 2).to(torch.float32)  # fmt: skip
+                inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+                attn_scale = 0.1 * math.log(scaling_factor) + 1.0
+                return inv_freq, attn_scale
+            case "default":
+                return 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)), 1.0
+            case other:
+                raise ValueError(f"unsupported rope_type: {other!r}")
 
     def set_cos_sin(self, config: GptOssConfig, inv_freq: torch.Tensor, attn_scale: float) -> None:
         t = torch.arange(config.max_position_embeddings, dtype=torch.float32)

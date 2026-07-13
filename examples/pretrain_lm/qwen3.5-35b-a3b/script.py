@@ -14,7 +14,7 @@ distributed.pipeline_parallel_size = 1
 distributed.expert_parallel_size = 8
 
 training = cfg.training
-training.model = Path("benchmarks/pretraining/qwen3.5-35b-a3b/model.json")
+training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
 training.optimizer = make_muon_optimizer
 kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.03, final_lr=1.0e-5)
 training.scheduler = partial(make_wsd_scheduler, **kwargs)

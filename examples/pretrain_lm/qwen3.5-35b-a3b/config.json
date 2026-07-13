@@ -59,7 +59,6 @@
   "linear_num_key_heads": 16,
   "linear_num_value_heads": 32,
   "linear_value_head_dim": 128,
-  "max_position_embeddings": 262144,
   "mlp_only_layers": [],
   "model_type": "qwen3_5_moe_text",
   "moe_intermediate_size": 512,

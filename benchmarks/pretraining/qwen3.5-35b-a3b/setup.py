@@ -56,7 +56,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 cfg = PretrainLMCfg()
 training = cfg.training
-training.model = Path("benchmarks/pretraining/qwen3.5-35b-a3b/model.json")
+training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
 training.optimizer = make_muon_optimizer
 training.scheduler = make_constant_scheduler
 training.lr = 1.0e-6

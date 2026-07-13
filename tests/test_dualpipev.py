@@ -432,7 +432,7 @@ def _entry() -> None:
     models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
-    models.append("benchmarks/pretraining/qwen3.5-35b-a3b/model.json")
+    models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
