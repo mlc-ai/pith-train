@@ -3,32 +3,21 @@ Correctness tests for Triton FP8 quantization kernels.
 
 Compares each Triton kernel in ``pithtrain.operators.deepgemm_quantize``
 against the reference pure-PyTorch implementation in ``deep_gemm.utils.math``.
-
-Tests are skipped when ``deep_gemm`` is not installed or CUDA is unavailable.
 """
 
 import pytest
 import torch
+from deep_gemm.utils.math import (
+    per_block_cast_to_fp8 as ref_per_block,
+)
+from deep_gemm.utils.math import (
+    per_channel_cast_to_fp8 as ref_per_channel,
+)
+from deep_gemm.utils.math import (
+    per_token_cast_to_fp8 as ref_per_token,
+)
 
-try:
-    from deep_gemm.utils.math import (
-        per_block_cast_to_fp8 as ref_per_block,
-    )
-    from deep_gemm.utils.math import (
-        per_channel_cast_to_fp8 as ref_per_channel,
-    )
-    from deep_gemm.utils.math import (
-        per_token_cast_to_fp8 as ref_per_token,
-    )
-
-    HAS_DEEP_GEMM = True
-except ImportError:
-    HAS_DEEP_GEMM = False
-
-requires_deep_gemm = pytest.mark.skipif(not HAS_DEEP_GEMM, reason="deep-gemm not installed")
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-
-_USE_E8M0 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+_USE_E8M0 = torch.cuda.get_device_capability()[0] >= 10
 
 
 def calc_diff(x, y):
@@ -50,8 +39,6 @@ def _make_bf16(shape, device="cuda"):
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
-@requires_cuda
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -101,7 +88,6 @@ def test_fused_per_token_per_channel(M, N):
     )
 
 
-@requires_cuda
 def test_fused_per_token_per_channel_all_zeros():
     """Fused kernel handles all-zero input (scale clamp prevents div-by-zero)."""
     from pithtrain.operators.deepgemm_quantize import (
@@ -122,8 +108,6 @@ def test_fused_per_token_per_channel_all_zeros():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
-@requires_cuda
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -170,7 +154,6 @@ def test_fused_per_token_and_transpose(M, N):
     )
 
 
-@requires_cuda
 def test_fused_per_token_and_transpose_all_zeros():
     """Fused transpose kernel handles all-zero input."""
     from pithtrain.operators.deepgemm_quantize import (
@@ -191,8 +174,6 @@ def test_fused_per_token_and_transpose_all_zeros():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
-@requires_cuda
 @pytest.mark.parametrize(
     "M,K",
     [
@@ -241,7 +222,6 @@ def test_fused_per_token_and_per_block_transpose(M, K):
     )
 
 
-@requires_cuda
 def test_fused_per_token_and_per_block_transpose_all_zeros():
     """Fused per_token+per_block_transpose handles all-zero input."""
     from pithtrain.operators.deepgemm_quantize import (
@@ -262,8 +242,6 @@ def test_fused_per_token_and_per_block_transpose_all_zeros():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
-@requires_cuda
 @pytest.mark.parametrize(
     "M,K",
     [
@@ -310,7 +288,6 @@ def test_fused_per_block_and_transpose(M, K):
     )
 
 
-@requires_cuda
 def test_fused_per_block_and_transpose_all_zeros():
     """Fused per_block+transpose handles all-zero input (finite scales)."""
     from pithtrain.operators.deepgemm_quantize import (
@@ -326,7 +303,6 @@ def test_fused_per_block_and_transpose_all_zeros():
     assert (fp8_t.float() == 0.0).all()
 
 
-@requires_cuda
 @pytest.mark.parametrize(
     "M,K",
     [
@@ -355,8 +331,6 @@ def test_fused_per_block_and_transpose_scale_symmetry(M, K):
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
-@requires_cuda
 @pytest.mark.parametrize(
     "G,N,K",
     [
@@ -413,7 +387,6 @@ def test_fused_per_block_and_transpose_batched(G, N, K):
     )
 
 
-@requires_cuda
 def test_fused_per_block_and_transpose_batched_all_zeros():
     """Fused batched per_block+transpose handles all-zero input (finite scales)."""
     from pithtrain.operators.deepgemm_quantize import (
@@ -429,7 +402,6 @@ def test_fused_per_block_and_transpose_batched_all_zeros():
     assert (fp8_t.float() == 0.0).all()
 
 
-@requires_cuda
 @pytest.mark.parametrize(
     "G,N,K",
     [

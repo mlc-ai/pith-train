@@ -5,8 +5,6 @@ import torch
 
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-
 ALPHA = 1.702
 LIMIT = 7.0
 
@@ -20,7 +18,6 @@ def _ref_forward(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Ten
     return (up_c + 1) * glu
 
 
-@requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "shape",
@@ -61,7 +58,6 @@ def test_clamped_swiglu_forward_backward(shape, dtype):
     torch.testing.assert_close(gate_up.grad, gate_up_ref.grad, atol=atol, rtol=rtol)
 
 
-@requires_cuda
 def test_clamped_swiglu_saturated_gradient_is_zero():
     """Values strictly outside [-limit, limit] must produce zero gradient.
 
@@ -99,7 +95,6 @@ def test_clamped_swiglu_saturated_gradient_is_zero():
     assert torch.all(grad_up == 0)
 
 
-@requires_cuda
 def test_clamped_swiglu_matches_hf_reference_shape():
     """Smoke test using gpt-oss-20b-like dims: 32 experts x 768-width tile."""
     torch.manual_seed(0)

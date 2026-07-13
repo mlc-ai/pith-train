@@ -6,14 +6,11 @@ import torch.nn.functional as F
 
 from pithtrain.operators.silu_mul import silu_mul
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-
 
 def _ref_forward(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
-@requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "shape",

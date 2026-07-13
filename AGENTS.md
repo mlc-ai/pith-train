@@ -150,7 +150,6 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 - `F.grouped_mm` may write NaN to padding rows (beyond `grouped_mm_offs[-1]`). Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 quantization tests use normalized squared-error (`calc_diff`), threshold typically `< 1e-3`.
-- Tests skip gracefully when `deep_gemm` is not installed or CUDA is unavailable.
 - Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`).
 
 ## Config Base Classes

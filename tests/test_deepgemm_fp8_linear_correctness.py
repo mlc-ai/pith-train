@@ -2,22 +2,13 @@
 Correctness test for DeepGEMM FP8Linear and FP8GroupedLinear.
 
 Tests compare DeepGEMM FP8 implementations against BF16 reference with
-appropriate tolerances for FP8 precision loss.  All tests are skipped
-when ``deep_gemm`` is not installed.
+appropriate tolerances for FP8 precision loss.
 """
 
+import deep_gemm  # noqa: F401
 import pytest
 import torch
 import torch.nn as nn
-
-try:
-    import deep_gemm  # noqa: F401
-
-    HAS_DEEP_GEMM = True
-except ImportError:
-    HAS_DEEP_GEMM = False
-
-requires_deep_gemm = pytest.mark.skipif(not HAS_DEEP_GEMM, reason="deep-gemm not installed")
 
 # Threshold for FP8 vs BF16 comparisons using normalized squared-error metric.
 ERR_THRESHOLD = 1e-3
@@ -66,7 +57,6 @@ def _copy_weights(src, dst):
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
 @pytest.mark.parametrize(
     "in_features,out_features",
     [(128, 256), (256, 128), (512, 512), (256, 1024)],
@@ -88,7 +78,6 @@ def test_fp8_linear_forward(in_features, out_features):
     assert diff < ERR_THRESHOLD, f"diff = {diff}"
 
 
-@requires_deep_gemm
 def test_fp8_linear_forward_with_bias():
     """FP8Linear forward with bias produces correct shape and reasonable values."""
     from pithtrain.operators.linear import FP8Linear
@@ -111,7 +100,6 @@ def test_fp8_linear_forward_with_bias():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
 def test_fp8_linear_backward_input_grad():
     """FP8Linear backward produces input gradients close to BF16."""
     from pithtrain.operators.linear import FP8Linear
@@ -133,7 +121,6 @@ def test_fp8_linear_backward_input_grad():
     assert diff < ERR_THRESHOLD, f"input grad diff = {diff}"
 
 
-@requires_deep_gemm
 def test_fp8_linear_backward_weight_grad():
     """FP8Linear backward produces weight gradients close to BF16."""
     from pithtrain.operators.linear import FP8Linear
@@ -160,7 +147,6 @@ def test_fp8_linear_backward_weight_grad():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
 @pytest.mark.parametrize(
     "num_groups,in_features,out_features",
     [(4, 128, 256), (8, 256, 512), (2, 256, 128)],
@@ -203,7 +189,6 @@ def test_fp8_grouped_linear_forward(num_groups, in_features, out_features):
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
 def test_fp8_grouped_linear_backward():
     """FP8GroupedLinear backward produces gradients close to BF16."""
     from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
@@ -251,7 +236,6 @@ def test_fp8_grouped_linear_backward():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
 def test_fp8_grouped_linear_weight_grad_store():
     """FP8GroupedLinear correctly defers weight gradients via WeightGradStore."""
     from pithtrain.dualpipe.utils import WeightGradStore
@@ -311,7 +295,6 @@ def test_fp8_grouped_linear_weight_grad_store():
 # ---------------------------------------------------------------------------
 
 
-@requires_deep_gemm
 def test_fp8_linear_empty_input():
     """FP8Linear handles zero-length input gracefully."""
     from pithtrain.operators.linear import FP8Linear
@@ -322,7 +305,6 @@ def test_fp8_linear_empty_input():
     assert out.shape == (0, 256)
 
 
-@requires_deep_gemm
 def test_fp8_grouped_linear_empty_input():
     """FP8GroupedLinear handles zero tokens gracefully."""
     from pithtrain.operators.grouped_linear import FP8GroupedLinear

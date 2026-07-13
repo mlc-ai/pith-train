@@ -12,10 +12,7 @@ from torch.optim import AdamW
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.training import is_muon_param
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
-
-@requires_cuda
 def test_muon_step_on_fp8_gradients():
     pytest.importorskip("deep_gemm")
     from pithtrain.contexts import training

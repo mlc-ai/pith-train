@@ -247,13 +247,6 @@ def test_mla_ring_attention_vs_dense(cp_size: int, req: MLARequest) -> None:
 # FP8 in-ring kv_b decompression (pass-latent CP with training.fp8 enabled).
 # ---------------------------------------------------------------------------
 
-# deep_gemm is a required dependency (GPU-only project), so no import guard; gate only on the
-# hardware the FP8 GEMM actually needs.
-requires_fp8 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9),
-    reason="FP8 kv_b path requires Hopper (SM90)+",
-)
-
 
 def record_mla_fp8(req: MLARequest):
     """
@@ -369,7 +362,6 @@ def verify_mla_fp8(req: MLARequest) -> None:
         )
 
 
-@requires_fp8
 @pytest.mark.parametrize("cp_size,req", MLA_REQUESTS)
 def test_mla_ring_attention_fp8_vs_dense(cp_size: int, req: MLARequest) -> None:
     cfg = DistributedCfg()
