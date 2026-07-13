@@ -42,22 +42,6 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
         return self.cos[:S], self.sin[:S]
 
 
-class Qwen3MoeMLP(nn.Module):
-    def __init__(self, config: Qwen3MoeConfig):
-        super().__init__()
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        self.gate_proj = training.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = training.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = training.Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
-
-    def reference_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x)
-
-
 class Qwen3MoeExperts(nn.Module):
     def __init__(self, config: Qwen3MoeConfig, num_experts: int):
         super().__init__()
@@ -197,10 +181,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         super().__init__()
         self.idx = layer_id
         self.self_attn = Qwen3MoeAttention(config)
-        mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
-        decoder_sparse_step = config.decoder_sparse_step
-        use_moe = config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0 and layer_id not in mlp_only_layers
-        self.mlp = Qwen3MoeMoE(config) if use_moe else Qwen3MoeMLP(config)
+        self.mlp = Qwen3MoeMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -217,8 +198,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, Qwen3MoeMLP):
-            return hidden_states, residual, None, None, None
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
