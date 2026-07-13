@@ -1,12 +1,14 @@
 """
 Execution for each stage in the schedule.
 
-Stage Mapping:
-    - Stage 1: Attention (LN + Attn + LN + Expert selection)
-    - Stage 2: Dispatch (All-to-all dispatch for expert parallelism)
-    - Stage 3: MLP (Expert/MLP computation)
-    - Stage 4: Combine (All-to-all combine for expert parallelism)
-    - Stage 5: Aggregate (Weighted expert output + residual connection)
+Each decoder layer is split into five stages so the pipeline scheduler can interleave different
+micro-batches and overlap the compute of one with the communication of another.
+
+- Stage 1: pre-dispatch compute.
+- Stage 2: dispatch all-to-all.
+- Stage 3: expert compute.
+- Stage 4: combine all-to-all.
+- Stage 5: post-combine compute.
 """
 
 from dataclasses import dataclass, fields
