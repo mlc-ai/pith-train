@@ -17,7 +17,7 @@ class RoutingInfo(NamedTuple):
     combine_splits: Optional[AllToAllSplits] = None
 
 
-class MlpProtocol(Protocol):
+class MLPProtocol(Protocol):
     """
     Protocol for the MLP component of a DualPipeV-compatible decoder layer.
     """
@@ -38,7 +38,7 @@ class LayerProtocol(Protocol):
     """
 
     idx: int
-    mlp: MlpProtocol
+    mlp: MLPProtocol
 
     def reference_forward(
         self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]
