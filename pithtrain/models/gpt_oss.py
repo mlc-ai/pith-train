@@ -368,9 +368,12 @@ class GptOssModel(nn.Module):
             case 1:
                 stage_count = distributed.pp_size * 2
                 stage_index = stage_count - 1 - distributed.pp_rank
-            case _:
+            case -1:
+                # non-pipelined reference: a single stage owns the whole model
                 stage_count = 1
                 stage_index = 0
+            case _:
+                raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
         self.stage_index, self.stage_count = stage_index, stage_count
         self.chunk_record: ChunkRecord | None = None
 
