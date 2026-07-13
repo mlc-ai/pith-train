@@ -18,7 +18,7 @@ def test_muon_step_on_fp8_gradients():
     from pithtrain.contexts import training
     from pithtrain.operators.linear import FP8Linear
 
-    prev = training.fp8
+    prev = getattr(training, "fp8", False)
     training.fp8 = True
     try:
         torch.manual_seed(0)

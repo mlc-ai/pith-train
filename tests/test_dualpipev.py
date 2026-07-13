@@ -16,7 +16,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
@@ -190,6 +190,11 @@ def main(model_name: str):
     torch.manual_seed(1234)
     torch.set_default_device(torch.cuda.current_device())
     dtype = torch.bfloat16
+
+    # This test builds models directly, bypassing setup_model; bind the BF16 linear backend it sets.
+    training.fp8 = False
+    training.Linear = nn.Linear
+    training.GroupedLinear = GroupedLinear
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
