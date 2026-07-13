@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 import torch
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
+# fmt: off
 
 @torch.library.custom_op("pithtrain::flash_attn4_mha_fwd", mutates_args=())
 def _mha_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float, causal: bool, window_size_left: Optional[int], window_size_right: Optional[int], learnable_sink: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:

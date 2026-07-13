@@ -23,6 +23,7 @@ from pithtrain.dualpipe.utils import WeightGradStore, run_backward
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import direct_all_to_all
 
+# fmt: off
 
 @dataclass(init=False, slots=True)
 class ExecutionCtx:
@@ -529,12 +530,7 @@ def layer_forward_dispatch(
 ):
     """All-to-all dispatch."""
     if dispatch_splits is not None:
-        gathered_tokens = direct_all_to_all(
-            dispatch_tokens,
-            dispatch_splits.output_splits,
-            dispatch_splits.input_splits,
-            ep_group,
-        )
+        gathered_tokens = direct_all_to_all(dispatch_tokens, dispatch_splits.output_splits, dispatch_splits.input_splits, ep_group)
         a2a_ctx = (dispatch_splits, ep_group)
     else:
         gathered_tokens = dispatch_tokens
@@ -549,12 +545,7 @@ def layer_forward_combine(
 ):
     """All-to-all combine."""
     if combine_splits is not None:
-        outs = direct_all_to_all(
-            outs,
-            combine_splits.input_splits,
-            combine_splits.output_splits,
-            ep_group,
-        )
+        outs = direct_all_to_all(outs, combine_splits.input_splits, combine_splits.output_splits, ep_group)
         a2a_ctx = (combine_splits, ep_group)
     else:
         a2a_ctx = None
@@ -582,18 +573,14 @@ def layer_forward(
     has_experts = routing is not None
     ep_group = distributed.ep_group if has_experts else None
 
-    record.outs = Stage1Outs(
-        dispatch_tokens, residual, routing.topk_weight if has_experts else None
-    )
+    record.outs = Stage1Outs(dispatch_tokens, residual, routing.topk_weight if has_experts else None)
     layer_record.stage1 = record
     nvtx.range_pop()
 
     # Stage 2.
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
-    gathered_tokens, record.ctx = layer_forward_dispatch(
-        dispatch_tokens.detach(), routing.dispatch_splits if has_experts else None, ep_group
-    )
+    gathered_tokens, record.ctx = layer_forward_dispatch(dispatch_tokens.detach(), routing.dispatch_splits if has_experts else None, ep_group)
     fwd_comm_work = getattr(gathered_tokens, "comm_work", None)
     setattr(gathered_tokens, "comm_work", None)
     layer_record.stage2 = record
@@ -614,11 +601,7 @@ def layer_forward(
     if has_experts and fwd_comm_work is not None:
         dispatch_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_stage3(
-        gathered_tokens,
-        routing.expert_idxs if has_experts else None,
-        routing.expand_idx if has_experts else None,
-    )
+    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None)
 
     record.outs = Stage3Outs(moe_outs)
     # Free args storage - values no longer needed, only .grad is read after backward.
@@ -633,9 +616,7 @@ def layer_forward(
     # Stage 4.
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
-    moe_outs, record.ctx = layer_forward_combine(
-        moe_outs.detach(), routing.combine_splits if has_experts else None, ep_group
-    )
+    moe_outs, record.ctx = layer_forward_combine(moe_outs.detach(), routing.combine_splits if has_experts else None, ep_group)
     fwd_comm_work = getattr(moe_outs, "comm_work", None)
     setattr(moe_outs, "comm_work", None)
     layer_record.stage4 = record
@@ -707,17 +688,13 @@ def layer_backward(
         loss.detach_()
     elif stage5_was_merged:
         nvtx.range_push("layer%02d.stage5_merged_skip" % layer.idx)
-        moe_outs_grad, topk_weight_grad, residual_grad = [
-            t.grad if t is not None else None for t in stage5_record.args
-        ]
+        moe_outs_grad, topk_weight_grad, residual_grad = [t.grad if t is not None else None for t in stage5_record.args]
         nvtx.range_pop()
     else:
         nvtx.range_push("layer%02d.stage5_b" % layer.idx)
         record = stage5_record
         run_backward(record.outs, dy)
-        moe_outs_grad, topk_weight_grad, residual_grad = [
-            t.grad if t is not None else None for t in record.args
-        ]
+        moe_outs_grad, topk_weight_grad, residual_grad = [t.grad if t is not None else None for t in record.args]
         nvtx.range_pop()
 
     # Stage 4.
@@ -725,9 +702,7 @@ def layer_backward(
     record = layer_record.stage4
     if record.ctx is not None:
         combine_splits, group = record.ctx
-        moe_outs_grad = direct_all_to_all(
-            moe_outs_grad, combine_splits.output_splits, combine_splits.input_splits, group
-        )
+        moe_outs_grad = direct_all_to_all(moe_outs_grad, combine_splits.output_splits, combine_splits.input_splits, group)
         bwd_comm_work = moe_outs_grad.comm_work
         moe_outs_grad.comm_work = None
     else:
@@ -750,9 +725,7 @@ def layer_backward(
     record = layer_record.stage2
     if record.ctx is not None:
         dispatch_splits, group = record.ctx
-        dispatch_tokens_grad = direct_all_to_all(
-            gathered_tokens_grad, dispatch_splits.input_splits, dispatch_splits.output_splits, group
-        )
+        dispatch_tokens_grad = direct_all_to_all(gathered_tokens_grad, dispatch_splits.input_splits, dispatch_splits.output_splits, group)
         bwd_comm_work = dispatch_tokens_grad.comm_work
         dispatch_tokens_grad.comm_work = None
     else:

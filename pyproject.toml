@@ -48,7 +48,6 @@ force-exclude = true
 
 [tool.ruff.format]
 quote-style = "double"
-exclude = ["pithtrain/dualpipe/execution.py", "pithtrain/operators/flash_attn_v4.py"]
 
 [tool.ruff.lint]
 ignore = ["E501", "E731"]
