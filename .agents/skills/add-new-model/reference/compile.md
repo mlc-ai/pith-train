@@ -1,45 +1,34 @@
-# `@torch.compile(fullgraph=True)` — The Three Hot Regions
+# `@torch.compile(fullgraph=True)` - The Compiled Compute Regions
 
-Three per-layer regions must be wrapped with
-`@torch.compile(fullgraph=True)`:
+The per-layer compute stages are wrapped with `@torch.compile(fullgraph=True)`:
 
-1. `_forward_attn_compute` — LN + attention + LN (+ shared experts if any)
-2. `router.compute` / `gate.compute` — top-k + softmax + load-balance injection
-3. `forward_aggregate` — weighted expert sum + residual add
+1. `forward_stage1_compute` - LN + attention + LN (+ shared experts if any)
+2. `forward_stage5` - weighted expert sum + residual add
 
-These are not recommendations. They are enforced by the framework: test
-failures and performance regressions have previously traced back to
-missing or weakened compile coverage on these regions.
+`forward_stage3` (the grouped expert GEMM + all-to-all glue) is **not** compiled: it calls communication-aware Triton and the dedup gather, which live outside the traced region. GPT-OSS additionally decorates its router `forward` (top-k + softmax + load-balance injection); Qwen3 and DeepSeek-V2 leave the gate eager. Match whichever the reference model you are copying does, and keep the two stage-compute regions compiled.
+
+These are not recommendations. They are enforced by the framework: test failures and performance regressions have previously traced back to missing or weakened compile coverage on these regions.
 
 ## Why `fullgraph=True` specifically
 
-`fullgraph=True` *forces* Dynamo to raise on any would-be graph break.
-`fullgraph=False` is strictly worse for this codebase:
+`fullgraph=True` *forces* Dynamo to raise on any would-be graph break. `fullgraph=False` is strictly worse for this codebase:
 
-- **Compile boundaries accumulate bf16 rounding drift.** Each sub-graph
-  gets its own compile; crossing back and forth adds rounding that the
-  single-shot fullgraph trace avoids.
-- **Cross-region fusion is missed.** The LN → matmul fusion, the
-  weighted-sum + residual fusion, etc., happen *because* the whole region
-  is one graph.
-- **Breakage is hidden.** Without `fullgraph=True` you don't learn that
-  a new attention kernel silently self-compiles until a microbench
-  shows the speedup is gone.
+- **Compile boundaries accumulate bf16 rounding drift.** Each sub-graph gets its own compile; crossing back and forth adds rounding that the single-shot fullgraph trace avoids.
+- **Cross-region fusion is missed.** The LN -> matmul fusion, the weighted-sum + residual fusion, etc., happen *because* the whole region is one graph.
+- **Breakage is hidden.** Without `fullgraph=True` you don't learn that a new attention kernel silently self-compiles until a microbench shows the speedup is gone.
 
-**Never reach for `fullgraph=False` as a workaround.** If a region can't
-compile fullgraph, unwrap the region entirely (see below) and treat the
-unwrap as tech debt.
+**Never reach for `fullgraph=False` as a workaround.** If a region can't compile fullgraph, unwrap the region entirely (see below) and treat the unwrap as tech debt.
 
-## The three regions — boilerplate
+## The compiled regions - boilerplate
 
-### Region 1: `_forward_attn_compute`
+### Region 1: `forward_stage1_compute`
 
 ```python
 @torch.compile(fullgraph=True)
-def _forward_attn_compute(self, hidden_states):
+def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
-    hidden_states = self.self_attn(hidden_states, position_embeddings=..., ...)
+    hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
     hidden_states = residual + hidden_states
 
     residual = hidden_states
@@ -49,171 +38,89 @@ def _forward_attn_compute(self, hidden_states):
     if hasattr(self.mlp, "shared_experts"):
         residual = residual + self.mlp.shared_experts(hidden_states)
 
-    return hidden_states, residual
+    topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)
+    return hidden_states, residual, topk_idx, topk_weight, lb_loss
 ```
 
-### Region 2: router / gate `compute`
+The `MoELoadBalanceLossTracker.add(lb_loss)` call and the dispatch prep stay in the *eager* `forward_stage1` wrapper - see `protocol.md`.
+
+### Region 2 (optional): router / gate `forward`
+
+GPT-OSS compiles its router; if you follow that pattern, the whole method must trace fullgraph, including the load-balance injection:
 
 ```python
-class <Prefix>TopKRouter(nn.Module):   # or <Prefix>Gate — match HF
+class <Prefix>TopKRouter(nn.Module):   # or <Prefix>Gate - match HF
     @torch.compile(fullgraph=True)
-    def compute(self, hidden_states):
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
-
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states, self.weight, self.bias)  # bias optional
         topk_logits, topk_idx = torch.topk(logits, k=self.num_experts_per_tok, dim=-1, sorted=True)
         topk_weight = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
 
-        if self.training and self.load_balance_loss_fn is not None:
-            scores = logits.softmax(dim=-1, dtype=torch.float32)
-            lb_loss = self.load_balance_loss_fn(
-                scores, topk_idx, self.num_experts, self.num_experts_per_tok,
-            )
-            topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
-        else:
-            lb_loss = None
-
+        if self.load_balance_loss_fn is None:
+            return topk_idx, topk_weight, None
+        scores = logits.softmax(dim=-1, dtype=torch.float32)
+        lb_loss = self.load_balance_loss_fn(
+            scores, topk_idx, self.num_experts, self.num_experts_per_tok,
+        )
+        topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
         return topk_idx, topk_weight, lb_loss
-
-    def forward(self, hidden_states):
-        topk_idx, topk_weight, lb_loss = self.compute(hidden_states)
-        if lb_loss is not None:
-            MoELoadBalanceLossTracker.add(lb_loss)
-        return topk_idx, topk_weight
 ```
 
-### Region 3: `forward_aggregate`
+### Region 3: `forward_stage5`
 
 ```python
 @torch.compile(fullgraph=True)
-def forward_aggregate(self, moe_outs, moe_local_idxs, topk_weight, residual):
-    # ... weighted sum branches — see protocol.md ...
-    return residual + hidden_states
+def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
+    # ... weighted-sum branches - see protocol.md ...
+    return residual + aggregated.view(*residual.shape)
 ```
 
-## When you MUST unwrap — the attention kernel problem
+## Attention kernels trace cleanly - no unwrap needed
 
-Some attention kernels compile themselves:
-- `flex_attention` (always, when called)
-- Ring attention with internal `torch.compile`
+Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func`) or, under context parallelism, `ring_attention_func`. These are registered as custom ops, so they trace as opaque nodes inside `forward_stage1_compute`'s `fullgraph=True` region: the models decorate that method **unconditionally** and call the kernels inside it, with no conditional unwrap. There is no `flex_attention` in the model path and no `compile-inside-compile` problem to work around.
 
-Nested compile fails: `torch._dynamo.exc.Unsupported: compile-inside-compile`.
+### If a future kernel *does* self-compile
 
-### Narrow, conditional unwrap (the pattern)
-
-Unwrap **only when the incompatible kernel is active**. Qwen3 and
-DeepSeek-V2 handle ring attention this way:
+Some kernels compile themselves (e.g. `flex_attention`). A nested compile fails: `torch._dynamo.exc.Unsupported: compile-inside-compile`. The narrowly-scoped fix is to unwrap the region **only when the incompatible kernel is active** - never a blanket unwrap, and never `fullgraph=False`. `@torch.compile` replaces the method with a wrapper whose original function is at `.__wrapped__`; re-bind it to the instance to run the eager body:
 
 ```python
-class <Prefix>DecoderLayer(nn.Module):
-    def __init__(self, ...):
-        super().__init__()
-        # ... build sub-modules ...
-
-        # Unwrap only if the incompatible attention kernel is selected.
-        if self.self_attn.use_ring_attn:
-            self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
-                self, type(self),
-            )
+if self.self_attn.uses_self_compiling_kernel:
+    self.forward_stage1_compute = self.forward_stage1_compute.__wrapped__.__get__(
+        self, type(self),
+    )
 ```
 
-Two reasons this is narrow:
+A blanket unwrap breaks performance for every configuration, not just the one with the problematic kernel. If the unwrap covers 100% of the attention compute you lose ~10-30% step-time at short context and ~5-15% at long context. Treat every unwrap as tech debt and record a brief in `docs/` describing what would let us re-land the compile.
 
-1. Most runs don't hit the unwrap (context parallel is off).
-2. The gate should depend on the *kernel selection*, not on a blanket
-   "always unwrap because flex is sometimes used" — that loses the
-   compile benefit for configurations that could have it.
+## Attention sinks - pass them to the kernel, not a closure
 
-Similarly, `setup_model` in `pithtrain/modules/training.py` unwraps the
-gate's `compute` when CP is on, because the all-reduce injected by the
-global-batch load balance loss breaks fullgraph tracing:
+If your attention needs a learned parameter inside the softmax (GPT-OSS attention sinks, some ALiBi variants), pass it straight to the FlashAttention v4 kernel as an argument - GPT-OSS uses `learnable_sink=`:
 
 ```python
-if cp_group is not None:
-    gate.compute = gate.compute.__wrapped__.__get__(gate, type(gate))
-```
-
-### The `__wrapped__.__get__` idiom
-
-`@torch.compile` replaces the method with a wrapped object. The original
-function is at `.__wrapped__`. Re-binding it to the instance is done
-with `.__get__(self, type(self))`. After the unwrap, calling
-`self._forward_attn_compute(x)` runs the eager Python body.
-
-### Don't unwrap unconditionally
-
-A blanket unwrap breaks performance for all configurations, not just
-the one with the problematic kernel. If the unwrap covers 100% of the
-attention compute, you've lost ~10–30% step-time at short context and
-~5–15% at long context. Treat every unwrap as tech debt; record a brief
-in `docs/` describing what would let us re-land the compile (e.g.
-"upstream flex_attention fix for nested compile").
-
-## The attention-sinks / learned-bias-in-closure problem
-
-If your attention needs a learned parameter inside the softmax (GPT-OSS
-attention sinks, some ALiBi variants), **do not** use a `score_mod`
-closure that captures the Parameter. The closure specialises the kernel's
-self-compile on the Parameter, and that specialisation is what forces
-our outer `fullgraph=True` to unwrap.
-
-### The LSE-renormalisation pattern
-
-Move the Parameter out of the closure and apply its effect as a pure
-post-op. For sinks:
-
-```python
-# Do NOT do this: closure over self.sinks forces nested compile.
-# def score_mod(score, b, h, q, kv): return torch.where(kv == seq_len, self.sinks[h], score)
-# attn_output = flex_attention(q, k, v, score_mod=score_mod, ...)
-
-# Do this instead: return the LSE and renorm as a pointwise post-op.
-attn_output, aux = flex_attention(
-    q, k, v,
-    block_mask=block_mask,
-    scale=self.scaling,
-    enable_gqa=True,
-    return_aux=AuxRequest(lse=True),
+sinks = self.sinks.to(query_states.dtype)
+attn_output = flash_attn_func(
+    query_states, key_states, value_states,
+    softmax_scale=self.scaling, causal=True,
+    window_size=window_size, learnable_sink=sinks,
 )
-lse = aux.lse
-# softmax([scores, sink])_i = softmax(scores)_i * sigmoid(lse − sink)
-sink_scale = torch.sigmoid(lse - self.sinks.float().view(1, -1, 1))
-attn_output = attn_output * sink_scale.to(attn_output.dtype).unsqueeze(-1)
 ```
 
-This is mathematically identical to including a virtual KV row at
-`v = 0` with per-head score `self.sinks[h]`. The sink doesn't
-contribute to the numerator (it has `v = 0`), only to the denominator
-(the `exp(sinks[h])` term). The `sigmoid(lse - sinks)` factor folds that
-denominator change into the output.
-
-**Before writing the refactor yourself, check upstream.** HuggingFace
-Transformers and TorchTitan have both converged on this pattern for
-GPT-OSS independently. HF's `integrations/flex_attention.py` has the
-literal comment that score_mod cannot implement sinks correctly.
+**Do not** implement sinks with a `score_mod` closure that captures the Parameter. The closure specialises a self-compiling kernel on the Parameter, and that specialisation is exactly what would force our outer `fullgraph=True` to unwrap. Handing the sink to the kernel as a plain tensor argument keeps `forward_stage1_compute` fully compiled.
 
 ## Inference-time compile (the seq-len-grows problem)
 
-At training time, seq_len is constant → one compile total.
+At training time, seq_len is constant -> one compile total.
 
-At **autoregressive inference**, seq_len grows by 1 every step. If the
-test harness passes the current `[batch, prompt_len + step, hidden]`
-tensor to `_forward_attn_compute`, Dynamo retraces every step. With
-flex_attention inside, each retrace can take tens of seconds.
+At **autoregressive inference**, seq_len grows by 1 every step. If the test harness passes the current `[batch, prompt_len + step, hidden]` tensor through the model, Dynamo retraces `forward_stage1_compute` every step, and each retrace can take many seconds.
 
 ### Do NOT fix this by weakening the model's compile
 
-Don't add `dynamic=True` to the model's `@torch.compile` decorator. The
-modeling code must stay identical to what training uses — see
-`feedback_modeling_code_matches_training`. An inference-only compile
-flag on production code means tests stop exercising the training path.
+Don't add `dynamic=True` to the model's `@torch.compile` decorators. The modeling code must stay identical to what training uses. An inference-only compile flag on production code means tests stop exercising the training path.
 
 ### Fix it in the test harness with static-seq-len decode
 
-Allocate a `[batch, prompt_len + max_new_tokens]` buffer up front, fill
-initial prompt tokens, advance a cursor each step, and always pass the
-full-size buffer through the model:
+Allocate a `[batch, prompt_len + max_new_tokens]` buffer up front, fill the prompt tokens, advance a cursor each step, and always pass the full-size buffer through the model:
 
 ```python
 max_seq_len = prompt_len + max_new_tokens
@@ -224,24 +131,20 @@ cursor = prompt_len
 set_p2p_tensor_shapes([(1, max_seq_len, hidden_size)])   # ONCE, outside the loop
 
 for step in range(max_new_tokens):
-    loss, outputs = dualpipev.step(buffer if ctx.pp_rank == 0 else None, ...)
+    loss, outputs = dualpipev.step(buffer if distributed.pp_rank == 0 else None, ...)
     next_tok = outputs[:, cursor - 1, :].float().argmax(dim=-1)   # logit at last real pos
     buffer[:, cursor] = next_tok
     cursor += 1
 ```
 
-Forward cost per step is higher (you always process `max_seq_len`
-positions), but you trade O(max_new_tokens) compiles for one. In
-practice this cuts a multi-minute test to tens of seconds.
-
-See `templates/inference_test.py` for the full harness.
+Forward cost per step is higher (you always process `max_seq_len` positions), but you trade O(max_new_tokens) compiles for one. In practice this cuts a multi-minute test to tens of seconds. See `templates/inference_test.py` for the full harness.
 
 ## Debugging checklist
 
 | Symptom | Likely cause |
 |---------|-------------|
-| `Unsupported: compile-inside-compile` | Nested `@torch.compile` — unwrap outer region *conditionally* on the kernel that self-compiles |
-| Inference wall-clock balloons after first few tokens | Per-seq-len retrace — fix with static-seq-len decode, not `dynamic=True` |
-| Graph breaks reported at each step | `fullgraph=False` is silently catching them — switch to `fullgraph=True` and fix |
-| Step time 30% slower than an earlier branch | Someone removed a `@torch.compile` — check the three hot regions |
-| `calc_diff` passes but worst bias grad looks wrong | Compile drift on small-magnitude params — see `testing.md` on label scaling |
+| `Unsupported: compile-inside-compile` | A kernel self-compiles - unwrap `forward_stage1_compute` *conditionally* on that kernel |
+| Inference wall-clock balloons after first few tokens | Per-seq-len retrace - fix with static-seq-len decode, not `dynamic=True` |
+| Graph breaks reported at each step | `fullgraph=False` is silently catching them - switch to `fullgraph=True` and fix |
+| Step time 30% slower than an earlier branch | Someone removed a `@torch.compile` - check `forward_stage1_compute` and `forward_stage5` |
+| `calc_diff` passes but worst bias grad looks wrong | Compile drift on small-magnitude params - see `testing.md` on label scaling |

@@ -1,125 +1,126 @@
 """
 <HF model card URL or name>.
 
-STRUCTURAL OUTLINE — NOT a working file.
+STRUCTURAL OUTLINE - NOT a working file.
 
 This template encodes only the framework-side contracts that every
 PithTrain model must satisfy:
-  • the 5-stage decoder-layer interface,
-  • `@torch.compile(fullgraph=True)` on the three hot regions,
-  • shared-expert placement inside `_forward_attn_compute`,
-  • the model-level `forward` stage-record copy and `backward`.
+  - the decoder-layer stage interface (`forward_stage1` / `forward_stage3`
+    / `forward_stage5` + `reference_forward`; see `pithtrain/models/interface.py`),
+  - `@torch.compile(fullgraph=True)` on the hot compute regions,
+  - shared-expert placement inside `forward_stage1_compute`,
+  - the model-level `forward` (recorded pipeline path) vs `reference_forward`
+    (plain autograd path) split, and the phase -> stage mapping.
 
 Everything that defines *this* model (class names, attribute names,
 tensor shapes, RoPE variant, attention kernel, expert activation, etc.)
-is marked `TODO_HF` — fill in from HuggingFace's `modeling_<model>.py`
+is marked `TODO_HF` - fill in from HuggingFace's `modeling_<model>.py`
 **before** looking at other PithTrain models.  Do not start from Qwen3 /
 DeepSeek-V2 / GPT-OSS and rename; that path has produced silent
 state_dict mismatches.  See `reference/conventions.md`.
+
+The engine splits each decoder layer into five stages so it can overlap
+one micro-batch's compute with another's communication:
+
+  - Stage 1: pre-dispatch compute (LN + attention + routing).  `forward_stage1`.
+  - Stage 2: dispatch all-to-all.  Driven by the engine, NOT a layer method.
+  - Stage 3: expert compute.  `forward_stage3`.
+  - Stage 4: combine all-to-all.  Driven by the engine, NOT a layer method.
+  - Stage 5: post-combine compute (weighted sum + residual).  `forward_stage5`.
 """
 
-from dataclasses import fields
-from typing import List, Optional, Tuple
-
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
-from pithtrain.dualpipe.layer_partition import layer_partition
-from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
-from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode, get_linear_cls
-from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.contexts import distributed, training
+from pithtrain.dualpipe.dualpipev import layer_partition
+from pithtrain.dualpipe.execution import ChunkRecord, record_forward
+from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
-from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
-from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
+from pithtrain.operators.ep_dispatch import prepare_dispatch
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.silu_mul import silu_mul
+from pithtrain.operators.token_scatter import (
+    padded_index_gather,
+    precompute_group_indices,
+    scatter_for_grouped_gemm,
+)
 
-torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
+# TODO_HF: import HF's config class, e.g.
+#   from transformers.models.<model>.configuration_<model> import <Prefix>Config
+# and annotate the classes below with it instead of the bare `config` parameter.
 
 
 # -----------------------------------------------------------------------------
 # Rotary Position Embedding
 #
 # TODO_HF: copy HF's <Prefix>RotaryEmbedding implementation (LLaMA-style,
-# YaRN, linear-scaled, etc.).  Match HF's *class name* exactly — YaRN is
-# an implementation detail, not part of the name.
+# YaRN, linear-scaled, etc.).  Match HF's *class name* exactly - YaRN is
+# an implementation detail, not part of the name.  The cos/sin cache is a
+# non-persistent buffer sized to `max_position_embeddings`; `forward(S)`
+# returns the leading `S` rows (the model applies per-document / per-CP
+# position selection in `forward_posemb`, not here).
 # -----------------------------------------------------------------------------
 
 
 class HFPrefixRotaryEmbedding(nn.Module):  # TODO_HF rename to match HF class
-    """<one-line summary>."""
-
-    def __init__(self, dim: int, max_position_embeddings: int, base: float):
+    def __init__(self, config) -> None:
         super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        # TODO_HF: build cos/sin cache identical to HF.
+        inv_freq = self.compute_rope_params(config)
+        self.set_cos_sin(config, inv_freq)
 
-    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # TODO_HF: return cos[:seq_len], sin[:seq_len] in x's dtype.
-        raise NotImplementedError
+    def compute_rope_params(self, config) -> torch.Tensor:
+        # TODO_HF: match HF's inv_freq computation (base, head_dim, any scaling).
+        base, dim = config.rope_theta, config.head_dim
+        return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
+    def set_cos_sin(self, config, inv_freq: torch.Tensor) -> None:
+        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos", emb.cos().to(torch.bfloat16), persistent=False)
+        self.register_buffer("sin", emb.sin().to(torch.bfloat16), persistent=False)
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(2)
-    sin = sin.unsqueeze(2)
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+    def forward(self, S: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos[:S], self.sin[:S]
 
 
 # -----------------------------------------------------------------------------
 # Experts
 #
-# TODO_HF: mirror HF's Experts module — class name, attribute names, fused
-# vs split projections.  Storage layout must be `[E, out, in]` (training-
-# framework consensus; see reference/conventions.md).  If HF stores
-# `[E, in, out]`, the transpose lives ONLY in dcp2hf, never here.
+# TODO_HF: mirror HF's expert MLP - class name, attribute names, fused vs
+# split projections, activation.
 #
-# If HF fuses gate+up into `gate_up_proj`, keep it fused.  Split the
-# output at forward time for different post-ops.
+# Two storage strategies, pick the one that matches HF's checkpoint layout:
 #
-# CRITICAL: if expert forward has bias-add or elementwise post-ops,
-# truncate x to sum(ks) before the grouped GEMM (see reference/pitfalls.md).
+#   (a) Split projections -> `training.GroupedLinear(num_experts, in, out)`
+#       (shown below, Qwen3-style).  GroupedLinear owns the fp8/bf16 backend
+#       swap and the per-group GEMM; you just call it with the grouped-mm
+#       metadata.
+#
+#   (b) Fused gate+up or per-expert bias -> raw `nn.Parameter` of shape
+#       `[E, out, in]` plus a private `_group_linear` helper that dispatches
+#       on `training.fp8` (GPT-OSS-style; see gpt_oss.py `GptOssExperts`).
+#       If HF stores `[E, in, out]`, the transpose lives ONLY in dcp2hf,
+#       never here.
+#
+# CRITICAL: if the expert forward has a bias-add or elementwise post-op,
+# truncate `x` to `sum(ks)` before the grouped GEMM - grouped_mm may write
+# NaN into padding rows.  See reference/pitfalls.md nan-padding.
 # -----------------------------------------------------------------------------
 
 
 class HFPrefixExperts(nn.Module):  # TODO_HF rename to match HF class
-    """<one-line summary>."""
-
-    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
+    def __init__(self, config, num_experts: int):
         super().__init__()
-        self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        # TODO_HF: match HF's weight shapes and names.
-        # Example (GPT-OSS style, fused gate+up, `[E, out, in]` layout,
-        # per-expert bias):
-        #   self.gate_up_proj = nn.Parameter(
-        #       torch.empty(num_experts, 2 * intermediate_size, hidden_size))
-        #   self.gate_up_proj_bias = nn.Parameter(
-        #       torch.zeros(num_experts, 2 * intermediate_size))
-        #   self.down_proj = nn.Parameter(
-        #       torch.empty(num_experts, hidden_size, intermediate_size))
-        #   self.down_proj_bias = nn.Parameter(torch.zeros(num_experts, hidden_size))
-
-    def _grouped_mm(
-        self, x: torch.Tensor, weight: nn.Parameter, offs: torch.Tensor
-    ) -> torch.Tensor:
-        # Empty-input guard: grouped_mm dislikes an M=0 input.
-        if x.shape[0] == 0:
-            return x @ weight[0].transpose(-2, -1)
-        # `[E, out, in]` storage → transpose view for F.grouped_mm.
-        return F.grouped_mm(x, weight.transpose(-2, -1), offs=offs)
+        hidden_size = config.hidden_size
+        moe_intermediate_size = config.moe_intermediate_size
+        # TODO_HF: match HF's projection names and fusion.
+        self.gate_proj = training.GroupedLinear(num_experts, hidden_size, moe_intermediate_size)
+        self.up_proj = training.GroupedLinear(num_experts, hidden_size, moe_intermediate_size)
+        self.down_proj = training.GroupedLinear(num_experts, moe_intermediate_size, hidden_size)
 
     def forward(
         self,
@@ -128,607 +129,347 @@ class HFPrefixExperts(nn.Module):  # TODO_HF rename to match HF class
         ks: list | None = None,
         ks_tensor: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NaN-padding protection: truncate to sum(ks) before matmul.
-        # See reference/pitfalls.md §nan-padding.
-        if ks is not None:
-            actual_m = sum(ks)
-            if actual_m < x.shape[0]:
-                x = x[:actual_m]
-
-        # TODO_HF: implement the HF expert forward.
-        # Typical SwiGLU pattern:
-        #   gate_up = self._grouped_mm(x, self.gate_up_proj, grouped_mm_offs)
-        #   gate, up = gate_up[:, ::2], gate_up[:, 1::2]     # if fused
-        #   activated = silu(gate) * up    # or clamped-SwiGLU, etc.
-        #   out = self._grouped_mm(activated, self.down_proj, grouped_mm_offs)
-        #   return out
-        raise NotImplementedError
+        gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
+        # TODO_HF: implement the HF expert forward (SwiGLU shown).
+        g = self.gate_proj(x, **kwargs)
+        u = self.up_proj(x, **kwargs)
+        return self.down_proj(silu_mul(g, u), **kwargs)
 
 
 # -----------------------------------------------------------------------------
 # Router / Gate
 #
 # TODO_HF: match HF's class name EXACTLY (e.g. `<Prefix>TopKRouter`,
-# `<Prefix>Gate`, etc.) and the attribute name in the MLP module
-# (`self.mlp.router` or `self.mlp.gate`).  State_dict keys depend on this.
+# `<Prefix>Gate`) and the attribute the MoE block uses to hold it
+# (`self.router` vs `self.gate` - follow HF).  State_dict keys depend on
+# both.  The router is a raw `nn.Parameter` weight (+ optional bias), not a
+# `training.Linear`.
 # -----------------------------------------------------------------------------
 
 
-class HFPrefixRouter(nn.Module):  # TODO_HF rename to match HF
-    """<one-line summary>."""
-
-    def __init__(self, hidden_size: int, num_experts: int, num_experts_per_tok: int):
+class HFPrefixGate(nn.Module):  # TODO_HF rename to match HF
+    def __init__(self, config):
         super().__init__()
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.load_balance_loss_fn = None  # set externally by setup_model
-        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
-        # TODO_HF: add `self.bias = nn.Parameter(torch.zeros(num_experts))` if HF has it.
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.load_balance_loss_fn = None
+        self.router_replay = None
+        self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size)))
+        # TODO_HF: add `self.bias = nn.Parameter(torch.zeros(self.num_experts))` if HF has it.
 
-    @torch.compile(fullgraph=True)
-    def compute(
+    def forward(
         self, hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Top-k routing — must be fullgraph-compilable.
-
-        TODO_HF: match HF's exact routing math (pre-softmax top-k,
-        post-softmax top-k, norm_topk_prob, etc.).
-        """
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
-
-        # TODO_HF: compute logits, top-k idx, top-k weight per HF's spec.
-        # Common patterns:
-        #   (a) GPT-OSS: softmax over topk_logits only
-        #       logits = F.linear(hidden_states, self.weight, self.bias)
-        #       topk_logits, topk_idx = torch.topk(logits, k=..., dim=-1, sorted=True)
-        #       topk_weight = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
-        #
-        #   (b) Qwen3: softmax-then-topk, optional renormalise
-        #       scores = F.linear(hidden_states, self.weight, None).softmax(
-        #           dim=-1, dtype=torch.float32)
-        #       topk_weight, topk_idx = torch.topk(scores, k=..., dim=-1, sorted=False)
-        #       if self.norm_topk_prob:
-        #           topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        # TODO_HF: match HF's routing math exactly. Two common shapes:
+        #   (a) softmax-then-topk (Qwen3, shown): topk over softmax scores, optional renorm.
+        #   (b) topk-then-softmax (GPT-OSS): topk over raw logits, softmax over the topk only.
         logits = F.linear(hidden_states, self.weight, None)  # TODO_HF: add bias if HF has it
-        raise NotImplementedError  # complete per HF's spec
-
-        # Load-balance loss injection — copy this block verbatim.
-        if self.training and self.load_balance_loss_fn is not None:
-            scores = logits.softmax(dim=-1, dtype=torch.float32)
-            lb_loss = self.load_balance_loss_fn(
-                scores, topk_idx, self.num_experts, self.num_experts_per_tok
-            )
-            topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss)
-        else:
-            lb_loss = None
-
+        scores = logits.softmax(dim=-1, dtype=torch.float32)
+        topk_weight, topk_idx = torch.topk(scores, k=self.num_experts_per_tok, dim=-1, sorted=False)
+        if self.router_replay is not None:
+            topk_idx = self.router_replay(topk_idx)
+            topk_weight = scores.gather(-1, topk_idx)
+        if self.norm_topk_prob:
+            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+        if self.load_balance_loss_fn is None:
+            return topk_idx, topk_weight, None
+        lb_loss = self.load_balance_loss_fn(
+            scores, topk_idx, self.num_experts, self.num_experts_per_tok
+        )
+        # Token-weight the injected lb gradient so train_step's 1/num_tokens grad scale leaves it
+        # correctly normalized (it bypasses the token-weighted criterion). lb_loss stays unscaled.
+        topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
         return topk_idx, topk_weight, lb_loss
-
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        topk_idx, topk_weight, lb_loss = self.compute(hidden_states)
-        if lb_loss is not None:
-            MoELoadBalanceLossTracker.add(lb_loss)
-        return topk_idx, topk_weight
 
 
 # -----------------------------------------------------------------------------
 # MoE Block (the `mlp` attribute on the decoder layer)
 #
-# TODO_HF: match HF's MLP class name (e.g. `<Prefix>MLP`,
-# `<Prefix>MoEBlock`) and the attribute that holds the router
-# (`self.router` vs `self.gate` — follow HF).
+# TODO_HF: match HF's MoE class name (e.g. `<Prefix>MoE`, `<Prefix>MoEBlock`).
+# `experts_per_rank` is the EP-local expert count; EP degree comes from the
+# `distributed` runtime context, never a constructor arg.
 # -----------------------------------------------------------------------------
 
 
-class HFPrefixMLP(nn.Module):  # TODO_HF rename to match HF
-    """MoE block with EP support."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        intermediate_size: int,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
-    ):
+class HFPrefixMoE(nn.Module):  # TODO_HF rename to match HF
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-
-        # Protocol contract (DecoderLayerMlpProtocol):
-        self.ep_size = ep_size
-        self.ep_group = ep_group
-        self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = num_experts // ep_size
-
-        self.experts = HFPrefixExperts(self.experts_per_rank, hidden_size, intermediate_size)
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.experts_per_rank = config.num_experts // distributed.ep_size
+        self.experts = HFPrefixExperts(config, self.experts_per_rank)
         # TODO_HF: name this attribute per HF: self.router OR self.gate.
-        self.router = HFPrefixRouter(hidden_size, num_experts, num_experts_per_tok)
+        self.gate = HFPrefixGate(config)
+        # TODO_HF (if applicable): self.shared_experts = <SharedMLP>(config)
 
-        # TODO_HF (if applicable): self.shared_experts = <SharedMLP>(...)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Non-pipelined reference forward — used by reference_forward + test."""
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.router(hidden_states)  # TODO_HF: .gate vs .router
+        topk_idx, topk_weight, lb_loss = self.gate(hidden_states)  # TODO_HF: .gate vs .router
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        y = self._moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-        return y
-
-    def _moe_infer(
-        self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
-    ) -> torch.Tensor:
-        assert self.ep_size == 1, "Reference implementation only supports ep_size=1"
-        expert_idxs = topk_ids.view(-1)
-        sorted_tokens = (
-            x.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, x.shape[-1])
+        expert_idxs = topk_idx.view(-1)
+        replicated_tokens = (
+            hidden_states.unsqueeze(1)
+            .expand(-1, self.num_experts_per_tok, -1)
+            .reshape(-1, hidden_states.shape[-1])
         )
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
-            scatter_for_grouped_gemm(sorted_tokens, expert_idxs, self.experts_per_rank)
+            scatter_for_grouped_gemm(replicated_tokens, expert_idxs, self.experts_per_rank)
         )
         outs = self.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = outs[reverse_shuffle_idxs]
-
-        final_out = (
-            (outs.view(*topk_ids.shape, -1) * topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .to(outs.dtype)
-        )
-        return final_out
+        y = (outs.view(*topk_idx.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)
+        return y.view(*orig_shape)
 
 
 # -----------------------------------------------------------------------------
 # Attention
 #
-# TODO_HF: copy HF's attention class structure.  Pick the kernel that
-# matches HF's features:
-#   • Standard GQA / MHA, no sinks → flash_attn_func
-#   • Sliding window or sinks        → flex_attention (+ LSE renorm post-op)
-#   • Context parallelism needed     → ring_attention_func (conditional unwrap)
-#
-# DO NOT use `score_mod` closures that capture Parameters.  If HF does
-# something like "add a learned bias to attention scores", do it as a
-# post-op on the kernel output with the LSE trick — see reference/compile.md.
+# TODO_HF: copy HF's attention class structure.  The framework is BSHD end
+# to end; only attention reshapes to the kernel's varlen layout.  Pick the
+# kernel dispatch that matches HF's features:
+#   - Context parallelism (cp_size > 1)     -> ring_attention_func
+#   - Packed / variable-length (cu_seqlens) -> flash_attn_varlen_func (squeeze
+#                                             batch dim of 1, unsqueeze back)
+#   - Dense causal                          -> flash_attn_func
+#   - Sliding window / attention sinks      -> pass window_size / learnable_sink
+#                                             to the flash_attn kernels (see gpt_oss.py)
 # -----------------------------------------------------------------------------
 
 
 class HFPrefixAttention(nn.Module):  # TODO_HF rename to match HF
-    """<one-line summary>."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        attention_bias: bool = False,
-    ):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.scaling = head_dim**-0.5
+        hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.scaling = self.head_dim**-0.5
+        attention_bias = config.attention_bias
+        self.q_proj = training.Linear(hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
+        self.k_proj = training.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = training.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.o_proj = training.Linear(self.num_heads * self.head_dim, hidden_size, bias=attention_bias)
+        # TODO_HF: add model-specific Parameters/norms (e.g. q_norm/k_norm, per-head sinks).
 
-        LinearCls = get_linear_cls()
-        self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
-        self.k_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
-        # TODO_HF: add any model-specific Parameters (e.g. per-head sinks).
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @staticmethod
+    def apply_rotary_posemb(
+        q: torch.Tensor, k: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = rotary_posemb
+        cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
+        q_embed = (q * cos) + (HFPrefixAttention.rotate_half(q) * sin)
+        k_embed = (k * cos) + (HFPrefixAttention.rotate_half(k) * sin)
+        return q_embed, k_embed
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        # TODO_HF: additional kwargs your kernel needs (block_mask, etc.)
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # TODO_HF: Q/K/V projection, RoPE, kernel call, o_proj.
-        raise NotImplementedError
+        B, S, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
+        # TODO_HF: apply q_norm/k_norm here if HF has them.
+        query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
+        if distributed.cp_size > 1:
+            attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)
+        elif cu_seqlens is not None:
+            attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True).unsqueeze(0)
+        else:
+            attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
+        attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
+        return self.o_proj(attn_output)
 
 
 # -----------------------------------------------------------------------------
-# Decoder Layer — the 5-stage protocol surface.
+# Decoder Layer - the stage-method surface (LayerProtocol).
 # -----------------------------------------------------------------------------
 
 
 class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
-    """Implements `DecoderLayerProtocol` (pithtrain/models/interface.py)."""
-
-    def __init__(
-        self,
-        # TODO_HF: the parameter list should reflect the HF config.
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        intermediate_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        rms_norm_eps: float,
-        attention_bias: bool,
-        layer_idx: int,
-        ep_size: int = 1,
-        ep_group: Optional[dist.ProcessGroup] = None,
-    ):
+    def __init__(self, config, layer_id: int):
         super().__init__()
-        self.idx = layer_idx  # protocol field — nvtx range labels use this
-        self.hidden_size = hidden_size
-
-        self.self_attn = HFPrefixAttention(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            attention_bias=attention_bias,
-        )
-
-        self.mlp = HFPrefixMLP(
-            hidden_size=hidden_size,
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            intermediate_size=intermediate_size,
-            ep_size=ep_size,
-            ep_group=ep_group,
-        )
-
-        self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-
-        # Conditional unwrap — only when a self-compiling attention kernel
-        # is active.  Leave this out if HF's attention doesn't need it.
-        # Example for ring attention:
-        #   if getattr(self.self_attn, "use_ring_attn", False):
-        #       self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
-        #           self, type(self),
-        #       )
+        self.idx = layer_id
+        self.self_attn = HFPrefixAttention(config)
+        self.mlp = HFPrefixMoE(config)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     # ----- Stage 1 ---------------------------------------------------------
     @torch.compile(fullgraph=True)
-    def _forward_attn_compute(self, hidden_states: torch.Tensor):
-        """LN + Attn + LN (+ shared experts if any).  Must be fullgraph-compilable.
-
-        NOTE: shared experts — if the model has them — are folded into
-        residual HERE, not in forward_aggregate.  Their compute overlaps
-        with the stage-2 all-to-all dispatch of the routed tokens.
-        """
+    def forward_stage1_compute(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
-
-        hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # TODO_HF (if applicable): residual = residual + self.mlp.shared_experts(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states)  # TODO_HF: .gate vs .router
+        return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
-        # Shared-expert fold (keep this stanza; it's a no-op when no shared experts).
-        if hasattr(self.mlp, "shared_experts"):
-            residual = residual + self.mlp.shared_experts(hidden_states)
-
-        return hidden_states, residual
-
-    def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
-
-        # TODO_HF (rare): dense fallback for non-MoE layers.  Most pure-MoE
-        # models don't need this; remove if every layer is MoE.
-        if not hasattr(self.mlp, "experts"):
-            return ForwardAttnOutput(
-                hidden_states,
-                None,
-                None,
-                None,
-                None,
-                None,
-                residual,
-            )
-
-        # Routing + dispatch prep
-        topk_ids, topk_weight = self.mlp.router(hidden_states)  # TODO_HF: .gate vs .router
-        (
-            sorted_tokens,
-            idxs,
-            expert_idxs,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-            input_splits,
-            output_splits,
-        ) = moe_ep_prepare_dispatch(
-            hidden_states,
-            topk_ids,
-            self.mlp.num_experts,
-            self.mlp.ep_size,
-            self.mlp.experts_per_rank,
-            self.mlp.ep_group,
-        )
-        return ForwardAttnOutput(
-            sorted_tokens,
-            idxs,
-            topk_weight,
-            output_splits,
-            input_splits,
-            expert_idxs,
-            residual,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-        )
+    def forward_stage1(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
+        dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
+        return dispatch_tokens, residual, routing
 
     # ----- Stage 3 ---------------------------------------------------------
-    def forward_mlp(
+    def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
-        expert_idxs: Optional[torch.Tensor] = None,
-        expand_idx: Optional[torch.Tensor] = None,
+        expert_idxs: torch.Tensor | None = None,
+        expand_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not hasattr(self.mlp, "experts"):
-            assert expert_idxs is None
-            return self.mlp(gathered_tokens)
-
-        assert expert_idxs is not None
-        if expand_idx is not None:
-            # `padded_index_gather`, NOT raw gathered_tokens[expand_idx].
+        if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
-            scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
-        )
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
         del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
-        outs = padded_index_gather(outs, reverse_shuffle_idxs)
-        return outs
+        return padded_index_gather(outs, reverse_shuffle_idxs)
 
     # ----- Stage 5 ---------------------------------------------------------
     @torch.compile(fullgraph=True)
-    def forward_aggregate(
+    def forward_stage5(
         self,
         moe_outs: torch.Tensor,
-        moe_local_idxs: Optional[torch.Tensor],
-        topk_weight: Optional[torch.Tensor],
+        moe_local_idxs: torch.Tensor | None,
+        topk_weight: torch.Tensor | None,
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        """Weighted expert sum + residual.  Shared experts are ALREADY folded into
-        residual inside `_forward_attn_compute` — do NOT re-add them here.
-        """
-        if hasattr(self.mlp, "experts"):
-            if self.mlp.ep_size > 1:
-                assert moe_local_idxs is not None
-                seq_len, topk = topk_weight.shape
-                permuted_probs = topk_weight.view(-1)[moe_local_idxs]
-                token_indices = moe_local_idxs // topk
-                weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
-                hidden_states = moe_outs.new_zeros(seq_len, moe_outs.shape[-1])
-                hidden_states.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
-                hidden_states = hidden_states.view(*residual.shape)
-            else:
-                assert moe_local_idxs is None
-                final_out = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
-                hidden_states = final_out.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)
-        else:
-            assert moe_local_idxs is None and topk_weight is None
-            hidden_states = moe_outs
-
-        return residual + hidden_states
+        if distributed.ep_size == 1:
+            weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
+            return residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)
+        permuted_probs = topk_weight.view(-1)[moe_local_idxs]
+        token_indices = moe_local_idxs // topk_weight.shape[1]
+        weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
+        aggregated = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
+        aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
+        return residual + aggregated.view(*residual.shape)
 
     # ----- Reference (non-pipelined) ---------------------------------------
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Plain forward — used by single-GPU test and the reference model in test_dualpipev."""
+    def reference_forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling reference_forward")
-
-        # TODO_HF: if self_attn has a ring-attention path, disable it here (see
-        # Qwen3 / DeepSeek-V2 for the `_disable_ring_attn` flag pattern).
-        hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp.reference_forward(hidden_states)
         return residual + hidden_states
 
 
 # -----------------------------------------------------------------------------
-# Full Model — one pipeline stage of the model, wired for DualPipeV.
+# Full Model - one pipeline stage (chunk) of the model, wired for DualPipeV.
+#
+# DualPipeV cuts the model into `2 * pp_size` chunks and gives each pp rank
+# two of them (a V-shape).  `phase` selects which chunk this instance is:
+#   phase 0  -> the "descending" chunk (stage_index = pp_rank),
+#   phase 1  -> the "ascending" chunk  (stage_index = 2*pp_size-1-pp_rank),
+#   phase -1 -> the whole model as a single stage (non-pipelined reference).
 # -----------------------------------------------------------------------------
 
 
 class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
-    """<one-line summary>."""
-
-    def __init__(
-        self,
-        config,
-        num_stages: int,
-        stage_id: int,
-        cp_group: Optional[dist.ProcessGroup] = None,
-        ep_group: Optional[dist.ProcessGroup] = None,
-    ):
+    def __init__(self, config, phase: int):
         super().__init__()
-        self.config = config
-        self.stage_id = stage_id
-        self.num_stages = num_stages
+        match phase:
+            case 0:
+                stage_count = distributed.pp_size * 2
+                stage_index = distributed.pp_rank
+            case 1:
+                stage_count = distributed.pp_size * 2
+                stage_index = stage_count - 1 - distributed.pp_rank
+            case -1:
+                # non-pipelined reference: a single stage owns the whole model
+                stage_count = 1
+                stage_index = 0
+            case _:
+                raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
+        self.stage_index, self.stage_count = stage_index, stage_count
+        self.chunk_record: ChunkRecord | None = None
 
-        # TODO_HF: read fields off `config`.  Use `getattr(config, X, default)`
-        # for fields that are optional in HF's config.
-        hidden_size = config.hidden_size
-        num_attention_heads = config.num_attention_heads
-        num_key_value_heads = config.num_key_value_heads
-        head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
-        intermediate_size = config.intermediate_size
-        num_experts = getattr(config, "num_local_experts", None) or config.num_experts
-        num_experts_per_tok = config.num_experts_per_tok
-        rms_norm_eps = config.rms_norm_eps
-        attention_bias = getattr(config, "attention_bias", False)
-        vocab_size = config.vocab_size
-        max_position_embeddings = config.max_position_embeddings
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-
-        ep_size = getattr(config, "ep_size", 1)
-
-        # First stage has embed_tokens; last stage has norm + lm_head.
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size) if stage_id == 0 else None
-
-        num_local_layers = layer_partition(config.num_hidden_layers, num_stages)
-        layer_id_begin = sum(num_local_layers[:stage_id])
-        layer_id_end = layer_id_begin + num_local_layers[stage_id]
-
-        # nn.ModuleDict keyed by absolute layer_id string (required by FSDP wrapping).
+        self.rotary_emb = HFPrefixRotaryEmbedding(config)
+        self.embed_tokens, self.norm, self.lm_head = None, None, None
+        if stage_index == 0:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if stage_index == stage_count - 1:
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(i): HFPrefixDecoderLayer(
-                    hidden_size=hidden_size,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_heads=num_key_value_heads,
-                    head_dim=head_dim,
-                    intermediate_size=intermediate_size,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    rms_norm_eps=rms_norm_eps,
-                    attention_bias=attention_bias,
-                    layer_idx=i,
-                    ep_size=ep_size,
-                    ep_group=ep_group,
-                )
-                for i in range(layer_id_begin, layer_id_end)
+                str(i): HFPrefixDecoderLayer(config, i)
+                for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
             }
         )
 
-        if stage_id == num_stages - 1:
-            self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        else:
-            self.norm = None
-            self.lm_head = None
+    def forward_posemb(
+        self, S: int, cu_seqlens: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = distributed.device
+        if cu_seqlens is not None:
+            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
+            lengths = ends - starts
+            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
+            cos, sin = self.rotary_emb(S)
+            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
+        cp_size, block_size = distributed.cp_size, S // 2
+        front_start = distributed.cp_rank * block_size
+        back_start = (2 * cp_size - distributed.cp_rank - 1) * block_size
+        front_end, back_end = front_start + block_size, back_start + block_size
+        position_ids = torch.cat([torch.arange(front_start, front_end, device=device), torch.arange(back_start, back_end, device=device)])
+        cos, sin = self.rotary_emb(S * cp_size)
+        return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
-        self.rotary_emb = HFPrefixRotaryEmbedding(
-            head_dim,
-            max_position_embeddings=max_position_embeddings,
-            base=rope_theta,
-        )
+    def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(hidden_states)
 
-        # TODO_HF: any other model-level state (e.g. block_mask cache for
-        # flex_attention).
+    def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.norm(hidden_states)
+        return self.lm_head(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass.  Two modes:
-        • Plain (intermediate_tensors is None): reference / eager inference.
-        • Recorded (intermediate_tensors is set): the 5-stage path — we
-          must copy every stage record into the pre-allocated slot.
-        """
-        intermediate_tensors: Optional[IntermediateTensors] = getattr(
-            self, "_intermediate_tensors", None
-        )
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return record_forward(self, hidden_states, self.chunk_record, cu_seqlens)
 
-        if self.embed_tokens is not None:
-            input_ids = hidden_states
-            hidden_states = self.embed_tokens(input_ids)
-
-        bsz, seq_len, _ = hidden_states.shape
-
-        cos, sin = self.rotary_emb(hidden_states, seq_len=seq_len)
-        position_embeddings = (cos[:seq_len].unsqueeze(0), sin[:seq_len].unsqueeze(0))
-
-        for layer_idx_str, layer in self.layers.items():
-            layer._position_embeddings = position_embeddings
-            # TODO_HF: set any other per-forward state on layers here
-            # (e.g. layer._block_mask, layer type flags, etc.).
-
-        # Plain forward — falls into this branch under `reference_forward`
-        # and under plain eager inference.
-        if intermediate_tensors is None:
-            for _, layer in self.layers.items():
-                ret = decoder_layer_forward(layer, hidden_states)
-                hidden_states = ret[0] if isinstance(ret, tuple) else ret
-            if self.norm is not None:
-                hidden_states = self.norm(hidden_states)
-                hidden_states = self.lm_head(hidden_states)
-            return hidden_states
-
-        # Recorded forward — the 5-stage path.  The stage-record copy is
-        # critical: iterate EVERY field of every record, including stages
-        # 2 and 4 which only have `.ctx`.  See reference/protocol.md.
-        layer_idx = 0
-        if self.embed_tokens is not None:
-            intermediate_tensors.prolog.args = PrologArgs()
-            intermediate_tensors.prolog.outs = PrologOuts(hidden_states)
-
+    def reference_forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.stage_index == 0:
+            hidden_states = self.forward_prolog(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
         for _, layer in self.layers.items():
-            ret = decoder_layer_forward(layer, hidden_states)
-            if len(ret) == 2:
-                hidden_states, layer_record = ret
-                dst = intermediate_tensors.layers[layer_idx]
-                for field in fields(layer_record):
-                    src_rec = getattr(layer_record, field.name)
-                    dst_rec = getattr(dst, field.name)
-                    for rf in fields(src_rec):
-                        setattr(dst_rec, rf.name, getattr(src_rec, rf.name))
-            else:
-                hidden_states = ret[0]
-                dst = intermediate_tensors.layers[layer_idx]
-                for field in fields(dst):
-                    record = getattr(dst, field.name)
-                    for rf in fields(record):
-                        setattr(record, rf.name, None)
-            layer_idx += 1
-
-        if self.norm is not None:
-            assert self.lm_head is not None
-            if not ModelImplMode.use_reference_fwd:
-                hidden_states = hidden_states.detach().requires_grad_()
-            intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
-            hidden_states = self.norm(hidden_states)
-            hidden_states = self.lm_head(hidden_states)
-
+            hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
+        if self.stage_index == self.stage_count - 1:
+            hidden_states = self.forward_epilog(hidden_states)
         return hidden_states
-
-    @staticmethod
-    def backward(
-        module: "HFPrefixModel",
-        dy: Optional[List[torch.Tensor]],
-        loss: Optional[torch.Tensor],
-        intermediate_tensors: IntermediateTensors,
-    ):
-        """Backward pass.  Copy this verbatim; only the class name in
-        `module: "HFPrefixModel"` changes per model.
-        """
-        assert (dy is None) != (loss is None), "Either dy or loss should be provided"
-
-        if loss is not None:
-            assert module.norm is not None
-            assert module.lm_head is not None
-            loss.backward()
-            loss.detach_()
-            dy = (intermediate_tensors.epilog.args.hidden_states.grad,)
-            intermediate_tensors.epilog.args = None
-            loss = None
-        else:
-            assert module.norm is None
-            assert module.lm_head is None
-
-        dx = dy
-        layers_list = [layer for _, layer in module.layers.items()]
-        for layer, intermediate_tensors_layer in zip(
-            reversed(layers_list), reversed(intermediate_tensors.layers)
-        ):
-            dx = (decoder_layer_backward(layer, dx, loss, intermediate_tensors_layer),)
-
-        final_grads = dx
-        if module.embed_tokens is not None:
-            record = intermediate_tensors.prolog
-            run_backward(record.outs, dx)
-            for rf in fields(record):
-                setattr(record, rf.name, None)
-            final_grads = (None,)
-
-        return final_grads
