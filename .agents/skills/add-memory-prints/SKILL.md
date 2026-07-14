@@ -24,7 +24,7 @@ All edits are observation-only:
 
 - `_lmem()` and `_mem_gb()` call `torch.cuda.synchronize()` + read `memory_allocated()`. No tensor modification.
 - `_SavedTensorsProfiler` uses `saved_tensors_hooks` with a pack function that returns the tensor unchanged.
-- Expert detail prints refactor `return self.down_proj(g * u, ...)` into `gu = g * u; out = self.down_proj(gu, ...); return out` — functionally identical.
+- Expert detail prints refactor `return self.down_proj(silu_mul(g, u), ...)` into `gu = silu_mul(g, u); out = self.down_proj(gu, ...); return out` — functionally identical.
 - Pipeline prints add synchronize/print between existing operations. Adds latency, does not change computation order.
 
 ## Before Starting
@@ -62,7 +62,7 @@ In `DualPipeV.__init__`, add after `self.comm_stream = ...`:
 self.memory_profiling = True  # Set to True to enable per-step memory logging
 ```
 
-### 1B: Layer-level helpers in `pithtrain/dualpipe/modeling.py`
+### 1B: Layer-level helpers in `pithtrain/dualpipe/execution.py`
 
 Add after imports, before any function definitions:
 
@@ -254,7 +254,7 @@ Replace with:
 ```python
 for i in range(step_1):
     if _profiling and i == 1:
-        import pithtrain.dualpipe.modeling as _mod
+        import pithtrain.dualpipe.execution as _mod
         _mod._layer_mem_profile = True
     self._forward_chunk(0)
     if _profiling and i == 1:
@@ -302,7 +302,7 @@ for i in range(step_2):
         )
     self._recv_forward(0)
     if _profiling and i == 0:
-        import pithtrain.dualpipe.modeling as _mod
+        import pithtrain.dualpipe.execution as _mod
         _mod._layer_mem_profile = True
     self._forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
     if _profiling and i == 0:
@@ -424,11 +424,11 @@ if _profiling:
 
 ---
 
-## Group 5: Per-Layer Prints (`pithtrain/dualpipe/modeling.py` + model file)
+## Group 5: Per-Layer Prints (`pithtrain/dualpipe/execution.py` + model file)
 
-### 5A: In `decoder_layer_forward()` (modeling.py)
+### 5A: In `layer_forward()` (execution.py)
 
-After `intermediate_tensors = IntermediateTensorsLayer()`, add:
+`layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens=None)` runs the five stages in order, each under its own `# Stage N.` comment block. At the top of the function, before `# Stage 1.`, add:
 
 ```python
 _do_lmem = _layer_mem_profile and layer.idx in DETAIL_LAYERS
@@ -441,56 +441,83 @@ if _do_saved:
 
 Then instrument each stage:
 
-**Stage 1** — before the stage, add `if _do_lmem: _lmem(...)`. Wrap `layer.forward_attn(...)`:
+**Stage 1** — wrap the `layer.forward_stage1(...)` call:
 
 ```python
 if _do_saved:
     _prof = _SavedTensorsProfiler(layer.idx, "stage1", _wt_ptrs)
     with _prof:
-        output = layer.forward_attn(next_hidden_states)
+        dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)
     _prof.print_summary()
 else:
-    output = layer.forward_attn(next_hidden_states)
+    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)
 ```
 
-After stage1 record setup: `if _do_lmem: _lmem(f"layer{layer.idx} after stage1 (forward_attn + gate + dispatch_prep)")`
+After the Stage 1 record is populated: `if _do_lmem: _lmem(f"layer{layer.idx} after stage1 (forward_stage1: attn + gate + dispatch_prep)")`
 
-**Stage 2** — after `nvtx.range_pop()`: `if _do_lmem: _lmem(f"layer{layer.idx} after stage2 (dispatch a2a)")`
+**Stage 2** — after the `nvtx.range_pop()` closing Stage 2: `if _do_lmem: _lmem(f"layer{layer.idx} after stage2 (dispatch a2a)")`
 
-**Stage 3** — same wrapping pattern as stage 1, using `_SavedTensorsProfiler(layer.idx, "stage3", _wt_ptrs)` around `layer.forward_mlp(...)`. After: `if _do_lmem: _lmem(f"layer{layer.idx} after stage3 (forward_mlp)")`
+**Stage 3** — same wrapping pattern as Stage 1, using `_SavedTensorsProfiler(layer.idx, "stage3", _wt_ptrs)` around the `layer.forward_stage3(...)` call:
 
-**Stage 4** — after `nvtx.range_pop()`: `if _do_lmem: _lmem(f"layer{layer.idx} after stage4 (combine a2a)")`
-
-**Stage 5** — same wrapping pattern around `layer.forward_aggregate(...)` with `_SavedTensorsProfiler(layer.idx, "stage5", _wt_ptrs)`. After: `if _do_lmem: _lmem(f"layer{layer.idx} after stage5 (forward_aggregate)")`
-
-### 5B: In model decoder layer `forward_attn` (model file)
-
-Add at the top:
 ```python
-from pithtrain.dualpipe.modeling import _layer_mem_profile, _lmem
+if _do_saved:
+    _prof = _SavedTensorsProfiler(layer.idx, "stage3", _wt_ptrs)
+    with _prof:
+        moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None)
+    _prof.print_summary()
+else:
+    moe_outs = layer.forward_stage3(gathered_tokens, routing.expert_idxs if has_experts else None, routing.expand_idx if has_experts else None)
+```
+
+After: `if _do_lmem: _lmem(f"layer{layer.idx} after stage3 (forward_stage3)")`
+
+**Stage 4** — after the `nvtx.range_pop()` closing Stage 4: `if _do_lmem: _lmem(f"layer{layer.idx} after stage4 (combine a2a)")`
+
+**Stage 5** — same wrapping pattern around the `layer.forward_stage5(...)` call with `_SavedTensorsProfiler(layer.idx, "stage5", _wt_ptrs)`:
+
+```python
+if _do_saved:
+    _prof = _SavedTensorsProfiler(layer.idx, "stage5", _wt_ptrs)
+    with _prof:
+        hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    _prof.print_summary()
+else:
+    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+```
+
+After: `if _do_lmem: _lmem(f"layer{layer.idx} after stage5 (forward_stage5)")`
+
+### 5B: In model decoder layer `forward_stage1` (model file)
+
+`forward_stage1` runs the compiled `forward_stage1_compute` helper (LN + attention + LN + router gate) and then `prepare_dispatch`. Add at the top:
+```python
+from pithtrain.dualpipe.execution import _layer_mem_profile, _lmem
 _do = _layer_mem_profile and self.idx in DETAIL_LAYERS
 ```
 
 Add `_lmem` prints:
-- Before `_forward_attn_compute`: `if _do: _lmem(f"  layer{self.idx} attn: before _forward_attn_compute")`
-- After `_forward_attn_compute`: `if _do: _lmem(f"  layer{self.idx} attn: after _forward_attn_compute (LN+Attn+LN)")`
-- After gate call (MoE layers only): `if _do: _lmem(f"  layer{self.idx} attn: after gate")`
-- After `moe_ep_prepare_dispatch`: `if _do: _lmem(f"  layer{self.idx} attn: after dispatch_prep  sorted={tuple(sorted_tokens.shape)}")`
+- Before the `forward_stage1_compute(...)` call: `if _do: _lmem(f"  layer{self.idx} stage1: before forward_stage1_compute")`
+- After the `forward_stage1_compute(...)` call: `if _do: _lmem(f"  layer{self.idx} stage1: after forward_stage1_compute (LN+Attn+LN+gate)")`
+- After `prepare_dispatch(...)`: `if _do: _lmem(f"  layer{self.idx} stage1: after dispatch_prep  dispatch={tuple(dispatch_tokens.shape)}")`
 
-### 5C: In model decoder layer `forward_mlp` (model file)
+The router gate runs inside the compiled `forward_stage1_compute`, so its allocation is captured by the "after forward_stage1_compute" probe rather than a separate print.
+
+### 5C: In model decoder layer `forward_stage3` (model file)
 
 Add at the top:
 ```python
-from pithtrain.dualpipe.modeling import _layer_mem_profile, _lmem
+from pithtrain.dualpipe.execution import _layer_mem_profile, _lmem
 _do = _layer_mem_profile and self.idx in DETAIL_LAYERS
 ```
 
 Add `_lmem` prints:
-- Before `expand_idx` gather: `if _do: _lmem(f"  layer{self.idx} mlp: before expand_idx  gathered={tuple(gathered_tokens.shape)}")`
-- After `expand_idx` gather: `if _do: _lmem(f"  layer{self.idx} mlp: after expand_idx   expanded={tuple(gathered_tokens.shape)}")`
-- After `scatter_for_grouped_gemm`: `if _do: _lmem(f"  layer{self.idx} mlp: after scatter      output_tokens={tuple(output_tokens.shape)}")`
-- After `self.mlp.experts(...)`: `if _do: _lmem(f"  layer{self.idx} mlp: after experts      outs={tuple(outs.shape)}")`
-- After unshuffle: `if _do: _lmem(f"  layer{self.idx} mlp: after unshuffle    outs={tuple(outs.shape)}")`
+- Before the `padded_index_gather(gathered_tokens, expand_idx)` gather (ep_size > 1 branch): `if _do: _lmem(f"  layer{self.idx} stage3: before expand gather  gathered={tuple(gathered_tokens.shape)}")`
+- After the expand gather: `if _do: _lmem(f"  layer{self.idx} stage3: after expand gather   expanded={tuple(gathered_tokens.shape)}")`
+- After `scatter_for_grouped_gemm`: `if _do: _lmem(f"  layer{self.idx} stage3: after scatter      output_tokens={tuple(output_tokens.shape)}")`
+- After `self.mlp.experts(...)`: `if _do: _lmem(f"  layer{self.idx} stage3: after experts      outs={tuple(outs.shape)}")`
+- After the reverse-shuffle `padded_index_gather(outs, reverse_shuffle_idxs)`: `if _do: _lmem(f"  layer{self.idx} stage3: after unshuffle    outs={tuple(outs.shape)}")`
+
+`forward_stage3` returns `padded_index_gather(outs, reverse_shuffle_idxs)` directly; assign it to `outs` first so the unshuffle print has a value to report before the `return`.
 
 **Critical**: Also pass `_do_mem=_do` to the experts forward call. Change:
 ```python
@@ -504,36 +531,36 @@ outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tens
 ### 5D: In model experts class `forward` (model file)
 
 1. Add `_do_mem: bool = False` parameter to the `forward()` signature.
-2. Add `from pithtrain.dualpipe.modeling import _lmem` at the top.
+2. Add `from pithtrain.dualpipe.execution import _lmem` at the top.
 3. Add prints guarded by `if _do_mem:`:
    - Before `gate_proj`: shape of input `x`
-   - After `gate_proj + activation`: shape of `g`
+   - After `gate_proj`: shape of `g`
    - After `up_proj`: shape of `u`
-   - After `g * u`: shape of `gu`
+   - After `silu_mul(g, u)`: shape of `gu`
    - After `down_proj`: shape of `out`
-4. **Refactor the return**: Change `return self.down_proj(g * u, ...)` to:
+4. **Refactor the return**: Change `return self.down_proj(silu_mul(g, u), **kwargs)` to:
    ```python
-   gu = g * u
+   gu = silu_mul(g, u)
    if _do_mem:
-       _lmem(f"    experts: after g*u         gu={tuple(gu.shape)}")
+       _lmem(f"    experts: after silu_mul    gu={tuple(gu.shape)}")
    out = self.down_proj(gu, **kwargs)
    if _do_mem:
        _lmem(f"    experts: after down_proj   out={tuple(out.shape)}")
    return out
    ```
 
-### 5E: In model class `forward` (model file)
+### 5E: In model `forward_prolog` / `forward_epilog` (model file)
 
-In the pipeline branch (`intermediate_tensors is not None`), add:
+Prolog (embed) and epilog (norm + lm_head) compute live in the model's `forward_prolog` and `forward_epilog` methods, which the pipeline invokes on the first and last stage respectively. Add the import in each method that uses it:
 ```python
-from pithtrain.dualpipe.modeling import _layer_mem_profile, _lmem
+from pithtrain.dualpipe.execution import _layer_mem_profile, _lmem
 ```
 
 Then:
-- After `embed_tokens` prolog: `if _layer_mem_profile: _lmem("after prolog (embed_tokens)")`
-- Before norm (epilog): `if _layer_mem_profile: _lmem("before epilog (norm + lm_head)")`
-- After `self.norm(...)`: `if _layer_mem_profile: _lmem("after norm, before lm_head")`
-- After `self.lm_head(...)`: `if _layer_mem_profile: _lmem("after lm_head")`
+- In `forward_prolog`, after embedding the tokens (assign to a local, print, then return): `if _layer_mem_profile: _lmem("after prolog (embed_tokens)")`
+- In `forward_epilog`, at the top before `self.norm(...)`: `if _layer_mem_profile: _lmem("before epilog (norm + lm_head)")`
+- In `forward_epilog`, after `self.norm(...)`: `if _layer_mem_profile: _lmem("after norm, before lm_head")`
+- In `forward_epilog`, after `self.lm_head(...)`: `if _layer_mem_profile: _lmem("after lm_head")`
 
 ---
 
@@ -631,7 +658,7 @@ if _mem_profile:
 
 ## Execution Order
 
-1. `pithtrain/dualpipe/modeling.py` — Groups 1B, 5A
+1. `pithtrain/dualpipe/execution.py` — Groups 1B, 5A
 2. `pithtrain/dualpipe/dualpipev.py` — Groups 1A, 4
 3. `pithtrain/models/<model>.py` — Groups 5B, 5C, 5D, 5E
 4. `pithtrain/modules/distributed.py` — Group 2
