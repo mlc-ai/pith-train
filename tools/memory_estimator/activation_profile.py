@@ -122,7 +122,7 @@ class ActivationEstimator:
         self, layer_idx: int, prefix: str
     ) -> tuple[MemoryBucket, MemoryBucket]:
         """
-        Compute IntermediateTensors record sizes and autograd overhead for one MoE layer.
+        Compute LayerRecord activation sizes and autograd overhead for one MoE layer.
 
         Returns (records_bucket, autograd_bucket).
         """
@@ -167,7 +167,7 @@ class ActivationEstimator:
         records.add(f"{prefix}.s1.outs.topk_ids", (m, k), "int64")
         records.add(f"{prefix}.s1.outs.residual", (B, S, H), "bf16")
 
-        # Stage 1 autograd (compiled _forward_attn_compute + gate)
+        # Stage 1 autograd (compiled forward_stage1_compute + gate)
         # NOTE: input_ln_input shares storage with s1.args.hidden (= prev
         # layer's hidden_states). NOT counted to avoid double-counting.
         autograd.add(f"{prefix}.s1.ag.qkv_proj_input", (B, S, H), "bf16")
@@ -184,7 +184,7 @@ class ActivationEstimator:
         # Gate (router) input: nn.Linear saves input for weight grad (bf16).
         autograd.add(f"{prefix}.s1.ag.gate_input", (m, H), "bf16")
 
-        # Stage 3 autograd (forward_mlp - not compiled)
+        # Stage 3 autograd (forward_stage3 - not compiled)
         #
         # The MLP operates at the SCATTERED dimension:
         #   m_scattered = m_expanded + experts_per_rank * 127  (GEMM 128-row alignment)
@@ -215,15 +215,15 @@ class ActivationEstimator:
 
         # Stage 4: combine all-to-all output (reverse of dispatch).
         # Output = results sent back to source ranks at m_times_k dimension.
-        # Stored as s5.args.moe_outs; also saved by forward_aggregate autograd
+        # Stored as s5.args.moe_outs; also saved by forward_stage5 autograd
         # (shared storage - counted once here in records, not in autograd).
         records.add(f"{prefix}.s5.args.combine_output", (m_times_k, H), "bf16")
 
         # Stage 5 outs
         records.add(f"{prefix}.s5.outs.hidden_states", (B, S, H), "bf16")
 
-        # Stage 5 autograd (compiled forward_aggregate)
-        # forward_aggregate saves moe_outs and topk_weight for backward,
+        # Stage 5 autograd (compiled forward_stage5)
+        # forward_stage5 saves moe_outs and topk_weight for backward,
         # but both already counted in records (s5.args.combine_output and
         # s1.outs.topk_weight share storage).  Only moe_local_idxs is new.
         autograd.add(f"{prefix}.s5.ag.moe_local_idxs", (m_times_k,), "int64")

@@ -66,7 +66,7 @@ def print_summary(
     print()
     print(f"{'  Component':<52s} {'GB':>8s}")
     print(f"  {_bar(58)}")
-    print(_format_bytes_line("Activations (IntermediateTensors records)", snap.activation_bytes))
+    print(_format_bytes_line("Activations (LayerRecord tensors)", snap.activation_bytes))
     print(_format_bytes_line("Autograd saved tensors", snap.autograd_bytes))
     print(_format_bytes_line("Gradients (accumulated)", snap.gradients.total_bytes))
     print(_format_bytes_line("Comm buffers (P2P + all-to-all)", snap.comm_buffers.total_bytes))
@@ -151,7 +151,7 @@ def print_detail(result: ScheduleResult) -> None:
 
         print()
         print(f"--- Live chunk phase={phase}, chunk={chunk_id} ---")
-        print(f"  IntermediateTensors records ({format_bytes(records.total_bytes)}):")
+        print(f"  LayerRecord tensors ({format_bytes(records.total_bytes)}):")
 
         # Group by layer
         layer_specs: dict[str, list] = {}

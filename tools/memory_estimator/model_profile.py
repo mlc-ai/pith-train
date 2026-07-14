@@ -75,7 +75,7 @@ def compute_layer_distribution(num_hidden_layers: int, num_stages: int) -> list[
     """
     Distribute decoder layers across pipeline stages.
 
-    Matches the algorithm in pithtrain/dualpipe/layer_partition.py:
+    Matches the algorithm in pithtrain/dualpipe/dualpipev.py:
     even base allocation, remainder layers go to inner stages first
     (edges stay light to compensate for embed/head overhead).
     """
