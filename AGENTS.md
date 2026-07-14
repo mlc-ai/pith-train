@@ -145,4 +145,10 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 ## Agent Skills
 
-This repo ships agent-native workflows under `.agents/skills/` (`add-new-model`, `add-memory-prints`, `capture-nsys-profile`, `analyze-nsys-profile`, `validate-correctness`, `estimate-memory`, `setup-benchmark-inputs`, `launch-with-slurm`). When the user's request matches one of those, invoke the skill rather than re-deriving the workflow from scratch.
+This repository ships agent-native workflows under `.agents/skills/`, loaded automatically. Invoke a skill whenever a request matches one instead of re-deriving the workflow from scratch.
+
+Skills are living documents, and you should keep them sharp as you work. When you notice any of the following, surface it for review rather than editing silently or derailing the task in progress:
+
+- **Fix** a skill you followed that was stale, wrong, or incomplete.
+- **Refine** a skill that worked but whose guidance could be sharper.
+- **Propose** a new skill when you did repeatable, skill-worthy work that none covered.
