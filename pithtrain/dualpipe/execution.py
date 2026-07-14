@@ -771,7 +771,7 @@ def layer_backward(
         return hidden_states_grad
 
 
-def record_forward(
+def model_forward(
     module: ModelProtocol,
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
@@ -795,7 +795,7 @@ def record_forward(
     return hidden_states
 
 
-def record_backward(
+def model_backward(
     module: ModelProtocol,
     dy: Optional[List[torch.Tensor]],
     loss: Optional[torch.Tensor],
@@ -804,7 +804,7 @@ def record_backward(
     """
     Sequential (non-overlapped) backward for one pipeline chunk: epilog -> layers -> prolog.
 
-    Backprops through the tensors ``record_forward`` saved in ``chunk_record`` and
+    Backprops through the tensors ``model_forward`` saved in ``chunk_record`` and
     returns the input gradients to hand back to the previous pipeline stage.
     """
     if loss is not None:
