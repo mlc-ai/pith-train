@@ -3,7 +3,7 @@ Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for CONSISTENCY 
 ### How to post
 
 - Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread; open its body with a bold **Consistency:** tag so its review dimension is clear at a glance.
-- Reserve `gh pr comment` for a single one-line note under a `### Consistency Review` heading: to report that nothing is stale, or to cite a stale reference whose line falls outside this PR's diff and so has no inline anchor. Never batch findings into a top-level comment.
+- Also post a quick top-level summary with `gh pr comment` under a `### Consistency Review` heading: a few sentences of high-level storyline over the issues, so a developer gets the overview before opening the threads. This is a summary, not a place to batch findings; the per-finding detail lives only in the inline threads. The one exception is a stale reference whose line falls outside this PR's diff, which has no inline thread, so state that one here. If no stale reference is found, say so here in one line.
 
 ### What to look for
 
