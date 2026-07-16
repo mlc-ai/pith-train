@@ -1,6 +1,12 @@
-Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for PERFORMANCE only.
+Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for PERFORMANCE only. The PR branch is already checked out in the current working directory.
 
-The PR branch is already checked out in the current working directory. Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread; open every comment body with a bold **Performance:** tag so its review dimension is clear at a glance. Reserve `gh pr comment` for at most a single one-line note: to report that nothing qualified, or to cite a finding whose line falls outside this PR's diff and so has no inline anchor; never batch findings into a top-level comment.
+### How to post
+
+- Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread.
+- Open every comment body with a bold **Performance:** tag so its review dimension is clear at a glance.
+- Reserve `gh pr comment` for at most a single one-line note: to report that nothing qualified, or to cite a finding whose line falls outside this PR's diff and so has no inline anchor. Never batch findings into a top-level comment.
+
+### What to look for
 
 PithTrain is a training framework whose whole point is throughput and memory efficiency: DualPipeV overlaps compute with communication, FP8 and fused kernels cut cost, and most hot code runs under torch.compile. Judge the change on whether it regresses training step time or peak memory. Real perf claims are established by measurement, not by reading the diff, so weigh the developer's evidence first.
 

@@ -1,6 +1,12 @@
-Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for CORRECTNESS only.
+Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for CORRECTNESS only. The PR branch is already checked out in the current working directory.
 
-The PR branch is already checked out in the current working directory. Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread; open every comment body with a bold **Correctness:** tag so its review dimension is clear at a glance. Reserve `gh pr comment` for at most a single one-line note: to report that nothing qualified, or to cite a finding whose line falls outside this PR's diff and so has no inline anchor; never batch findings into a top-level comment.
+### How to post
+
+- Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread.
+- Open every comment body with a bold **Correctness:** tag so its review dimension is clear at a glance.
+- Reserve `gh pr comment` for at most a single one-line note: to report that nothing qualified, or to cite a finding whose line falls outside this PR's diff and so has no inline anchor. Never batch findings into a top-level comment.
+
+### What to look for
 
 PithTrain is a distributed MoE training framework (DualPipeV pipeline parallelism, expert/context/data parallelism, FP8, torch.compile, custom autograd and Triton kernels). The failure modes that matter here are subtle: a bug can leave the forward pass and loss numerically identical while silently corrupting gradients, a parallelism dimension, or a kernel's edge case, so a static read of the diff and a quick unit test both pass while training is quietly wrong. Because of that, correctness here is established by evidence, not by inspection alone.
 

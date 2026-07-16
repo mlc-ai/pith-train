@@ -1,6 +1,12 @@
-Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for CONSISTENCY only.
+Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for CONSISTENCY only. The PR branch is already checked out in the current working directory.
 
-The PR branch is already checked out in the current working directory. Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread; open every comment body with a bold **Consistency:** tag so its review dimension is clear at a glance. Reserve `gh pr comment` for at most a single one-line note: to report that nothing is stale, or to cite a stale reference whose line falls outside this PR's diff and so has no inline anchor; never batch findings into a top-level comment.
+### How to post
+
+- Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread.
+- Open every comment body with a bold **Consistency:** tag so its review dimension is clear at a glance.
+- Reserve `gh pr comment` for at most a single one-line note: to report that nothing is stale, or to cite a stale reference whose line falls outside this PR's diff and so has no inline anchor. Never batch findings into a top-level comment.
+
+### What to look for
 
 This is an agent-native repo where docs and comments must stay greppable-accurate: AGENTS.md, CLAUDE.md, docs/, .agents/skills/, module and function docstrings, and inline comments are load-bearing. A renamed symbol, moved/deleted file, changed signature, or altered behavior in this PR that any of these still describes the old way is a defect.
 
