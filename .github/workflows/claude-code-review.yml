@@ -15,109 +15,35 @@ jobs:
       pull-requests: write
       issues: read
       id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        review:
+          - { name: Correctness, slug: correctness }
+          - { name: Performance, slug: performance }
+          - { name: Compactness, slug: compactness }
+          - { name: Consistency, slug: consistency }
     steps:
       - name: Checkout PR
         uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ github.event.issue.number }}/head
           fetch-depth: 0
-
-      - name: Correctness Review
+      - name: Render ${{ matrix.review.name }} Prompt
+        id: render
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          {
+            echo "prompt<<PROMPT_EOF"
+            envsubst '${GITHUB_REPOSITORY} ${GITHUB_EVENT_ISSUE_NUMBER}' < ".github/review-prompts/${{ matrix.review.slug }}.md"
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Conduct ${{ matrix.review.name }} Review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          show_full_output: true
+          prompt: ${{ steps.render.outputs.prompt }}
           claude_args: '--model claude-opus-4-8 --effort high --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(grep:*),Read,Grep,Glob,WebFetch"'
-          prompt: |
-            Reviewing ${{ github.repository }} PR #${{ github.event.issue.number }} for CORRECTNESS only. The PR branch is already checked out in the current working directory.
-            Use `gh pr comment` for top-level feedback, and `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
-
-            PithTrain is a distributed MoE training framework (DualPipeV pipeline parallelism, expert/context/data parallelism, FP8, torch.compile, custom autograd and Triton kernels).
-            The failure modes that matter here are subtle: a bug can leave the forward pass and loss numerically identical while silently corrupting gradients, a parallelism dimension, or a kernel's edge case, so a static read of the diff and a quick unit test both pass while training is quietly wrong.
-            Because of that, correctness here is established by evidence, not by inspection alone.
-
-            First, gather the developer's evidence.
-            Read the PR description and comments (`gh pr view`, including `--comments`) and any results the PR commits (training logs, stdout captures, loss/accuracy tables, links to wandb runs).
-            Judge whether that evidence actually supports the change: e.g. for a behavior-affecting change, is there a loss-curve or metric comparison against a baseline, at a relevant configuration, showing parity or the intended effect?
-
-            Then report:
-            - Where the provided evidence is missing, weak, or does not match the change. For a risky, behavior-affecting change (gradients, parallelism, numerics, kernels) with no test result, loss comparison, or metric shown, flag that the evidence is insufficient and say what would settle it.
-            - Concrete bugs the change introduces that the evidence would not catch: severed or double-counted gradients, missing cross-rank reductions, wrong scaling, misplaced detach/no_grad, custom-Function backward disagreeing with forward, wrong rank/group/size or mesh-axis math, mismatched collectives, dtype/precision or reduction mistakes, indexing/shape/off-by-one/padding/empty-group edge cases.
-
-            Trace the actual data/gradient flow rather than pattern-matching, and weigh it against the evidence provided.
-            Only raise an issue you can justify with a concrete failure scenario or a concrete gap in the evidence. If nothing qualifies, say so in one line.
-            Post findings with `gh pr comment` under a "### Correctness Review" heading; cite each with a permalink (full commit SHA + line range).
-
-      - name: Performance Review
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           show_full_output: true
-          claude_args: '--model claude-opus-4-8 --effort high --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(grep:*),Read,Grep,Glob,WebFetch"'
-          prompt: |
-            Reviewing ${{ github.repository }} PR #${{ github.event.issue.number }} for PERFORMANCE only. The PR branch is already checked out in the current working directory.
-            Use `gh pr comment` for top-level feedback, and `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
-
-            PithTrain is a training framework whose whole point is throughput and memory efficiency: DualPipeV overlaps compute with communication, FP8 and fused kernels cut cost, and most hot code runs under torch.compile.
-            Judge the change on whether it regresses training step time or peak memory.
-            Real perf claims are established by measurement, not by reading the diff, so weigh the developer's evidence first.
-
-            First, gather the developer's evidence.
-            Read the PR description and comments (`gh pr view`, including `--comments`) and any results the PR commits (step-time / tokens-per-second numbers, peak-memory figures, nsys traces, benchmark output, links to wandb runs).
-            Judge whether it shows the change holds throughput and memory versus a baseline at a relevant configuration.
-
-            Then report:
-            - Where the evidence is missing, weak, or does not match the change. For a change to the hot path or a perf-sensitive mechanism (comm overlap, kernels, compiled regions) with no timing or memory number shown, flag that the evidence is insufficient and say what measurement would settle it.
-            - Concrete regressions the change introduces: collectives (all-to-all dispatch/combine, ring K/V exchange, FSDP gather/reduce) moved onto the compute stream or made synchronous, breaking overlap; device syncs on the hot path (`.item()`, `.cpu()`, `.tolist()`, python branching on tensor values, `torch.cuda.synchronize`, per-step/per-layer host-device transfers); torch.compile graph breaks or recompiles introduced in a compiled region (data-dependent shapes, unguarded python, `torch.compiler.disable`); redundant compute or allocations in the per-step / per-layer / per-micro-batch path.
-
-            Only raise an issue you can locate on a real hot path and explain the cost of, or a concrete gap in the evidence. If nothing qualifies, say so in one line.
-            Post findings with `gh pr comment` under a "### Performance Review" heading; cite each with a permalink (full commit SHA + line range).
-
-      - name: Compactness Review
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          show_full_output: true
-          claude_args: '--model claude-opus-4-8 --effort high --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(grep:*),Read,Grep,Glob"'
-          prompt: |
-            Reviewing ${{ github.repository }} PR #${{ github.event.issue.number }} for COMPACTNESS only. The PR branch is already checked out in the current working directory.
-            Use `gh pr comment` for top-level feedback, and `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
-
-            PithTrain is a deliberately compact, agent-native codebase.
-            Its stated design (see AGENTS.md and docs/architecture.md) favors local readability over cross-model reuse: implement only what training needs, keep per-model code self-contained, and avoid indirection a reader has to chase.
-            The runtime is also fixed: NVIDIA H100 (SM90) or B200 (SM100) GPUs are required, and every dependency in pyproject.toml is assumed installed, so guarding for their absence is dead defensiveness.
-            Judge the change against that bar.
-
-            Flag only changes this PR introduces that add abstraction it did not need. Look for:
-            - New layers of indirection (wrappers, factories, registries, base classes, managers) where a direct call or inline code would read better.
-            - Parameters, config fields, or generality added for cases the codebase does not actually train (inference-only knobs, unused flexibility, speculative hooks).
-            - Helpers hoisted into shared modules that would read better duplicated locally per the codebase's local-editability convention.
-            - Re-wrapping or renaming that adds surface without removing any.
-            - Defensive guards for conditions that cannot occur here: `try`/`except ImportError` fallbacks or availability checks for required dependencies (e.g. deep_gemm), and CUDA-presence or GPU-architecture guards.
-
-            Be concrete and conservative.
-            Only raise a point if you can name the simpler alternative. If nothing qualifies, say so in one line.
-            Post findings with `gh pr comment` under a "### Compactness Review" heading; cite each with a permalink (full commit SHA + line range).
-
-      - name: Consistency Review
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          show_full_output: true
-          claude_args: '--model claude-opus-4-8 --effort high --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(grep:*),Read,Grep,Glob"'
-          prompt: |
-            Reviewing ${{ github.repository }} PR #${{ github.event.issue.number }} for CONSISTENCY only: documentation and comments that this change makes out of date. The PR branch is already checked out in the current working directory.
-            Use `gh pr comment` for top-level feedback, and `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
-
-            This is an agent-native repo where docs and comments must stay greppable-accurate: AGENTS.md, CLAUDE.md, docs/, .agents/skills/, module and function docstrings, and inline comments are load-bearing.
-            A renamed symbol, moved/deleted file, changed signature, or altered behavior in this PR that any of these still describes the old way is a defect.
-
-            For every symbol renamed, file moved or deleted, signature changed, or behavior altered in the diff, grep the repo for prose or comments that still describe the old state, and flag each stale reference.
-            Also flag: new docs/comments added by this PR that are already inaccurate, and example or config snippets that no longer match the code.
-
-            Flag post-mortem phrasing in docstrings or comments this PR adds or edits: they must read as if the code was always in its new state, describing what the code is, not narrating the change that produced it.
-            Phrasings like "previously X", "used to", "renamed from", "now does Y", "changed to", or "no longer" in a docstring or comment are a defect even when technically accurate, because the next reader has no memory of the old state.
-
-            Separately, when you cite a fix, describe the corrected text as it should read, never narrate the change ("was X, now Y").
-
-            Post findings with `gh pr comment` under a "### Consistency Review" heading; cite each with a permalink (full commit SHA + line range). If nothing is stale, say so in one line.
