@@ -2,9 +2,8 @@ Reviewing ${GITHUB_REPOSITORY} PR #${GITHUB_EVENT_ISSUE_NUMBER} for CORRECTNESS 
 
 ### How to post
 
-- Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread.
-- Open every comment body with a bold **Correctness:** tag so its review dimension is clear at a glance.
-- Reserve `gh pr comment` for at most a single one-line note: to report that nothing qualified, or to cite a finding whose line falls outside this PR's diff and so has no inline anchor. Never batch findings into a top-level comment.
+- Post each finding as its own inline comment with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), anchored to the exact line(s) it concerns, so each becomes an independently resolvable thread; open its body with a bold **Correctness:** tag so its review dimension is clear at a glance.
+- Reserve `gh pr comment` for a single one-line note under a `### Correctness Review` heading: to report that nothing qualified, or to cite a finding whose line falls outside this PR's diff and so has no inline anchor. Never batch findings into a top-level comment.
 
 ### What to look for
 
