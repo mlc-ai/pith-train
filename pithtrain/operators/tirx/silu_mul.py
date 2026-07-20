@@ -47,18 +47,18 @@ _DTYPE_MAP = {
 _VEC_BYTES = 16  # 128-bit vectorized global access
 
 # Flat-grid configs as (BLOCK threads, ELEMS_PER_CTA), selected by element count.
-_CONFIG_C = (256, 2048)  # small problems
+_CONFIG_SMALL = (256, 2048)  # small problems
 _CONFIG_MID = (128, 2048)  # medium problems ("current")
-_CONFIG_B = (128, 1024)  # large problems
+_CONFIG_LARGE = (128, 1024)  # large problems
 
 
 def _select_config(n: int) -> tuple[int, int]:
     """Pick (BLOCK, ELEMS_PER_CTA) for a flat array of ``n`` elements."""
     if n < 4194304:
-        return _CONFIG_C
+        return _CONFIG_SMALL
     if n < 16777216:
         return _CONFIG_MID
-    return _CONFIG_B
+    return _CONFIG_LARGE
 
 
 def _launch_params(block: int, tile: int, elem_bytes: int) -> tuple[int, int, int]:
