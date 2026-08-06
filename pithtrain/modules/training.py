@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Optional, Union
 
@@ -25,7 +25,12 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
-from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
+from pithtrain.modules.dataset import (
+    ConcatDataset,
+    MemmapDataset,
+    SourceDataset,
+    WeightedMixtureDataset,
+)
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
@@ -129,8 +134,20 @@ def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
 
 @dataclass(init=False, slots=True)
 class TrainingCfg(SlottedDefault):
-    dataset: Path
-    """The root directory hosting the tokenized dataset."""
+    dataset: Optional[Path] = None
+    """Root directory hosting the tokenized dataset in single-source mode."""
+
+    dataset_sources: dict[str, Path] = field(default_factory=dict)
+    """Named dataset roots for weighted mixture mode."""
+
+    dataset_mixture: dict[str, float] = field(default_factory=dict)
+    """Initial mixture weights for ``dataset_sources``. Must sum to 1.0."""
+
+    dataset_mixture_hot_reload_path: Optional[Path] = None
+    """Optional JSON file path for online mixture reweighting."""
+
+    dataset_mixture_poll_interval_steps: int = 1
+    """Poll cadence for ``dataset_mixture_hot_reload_path``."""
 
     sequence_length: int
     """The sequence length for each training sample."""
@@ -288,9 +305,27 @@ class TrainingCfg(SlottedDefault):
 
 
 def setup_dataset(cfg: TrainingCfg) -> None:
+    training.dataset_mixture_last_mtime_ns = None
+    training.dataset_mixture_version = 0
+    if cfg.dataset_sources:
+        if not cfg.dataset_mixture:
+            raise ValueError("dataset_mixture must be provided when dataset_sources is set.")
+        source_datasets: dict[str, SourceDataset] = {}
+        for source_name, source_root in sorted(cfg.dataset_sources.items()):
+            memmap_datasets = []
+            for file in sorted(source_root.rglob("*.bin")):
+                memmap_datasets.append(MemmapDataset(file, cfg.sequence_length))
+            source_datasets[source_name] = SourceDataset(source_name, memmap_datasets)
+        training.dataset = WeightedMixtureDataset(source_datasets, cfg.seed, cfg.dataset_mixture)
+        return
+
+    if cfg.dataset is None:
+        raise ValueError("training.dataset must be set when dataset_sources is empty.")
     memmap_datasets = []
     for file in sorted(cfg.dataset.rglob("*.bin")):
         memmap_datasets.append(MemmapDataset(file, cfg.sequence_length))
+    if not memmap_datasets:
+        raise ValueError(f"No tokenized dataset files found under: {cfg.dataset}")
     training.dataset = ConcatDataset(memmap_datasets, cfg.seed)
 
 
