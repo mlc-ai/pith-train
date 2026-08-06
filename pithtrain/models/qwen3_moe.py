@@ -101,6 +101,7 @@ class Qwen3MoeMoE(nn.Module):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.ep_rank = distributed.ep_rank
         self.experts_per_rank = config.num_experts // distributed.ep_size
         self.experts = Qwen3MoeExperts(config, self.experts_per_rank)
         self.gate = Qwen3MoeGate(config)

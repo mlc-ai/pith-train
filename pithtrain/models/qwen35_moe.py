@@ -235,6 +235,7 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.ep_rank = distributed.ep_rank
         self.experts_per_rank = self.num_experts // distributed.ep_size
 
         self.gate = Qwen35MoeTopKRouter(config)
