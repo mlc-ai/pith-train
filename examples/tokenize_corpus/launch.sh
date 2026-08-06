@@ -11,6 +11,10 @@
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$ROOT"
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 # Launch the tokenization.
 SCRIPT=examples/tokenize_corpus/$1/script.py
 OUTPUT=logging/tokenize_corpus/${1}_node${SLURM_NODEID:-0}.log
