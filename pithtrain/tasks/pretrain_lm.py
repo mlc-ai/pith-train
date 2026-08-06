@@ -32,6 +32,7 @@ from pithtrain.modules.checkpoint import (
     to_localized_model,
     to_localized_optim,
 )
+from pithtrain.modules.dataset import WeightedMixtureDataset, load_dataset_mixture_file
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
@@ -220,8 +221,77 @@ class AppState(Stateful):
                 scheduler.load_state_dict(st)
 
 
+def maybe_reload_dataset_mixture(cfg: PretrainLMCfg) -> None:
+    """Optionally hot-reload weighted dataset mixture and broadcast updates."""
+    dataset = training.dataset
+    if not isinstance(dataset, WeightedMixtureDataset):
+        return
+
+    poll_interval = cfg.training.dataset_mixture_poll_interval_steps
+    if poll_interval <= 0:
+        raise ValueError("dataset_mixture_poll_interval_steps must be > 0.")
+    if training.step % poll_interval != 0:
+        return
+
+    hot_reload_path = cfg.training.dataset_mixture_hot_reload_path
+    if hot_reload_path is None:
+        return
+
+    payload = None
+    logger = logging.stdout
+    if distributed.rank == 0:
+        try:
+            mtime_ns = hot_reload_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime_ns = None
+        except OSError as err:
+            logger.warning("Failed to stat mixture file %s: %s", hot_reload_path, err)
+            mtime_ns = None
+
+        if mtime_ns is not None and mtime_ns != training.dataset_mixture_last_mtime_ns:
+            try:
+                new_weights = load_dataset_mixture_file(hot_reload_path)
+                dataset.update_weights(new_weights)
+                training.dataset_mixture_last_mtime_ns = mtime_ns
+                training.dataset_mixture_version += 1
+                payload = {
+                    "version": training.dataset_mixture_version,
+                    "weights": dataset.current_weights(),
+                }
+                logger.info(
+                    "Applied dataset mixture update v%s at step %08d from %s: %s",
+                    payload["version"],
+                    training.step,
+                    hot_reload_path,
+                    payload["weights"],
+                )
+            except Exception as err:
+                logger.warning(
+                    "Ignoring invalid dataset mixture file %s: %s.",
+                    hot_reload_path,
+                    err,
+                )
+
+    object_list = [payload]
+    torch.distributed.broadcast_object_list(object_list, src=0)
+    received = object_list[0]
+    if distributed.rank == 0 or received is None:
+        return
+    dataset.update_weights(received["weights"])
+    training.dataset_mixture_version = int(received["version"])
+    logger.info(
+        "Applied dataset mixture update v%s at step %08d: %s",
+        received["version"],
+        training.step,
+        received["weights"],
+    )
+
+
 def raise_if_dataset_insufficient(cfg: PretrainLMCfg) -> None:
     """Raise if configured run requires more samples than available in dataset."""
+    if isinstance(training.dataset, WeightedMixtureDataset):
+        return
+
     global_batch_size = cfg.training.global_batch_size
     max_steps = cfg.training.max_steps
 
@@ -359,6 +429,8 @@ def train_step(cfg: PretrainLMCfg) -> None:
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
     assert global_batch_size % (micro_batch_size * dp_size * ep_size) == 0
+
+    maybe_reload_dataset_mixture(cfg)
 
     # Gather the data for this rank's portion of the global batch.
     accumulate_steps = global_batch_size // (micro_batch_size * dp_size * ep_size)
