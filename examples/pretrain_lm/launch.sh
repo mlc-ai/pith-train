@@ -20,7 +20,8 @@ fi
 # Setup distributed.
 LAUNCH_ARGS=()
 LAUNCH_ARGS+=(--nnodes=${SLURM_NNODES:-1} --node-rank=${SLURM_NODEID:-0} --nproc-per-node=gpu)
-LAUNCH_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=${SLURM_LAUNCH_NODE_IPADDR:-localhost}:15213)
+RDZV_HOST=$(scontrol show hostnames "${SLURM_STEP_NODELIST:-localhost}" | head -1 || echo localhost)
+LAUNCH_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=$RDZV_HOST:15213)
 
 # Launch the training.
 SCRIPT=examples/pretrain_lm/$1/script.py
