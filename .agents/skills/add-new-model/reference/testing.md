@@ -12,6 +12,8 @@ nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
 
 Pick indices whose `memory.used` is under ~1000 MiB. Do this check **again** before each command, not once at the start of the session - another user can grab GPUs between your runs. When running multiple torchruns in sequence, reset the chosen GPU set each time.
 
+If no GPUs are visible (e.g., on a login node), dispatch each command as an srun step via the **launch-with-slurm** skill and keep the `CUDA_VISIBLE_DEVICES` selection inside the step.
+
 ## Timeouts (keep them short)
 
 - Single-GPU sanity: 120s

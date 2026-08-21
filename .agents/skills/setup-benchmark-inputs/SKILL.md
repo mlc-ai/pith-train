@@ -19,6 +19,6 @@ mkdir -p logging
 # Single-node (DeepSeek-V2-Lite)
 bash .agents/skills/setup-benchmark-inputs/scripts/launch_setup.sh --model deepseek-v2-lite 2>&1 | tee logging/setup-deepseek-v2-lite.log
 
-# Multi-node via SLURM (Qwen3-30B-A3B)
+# Multi-node via SLURM (Qwen3-30B-A3B) — anchor the step with the launch-with-slurm skill
 srun -W 0 -o logging/setup-qwen3-30b-a3b.log .agents/skills/setup-benchmark-inputs/scripts/launch_setup.sh --model qwen3-30b-a3b
 ```

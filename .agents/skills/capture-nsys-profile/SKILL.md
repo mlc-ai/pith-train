@@ -38,7 +38,7 @@ Target DP=1 (smallest world that satisfies the parallelism plan). Assuming 8 GPU
 
 ### If running under SLURM
 
-If `$SLURM_JOB_ID` is set, use the **launch-with-slurm** skill to read the allocation's node count and compare it to the minimum above. If the allocation is short, surface that to the user instead of launching.
+Use the **launch-with-slurm** skill to find the allocation and read its node count; compare it to the minimum above. If the allocation is short, surface that to the user instead of launching.
 
 ## Step 3: Capture the profile
 
