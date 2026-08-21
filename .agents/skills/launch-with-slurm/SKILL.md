@@ -49,7 +49,6 @@ Before launching anything long-running, compare this against the estimated runti
 
 - **`--jobid=<jobid>`** — anchor the step to the allocation. Required when `$SLURM_JOB_ID` is unset or holds a different job; redundant but harmless when it already holds the target.
 - **`-N <n>`** — number of nodes to dispatch to. In most training runs this matches PP, but the full parallelism plan and GPUs-per-node determine total nodes (e.g., PP=1 with EP=16 on 8-GPU nodes still needs 2). `-N1` borrows one node of a multi-node allocation for probes or single-node tests.
-- **`-n <n>`** — number of tasks. `-n1` for a one-shot probe; omit (or match `-N` × GPUs) for `torchrun`-style whole-node runs.
 - **`-W 0`** — wait indefinitely for stragglers after the first task exits. The default behavior terminates remaining tasks shortly after the first one ends, which kills workers that are still cleanly shutting down. Always use `-W 0` for training and evaluation runs.
 - **`-o <file>`** — stdout redirection. Use this instead of piping through `tee`. On multi-node, `tee`ing srun output collapses concurrent writes from all ranks. `-o` is distributed-aware — srun collects output from every rank into the single specified file, preserving the one-command-one-log abstraction. By convention, PithTrain runs log under `logging/<descriptive-name>.log`.
 - **`--open-mode=append`** vs **`--open-mode=truncate`** — for resumed training, `append` preserves history across restarts. Use `truncate` for fresh runs where overwriting is intended.
