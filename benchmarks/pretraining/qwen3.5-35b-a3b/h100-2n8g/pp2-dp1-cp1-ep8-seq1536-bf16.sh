@@ -1,6 +1,8 @@
 #!/bin/bash
 # Launch the training.
 
+set -euo pipefail
+
 TRUN_ARGS=()
 TRUN_ARGS+=(--nnodes=${SLURM_NNODES:-1} --node-rank=${SLURM_NODEID:-0} --nproc-per-node=gpu)
 RDZV_HOST=$(scontrol show hostnames "${SLURM_STEP_NODELIST:-localhost}" | head -1 || echo localhost)
