@@ -32,6 +32,7 @@ from pithtrain.modules.checkpoint import (
     to_localized_model,
     to_localized_optim,
 )
+from pithtrain.modules.dataset import WeightedMixtureDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
@@ -222,6 +223,9 @@ class AppState(Stateful):
 
 def raise_if_dataset_insufficient(cfg: PretrainLMCfg) -> None:
     """Raise if configured run requires more samples than available in dataset."""
+    if isinstance(training.dataset, WeightedMixtureDataset):
+        return
+
     global_batch_size = cfg.training.global_batch_size
     max_steps = cfg.training.max_steps
 
