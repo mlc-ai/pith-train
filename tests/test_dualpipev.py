@@ -7,6 +7,7 @@ import argparse
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Tuple
 
 import torch
 import torch.distributed.fsdp
@@ -17,7 +18,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
+from pithtrain.dualpipe import DualPipeV, Microbatch
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
@@ -59,22 +60,27 @@ def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(output, target).clone()
 
 
-def reference_step(
-    x: torch.Tensor,
-    l: torch.Tensor,  # noqa: E741
-    model: DeepSeekV2Model,
-    chunks: int,
-    cu_seqlens: torch.Tensor = None,
-):
+def objective(
+    model_outputs: Tuple[torch.Tensor, ...],
+    objective_inputs: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Wrap criterion in the objective contract, returning the detached loss to the caller."""
+    (output,) = model_outputs
+    (target,) = objective_inputs
+    loss = criterion(output, target)
+    return loss, loss.detach()
+
+
+def reference_step(chunks, model: DeepSeekV2Model):
+    """Run the reference forward/backward over the same micro-batches DualPipeV will see."""
     ys, ls = [], []
-    for i, (micro_x, micro_l) in enumerate(zip(x.chunk(chunks), l.chunk(chunks))):
-        cu = cu_seqlens[i] if cu_seqlens is not None else None
+    for micro_x, micro_l, cu in chunks:
         micro_y = model.reference_forward(micro_x, cu)
         loss = criterion(micro_y, micro_l)
         loss.backward()
         ys.append(micro_y)
         ls.append(loss)
-    return torch.stack(ls), torch.cat(ys, 0)
+    return torch.stack(ls), ys
 
 
 def shard_layers(layers: nn.ModuleDict, stage_id: int, num_stages: int, config):
@@ -197,6 +203,7 @@ def main(model_name: str):
     training.GroupedLinear = GroupedLinear
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
+    ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
     num_chunks, sequence_length = 20, 128
 
@@ -230,32 +237,48 @@ def main(model_name: str):
     torch.distributed.barrier()
     torch.manual_seed(1234)
 
-    hidden_size, vocab_size = config.hidden_size, config.vocab_size
+    vocab_size = config.vocab_size
 
-    # Create the dummy inputs.
-    full_x = torch.randint(
-        0, vocab_size, (ep_size * num_chunks * micro_batch_size, sequence_length)
-    )
-    # Labels are scaled up so MSE gradients on small bias terms (router.bias,
-    # layer-norm weights) sit well above the bf16 mantissa noise floor.
-    label_scale = 10.0
-    full_l = label_scale * torch.randn(
-        ep_size * num_chunks * micro_batch_size, sequence_length, vocab_size, dtype=dtype
-    )
-    local_x = full_x.reshape(ep_size, num_chunks * micro_batch_size, sequence_length)[ep_rank]
-    local_l = full_l.reshape(ep_size, num_chunks * micro_batch_size, sequence_length, vocab_size)[
-        ep_rank
-    ]
+    # Build the micro-batches, one entry per global chunk, ordered expert-parallel-major so
+    # rank r owns chunks [r * num_chunks, (r + 1) * num_chunks).
+    #
+    # Two steps are run, so the shapes agreed for one step cannot leak into the next: under
+    # ragged the second step uses different sequence lengths than the first.
+    num_global_chunks = ep_size * num_chunks
+    label_scale = 10.0  # scaled up so MSE grads on small bias terms clear the bf16 noise floor
 
-    # Packed sequences: split each length-S sample into three documents and check the
-    # block-diagonal cu_seqlens path matches the reference (attention only; MSE loss unaffected).
-    full_cu = local_cu = None
-    if packed:
-        bounds = [0, sequence_length // 3, 2 * (sequence_length // 3), sequence_length]
-        full_cu = torch.tensor(bounds, dtype=torch.int32).repeat(
-            ep_size * num_chunks * micro_batch_size, 1
-        )
-        local_cu = full_cu.reshape(ep_size, num_chunks * micro_batch_size, -1)[ep_rank]
+    def build_chunks(step_index):
+        if ragged:
+            # Vary the sequence length per micro-batch so every P2P buffer must be sized on its
+            # own, and shift the pattern per step so the second step's shapes differ.
+            pattern = [
+                sequence_length,
+                sequence_length - 64,
+                sequence_length + 32,
+                sequence_length - 32,
+            ]
+            offset = step_index * 2
+            seqlens = [pattern[(j + offset) % len(pattern)] for j in range(num_global_chunks)]
+        else:
+            seqlens = [sequence_length] * num_global_chunks
+
+        chunks = []
+        for j, seqlen in enumerate(seqlens):
+            chunk_x = torch.randint(0, vocab_size, (micro_batch_size, seqlen))
+            chunk_l = label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype)
+            chunk_cu = None
+            if packed:
+                # Split each sample into documents and check the block-diagonal cu_seqlens path
+                # against the reference (attention only; the MSE loss is unaffected). Under
+                # ragged the document count varies too, so the boundaries broadcast at mixed
+                # widths.
+                num_docs = 2 + (j % 2) if ragged else 3
+                bounds = [round(seqlen * k / num_docs) for k in range(num_docs + 1)]
+                chunk_cu = torch.tensor(bounds, dtype=torch.int32)
+            chunks.append((chunk_x, chunk_l, chunk_cu))
+        return chunks
+
+    chunk_steps = [build_chunks(0), build_chunks(1)]
 
     # Reference runs single-device (pp=ep=1); restore the real mesh before DualPipeV.
     distributed.pp_size = distributed.ep_size = 1
@@ -268,18 +291,12 @@ def main(model_name: str):
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
-    loss_ref, output_ref = reference_step(
-        full_x, full_l, full_modules, num_chunks * ep_size, full_cu
-    )
+    loss_refs = [reference_step(chunks, full_modules)[0] for chunks in chunk_steps]
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
 
     if distributed.rank == 0:
         print("[INFO] Completed the reference step.", flush=True)
     torch.distributed.barrier()
-
-    # Setup DualPipeV.
-    set_p2p_tensor_shapes([(micro_batch_size, sequence_length, hidden_size)])
-    set_p2p_tensor_dtype(dtype)
 
     # Shard the full modules whose weights and gradients will be used for checking.
     num_stages = pp_size * 2
@@ -318,41 +335,41 @@ def main(model_name: str):
     dualpipev_model = DualPipeV(local_modules)
 
     # Run the DualPipeV step.
-    kwargs = dict()
-    kwargs["num_chunks"] = num_chunks
-    kwargs["criterion"] = criterion
-    kwargs["return_outputs"] = False
-    local_x = None if pp_rank != 0 else local_x
-    local_l = None if pp_rank != 0 else local_l
-    local_cu = None if pp_rank != 0 else local_cu
-    kwargs["labels"] = (local_l,)
-    kwargs["cu_seqlens"] = local_cu
+    for step_index, chunks in enumerate(chunk_steps):
+        # Every pipeline rank builds the same micro-batches, so each derives its own P2P
+        # shapes; only the first rank reads the tensors.
+        local_chunks = chunks[ep_rank * num_chunks : (ep_rank + 1) * num_chunks]
+        microbatches = [
+            Microbatch(model_inputs=(x,), cu_seqlens=cu, objective_inputs=(lab,))
+            for x, lab, cu in local_chunks
+        ]
 
-    if distributed.rank == 0:
-        print("[INFO] Running the DualPipeV step.", flush=True)
-    torch.distributed.barrier()
+        if distributed.rank == 0:
+            print("[INFO] Running DualPipeV step %d." % step_index, flush=True)
+        torch.distributed.barrier()
 
-    loss, outputs = dualpipev_model.step(local_x, **kwargs)
+        objective_outputs = dualpipev_model.step(microbatches, objective)
 
-    if distributed.rank == 0:
-        print("[INFO] Completed the DualPipeV step.", flush=True)
-    torch.distributed.barrier()
+        if distributed.rank == 0:
+            print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
+        torch.distributed.barrier()
 
-    # Validate the loss.
-    if pp_rank == 0:
-        loss_ref = loss_ref.reshape(ep_size, -1)
-        loss_ref = loss_ref[ep_rank]
-        print(
-            "[INFO] rank-%d, loss: %s, loss_ref: %s" % (distributed.rank, loss, loss_ref),
-            flush=True,
-        )
-        assert torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)
-    else:
-        assert loss is None
+        # Validate the loss.
+        if pp_rank == 0:
+            loss = torch.stack(objective_outputs)
+            loss_ref = loss_refs[step_index].reshape(ep_size, -1)[ep_rank]
+            print(
+                "[INFO] rank-%d, step %d, loss: %s, loss_ref: %s"
+                % (distributed.rank, step_index, loss, loss_ref),
+                flush=True,
+            )
+            assert torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)
+        else:
+            assert objective_outputs == []
 
-    if distributed.rank == 0:
-        print("[INFO] Loss matches the reference.", flush=True)
-    torch.distributed.barrier()
+        if distributed.rank == 0:
+            print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
+        torch.distributed.barrier()
 
     # Validate the gradients.
     eps = 1e-2

@@ -89,6 +89,7 @@ class ModelProtocol(Protocol):
 
     stage_index: int
     stage_count: int
+    hidden_size: int
     layers: Dict[str, LayerProtocol]
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

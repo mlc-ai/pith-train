@@ -4,7 +4,7 @@ import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.cuda
@@ -26,6 +26,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
+from pithtrain.dualpipe import Microbatch
 from pithtrain.modules.checkpoint import (
     to_canonical_model,
     to_canonical_optim,
@@ -53,13 +54,15 @@ class PretrainLMCfg(SlottedDefault):
     """Logging configuration."""
 
 
-def get_global_batch(
-    cfg: PretrainLMCfg, device: torch.device
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Gather this rank's portion of the global batch on pipeline parallel rank 0."""
-    if distributed.pp_rank != 0:
-        return None, None
+def get_global_batch(cfg: PretrainLMCfg, device: torch.device) -> List[Microbatch]:
+    """
+    Gather this rank's portion of the global batch, already split into micro-batches.
 
+    Every pipeline rank reads the same rows: the offsets below depend on the step and on the
+    data, expert and context ranks, never on the pipeline rank, so each builds an identical list
+    and DualPipeV needs no broadcast to learn the shapes. Only the first rank consumes the
+    tensors, since under the V-shape it holds both the embedding and the loss.
+    """
     # short-hands
     step = training.step
     micro_batch_size = cfg.training.micro_batch_size
@@ -109,17 +112,37 @@ def get_global_batch(
     local_tokens = local_tokens.to(device, non_blocking=True)
     local_labels = local_labels.to(device, non_blocking=True)
 
-    return local_tokens, local_labels
+    # Rows are already micro-batch major, so a plain split reproduces the pipeline's own
+    # partitioning: rows [i * mbs, (i + 1) * mbs) belong to micro-batch i.
+    return [
+        Microbatch(
+            model_inputs=(local_tokens[i : i + micro_batch_size],),
+            cu_seqlens=None,
+            objective_inputs=(local_labels[i : i + micro_batch_size],),
+        )
+        for i in range(0, local_batch_size, micro_batch_size)
+    ]
 
 
-def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    # Return the summed (not mean) loss so the pipeline's per-micro-batch backward accumulates
-    # d(sum loss); the training step divides by the global non-ignored token count for a correct
-    # token-weighted mean.
-    output = output.view(-1, output.size(-1))
-    target = target.view(-1)
-    n_tokens = (target != -100).sum().clamp_min(1)
-    return cross_entropy(output, target, ignore_index=-100) * n_tokens
+def objective(
+    model_outputs: Tuple[torch.Tensor, ...],
+    objective_inputs: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cross-entropy objective for language-model pretraining.
+
+    Returns the loss summed over this micro-batch's tokens, so gradients accumulate across
+    micro-batches; the training step divides by the global non-ignored token count for a correct
+    token-weighted mean. The second return value is the same loss detached, which the step
+    reduces the same way to log the training loss.
+    """
+    (logits,) = model_outputs
+    (labels,) = objective_inputs
+    logits = logits.view(-1, logits.size(-1))
+    labels = labels.view(-1)
+    n_tokens = (labels != -100).sum().clamp_min(1)
+    loss = cross_entropy(logits, labels, ignore_index=-100) * n_tokens
+    return loss, loss.detach()
 
 
 @torch.no_grad()
@@ -360,32 +383,26 @@ def train_step(cfg: PretrainLMCfg) -> None:
     global_batch_size = cfg.training.global_batch_size
     assert global_batch_size % (micro_batch_size * dp_size * ep_size) == 0
 
-    # Gather the data for this rank's portion of the global batch.
-    accumulate_steps = global_batch_size // (micro_batch_size * dp_size * ep_size)
-    global_tokens, global_labels = get_global_batch(cfg, device)
+    # Gather the data for this rank's portion of the global batch, split into micro-batches.
+    microbatches = get_global_batch(cfg, device)
 
-    # Run the forward and backward pass.
-    loss, _ = model.step(
-        global_tokens,
-        num_chunks=accumulate_steps,
-        criterion=criterion,
-        labels=(global_labels,),
-        return_outputs=False,
-    )
+    # Run the forward and backward pass. The objective hands back one detached loss per
+    # micro-batch on pipeline rank 0; every other rank gets an empty list.
+    objective_outputs = model.step(microbatches, objective)
 
-    # Token-weighted reduction. The criterion returns per-micro-batch loss SUMS, so gradients
-    # accumulate d(sum loss); dividing by the total non-ignored token count yields the correct
-    # token-mean regardless of how tokens split across micro-batches. The count lives on pipeline
-    # rank 0 (the only rank with labels), so broadcast it to every stage for the gradient scale.
-    num_tokens = torch.ones((), device=device)
-    if distributed.pp_rank == 0:
-        num_tokens.fill_((global_labels != -100).sum().clamp_min(1))
-    if distributed.pp_size > 1:
-        torch.distributed.broadcast(num_tokens, group_src=0, group=distributed.pp_group)
+    # Token-weighted reduction. The objective returns a loss summed over each micro-batch's
+    # tokens, so dividing by the total non-ignored token count yields the correct token-mean
+    # regardless of how tokens split across micro-batches. Every rank holds the same labels, so
+    # each counts the same total for the gradient scale.
+    counted = 0
+    for mb in microbatches:
+        (labels,) = mb.objective_inputs
+        counted = counted + (labels != -100).sum()
+    num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
 
     cp_size = distributed.cp_size
-    if loss is not None:
-        loss = loss.sum() / num_tokens
+    if distributed.pp_rank == 0:
+        loss = torch.stack(objective_outputs).sum() / num_tokens
         if cp_size > 1:
             torch.distributed.all_reduce(loss, group=distributed.cp_group)
             loss /= cp_size

@@ -20,7 +20,7 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
+from pithtrain.dualpipe import DualPipeV
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
@@ -347,7 +347,7 @@ def apply_fsdp(
     else:
         raise ValueError(f"Unknown sharding_strategy: {sharding_strategy!r}")
     mp = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
+        param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
@@ -402,8 +402,6 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    hidden_size = module_config.hidden_size
-
     # All models read their parallel groups from `distributed` directly.
     if module_config.model_type == "deepseek_v2":
         ModelClass = DeepSeekV2Model
@@ -432,8 +430,6 @@ def setup_model(
         modules[1].rotary_emb = modules[0].rotary_emb
 
     local_seq_len = cfg.sequence_length // cp_size
-    # sequence_length = cfg.sequence_length, TODO this is kept here for stripe context parallelism
-    micro_batch_size = cfg.micro_batch_size
 
     # Propagate MoE load balance loss to gate modules.
     if cfg.moe_load_balance_coef > 0:
@@ -460,8 +456,6 @@ def setup_model(
                 module.router_replay = force_balance(module.num_experts)
 
     training.model = DualPipeV(modules)
-    set_p2p_tensor_shapes([(micro_batch_size, local_seq_len, hidden_size)])
-    set_p2p_tensor_dtype(torch.bfloat16)
 
 
 def setup_training(cfg: object) -> None:

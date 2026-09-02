@@ -8,7 +8,7 @@ computation-communication overlap.
 """
 
 from dataclasses import fields
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -50,8 +50,8 @@ def _clear_layer_records(layer: LayerRecord) -> None:
 def overlapped_forward_backward(
     module0: ModelProtocol,
     inputs0: List[torch.Tensor],
-    criterion0: Optional[Callable],
-    labels0: Optional[List[torch.Tensor]],
+    objective0: Optional[Callable],
+    objective_inputs0: Optional[Tuple[torch.Tensor, ...]],
     chunk_record0: ChunkRecord,
     cu_seqlens0: Optional[torch.Tensor],
     module1: ModelProtocol,
@@ -317,15 +317,15 @@ def overlapped_forward_backward(
     if module0.stage_index == module0.stage_count - 1:
         hidden_states = epilog_f(module0, hidden_states, chunk_record0.epilog)
 
-    # Run criterion if needed
+    # Run the objective if needed
     outputs0 = [hidden_states]
-    if criterion0 is not None:
-        nvtx.range_push("criterion0(*outputs0, *labels0)")
-        loss0 = criterion0(*outputs0, *labels0)
+    if objective0 is not None:
+        nvtx.range_push("objective0(model_outputs0, objective_inputs0)")
+        loss0, objective_output0 = objective0(tuple(outputs0), objective_inputs0)
         nvtx.range_pop()
     else:
-        loss0 = None
+        loss0, objective_output0 = None, None
 
     del ctx.fwd_comm_work, ctx.bwd_comm_work, ctx.fwd_event, ctx.bwd_event
     # chunk_record0 was modified in place, no need to return it
-    return outputs0, loss0, final_grads
+    return outputs0, loss0, objective_output0, final_grads

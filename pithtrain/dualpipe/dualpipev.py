@@ -9,7 +9,9 @@ and the project-root ``NOTICE`` file for the full license text and details
 of which portions are derived.
 
 The 8-step scheduling algorithm in ``DualPipeV.step()`` and the P2P
-communication orchestration methods are closely adapted from the original.
+communication orchestration methods are closely adapted from the original,
+as are the ``_append_irecv`` / ``_append_isend`` helpers, which were merged
+in from ``dualpipe/comm.py`` of the same project.
 The ``overlapped_forward_backward()`` function (see ``overlap.py``), FSDP
 integration, FP8 weight caching, and the 5-stage decomposition are original
 additions.
@@ -22,7 +24,8 @@ Stage Mapping:
     - Stage 5: Aggregate (Weighted expert output + residual connection)
 """
 
-from typing import Callable, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -30,15 +33,14 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule, fully_shard
 
-from pithtrain.contexts import distributed
-from pithtrain.dualpipe import comm
+from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import (
     ChunkRecord,
     create_chunk_record,
     model_backward,
 )
 from pithtrain.dualpipe.overlap import overlapped_forward_backward
-from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
+from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore
 
 
 def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> range:
@@ -62,6 +64,31 @@ def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> rang
     return range(begin, end)
 
 
+@dataclass(slots=True, kw_only=True)
+class Microbatch:
+    """
+    One micro-batch of work for DualPipeV.step.
+
+    The caller partitions the global batch into these and hands the same list to every pipeline
+    rank, so each derives its own receive-buffer shapes without a broadcast. Only the first rank
+    reads the tensors: under the V-shape it holds both the model inputs and the final model
+    outputs.
+
+    Attributes:
+        model_inputs: Inputs to the model, for instance the token ids, handed to its first
+            stage positionally. The batch and sequence dimensions of the first one size the
+            activation buffers every pipeline stage receives, so it must lead with those two.
+        cu_seqlens: Document boundaries when this micro-batch packs several sequences, or None
+            when each row holds a single sequence.
+        objective_inputs: Whatever the objective needs for this micro-batch, passed through
+            untouched. The engine never inspects it.
+    """
+
+    model_inputs: Tuple[torch.Tensor, ...]
+    cu_seqlens: Optional[torch.Tensor]
+    objective_inputs: Any
+
+
 class DualPipeV(nn.Module):
     """V-shaped bidirectional pipeline parallelism scheduler.
 
@@ -80,16 +107,13 @@ class DualPipeV(nn.Module):
       - Pre-allocated ``ChunkRecord`` for zero-allocation pipeline execution.
     """
 
-    def __init__(
-        self,
-        modules: Tuple[nn.Module, nn.Module],
-    ) -> None:
+    def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
         super().__init__()
 
         device = torch.device(torch.cuda.current_device())
         assert next(modules[0].parameters()).device == device
         self.module = nn.ModuleList(modules)
-        self.batch_dim = 0
+        self.p2p_shapes: List[List[Tuple[int, ...]]] = []
         self.rank = torch.distributed.get_rank()
 
         self.pp_group = distributed.pp_group
@@ -148,9 +172,10 @@ class DualPipeV(nn.Module):
             [],
             [],
         )
-        self.labels: List[List[torch.Tensor]] = None
-        self.loss_chunks: List[torch.Tensor] = []
-        self.criterion: Callable = None
+        self.objective_inputs: List[Tuple[torch.Tensor, ...]] = None
+        self.loss_chunks: List[Optional[torch.Tensor]] = []
+        self.objective_output_chunks: List[Any] = []
+        self.objective: Callable = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
         self.current_b_chunk_id: List[int] = [0, 0]
@@ -161,40 +186,36 @@ class DualPipeV(nn.Module):
         self.comm_ops: List[dist.P2POp] = []
         self.to_free: List[torch.Tensor] = []
 
-    def setup_cu_seqlens(self, cu_seqlens: Optional[torch.Tensor], num_chunks: int) -> None:
+    def setup_step_metadata(self, microbatches: List[Microbatch]) -> int:
         """
-        Broadcast per-micro-batch packed-sequence offsets along the pipeline group.
+        Record the per-step shapes.
 
-        Expects a rectangular ``(num_chunks, W)`` tensor: the caller pads each micro-batch's
-        ragged document boundaries to a common width ``W`` with trailing zero-length documents
-        (``None`` = dense / non-packed).
+        Every pipeline rank is given the same micro-batches, so each derives the activation shape
+        of every one locally and no metadata crosses the pipeline. Micro-batches may differ in
+        shape from one another. The hidden dimension is read from the local model.
+
+        Returns the number of micro-batches in this step.
         """
-        # Single rank: no broadcast needed, this rank already holds cu_seqlens.
-        if self.pp_size == 1:
-            self.cu_seqlens_chunks = (
-                None if cu_seqlens is None else [cu_seqlens[i] for i in range(num_chunks)]
-            )
-            return
-
-        # Multiple ranks: broadcast the row width first so every stage learns whether this step is
-        # packed (width > 0) or dense (width == 0) before allocating a receive buffer.
         device = distributed.device
-        width = torch.zeros(1, device=device, dtype=torch.long)
-        if self.is_first_pp_rank and cu_seqlens is not None:
-            width.fill_(cu_seqlens.shape[1])
-        torch.distributed.broadcast(width, group_src=0, group=self.pp_group)
-        if int(width) == 0:
-            self.cu_seqlens_chunks = None
-            return
+        hidden = self.module[0].hidden_size
 
-        # Packed: broadcast the (num_chunks, width) offsets and split them per micro-batch.
-        buf = (
-            cu_seqlens.to(device=device, dtype=torch.int32)
-            if self.is_first_pp_rank
-            else torch.empty((num_chunks, int(width)), device=device, dtype=torch.int32)
-        )
-        torch.distributed.broadcast(buf, group_src=0, group=self.pp_group)
-        self.cu_seqlens_chunks = [buf[i] for i in range(num_chunks)]
+        # One shape per micro-batch, so a ragged step sizes each receive buffer correctly.
+        self.p2p_shapes = []
+        for mb in microbatches:
+            first_input, *_ = mb.model_inputs
+            batch, sequence, *_ = first_input.shape
+            self.p2p_shapes.append([(batch, sequence, hidden)])
+
+        # A micro-batch without boundaries is left dense; attention dispatches on None.
+        self.cu_seqlens_chunks = None
+        if any(mb.cu_seqlens is not None for mb in microbatches):
+            chunks = []
+            for mb in microbatches:
+                cu = mb.cu_seqlens
+                chunks.append(None if cu is None else cu.to(device=device, dtype=torch.int32))
+            self.cu_seqlens_chunks = chunks
+
+        return len(microbatches)
 
     def _forward_compute_chunk(self, phase: int) -> None:
         chunk_id = self.current_f_chunk_id[phase]
@@ -215,15 +236,15 @@ class DualPipeV(nn.Module):
         outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
-        if is_last_stage and self.criterion is not None:
-            labels = self.labels[chunk_id]
-            loss = self.criterion(*outputs, *labels)
+        if is_last_stage:
+            loss, objective_output = self.objective(tuple(outputs), self.objective_inputs[chunk_id])
             self.loss_chunks.append(loss)
+            self.objective_output_chunks.append(objective_output)
         nvtx.range_pop()
 
         if self.is_last_pp_rank and phase == 0:
             self.input_chunks[1].append([output.detach().requires_grad_() for output in outputs])
-        if (not is_last_stage) or self.return_outputs:
+        if not is_last_stage:
             self.output_chunks[phase].append(outputs)
         # No need to append - chunk_record is pre-allocated and was modified in place
 
@@ -240,6 +261,10 @@ class DualPipeV(nn.Module):
         WeightGradStore.enabled = enable_zb
         if is_last_stage:
             loss = self.loss_chunks[chunk_id]
+            assert loss is not None, (
+                "the objective must return a loss when gradients are enabled; "
+                "a None loss is only valid under torch.no_grad()"
+            )
             input_grads = model_backward(
                 self.module[phase],
                 None,
@@ -249,8 +274,7 @@ class DualPipeV(nn.Module):
             loss.detach_()
         else:
             outputs = self.output_chunks[phase][chunk_id]
-            if not self.return_outputs:
-                self.output_chunks[phase][chunk_id] = None
+            self.output_chunks[phase][chunk_id] = None
             output_grads = self.output_grad_chunks[phase][chunk_id]
             self.output_grad_chunks[phase][chunk_id] = None
             non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
@@ -289,12 +313,12 @@ class DualPipeV(nn.Module):
         )
         is_last_stage0 = self.is_first_pp_rank and phase0 == 1
 
-        if is_last_stage0 and self.criterion is not None:
-            labels0 = self.labels[chunk_id0]
-            criterion0 = self.criterion
+        if is_last_stage0:
+            objective_inputs0 = self.objective_inputs[chunk_id0]
+            objective0 = self.objective
         else:
-            labels0 = []
-            criterion0 = None
+            objective_inputs0 = None
+            objective0 = None
 
         # pre-backward
         chunk_id1 = self.current_b_chunk_id[phase1]
@@ -309,8 +333,7 @@ class DualPipeV(nn.Module):
         else:
             loss1 = None
             outputs1 = self.output_chunks[phase1][chunk_id1]
-            if not self.return_outputs:
-                self.output_chunks[phase1][chunk_id1] = None
+            self.output_chunks[phase1][chunk_id1] = None
             output_grads1 = self.output_grad_chunks[phase1][chunk_id1]
             self.output_grad_chunks[phase1][chunk_id1] = None
             non_empty = [(t, g) for t, g in zip(outputs1, output_grads1) if g is not None]
@@ -320,11 +343,11 @@ class DualPipeV(nn.Module):
         nvtx.range_push(
             f"forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
         )
-        outputs0, loss0, input_grads1 = overlapped_forward_backward(
+        outputs0, loss0, objective_output0, input_grads1 = overlapped_forward_backward(
             module0,
             inputs0,
-            criterion0,
-            labels0,
+            objective0,
+            objective_inputs0,
             self.chunk_records[phase0][chunk_id0],
             cu_seqlens0,
             module1,
@@ -340,10 +363,11 @@ class DualPipeV(nn.Module):
         # post-forward
         if self.is_last_pp_rank and phase0 == 0:
             self.input_chunks[1].append([output.detach().requires_grad_() for output in outputs0])
-        if (not is_last_stage0) or self.return_outputs:
+        if not is_last_stage0:
             self.output_chunks[phase0].append(outputs0)
-        if is_last_stage0 and self.criterion is not None:
+        if is_last_stage0:
             self.loss_chunks.append(loss0)
+            self.objective_output_chunks.append(objective_output0)
 
         # post-backward
         self.input_chunks[phase1][chunk_id1] = None
@@ -404,15 +428,38 @@ class DualPipeV(nn.Module):
             tensor.data = torch.Tensor()
         self.to_free = []
 
+    def _append_irecv(self, src: int, chunk_id: int) -> List[torch.Tensor]:
+        """Post a receive for one activation, sized by the shape agreed for that micro-batch."""
+        tensors = [
+            torch.empty(
+                shape,
+                dtype=training.PARAM_DTYPE,
+                device=distributed.device,
+                requires_grad=True,
+            )
+            for shape in self.p2p_shapes[chunk_id]
+        ]
+        src = dist.distributed_c10d.get_global_rank(self.pp_group, src)
+        for tensor in tensors:
+            if tensor is not None:
+                self.comm_ops.append(dist.P2POp(dist.irecv, tensor, src))
+        return tensors
+
+    def _append_isend(self, tensors: List[torch.Tensor], dst: int) -> None:
+        """Post a send for one activation."""
+        dst = dist.distributed_c10d.get_global_rank(self.pp_group, dst)
+        for tensor in tensors:
+            if tensor is not None:
+                self.comm_ops.append(dist.P2POp(dist.isend, tensor, dst))
+
     def _recv_forward(self, phase: int) -> None:
         if (self.is_first_pp_rank and phase == 0) or (self.is_last_pp_rank and phase == 1):
             return
 
+        chunk_id = self.current_recv_f_chunk_id[phase]
         self.current_recv_f_chunk_id[phase] += 1
-        tensors = comm.append_irecv(
-            self.comm_ops,
-            self.prev_pp_rank if phase == 0 else self.next_pp_rank,
-            self.pp_group,
+        tensors = self._append_irecv(
+            self.prev_pp_rank if phase == 0 else self.next_pp_rank, chunk_id
         )
         self.input_chunks[phase].append(tensors)
 
@@ -424,15 +471,8 @@ class DualPipeV(nn.Module):
         self.current_send_f_chunk_id[phase] += 1
         tensors = self.output_chunks[phase][chunk_id]
 
-        comm.append_isend(
-            self.comm_ops,
-            tensors,
-            self.next_pp_rank if phase == 0 else self.prev_pp_rank,
-            self.pp_group,
-        )
-
-        if not self.return_outputs:
-            self.to_free.extend(tensors)
+        self._append_isend(tensors, self.next_pp_rank if phase == 0 else self.prev_pp_rank)
+        self.to_free.extend(tensors)
 
     def _recv_backward(self, phase: int) -> None:
         if self.forward_only:
@@ -441,11 +481,10 @@ class DualPipeV(nn.Module):
         if (self.is_first_pp_rank and phase == 1) or (self.is_last_pp_rank and phase == 0):
             return
 
+        chunk_id = self.current_recv_b_chunk_id[phase]
         self.current_recv_b_chunk_id[phase] += 1
-        tensors = comm.append_irecv(
-            self.comm_ops,
-            self.next_pp_rank if phase == 0 else self.prev_pp_rank,
-            self.pp_group,
+        tensors = self._append_irecv(
+            self.next_pp_rank if phase == 0 else self.prev_pp_rank, chunk_id
         )
         assert None not in tensors
         self.output_grad_chunks[phase].append(tensors)
@@ -462,12 +501,7 @@ class DualPipeV(nn.Module):
         tensors = self.input_grad_chunks[phase][chunk_id]
         self.input_grad_chunks[phase][chunk_id] = None
 
-        comm.append_isend(
-            self.comm_ops,
-            tensors,
-            self.prev_pp_rank if phase == 0 else self.next_pp_rank,
-            self.pp_group,
-        )
+        self._append_isend(tensors, self.prev_pp_rank if phase == 0 else self.next_pp_rank)
 
     def _commit_and_wait_comm(self) -> None:
         if not self.comm_ops:
@@ -482,33 +516,31 @@ class DualPipeV(nn.Module):
 
     def step(
         self,
-        *inputs: Optional[torch.Tensor],
-        num_chunks: int = 0,
-        criterion: Optional[Callable] = None,
-        labels: List[Optional[torch.Tensor]] = [],
-        cu_seqlens: Optional[torch.Tensor] = None,
-        return_outputs: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Union[torch.Tensor, Tuple[torch.Tensor]]]]:
+        microbatches: List[Microbatch],
+        objective: Optional[Callable] = None,
+    ) -> List[Any]:
         """
         Execute a training or inference step.
 
+        The objective runs on the stage holding the final model outputs, before that
+        micro-batch's backward; the loss it returns is then backpropagated and the outputs
+        released. Nothing else from a micro-batch survives the step.
+
         Arguments:
-            *inputs: Module inputs. Required only on the first rank.
-            num_chunks: The number of micro-batches.
-            criterion: Loss function, invoked as ``criterion(*outputs, *labels)``. Required only on the first rank.
-            labels: Labels of the loss function. Required only on the first rank.
-            return_outputs: Whether to return outputs on the first rank. Default: ``False``.
+            microbatches: The micro-batches to run, in order. Required on every pipeline rank,
+                identical on each. See Microbatch.
+            objective: Invoked once per micro-batch as objective(model_outputs,
+                objective_inputs), returning a (loss, objective_output) pair. The loss is
+                scheduled for backward, or None for a collection-only pass under
+                torch.no_grad(). Required only on the first pipeline rank.
 
-        Returns: (loss, outputs)
-            loss: Loss for the batch. Returned only on the first rank.
-            outputs: Module outputs. Returned only if ``return_outputs=True`` and on the first rank.
-
+        Returns:
+            One objective_output per micro-batch, in order; empty on ranks that do not hold the
+            final model outputs, which under the V-shape is every rank but the first. The loss is
+            detached in place after its backward, so return loss.detach() if the value is needed
+            once the step is done.
         """
-        assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, (
-            "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before executing a step."
-        )
         self.forward_only = not torch.is_grad_enabled()
-        self.return_outputs = return_outputs
 
         # Disable reshard and gradient sync after backward for FSDP
         for module in self.module:
@@ -526,20 +558,25 @@ class DualPipeV(nn.Module):
 
         pp_rank = self.pp_rank
         pp_size = self.pp_size
-        assert num_chunks > 0 and num_chunks >= pp_size * 2, f"{num_chunks=}, {pp_size=}"
 
-        if not self.forward_only and self.is_first_pp_rank:
-            assert criterion is not None
+        if self.is_first_pp_rank:
+            assert objective is not None, (
+                "the first pipeline rank holds the final model outputs and needs an objective"
+            )
 
         self._reset_states()
         FP8WeightCacheControl.step()
+        num_chunks = self.setup_step_metadata(microbatches)
+        assert num_chunks >= pp_size * 2, (
+            f"the V-shape gives each rank two model chunks, so a step needs at least "
+            f"{pp_size * 2} micro-batches, got {num_chunks}"
+        )
         self._ensure_chunk_records_allocated(num_chunks)
 
         if self.is_first_pp_rank:
-            self.input_chunks = (scatter(inputs, num_chunks, self.batch_dim), [])
-            self.labels = scatter(labels, num_chunks, self.batch_dim)
-            self.criterion = criterion
-        self.setup_cu_seqlens(cu_seqlens, num_chunks)
+            self.input_chunks = ([tuple(mb.model_inputs) for mb in microbatches], [])
+            self.objective_inputs = [mb.objective_inputs for mb in microbatches]
+            self.objective = objective
 
         # Step 1: nF0
         step_1 = (pp_size - pp_rank - 1) * 2
@@ -611,14 +648,7 @@ class DualPipeV(nn.Module):
 
         self._commit_and_wait_comm()
 
-        loss, outputs = None, None
-        if self.is_first_pp_rank:
-            if criterion is not None:
-                loss = torch.stack(self.loss_chunks)
-            if return_outputs:
-                outputs = gather(self.output_chunks[1], self.batch_dim)
-                if len(outputs) == 1:
-                    outputs = outputs[0]
+        objective_outputs = self.objective_output_chunks
 
         self._reset_states()
 
@@ -652,4 +682,4 @@ class DualPipeV(nn.Module):
             if isinstance(module, FSDPModule):
                 run_post_backward(module)
 
-        return loss, outputs
+        return objective_outputs

@@ -389,6 +389,7 @@ class DeepSeekV2Model(nn.Module):
             case _:
                 raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
         self.stage_index, self.stage_count = stage_index, stage_count
+        self.hidden_size = config.hidden_size
         self.chunk_record: ChunkRecord | None = None
 
         self.rotary_emb = DeepSeekV2RotaryEmbedding(config)

@@ -464,7 +464,7 @@ def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogR
     Epilog forward: norm + lm_head, recording its input activation into ``record``.
 
     The backward is handled by ``loss.backward()`` which traverses the autograd
-    graph through norm -> lm_head -> criterion.  The only thing the caller needs
+    graph through norm -> lm_head -> objective.  The only thing the caller needs
     from the record is ``args.hidden_states.grad`` (populated by autograd).
     """
     nvtx.range_push("epilog_f")
