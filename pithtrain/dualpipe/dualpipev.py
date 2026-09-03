@@ -441,8 +441,7 @@ class DualPipeV(nn.Module):
         ]
         src = dist.distributed_c10d.get_global_rank(self.pp_group, src)
         for tensor in tensors:
-            if tensor is not None:
-                self.comm_ops.append(dist.P2POp(dist.irecv, tensor, src))
+            self.comm_ops.append(dist.P2POp(dist.irecv, tensor, src))
         return tensors
 
     def _append_isend(self, tensors: List[torch.Tensor], dst: int) -> None:
@@ -486,7 +485,6 @@ class DualPipeV(nn.Module):
         tensors = self._append_irecv(
             self.next_pp_rank if phase == 0 else self.prev_pp_rank, chunk_id
         )
-        assert None not in tensors
         self.output_grad_chunks[phase].append(tensors)
 
     def _send_backward(self, phase: int) -> None:
