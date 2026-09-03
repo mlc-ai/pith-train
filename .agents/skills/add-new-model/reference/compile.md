@@ -128,11 +128,19 @@ buffer = torch.full((batch, max_seq_len), pad_id, dtype=torch.long, device=devic
 for i, t in enumerate(encoded_prompts):
     buffer[i, :prompt_len] = t[:prompt_len].to(device)
 cursor = prompt_len
-set_p2p_tensor_shapes([(1, max_seq_len, hidden_size)])   # ONCE, outside the loop
+
+# A collection-only pass: the objective returns no loss, just the logits to read.
+def collect(model_outputs, objective_inputs):
+    (logits,) = model_outputs
+    return None, logits
 
 for step in range(max_new_tokens):
-    loss, outputs = dualpipev.step(buffer if distributed.pp_rank == 0 else None, ...)
-    next_tok = outputs[:, cursor - 1, :].float().argmax(dim=-1)   # logit at last real pos
+    microbatches = [
+        Microbatch(model_inputs=(buffer,), cu_seqlens=None, objective_inputs=None)
+    ]
+    with torch.no_grad():
+        (logits,) = dualpipev.step(microbatches, collect)
+    next_tok = logits[:, cursor - 1, :].float().argmax(dim=-1)   # logit at last real pos
     buffer[:, cursor] = next_tok
     cursor += 1
 ```

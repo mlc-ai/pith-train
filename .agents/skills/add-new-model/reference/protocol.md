@@ -214,6 +214,7 @@ There is no model `backward` method. The engine drives `record_backward` (`pitht
 The model constructor takes `(config, phase)`. `phase` selects the V-shape role and fixes `stage_count` / `stage_index`: phase `0` is the descending leg (`stage_index = pp_rank`), phase `1` is the ascending leg (`stage_index = stage_count - 1 - pp_rank`), and phase `-1` is the non-pipelined reference (a single stage owns the whole model). Then:
 
 - `self.stage_index`, `self.stage_count` stored for later edge checks.
+- `self.hidden_size = config.hidden_size` - `DualPipeV.setup_step_metadata` reads it off the local model to size the P2P receive buffers, so a model without it raises `AttributeError` on the first step.
 - `self.chunk_record = None` - the scheduler sets it per forward.
 - Layers distributed via `layer_partition(config.num_hidden_layers, stage_count, stage_index)` (import from `pithtrain.dualpipe.dualpipev`), collected into an `nn.ModuleDict` keyed by the absolute layer id as a string (required by FSDP wrapping and by weight init).
 - First stage (`stage_index == 0`) has `self.embed_tokens`; last stage (`stage_index == stage_count - 1`) has `self.norm` and `self.lm_head`. All other stages set these to `None`.
@@ -248,7 +249,7 @@ The router class (`gate` on Qwen3 / DeepSeek-V2, `router` on GPT-OSS - match HF'
       return topk_idx, topk_weight, None
   lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.num_experts, self.num_experts_per_tok)
   # Token-weight the injected lb gradient so train_step's 1/num_tokens grad
-  # scale leaves it normalized (it bypasses the token-weighted criterion).
+  # scale leaves it normalized (it bypasses the token-weighted objective).
   topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
   return topk_idx, topk_weight, lb_loss
   ```

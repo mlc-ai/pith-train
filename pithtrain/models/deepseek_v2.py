@@ -166,7 +166,7 @@ class DeepSeekV2MoEGate(nn.Module):
             return topk_idx, topk_weight, None
         lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.n_routed_experts, self.top_k)
         # Token-weight the injected lb gradient so train_step's 1/num_tokens grad scale leaves it
-        # correctly normalized (it bypasses the token-weighted criterion). lb_loss stays unscaled.
+        # correctly normalized (it bypasses the token-weighted objective). lb_loss stays unscaled.
         topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
         return topk_idx, topk_weight, lb_loss
 

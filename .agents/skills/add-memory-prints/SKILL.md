@@ -229,7 +229,7 @@ Add `_setup_mem(...)` calls at these 5 points in `setup_model`:
 
 This is the most complex group. All insertions go into `DualPipeV.step()`. The code below shows every insertion with its exact anchor point.
 
-**4A: Profiling flag setup** — insert after input scattering (`self.criterion = criterion`), before `# Step 1`:
+**4A: Profiling flag setup** — insert after the first-rank micro-batch setup (`self.objective = objective`), before `# Step 1`:
 
 ```python
 _profiling = self.memory_profiling and self.rank in RANKS
@@ -618,13 +618,7 @@ if _mem_snapshot:
 
 ```python
 try:
-    loss, _ = model.step(
-        global_tokens,
-        num_chunks=accumulate_steps,
-        criterion=criterion,
-        labels=(global_labels,),
-        return_outputs=False,
-    )
+    objective_outputs = model.step(microbatches, objective)
 except torch.OutOfMemoryError:
     if _mem_snapshot:
         snapshot = torch.cuda.memory._snapshot()

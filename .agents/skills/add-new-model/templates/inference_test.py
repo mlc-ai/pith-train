@@ -49,16 +49,15 @@ from torch.distributed.checkpoint import FileSystemReader
 from transformers import AutoConfig, AutoTokenizer
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.modules.distributed import DistributedCfg, setup_distributed
-from pithtrain.operators.grouped_linear import GroupedLinear
-from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
-from pithtrain.tasks.convert_checkpoint import launch as convert_launch
+from pithtrain.dualpipe import DualPipeV, Microbatch
 
 # TODO_MODEL: import the model class you're testing (rename to match the file
 # you created from model_skeleton.py, e.g. `from pithtrain.models.mixtral import MixtralModel`).
 from pithtrain.models.hf_prefix import HFPrefixModel
-
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.operators.grouped_linear import GroupedLinear
+from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
+from pithtrain.tasks.convert_checkpoint import launch as convert_launch
 
 # TODO_MODEL: default HF id and local root.  The root holds hf/ and dcp/
 # subdirs; both are created lazily on rank 0 when missing.
@@ -224,26 +223,24 @@ def generate(
     cursor = prompt_len
     generated = [[] for _ in range(len(prompts))]
 
-    set_p2p_tensor_shapes([(1, max_seq_len, hidden_size)])
-    set_p2p_tensor_dtype(dtype)
+    # A collection-only objective: no loss to backward, it just hands the logits back.
+    def collect(model_outputs, objective_inputs):
+        (logits,) = model_outputs
+        return None, logits
 
     for step in range(max_new_tokens):
-        inputs = buffer if distributed.pp_rank == 0 else None
+        # Every pipeline rank is given the same micro-batches; only the first reads the tensors.
+        microbatches = [
+            Microbatch(model_inputs=(chunk,), cu_seqlens=None, objective_inputs=None)
+            for chunk in buffer.chunk(num_chunks)
+        ]
         # forward_only is inferred from torch.is_grad_enabled(); the @torch.no_grad()
         # decorator puts DualPipeV.step on the inference (forward-only) path.
-        loss, outputs = dualpipev.step(
-            inputs,
-            num_chunks=num_chunks,
-            criterion=None,
-            labels=[],
-            return_outputs=True,
-        )
+        objective_outputs = dualpipev.step(microbatches, collect)
 
         next_tok = torch.empty(len(prompts), dtype=torch.long, device=device)
         if distributed.pp_rank == 0:
-            logits = outputs
-            if isinstance(logits, tuple):
-                logits = logits[0]
+            logits = torch.cat(objective_outputs, dim=0)
             # Use the logit at position (cursor - 1): the prediction made
             # by the last real input position.  Positions beyond the cursor
             # hold pad_id and don't contaminate causal attention from

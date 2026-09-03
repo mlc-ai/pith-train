@@ -180,7 +180,7 @@ class HFPrefixGate(nn.Module):  # TODO_HF rename to match HF
             scores, topk_idx, self.num_experts, self.num_experts_per_tok
         )
         # Token-weight the injected lb gradient so train_step's 1/num_tokens grad scale leaves it
-        # correctly normalized (it bypasses the token-weighted criterion). lb_loss stays unscaled.
+        # correctly normalized (it bypasses the token-weighted objective). lb_loss stays unscaled.
         topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
         return topk_idx, topk_weight, lb_loss
 
@@ -416,6 +416,7 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
             case _:
                 raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
         self.stage_index, self.stage_count = stage_index, stage_count
+        self.hidden_size = config.hidden_size
         self.chunk_record: ChunkRecord | None = None
 
         self.rotary_emb = HFPrefixRotaryEmbedding(config)
