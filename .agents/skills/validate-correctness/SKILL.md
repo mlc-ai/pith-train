@@ -1,6 +1,6 @@
 ---
 name: validate-correctness
-description: Validates that code changes do not break training correctness by comparing per-step loss curves between a base branch and the current feature branch. Use when user asks to "validate correctness", "check if changes break training", "compare loss curves", "run a regression test", or "verify my changes are correct". The user specifies which model to validate and at which parallelism mesh (PP/EP/CP) — do not infer this from git diff.
+description: Validates that code changes do not break training correctness by comparing loss deltas against a base-vs-base run-to-run envelope. Use when user asks to "validate correctness", "check if changes break training", "compare loss curves", "run a regression test", or "verify my changes are correct". The user specifies which model to validate and at which parallelism mesh (PP/EP/CP) — do not infer this from git diff.
 ---
 
 # Validate Correctness
@@ -92,7 +92,7 @@ The verdict is the ratio of mean |delta| for base-vs-feature over base-vs-base:
 - **3x to 5x** — INVESTIGATE. Add a `base2` run: one envelope is a point estimate, and a 2.92x reading on one mesh was contradicted by 0.25x, 0.59x and 1.14x on three others.
 - **above 5x** — FAIL.
 
-Step 1 is gated separately and strictly, since it precedes any optimizer update and the forward is the only directly comparable signal. A mismatch there is a forward-path regression whatever the envelope says.
+The step-1 row is reported, not gated. It precedes any optimizer update, so its floor is normally zero and its signal is exactly the numerical difference the change makes to the forward — nonzero means the forward moved, which is expected for a reordered reduction or a swapped kernel and unexpected otherwise. Judge it yourself; a real forward regression also shows up in the 32-step ratio.
 
 ## Constraints
 
