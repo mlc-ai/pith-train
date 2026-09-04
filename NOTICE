@@ -39,13 +39,13 @@ adapted from the original DualPipe project:
       and state management) is derived from dualpipe/dualpipev.py in the
       original repository. The _append_irecv and _append_isend helpers are
       derived from dualpipe/comm.py, which was merged into this file. The
-      five-stage decomposition (execution.py), the overlapped execution loop
-      (overlap.py), and the FSDP/FP8 integration are original additions and
-      contain no derived code.
+      five-stage decomposition, the overlapped execution loop (overlap.py),
+      and the FSDP/FP8 integration are original additions.
 
-  pithtrain/dualpipe/utils.py
+  pithtrain/dualpipe/execution.py
     - WeightGradStore and run_backward are derived from dualpipe/utils.py in
-      the original repository. FP8WeightCacheControl is an original addition.
+      the original repository. Everything else in the file -- the five-stage
+      decomposition and its forward/backward implementations -- is original.
 
 A copy of the original MIT license is also retained at:
   pithtrain/dualpipe/LICENSE

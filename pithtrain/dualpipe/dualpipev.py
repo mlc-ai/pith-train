@@ -36,11 +36,12 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.execution import (
     ChunkRecord,
+    WeightGradStore,
     create_chunk_record,
     model_backward,
 )
 from pithtrain.dualpipe.overlap import overlapped_forward_backward
-from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore
+from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 
 
 def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> range:

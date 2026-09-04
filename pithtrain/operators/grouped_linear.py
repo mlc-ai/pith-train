@@ -6,12 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore
+from pithtrain.dualpipe.execution import WeightGradStore
 from pithtrain.operators.deepgemm_quantize import (
     fp8cast_blockwise_transpose_batched,
     fp8cast_rowwise_colwise,
     fp8cast_rowwise_kmajor,
 )
+from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.operators.linear import ARCH_MAJOR
 
 

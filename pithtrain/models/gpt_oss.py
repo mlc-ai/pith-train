@@ -10,13 +10,13 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from pithtrain.contexts import distributed, training
 from pithtrain.dualpipe.dualpipev import layer_partition
 from pithtrain.dualpipe.execution import ChunkRecord, model_forward
-from pithtrain.dualpipe.utils import FP8WeightCacheControl
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
 from pithtrain.operators.token_scatter import (

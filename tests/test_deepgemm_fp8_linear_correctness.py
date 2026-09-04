@@ -238,7 +238,7 @@ def test_fp8_grouped_linear_backward():
 
 def test_fp8_grouped_linear_weight_grad_store():
     """FP8GroupedLinear correctly defers weight gradients via WeightGradStore."""
-    from pithtrain.dualpipe.utils import WeightGradStore
+    from pithtrain.dualpipe.execution import WeightGradStore
     from pithtrain.operators.grouped_linear import FP8GroupedLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 

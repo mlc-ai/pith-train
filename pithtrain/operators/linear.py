@@ -13,12 +13,12 @@ import deep_gemm
 import torch
 import torch.nn as nn
 
-from pithtrain.dualpipe.utils import FP8WeightCacheControl
 from pithtrain.operators.deepgemm_quantize import (
     fp8cast_blockwise_transpose,
     fp8cast_rowwise_blockwise_transpose,
     fp8cast_rowwise_transpose,
 )
+from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 
 ARCH_MAJOR, _ = torch.cuda.get_device_capability()
 

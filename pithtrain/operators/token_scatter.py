@@ -13,7 +13,7 @@ from pithtrain.operators.linear import ARCH_MAJOR
 #
 # These are process-global, not per-thread, which is fine because the MoE ops only ever run
 # on one thread at a time. DualPipeV launches forwards from a single thread and runs every
-# backward through run_backward(), which disables autograd multithreading (dualpipe/utils.py),
+# backward through run_backward(), which disables autograd multithreading (dualpipe/execution.py),
 # and nothing recomputes the MoE forward on a separate thread. If that ever changes (two
 # models stepping in one process, or a plain multithreaded .backward() overlapping a forward)
 # the shared buffers would race and corrupt the ks / EP-splits read-back, so key the buffer

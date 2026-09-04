@@ -592,7 +592,7 @@ def test_scatter_then_grouped_mm_end_to_end():
 
 def test_grouped_linear_weight_grad_store():
     """GroupedLinear correctly defers weight gradients via WeightGradStore."""
-    from pithtrain.dualpipe.utils import WeightGradStore
+    from pithtrain.dualpipe.execution import WeightGradStore
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -655,7 +655,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     add lives outside GroupedLinearFunc so its grad is computed eagerly via
     autograd on both paths.
     """
-    from pithtrain.dualpipe.utils import WeightGradStore
+    from pithtrain.dualpipe.execution import WeightGradStore
     from pithtrain.models.gpt_oss import GptOssExperts
 
     device = torch.device("cuda")

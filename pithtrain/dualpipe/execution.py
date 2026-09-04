@@ -9,21 +9,74 @@ micro-batches and overlap the compute of one with the communication of another.
 - Stage 3: expert compute.
 - Stage 4: combine all-to-all.
 - Stage 5: post-combine compute.
+
+``WeightGradStore`` and ``run_backward`` are derived from ``dualpipe/utils.py`` in DeepSeek's
+DualPipe project (https://github.com/deepseek-ai/DualPipe), licensed under the MIT License.
+Copyright (c) 2025 DeepSeek. See ``pithtrain/dualpipe/LICENSE`` for the full license text. The
+five-stage decomposition is an original addition.
 """
 
+import queue
 from dataclasses import dataclass, fields
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.cuda.nvtx as nvtx
 import torch.distributed
+from torch.autograd import Variable
 
 from pithtrain.contexts import distributed
-from pithtrain.dualpipe.utils import WeightGradStore, run_backward
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 # fmt: off
+
+# ------------------------------------------------------------
+# DEFERRED WEIGHT GRADIENTS / MANUAL BACKWARD
+# ------------------------------------------------------------
+
+
+class WeightGradStore:
+    enabled: bool = False
+    cache: List[Callable] = []
+    funcs_queue = queue.Queue()
+
+    @classmethod
+    def put(cls, func: Callable) -> None:
+        cls.cache.append(func)
+
+    @classmethod
+    def flush(cls) -> None:
+        cls.funcs_queue.put(cls.cache)
+        cls.cache = []
+
+    @classmethod
+    def pop(cls) -> None:
+        assert not cls.funcs_queue.empty(), "Pop empty queue."
+        funcs = cls.funcs_queue.get()
+        for func in funcs:
+            func()
+
+    @classmethod
+    def clear(cls) -> None:
+        cls.cache = []
+        cls.funcs_queue = queue.Queue()
+
+
+def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:
+    pairs = [(t, g) for t, g in zip(tensors, grad_tensors) if t is not None]
+    if not pairs:
+        return
+    tensors, grad_tensors = map(tuple, zip(*pairs))
+    kwargs = dict(
+        keep_graph=False,
+        create_graph=False,
+        allow_unreachable=True,
+        accumulate_grad=True,
+    )
+    with torch.autograd.set_multithreading_enabled(False):
+        Variable._execution_engine.run_backward(tensors, grad_tensors, **kwargs)
+
 
 @dataclass(init=False, slots=True)
 class ExecutionCtx:
