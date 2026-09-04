@@ -1,18 +1,18 @@
 """
 DualPipeV: Overlapped forward-backward pipeline parallelism.
 
-The ``DualPipeV`` class in this module is derived from the DualPipeV
+The DualPipeV class in this module is derived from the DualPipeV
 implementation in DeepSeek's DualPipe project
 (https://github.com/deepseek-ai/DualPipe), which is licensed under the
-MIT License. Copyright (c) 2025 DeepSeek. See ``pithtrain/pipeline/LICENSE``
-and the project-root ``NOTICE`` file for the full license text and details
+MIT License. Copyright (c) 2025 DeepSeek. See pithtrain/pipeline/LICENSE
+and the project-root NOTICE file for the full license text and details
 of which portions are derived.
 
-The 8-step scheduling algorithm in ``DualPipeV.step()`` and the P2P
+The 8-step scheduling algorithm in DualPipeV.step() and the P2P
 communication orchestration methods are closely adapted from the original,
-as are the ``_append_irecv`` / ``_append_isend`` helpers, which were merged
-in from ``dualpipe/comm.py`` of the same project.
-The ``overlapped_forward_backward()`` function, FSDP integration, FP8 weight
+as are the _append_irecv / _append_isend helpers, which were merged
+in from dualpipe/comm.py of the same project.
+The overlapped_forward_backward() function, FSDP integration, FP8 weight
 caching, and the 5-stage decomposition are original additions.
 
 Stage Mapping:
@@ -23,7 +23,7 @@ Stage Mapping:
     - Stage 5: Aggregate (Weighted expert output + residual connection)
 """
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -38,8 +38,8 @@ from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.pipeline.execution import (
     ChunkRecord,
     ExecutionCtx,
-    LayerRecord,
     WeightGradStore,
+    clear_layer_records,
     create_chunk_record,
     epilog_f,
     layer_backward,
@@ -49,6 +49,7 @@ from pithtrain.pipeline.execution import (
     prolog_f,
     stage1_b,
     stage1_f,
+    stage1_stage5_b,
     stage2_b,
     stage2_f,
     stage3_b,
@@ -56,10 +57,9 @@ from pithtrain.pipeline.execution import (
     stage3_w,
     stage4_b,
     stage4_f,
-    stage5_and_stage1_b,
-    stage5_and_stage1_f,
     stage5_b,
     stage5_f,
+    stage5_stage1_f,
 )
 
 
@@ -110,21 +110,22 @@ class Microbatch:
 
 
 class DualPipeV(nn.Module):
-    """V-shaped bidirectional pipeline parallelism scheduler.
+    """
+    V-shaped bidirectional pipeline parallelism scheduler.
 
     Derived from the DualPipeV class in DeepSeek's DualPipe project
     (https://github.com/deepseek-ai/DualPipe), which implements the algorithm
-    described in the `DeepSeek-V3 Technical Report <https://arxiv.org/abs/2412.19437>`_.
+    described in the DeepSeek-V3 Technical Report (https://arxiv.org/abs/2412.19437).
     The original V-shape "cut-in-half" procedure was introduced by Sea AI Lab.
 
     This implementation extends the original with:
-      - A 5-stage overlapped forward-backward loop (``overlapped_forward_backward``)
+      - A 5-stage overlapped forward-backward loop (overlapped_forward_backward)
         that decomposes each transformer layer into Attention / Dispatch / MLP /
         Combine / Aggregate stages for fine-grained computation-communication overlap.
       - FSDP2 integration (hook suppression during the pipeline loop, manual
-        ``post_backward`` invocation after the loop).
-      - FP8 weight caching across micro-batches via ``FP8WeightCacheControl``.
-      - Pre-allocated ``ChunkRecord`` for zero-allocation pipeline execution.
+        post_backward invocation after the loop).
+      - FP8 weight caching across micro-batches via FP8WeightCacheControl.
+      - Pre-allocated ChunkRecord for zero-allocation pipeline execution.
     """
 
     def __init__(self, modules: Tuple[nn.Module, nn.Module]) -> None:
@@ -134,47 +135,36 @@ class DualPipeV(nn.Module):
         assert next(modules[0].parameters()).device == device
         self.module = nn.ModuleList(modules)
         self.p2p_shapes: List[List[Tuple[int, ...]]] = []
-        self.rank = torch.distributed.get_rank()
 
-        self.pp_group = distributed.pp_group
-        self.ep_group = distributed.ep_group
-        self.pp_size = distributed.pp_size
-        self.ep_size = distributed.ep_size
-        self.ep_rank = distributed.ep_rank
-        self.pp_rank = distributed.pp_rank
-        self.prev_pp_rank = self.pp_rank - 1 if self.pp_rank > 0 else None
-        self.next_pp_rank = self.pp_rank + 1 if self.pp_rank < self.pp_size - 1 else None
-        self.is_first_pp_rank = self.pp_rank == 0
-        self.is_last_pp_rank = self.pp_rank == self.pp_size - 1
+        pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
+        self.prev_pp_rank = pp_rank - 1 if pp_rank > 0 else None
+        self.next_pp_rank = pp_rank + 1 if pp_rank < pp_size - 1 else None
+        self.is_first_pp_rank = pp_rank == 0
+        self.is_last_pp_rank = pp_rank == pp_size - 1
 
         self.comm_stream = torch.cuda.Stream(device=device)
 
-        # Pre-allocation tracking
         self._num_chunks_allocated = 0
         self.chunk_records: Tuple[List[ChunkRecord], List[ChunkRecord]] = ([], [])
         self.cu_seqlens_chunks: Optional[List[torch.Tensor]] = None
 
+        self.forward_only = False
+        self._reset_states()
+
     def _ensure_chunk_records_allocated(self, num_chunks: int) -> None:
-        """Pre-allocate ChunkRecord structures for reuse across iterations."""
+        """
+        Pre-allocate ChunkRecord structures for reuse across iterations.
+        """
         if self._num_chunks_allocated == num_chunks:
             return
-        self.chunk_records = (
+        self.chunk_records = tuple(
             [
                 create_chunk_record(
-                    len(self.module[0].layers),
-                    self.module[0].stage_index == 0,
-                    self.module[0].stage_index == self.module[0].stage_count - 1,
+                    len(m.layers), m.stage_index == 0, m.stage_index == m.stage_count - 1
                 )
                 for _ in range(num_chunks)
-            ],
-            [
-                create_chunk_record(
-                    len(self.module[1].layers),
-                    self.module[1].stage_index == 0,
-                    self.module[1].stage_index == self.module[1].stage_count - 1,
-                )
-                for _ in range(num_chunks)
-            ],
+            ]
+            for m in self.module
         )
         self._num_chunks_allocated = num_chunks
 
@@ -192,10 +182,10 @@ class DualPipeV(nn.Module):
             [],
             [],
         )
-        self.objective_inputs: List[Tuple[torch.Tensor, ...]] = None
+        self.objective_inputs: Optional[List[Any]] = None
         self.loss_chunks: List[Optional[torch.Tensor]] = []
         self.objective_output_chunks: List[Any] = []
-        self.objective: Callable = None
+        self.objective: Optional[Callable] = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
         self.current_b_chunk_id: List[int] = [0, 0]
@@ -299,13 +289,12 @@ class DualPipeV(nn.Module):
             self.output_grad_chunks[phase][chunk_id] = None
             non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
             outputs, output_grads = list(zip(*non_empty))
-            if len(outputs) > 0:
-                input_grads = model_backward(
-                    self.module[phase],
-                    output_grads,
-                    None,
-                    self.chunk_records[phase][chunk_id],
-                )
+            input_grads = model_backward(
+                self.module[phase],
+                output_grads,
+                None,
+                self.chunk_records[phase][chunk_id],
+            )
         # Note: chunk_record is pre-allocated and reused; backward clears tensor refs inside
         WeightGradStore.enabled = False
         if enable_zb:
@@ -376,7 +365,6 @@ class DualPipeV(nn.Module):
             output_grads1,
             self.chunk_records[phase1][chunk_id1],
             self.comm_stream,
-            self.ep_group,
         )
         nvtx.range_pop()
 
@@ -449,7 +437,9 @@ class DualPipeV(nn.Module):
         self.to_free = []
 
     def _append_irecv(self, src: int, chunk_id: int) -> List[torch.Tensor]:
-        """Post a receive for one activation, sized by the shape agreed for that micro-batch."""
+        """
+        Post a receive for one activation, sized by the shape agreed for that micro-batch.
+        """
         tensors = [
             torch.empty(
                 shape,
@@ -459,14 +449,16 @@ class DualPipeV(nn.Module):
             )
             for shape in self.p2p_shapes[chunk_id]
         ]
-        src = dist.distributed_c10d.get_global_rank(self.pp_group, src)
+        src = dist.distributed_c10d.get_global_rank(distributed.pp_group, src)
         for tensor in tensors:
             self.comm_ops.append(dist.P2POp(dist.irecv, tensor, src))
         return tensors
 
     def _append_isend(self, tensors: List[torch.Tensor], dst: int) -> None:
-        """Post a send for one activation."""
-        dst = dist.distributed_c10d.get_global_rank(self.pp_group, dst)
+        """
+        Post a send for one activation.
+        """
+        dst = dist.distributed_c10d.get_global_rank(distributed.pp_group, dst)
         for tensor in tensors:
             if tensor is not None:
                 self.comm_ops.append(dist.P2POp(dist.isend, tensor, dst))
@@ -574,8 +566,7 @@ class DualPipeV(nn.Module):
                 if not self.forward_only:
                     fully_shard.state(module)._state_ctx.post_backward_final_callback_queued = True
 
-        pp_rank = self.pp_rank
-        pp_size = self.pp_size
+        pp_rank, pp_size = distributed.pp_rank, distributed.pp_size
 
         if self.is_first_pp_rank:
             assert objective is not None, (
@@ -671,10 +662,8 @@ class DualPipeV(nn.Module):
         self._reset_states()
 
         # Release FP8 weight caches so the memory is available for optimizer.step().
-        # They will be regenerated on the next forward pass.
         FP8WeightCacheControl.clear(*self.module)
 
-        # Manually call post backward for FSDP
         def run_post_backward(fsdp_module: FSDPModule) -> None:
             fsdp_module.set_is_last_backward(True)
             fsdp_module.set_reshard_after_backward(True)
@@ -708,28 +697,19 @@ class DualPipeV(nn.Module):
 # ------------------------------------------------------------
 
 
-def _clear_layer_records(layer: LayerRecord) -> None:
-    """Clear tensor references from a layer's records while keeping records pre-allocated."""
-    for field in fields(layer):
-        record = getattr(layer, field.name)
-        for rf in fields(record):
-            setattr(record, rf.name, None)
-
-
 def overlapped_forward_backward(
     module0: ModelProtocol,
     inputs0: List[torch.Tensor],
     objective0: Optional[Callable],
     objective_inputs0: Optional[Tuple[torch.Tensor, ...]],
     chunk_record0: ChunkRecord,
-    cu_seqlens0: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
     module1: ModelProtocol,
     loss1: Optional[torch.Tensor],
     outputs1: Optional[List[torch.Tensor]],
     output_grads1: Optional[List[torch.Tensor]],
     chunk_record1: ChunkRecord,
     comm_stream: Optional[torch.cuda.Stream],
-    ep_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """
     Interleave the forward pass of one model replica with the backward pass of another.
@@ -740,22 +720,14 @@ def overlapped_forward_backward(
     assert abs(len(module0.layers) - len(module1.layers)) <= 1
     assert len(chunk_record1.layers) == len(module1.layers)
     num_layers = min(len(module0.layers), len(module1.layers))
-    module0_layers = [layer for _, layer in module0.layers.items()]
-    module1_layers = [layer for _, layer in module1.layers.items()]
+    module0_layers = list(module0.layers.values())
+    module1_layers = list(module1.layers.values())
 
     (hidden_states,) = inputs0
-    cu_seqlens = cu_seqlens0
-    # chunk_record0 is pre-allocated and passed in
     layer_idx0 = 0  # Index into chunk_record0.layers
+    dispatch_tokens_grad = moe_outs = None  # carried across loop iterations
 
-    ctx = ExecutionCtx()
-    ctx.comp_stream = torch.cuda.default_stream()
-    ctx.comm_stream = comm_stream
-    ctx.fwd_event = torch.cuda.Event()
-    ctx.bwd_event = torch.cuda.Event()
-    ctx.fwd_comm_work = None
-    ctx.bwd_comm_work = None
-    ctx.fwd_comm_deferred_free = []
+    ctx = ExecutionCtx(comm_stream=comm_stream)
 
     # Module 1 layer L-1 stage 5 backward
     if loss1 is not None:
@@ -792,49 +764,40 @@ def overlapped_forward_backward(
 
     for l in range(num_layers):  # noqa: E741
         if l != 0:
-            # Detect merged case using asymmetric None pattern:
-            # - Merged: stage1.outs is set, stage1.args is None (at next layer)
-            #           stage5.args is set, stage5.outs is None (at prev layer)
-            # - Normal: both args and outs are set for both stage1 and stage5
+            # Merged layers set outs without args at the next layer, and args without outs
+            # at the previous one; unmerged layers set both.
             stage1_record = chunk_record1.layers[-l].stage1
-            use_merged = (
-                hasattr(stage1_record, "outs")
-                and stage1_record.outs is not None
-                and not (hasattr(stage1_record, "args") and stage1_record.args is not None)
-            )
+            use_merged = stage1_record.outs is not None and stage1_record.args is None
 
             if use_merged:
                 next_layer, prev_layer = module1_layers[-l], module1_layers[-l - 1]
                 stage1_outs = stage1_record.outs
                 stage5_args = chunk_record1.layers[-l - 1].stage5.args
-                grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)  # noqa: F821
-                moe_outs_grad, topk_weight_grad, residual_grad = stage5_and_stage1_b(
+                grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)
+                moe_outs_grad, topk_weight_grad, residual_grad = stage1_stage5_b(
                     ctx, next_layer, prev_layer, stage1_outs, stage5_args, grad_tensors
                 )
-                # Clear tensor refs but keep pre-allocated records
-                _clear_layer_records(chunk_record1.layers[-l])
+                clear_layer_records(chunk_record1.layers[-l])
             else:
                 # Module 1 layer L-l stage 1 backward
                 record = chunk_record1.layers[-l].stage1
-                grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)  # noqa: F821
+                grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)
                 hidden_states_grad = stage1_b(ctx, module1_layers[-l], record, grad_tensors)
                 # Module 1 layer L-l-1 stage 5 backward
                 record = chunk_record1.layers[-l - 1].stage5
                 moe_outs_grad, topk_weight_grad, residual_grad = stage5_b(
                     ctx, module1_layers[-l - 1], record, (hidden_states_grad,)
                 )
-                # Clear tensor refs but keep pre-allocated records
-                _clear_layer_records(chunk_record1.layers[-l])
+                clear_layer_records(chunk_record1.layers[-l])
 
             # Module 0 layer l-1 stage 4 forward
             record, moe_outs = stage4_f(
                 ctx,
                 module0_layers[l - 1],
-                moe_outs,  # noqa: F821
+                moe_outs,
                 routing.combine_splits if routing is not None else None,
-                ep_group,
             )
-            chunk_record0.layers[layer_idx0].stage4.ctx = record.ctx
+            chunk_record0.layers[layer_idx0].stage4.splits = record.splits
             if routing is not None and ctx.fwd_comm_work is not None:
                 ctx.fwd_comm_deferred_free.append(
                     chunk_record0.layers[layer_idx0].stage3.outs.moe_outs
@@ -848,12 +811,10 @@ def overlapped_forward_backward(
             # 1. module0 has fewer layers, or that both modules have the same number of layers, so no handle of the extra layer
             # 2. we aren't the first or the last layer
             if len(module0_layers) <= len(module1.layers) or (l - 1 > 0 and l < num_layers - 1):
-                # Merge the stage 5 and stage 1 forward into a single stage.
-                # Use asymmetric None pattern for detection:
-                # - Store stage5.args at prev layer (no outs)
-                # - Store stage1.outs at next layer (no args)
+                # stage5.args goes on the previous layer with outs left None, stage1.outs on
+                # the next layer with args left None -- that is the merged marker.
                 prev_layer, next_layer = module0_layers[l - 1], module0_layers[l]
-                stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_and_stage1_f(
+                stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_stage1_f(
                     ctx,
                     prev_layer,
                     next_layer,
@@ -863,12 +824,8 @@ def overlapped_forward_backward(
                     rotary_posemb,
                     cu_seqlens,
                 )
-                # Store stage5.args at prev layer (no outs -> merged indicator)
                 chunk_record0.layers[layer_idx0].stage5.args = stage5_args
-                # stage5.outs stays None
                 layer_idx0 += 1
-                # Store stage1.outs at next layer (no args -> merged indicator)
-                # stage1.args stays None
                 chunk_record0.layers[layer_idx0].stage1.outs = stage1_outs
             else:
                 # Module 0 layer l-1 stage 5 forward
@@ -899,9 +856,8 @@ def overlapped_forward_backward(
             module0_layers[l],
             dispatch_tokens,
             routing.dispatch_splits if routing is not None else None,
-            ep_group,
         )
-        chunk_record0.layers[layer_idx0].stage2.ctx = record.ctx
+        chunk_record0.layers[layer_idx0].stage2.splits = record.splits
         if routing is not None and ctx.fwd_comm_work is not None:
             ctx.fwd_comm_deferred_free.append(dispatch_tokens)  # freed after Stage 3 waits
 
@@ -912,7 +868,7 @@ def overlapped_forward_backward(
         )
 
         # Module 1 layer L-l-1 stage 3 weight backward
-        stage3_w(ctx, module1_layers[-l - 1])
+        stage3_w(module1_layers[-l - 1])
 
         # Module 0 layer l stage 3 forward
         record, moe_outs = stage3_f(
@@ -931,9 +887,8 @@ def overlapped_forward_backward(
         module0_layers[num_layers - 1],
         moe_outs,
         routing.combine_splits if routing is not None else None,
-        ep_group,
     )
-    chunk_record0.layers[layer_idx0].stage4.ctx = record.ctx
+    chunk_record0.layers[layer_idx0].stage4.splits = record.splits
     if routing is not None and ctx.fwd_comm_work is not None:
         ctx.fwd_comm_deferred_free.append(
             chunk_record0.layers[layer_idx0].stage3.outs.moe_outs
@@ -945,8 +900,7 @@ def overlapped_forward_backward(
     grad_tensors = (dispatch_tokens_grad, residual_grad, topk_weight_grad)
     hidden_states_grad = stage1_b(ctx, module1_layers[-num_layers], record, grad_tensors)
 
-    # Clear tensor refs but keep pre-allocated records
-    _clear_layer_records(chunk_record1.layers[-num_layers])
+    clear_layer_records(chunk_record1.layers[-num_layers])
 
     # Module 0 layer L-1 stage 5 forward
     record, hidden_states = stage5_f(
@@ -975,7 +929,6 @@ def overlapped_forward_backward(
         hidden_states_grad = layer_backward(
             module1_layers[0],
             (hidden_states_grad,),
-            None,
             chunk_record1.layers[-num_layers - 1],
         )
     else:
@@ -986,13 +939,10 @@ def overlapped_forward_backward(
         record = chunk_record1.prolog
         prolog_b(module1, record, (hidden_states_grad,))
         final_grads = (None,)
-        # Clear tensor refs but keep pre-allocated record
-        record.args = None
-        record.outs = None
+        record.outs = None  # keep the pre-allocated record, drop the tensor ref
     if module0.stage_index == module0.stage_count - 1:
         hidden_states = epilog_f(module0, hidden_states, chunk_record0.epilog)
 
-    # Run the objective if needed
     outputs0 = [hidden_states]
     if objective0 is not None:
         nvtx.range_push("objective0(model_outputs0, objective_inputs0)")
@@ -1001,6 +951,5 @@ def overlapped_forward_backward(
     else:
         loss0, objective_output0 = None, None
 
-    del ctx.fwd_comm_work, ctx.bwd_comm_work, ctx.fwd_event, ctx.bwd_event
     # chunk_record0 was modified in place, no need to return it
     return outputs0, loss0, objective_output0, final_grads

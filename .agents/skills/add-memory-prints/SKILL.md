@@ -232,12 +232,12 @@ This is the most complex group. All insertions go into `DualPipeV.step()`. The c
 **4A: Profiling flag setup** — insert after the first-rank micro-batch setup (`self.objective = objective`), before `# Step 1`:
 
 ```python
-_profiling = self.memory_profiling and self.rank in RANKS
+_profiling = self.memory_profiling and distributed.rank in RANKS
 if _profiling:
     torch.cuda.synchronize()
     _m0 = _mem_gb()
     print(
-        f"[rank={self.rank} pp={pp_rank}] Before pipeline: {_m0:.2f} GiB | {_mem_detail()}",
+        f"[rank={distributed.rank} pp={pp_rank}] Before pipeline: {_m0:.2f} GiB | {_mem_detail()}",
         flush=True,
     )
 ```
@@ -262,7 +262,7 @@ for i in range(step_1):
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step1 F0 i={i}: {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step1 F0 i={i}: {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
             flush=True,
         )
 ```
@@ -274,7 +274,7 @@ if _profiling:
     torch.cuda.synchronize()
     _m1 = _mem_gb()
     print(
-        f"[rank={self.rank} pp={pp_rank}] After Step1 ({step_1} F0): {_m1:.2f} GiB (+{_m1 - _m0:.2f}) | {_mem_detail()}",
+        f"[rank={distributed.rank} pp={pp_rank}] After Step1 ({step_1} F0): {_m1:.2f} GiB (+{_m1 - _m0:.2f}) | {_mem_detail()}",
         flush=True,
     )
 ```
@@ -297,7 +297,7 @@ for i in range(step_2):
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step2 i={i} forward_chunk(0): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step2 i={i} forward_chunk(0): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
             flush=True,
         )
     self._recv_forward(0)
@@ -310,7 +310,7 @@ for i in range(step_2):
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step2 i={i} forward_chunk(1): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step2 i={i} forward_chunk(1): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
             flush=True,
         )
     self._send_forward(0)
@@ -323,7 +323,7 @@ if _profiling:
     torch.cuda.synchronize()
     _m2 = _mem_gb()
     print(
-        f"[rank={self.rank} pp={pp_rank}] After Step2 ({step_2} F0F1): {_m2:.2f} GiB (+{_m2 - _m0:.2f}) | {_mem_detail()}",
+        f"[rank={distributed.rank} pp={pp_rank}] After Step2 ({step_2} F0F1): {_m2:.2f} GiB (+{_m2 - _m0:.2f}) | {_mem_detail()}",
         flush=True,
     )
 ```
@@ -346,14 +346,14 @@ for i in range(step_3):
         torch.cuda.synchronize()
         _ms3 = _mem_gb()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step3 i={i} before B1: {_ms3:.2f} GiB | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} before B1: {_ms3:.2f} GiB | {_mem_detail()}",
             flush=True,
         )
     self._backward_chunk(1, enable_zb=True)
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step3 i={i} after B1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} after B1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
             flush=True,
         )
     self._recv_forward(1)
@@ -361,14 +361,14 @@ for i in range(step_3):
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step3 i={i} after W1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} after W1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
             flush=True,
         )
     self._forward_chunk(1, recv=False)
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step3 i={i} after F1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} after F1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
             flush=True,
         )
 ```
@@ -380,7 +380,7 @@ if _profiling:
     torch.cuda.synchronize()
     _m3 = _mem_gb()
     print(
-        f"[rank={self.rank} pp={pp_rank}] After Step3 ({step_3} B1W1F1): {_m3:.2f} GiB (+{_m3 - _m0:.2f}) | {_mem_detail()}",
+        f"[rank={distributed.rank} pp={pp_rank}] After Step3 ({step_3} B1W1F1): {_m3:.2f} GiB (+{_m3 - _m0:.2f}) | {_mem_detail()}",
         flush=True,
     )
 ```
@@ -391,7 +391,7 @@ if _profiling:
     if _profiling:
         torch.cuda.synchronize()
         print(
-            f"[rank={self.rank} pp={pp_rank}] Step4 i={i}: {_mem_gb():.2f} GiB | {_mem_detail()}",
+            f"[rank={distributed.rank} pp={pp_rank}] Step4 i={i}: {_mem_gb():.2f} GiB | {_mem_detail()}",
             flush=True,
         )
 ```
@@ -403,7 +403,7 @@ if _profiling:
     torch.cuda.synchronize()
     _m4 = _mem_gb()
     print(
-        f"[rank={self.rank} pp={pp_rank}] After Step4 ({step_4} F0B1F1B0): {_m4:.2f} GiB | {_mem_detail()}",
+        f"[rank={distributed.rank} pp={pp_rank}] After Step4 ({step_4} F0B1F1B0): {_m4:.2f} GiB | {_mem_detail()}",
         flush=True,
     )
 ```
@@ -417,7 +417,7 @@ if _profiling:
     torch.cuda.synchronize()
     _m8 = _mem_gb()
     print(
-        f"[rank={self.rank} pp={pp_rank}] After Step8 (end of pipeline): {_m8:.2f} GiB | {_mem_detail()}",
+        f"[rank={distributed.rank} pp={pp_rank}] After Step8 (end of pipeline): {_m8:.2f} GiB | {_mem_detail()}",
         flush=True,
     )
 ```
