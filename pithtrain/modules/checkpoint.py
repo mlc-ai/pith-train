@@ -18,6 +18,8 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
+from pithtrain.contexts import distributed
+
 __all__ = ["to_canonical_model", "to_canonical_optim", "to_localized_model", "to_localized_optim"]
 
 MODULE_PREFIX_RE = re.compile(r"^module\.\d+\.")
@@ -43,14 +45,14 @@ def find_moe(key: str, named_modules: Dict[str, nn.Module]) -> Optional[nn.Modul
     if after and after.split(".")[0].isdigit():
         return None
     mod = named_modules.get(moe_path)
-    if mod and hasattr(mod, "ep_rank") and hasattr(mod, "experts_per_rank"):
+    if mod and hasattr(mod, "experts_per_rank"):
         return mod
     return None
 
 
 def expert_range(mod: nn.Module) -> Tuple[int, int]:
     """Global expert index range [start, end) for this EP rank."""
-    start = mod.ep_rank * mod.experts_per_rank
+    start = distributed.ep_rank * mod.experts_per_rank
     return start, start + mod.experts_per_rank
 
 
@@ -172,7 +174,7 @@ def repack(
             if local is not None:
                 moe_path = local.partition(".experts.")[0]
                 moe = named_modules.get(moe_path)
-                if moe and hasattr(moe, "ep_rank"):
+                if moe and hasattr(moe, "experts_per_rank"):
                     s, e = expert_range(moe)
                     idx = int(idx_str)
                     if s <= idx < e:
