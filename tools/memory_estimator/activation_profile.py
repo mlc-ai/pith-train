@@ -151,7 +151,7 @@ class ActivationEstimator:
         # counted in the producing stage.
         #
         # s1.outs.sorted_tokens: FREED at stage3 start via deferred_free
-        # (overlap.py: ctx.fwd_comm_deferred_free.append(sorted_tokens)).
+        # (dualpipev.py: ctx.fwd_comm_deferred_free.append(sorted_tokens)).
         # Does NOT persist beyond the layer - not counted.
         #
         # s2.outs.gathered_tokens: FREED immediately in stage3_f
@@ -159,7 +159,7 @@ class ActivationEstimator:
         # Does NOT persist - not counted.
         #
         # s3.outs.moe_outs: FREED at stage5 start via deferred_free
-        # (overlap.py: ctx.fwd_comm_deferred_free.append(s3.outs.moe_outs)).
+        # (dualpipev.py: ctx.fwd_comm_deferred_free.append(s3.outs.moe_outs)).
         # Does NOT persist beyond the layer - not counted.
 
         # Persistent stage 1 outs:

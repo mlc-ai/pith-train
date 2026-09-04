@@ -25,7 +25,7 @@ A high-level map (one representative file noted per area; the directories hold m
 ```
 pithtrain/
 ├── tasks/     # APPLICATION: launchable entry points (pretrain_lm.py)
-├── dualpipe/  # ENGINE: DualPipeV scheduler + F/B overlap (dualpipev.py, overlap.py)
+├── dualpipe/  # ENGINE: DualPipeV scheduler + F/B overlap (dualpipev.py, execution.py)
 ├── models/    # ENGINE: one file per model family (qwen3_moe.py); interface.py is the contract
 ├── modules/   # ENGINE: distributed + training infra (distributed.py, training.py)
 ├── contexts/  # ENGINE: runtime state (distributed.pp_group, training.dataset)

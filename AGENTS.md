@@ -86,8 +86,7 @@ The core pipeline assigns each rank two model chunks in a V-shape (the model is 
 Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/dualpipe/execution.py`), not layer methods.
 
 Key files:
-- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
-- `overlap.py` — `overlapped_forward_backward()` interleaved loop for one pair of micro-batches
+- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), `overlapped_forward_backward()` is the interleaved loop for one pair of micro-batches, plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
 - `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, the dispatch/combine helpers, and `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
 
 ### FP8 Training
