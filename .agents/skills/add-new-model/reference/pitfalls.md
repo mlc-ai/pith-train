@@ -111,9 +111,9 @@ Extend the gate condition with your model's distinctive expert-weight name if it
 
 ## Stage recording - stages 2 and 4 carry only `.ctx`
 
-`Model.forward` delegates to `record_forward` (in `pithtrain/dualpipe/execution.py`), which runs each layer through `layer_forward` and records every stage into the pre-allocated `ChunkRecord` - one `LayerRecord` per layer, each holding `stage1..stage5`. Stages 1, 3, 5 record `.args`, `.ctx`, `.outs`; stages 2 and 4 (the dispatch / combine all-to-alls) record `.ctx` only.
+`Model.forward` delegates to `model_forward` (in `pithtrain/dualpipe/execution.py`), which runs each layer through `layer_forward` and records every stage into the pre-allocated `ChunkRecord` - one `LayerRecord` per layer, each holding `stage1..stage5`. Stages 1, 3, 5 record `.args`, `.ctx`, `.outs`; stages 2 and 4 (the dispatch / combine all-to-alls) record `.ctx` only.
 
-The engine owns this plumbing, so a new model does **not** write a record-copy loop - it implements `forward_stage1/3/5` and returns `record_forward(self, hidden_states, self.chunk_record, cu_seqlens)` from `forward`. The invariant this protects: any code that walks the records and special-cases on the presence of `.args` silently drops the stage-2 / stage-4 all-to-all contexts.
+The engine owns this plumbing, so a new model does **not** write a record-copy loop - it implements `forward_stage1/3/5` and returns `model_forward(self, hidden_states, self.chunk_record, cu_seqlens)` from `forward`. The invariant this protects: any code that walks the records and special-cases on the presence of `.args` silently drops the stage-2 / stage-4 all-to-all contexts.
 
 ### Wrong
 

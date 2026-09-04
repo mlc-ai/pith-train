@@ -27,7 +27,7 @@ If the test exceeds the timeout, it is **hanging**, not slow. The usual cause is
 
 Run `tests/test_dualpipev.py` on one GPU at `--pp-size 1 --ep-size 1`. This is the lightest rung of the same harness the rest of the ladder uses - no PP P2P, no EP all-to-all - so it isolates modeling bugs, NaNs, and compile drift before any distributed machinery is involved. Wire the new model into `tests/test_dualpipev.py` first (see below).
 
-**What it checks:** the model builds at `phase=-1` (single-device reference) and at `phase=0` / `phase=1` (the two DualPipeV chunks); the eager `reference_forward` autograd path runs to completion; and the pipelined 5-stage `forward` (driven through `DualPipeV.step`, which records each stage into the model's `ChunkRecord` via `record_forward`) matches `reference_forward` on both loss and per-parameter gradients.
+**What it checks:** the model builds at `phase=-1` (single-device reference) and at `phase=0` / `phase=1` (the two DualPipeV chunks); the eager `reference_forward` autograd path runs to completion; and the pipelined 5-stage `forward` (driven through `DualPipeV.step`, which records each stage into the model's `ChunkRecord` via `model_forward`) matches `reference_forward` on both loss and per-parameter gradients.
 
 ```bash
 # Check GPUs

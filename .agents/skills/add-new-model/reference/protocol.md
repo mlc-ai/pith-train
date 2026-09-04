@@ -176,14 +176,14 @@ def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
 
 The model exposes two forward paths.
 
-**`forward`** is the pipelined path. It delegates to `record_forward` (`pithtrain.dualpipe.execution`):
+**`forward`** is the pipelined path. It delegates to `model_forward` (`pithtrain.dualpipe.execution`):
 
 ```python
 def forward(self, hidden_states, cu_seqlens=None):
-    return record_forward(self, hidden_states, self.chunk_record, cu_seqlens)
+    return model_forward(self, hidden_states, self.chunk_record, cu_seqlens)
 ```
 
-`record_forward` runs `forward_prolog` (first stage only) -> every layer's five stages -> `forward_epilog` (last stage only), stashing each stage's args and outputs into a pre-allocated `ChunkRecord` so the manual pipeline backward can backprop stage-by-stage instead of building one monolithic autograd graph. The scheduler sets `self.chunk_record` before the call.
+`model_forward` runs `forward_prolog` (first stage only) -> every layer's five stages -> `forward_epilog` (last stage only), stashing each stage's args and outputs into a pre-allocated `ChunkRecord` so the manual pipeline backward can backprop stage-by-stage instead of building one monolithic autograd graph. The scheduler sets `self.chunk_record` before the call.
 
 **`reference_forward`** is the plain-autograd path used for correctness validation:
 
@@ -199,7 +199,7 @@ def reference_forward(self, hidden_states, cu_seqlens=None):
     return hidden_states
 ```
 
-You implement `forward_prolog`, `forward_epilog`, and `forward_posemb`; the stage recording lives entirely in `record_forward` / `layer_forward`, so a new model never hand-rolls the record copy.
+You implement `forward_prolog`, `forward_epilog`, and `forward_posemb`; the stage recording lives entirely in `model_forward` / `layer_forward`, so a new model never hand-rolls the record copy.
 
 ## The `ChunkRecord` structure
 
@@ -207,7 +207,7 @@ You implement `forward_prolog`, `forward_epilog`, and `forward_posemb`; the stag
 
 ## Model-level backward
 
-There is no model `backward` method. The engine drives `record_backward` (`pithtrain.dualpipe.execution`), which runs epilog backward (via `loss.backward()` on the last stage), loops the layers in reverse through `layer_backward`, then runs prolog backward. Because it backprops through the tensors `record_forward` saved in the `ChunkRecord`, a new model needs no backward code as long as `forward_stage1` / `forward_stage3` / `forward_stage5` build ordinary autograd graphs.
+There is no model `backward` method. The engine drives `model_backward` (`pithtrain.dualpipe.execution`), which runs epilog backward (via `loss.backward()` on the last stage), loops the layers in reverse through `layer_backward`, then runs prolog backward. Because it backprops through the tensors `model_forward` saved in the `ChunkRecord`, a new model needs no backward code as long as `forward_stage1` / `forward_stage3` / `forward_stage5` build ordinary autograd graphs.
 
 ## Model.__init__ requirements <a id="init-requirements"></a>
 

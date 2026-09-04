@@ -7,7 +7,7 @@ run it through the pp/ep scaling ladder.
 
 The purpose of this test is to verify that **real released weights**
 produce coherent text when run through **DualPipeV's recorded pipeline
-path** (``forward`` -> ``record_forward``, not ``reference_forward``).  This
+path** (``forward`` -> ``model_forward``, not ``reference_forward``).  This
 catches:
   - checkpoint-conversion layout bugs (symptom: gibberish even after
     the FSDP gradient test passes with random weights),

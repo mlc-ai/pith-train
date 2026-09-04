@@ -37,18 +37,15 @@ adapted from the original DualPipe project:
   pithtrain/dualpipe/dualpipev.py
     - The DualPipeV class (scheduling algorithm, P2P communication methods,
       and state management) is derived from dualpipe/dualpipev.py in the
-      original repository. The overlapped_forward_backward() function and
-      FSDP/FP8 integration are original additions.
-
-  pithtrain/dualpipe/comm.py
-    - P2P communication helpers (set_p2p_tensor_shapes, set_p2p_tensor_dtype,
-      append_irecv, append_isend) are derived from dualpipe/comm.py in the
-      original repository.
+      original repository. The _append_irecv and _append_isend helpers are
+      derived from dualpipe/comm.py, which was merged into this file. The
+      five-stage decomposition (execution.py), the overlapped execution loop
+      (overlap.py), and the FSDP/FP8 integration are original additions and
+      contain no derived code.
 
   pithtrain/dualpipe/utils.py
-    - WeightGradStore, run_backward, chunk_tensor, cat_tensor, scatter, and
-      gather are derived from dualpipe/utils.py in the original repository.
-      FP8WeightCacheControl and diagnostic utilities are original additions.
+    - WeightGradStore and run_backward are derived from dualpipe/utils.py in
+      the original repository. FP8WeightCacheControl is an original addition.
 
 A copy of the original MIT license is also retained at:
   pithtrain/dualpipe/LICENSE
