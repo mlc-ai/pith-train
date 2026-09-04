@@ -8,8 +8,6 @@ from torch import nn
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe.dualpipev import layer_partition
-from pithtrain.dualpipe.execution import ChunkRecord, model_forward
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
@@ -21,6 +19,8 @@ from pithtrain.operators.token_scatter import (
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
+from pithtrain.pipeline.dualpipev import layer_partition
+from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
 
 class DeepSeekV2RotaryEmbedding(nn.Module):

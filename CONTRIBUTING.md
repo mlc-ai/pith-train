@@ -101,7 +101,7 @@ Keep new knobs documented with field docstrings (as in `DistributedCfg`).
 
 ### Change the pipeline schedule or parallelism
 
-These live in `pithtrain/dualpipe/` and `pithtrain/modules/distributed.py` and touch correctness and performance broadly. Expect to:
+These live in `pithtrain/pipeline/` and `pithtrain/modules/distributed.py` and touch correctness and performance broadly. Expect to:
 
 - run `bash tests/test_dualpipev.sh`,
 - validate loss-curve parity (`validate-correctness`), and
@@ -119,4 +119,4 @@ These live in `pithtrain/dualpipe/` and `pithtrain/modules/distributed.py` and t
 
 ## License
 
-By contributing, you agree your contributions are licensed under the [Apache 2.0 License](LICENSE). Note that `pithtrain/dualpipe/` contains code derived from DeepSeek's DualPipe (MIT) — see `pithtrain/dualpipe/LICENSE` and the project-root `NOTICE`; keep attribution intact when modifying those files.
+By contributing, you agree your contributions are licensed under the [Apache 2.0 License](LICENSE). Note that `pithtrain/pipeline/` contains code derived from DeepSeek's DualPipe (MIT) — see `pithtrain/pipeline/LICENSE` and the project-root `NOTICE`; keep attribution intact when modifying those files.

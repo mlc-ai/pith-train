@@ -35,7 +35,7 @@ All edits are observation-only:
 
 ## Group 1: Helpers
 
-### 1A: Pipeline helpers in `pithtrain/dualpipe/dualpipev.py`
+### 1A: Pipeline helpers in `pithtrain/pipeline/dualpipev.py`
 
 Add right before `class DualPipeV`:
 
@@ -62,7 +62,7 @@ In `DualPipeV.__init__`, add after `self.comm_stream = ...`:
 self.memory_profiling = True  # Set to True to enable per-step memory logging
 ```
 
-### 1B: Layer-level helpers in `pithtrain/dualpipe/execution.py`
+### 1B: Layer-level helpers in `pithtrain/pipeline/execution.py`
 
 Add after imports, before any function definitions:
 
@@ -225,7 +225,7 @@ Add `_setup_mem(...)` calls at these 5 points in `setup_model`:
 
 ---
 
-## Group 4: Pipeline-Level Prints (`pithtrain/dualpipe/dualpipev.py`)
+## Group 4: Pipeline-Level Prints (`pithtrain/pipeline/dualpipev.py`)
 
 This is the most complex group. All insertions go into `DualPipeV.step()`. The code below shows every insertion with its exact anchor point.
 
@@ -254,7 +254,7 @@ Replace with:
 ```python
 for i in range(step_1):
     if _profiling and i == 1:
-        import pithtrain.dualpipe.execution as _mod
+        import pithtrain.pipeline.execution as _mod
         _mod._layer_mem_profile = True
     self._forward_chunk(0)
     if _profiling and i == 1:
@@ -302,7 +302,7 @@ for i in range(step_2):
         )
     self._recv_forward(0)
     if _profiling and i == 0:
-        import pithtrain.dualpipe.execution as _mod
+        import pithtrain.pipeline.execution as _mod
         _mod._layer_mem_profile = True
     self._forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
     if _profiling and i == 0:
@@ -424,7 +424,7 @@ if _profiling:
 
 ---
 
-## Group 5: Per-Layer Prints (`pithtrain/dualpipe/execution.py` + model file)
+## Group 5: Per-Layer Prints (`pithtrain/pipeline/execution.py` + model file)
 
 ### 5A: In `layer_forward()` (execution.py)
 
@@ -491,7 +491,7 @@ After: `if _do_lmem: _lmem(f"layer{layer.idx} after stage5 (forward_stage5)")`
 
 `forward_stage1` runs the compiled `forward_stage1_compute` helper (LN + attention + LN + router gate) and then `prepare_dispatch`. Add at the top:
 ```python
-from pithtrain.dualpipe.execution import _layer_mem_profile, _lmem
+from pithtrain.pipeline.execution import _layer_mem_profile, _lmem
 _do = _layer_mem_profile and self.idx in DETAIL_LAYERS
 ```
 
@@ -506,7 +506,7 @@ The router gate runs inside the compiled `forward_stage1_compute`, so its alloca
 
 Add at the top:
 ```python
-from pithtrain.dualpipe.execution import _layer_mem_profile, _lmem
+from pithtrain.pipeline.execution import _layer_mem_profile, _lmem
 _do = _layer_mem_profile and self.idx in DETAIL_LAYERS
 ```
 
@@ -531,7 +531,7 @@ outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tens
 ### 5D: In model experts class `forward` (model file)
 
 1. Add `_do_mem: bool = False` parameter to the `forward()` signature.
-2. Add `from pithtrain.dualpipe.execution import _lmem` at the top.
+2. Add `from pithtrain.pipeline.execution import _lmem` at the top.
 3. Add prints guarded by `if _do_mem:`:
    - Before `gate_proj`: shape of input `x`
    - After `gate_proj`: shape of `g`
@@ -553,7 +553,7 @@ outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tens
 
 Prolog (embed) and epilog (norm + lm_head) compute live in the model's `forward_prolog` and `forward_epilog` methods, which the pipeline invokes on the first and last stage respectively. Add the import in each method that uses it:
 ```python
-from pithtrain.dualpipe.execution import _layer_mem_profile, _lmem
+from pithtrain.pipeline.execution import _layer_mem_profile, _lmem
 ```
 
 Then:
@@ -652,8 +652,8 @@ if _mem_profile:
 
 ## Execution Order
 
-1. `pithtrain/dualpipe/execution.py` — Groups 1B, 5A
-2. `pithtrain/dualpipe/dualpipev.py` — Groups 1A, 4
+1. `pithtrain/pipeline/execution.py` — Groups 1B, 5A
+2. `pithtrain/pipeline/dualpipev.py` — Groups 1A, 4
 3. `pithtrain/models/<model>.py` — Groups 5B, 5C, 5D, 5E
 4. `pithtrain/modules/distributed.py` — Group 2
 5. `pithtrain/modules/training.py` — Groups 1C, 3

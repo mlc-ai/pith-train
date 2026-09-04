@@ -4,7 +4,7 @@ DualPipeV: Overlapped forward-backward pipeline parallelism.
 The ``DualPipeV`` class in this module is derived from the DualPipeV
 implementation in DeepSeek's DualPipe project
 (https://github.com/deepseek-ai/DualPipe), which is licensed under the
-MIT License. Copyright (c) 2025 DeepSeek. See ``pithtrain/dualpipe/LICENSE``
+MIT License. Copyright (c) 2025 DeepSeek. See ``pithtrain/pipeline/LICENSE``
 and the project-root ``NOTICE`` file for the full license text and details
 of which portions are derived.
 
@@ -33,7 +33,9 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule, fully_shard
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe.execution import (
+from pithtrain.models.interface import ModelProtocol
+from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.pipeline.execution import (
     ChunkRecord,
     ExecutionCtx,
     LayerRecord,
@@ -59,8 +61,6 @@ from pithtrain.dualpipe.execution import (
     stage5_b,
     stage5_f,
 )
-from pithtrain.models.interface import ModelProtocol
-from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 
 
 def layer_partition(num_layers: int, stage_count: int, stage_index: int) -> range:

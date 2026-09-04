@@ -26,7 +26,6 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
-from pithtrain.dualpipe import Microbatch
 from pithtrain.modules.checkpoint import (
     to_canonical_model,
     to_canonical_optim,
@@ -38,6 +37,7 @@ from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cross_entropy import cross_entropy
+from pithtrain.pipeline import Microbatch
 
 
 @dataclass(init=False, slots=True)

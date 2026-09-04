@@ -49,7 +49,7 @@ from torch.distributed.checkpoint import FileSystemReader
 from transformers import AutoConfig, AutoTokenizer
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe import DualPipeV, Microbatch
+from pithtrain.pipeline import DualPipeV, Microbatch
 
 # TODO_MODEL: import the model class you're testing (rename to match the file
 # you created from model_skeleton.py, e.g. `from pithtrain.models.mixtral import MixtralModel`).

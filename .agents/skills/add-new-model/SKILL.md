@@ -91,8 +91,8 @@ Record in a scratch doc (not a committed file): class names, attribute names, ex
    - [ ] `forward_stage3` truncates expert input by `sum(ks)` if the expert block has biases or elementwise post-ops (prevents 0*NaN=NaN in backward)
    - [ ] `forward_stage3` uses `padded_index_gather` (not raw indexing) for both expand and reverse shuffle
 4. Checklist for the model class:
-   - [ ] Layers built via `layer_partition(config.num_hidden_layers, stage_count, stage_index)` from `pithtrain/dualpipe/dualpipev.py`
-   - [ ] `forward` delegates to `model_forward(self, hidden_states, self.chunk_record, cu_seqlens)`; the engine records each stage into `self.chunk_record` (a `ChunkRecord` from `pithtrain/dualpipe/execution.py`) for the pipeline backward, which the engine drives via `model_backward`.
+   - [ ] Layers built via `layer_partition(config.num_hidden_layers, stage_count, stage_index)` from `pithtrain/pipeline/dualpipev.py`
+   - [ ] `forward` delegates to `model_forward(self, hidden_states, self.chunk_record, cu_seqlens)`; the engine records each stage into `self.chunk_record` (a `ChunkRecord` from `pithtrain/pipeline/execution.py`) for the pipeline backward, which the engine drives via `model_backward`.
    - [ ] `forward_posemb`, `forward_prolog`, `forward_epilog`, and `reference_forward` implemented per `ModelProtocol`.
 
 **Gate:** file imports cleanly (`python -c "from pithtrain.models.<model> import <Model>"`).

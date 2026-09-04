@@ -12,7 +12,7 @@ micro-batches and overlap the compute of one with the communication of another.
 
 ``WeightGradStore`` and ``run_backward`` are derived from ``dualpipe/utils.py`` in DeepSeek's
 DualPipe project (https://github.com/deepseek-ai/DualPipe), licensed under the MIT License.
-Copyright (c) 2025 DeepSeek. See ``pithtrain/dualpipe/LICENSE`` for the full license text. The
+Copyright (c) 2025 DeepSeek. See ``pithtrain/pipeline/LICENSE`` for the full license text. The
 five-stage decomposition is an original addition.
 """
 

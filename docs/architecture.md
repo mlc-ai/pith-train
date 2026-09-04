@@ -13,7 +13,7 @@ The codebase is organized into three layers:
 | Layer | Directory | Responsibility |
 |---|---|---|
 | Application | `pithtrain/tasks` | End-to-end workflows: pretraining, corpus tokenization, checkpoint conversion. |
-| Engine | `pithtrain/{dualpipe,models,modules,contexts}` | The bulk of PithTrain: pipeline scheduler, model implementations, and distributed/training infrastructure. |
+| Engine | `pithtrain/{pipeline,models,modules,contexts}` | The bulk of PithTrain: pipeline scheduler, model implementations, and distributed/training infrastructure. |
 | Operator | `pithtrain/operators` | Fused Triton / library-backed kernels for compute- and communication-critical paths. |
 
 Everything sits on top of PyTorch (NCCL, FSDP2, DCP, `torch.compile`), with external kernel libraries (DeepGEMM, FlashAttention) and a Python kernel DSL (Triton) at the operator layer.
@@ -25,7 +25,7 @@ A high-level map (one representative file noted per area; the directories hold m
 ```
 pithtrain/
 ├── tasks/     # APPLICATION: launchable entry points (pretrain_lm.py)
-├── dualpipe/  # ENGINE: DualPipeV scheduler + F/B overlap (dualpipev.py, execution.py)
+├── pipeline/  # ENGINE: DualPipeV scheduler + F/B overlap (dualpipev.py, execution.py)
 ├── models/    # ENGINE: one file per model family (qwen3_moe.py); interface.py is the contract
 ├── modules/   # ENGINE: distributed + training infra (distributed.py, training.py)
 ├── contexts/  # ENGINE: runtime state (distributed.pp_group, training.dataset)
@@ -79,7 +79,7 @@ See `pithtrain/models/qwen3_moe.py` for a complete, readable implementation of t
 
 ## 3. DualPipeV: the pipeline engine
 
-`pithtrain/dualpipe` is the heart of the framework, derived from DeepSeek's [DualPipe](https://github.com/deepseek-ai/DualPipe) with the compute-communication overlap added on top.
+`pithtrain/pipeline` is the heart of the framework, derived from DeepSeek's [DualPipe](https://github.com/deepseek-ai/DualPipe) with the compute-communication overlap added on top.
 
 V-shaped placement. Instead of one contiguous slice of layers per rank, the model is cut into `2 x pp_size` chunks arranged in a "V": rank `r` holds chunk `r` and chunk `2 x pp_size - 1 - r`. That is why `DualPipeV` is built from a pair of modules, and it is what keeps each rank busy on both the forward and backward sweep (reducing the pipeline bubble). When the layers don't divide evenly across the pipeline, the edge chunks get fewer transformer layers, since they also carry the embeddings and the language-model head.
 

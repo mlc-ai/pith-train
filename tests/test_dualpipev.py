@@ -18,13 +18,13 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe import DualPipeV, Microbatch
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.grouped_linear import GroupedLinear
+from pithtrain.pipeline import DualPipeV, Microbatch
 
 
 def fill_weights(module: nn.Module):

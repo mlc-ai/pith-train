@@ -14,7 +14,7 @@ Every decoder layer is split into 5 stages so the scheduler can interleave diffe
 | 4 | (engine) | engine | All-to-all combine on comm stream |
 | 5 | `forward_stage5` | model | Weighted expert sum + residual add |
 
-Stages 2 and 4 are **not** layer methods - the engine (`pithtrain/dualpipe/execution.py`) drives the all-to-all on the comm stream. A layer implements only the three compute stages, plus a non-pipelined `reference_forward` for correctness validation.
+Stages 2 and 4 are **not** layer methods - the engine (`pithtrain/pipeline/execution.py`) drives the all-to-all on the comm stream. A layer implements only the three compute stages, plus a non-pipelined `reference_forward` for correctness validation.
 
 ## `LayerProtocol` (see `pithtrain/models/interface.py`)
 
@@ -176,7 +176,7 @@ def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
 
 The model exposes two forward paths.
 
-**`forward`** is the pipelined path. It delegates to `model_forward` (`pithtrain.dualpipe.execution`):
+**`forward`** is the pipelined path. It delegates to `model_forward` (`pithtrain.pipeline.execution`):
 
 ```python
 def forward(self, hidden_states, cu_seqlens=None):
@@ -203,11 +203,11 @@ You implement `forward_prolog`, `forward_epilog`, and `forward_posemb`; the stag
 
 ## The `ChunkRecord` structure
 
-`ChunkRecord` (`pithtrain.dualpipe.execution`) holds `prolog`, `epilog`, and a `layers` list of `LayerRecord`. Each `LayerRecord` carries a `stage1 .. stage5` record. The stage-2 / stage-4 records hold only the all-to-all `ctx` (splits + process group) - which is why the engine, not the model, owns dispatch and combine. `create_chunk_record` pre-allocates these once and the scheduler reuses them across micro-batches for zero-allocation stepping.
+`ChunkRecord` (`pithtrain.pipeline.execution`) holds `prolog`, `epilog`, and a `layers` list of `LayerRecord`. Each `LayerRecord` carries a `stage1 .. stage5` record. The stage-2 / stage-4 records hold only the all-to-all `ctx` (splits + process group) - which is why the engine, not the model, owns dispatch and combine. `create_chunk_record` pre-allocates these once and the scheduler reuses them across micro-batches for zero-allocation stepping.
 
 ## Model-level backward
 
-There is no model `backward` method. The engine drives `model_backward` (`pithtrain.dualpipe.execution`), which runs epilog backward (via `loss.backward()` on the last stage), loops the layers in reverse through `layer_backward`, then runs prolog backward. Because it backprops through the tensors `model_forward` saved in the `ChunkRecord`, a new model needs no backward code as long as `forward_stage1` / `forward_stage3` / `forward_stage5` build ordinary autograd graphs.
+There is no model `backward` method. The engine drives `model_backward` (`pithtrain.pipeline.execution`), which runs epilog backward (via `loss.backward()` on the last stage), loops the layers in reverse through `layer_backward`, then runs prolog backward. Because it backprops through the tensors `model_forward` saved in the `ChunkRecord`, a new model needs no backward code as long as `forward_stage1` / `forward_stage3` / `forward_stage5` build ordinary autograd graphs.
 
 ## Model.__init__ requirements <a id="init-requirements"></a>
 
@@ -216,7 +216,7 @@ The model constructor takes `(config, phase)`. `phase` selects the V-shape role 
 - `self.stage_index`, `self.stage_count` stored for later edge checks.
 - `self.hidden_size = config.hidden_size` - `DualPipeV.setup_step_metadata` reads it off the local model to size the P2P receive buffers, so a model without it raises `AttributeError` on the first step.
 - `self.chunk_record = None` - the scheduler sets it per forward.
-- Layers distributed via `layer_partition(config.num_hidden_layers, stage_count, stage_index)` (import from `pithtrain.dualpipe.dualpipev`), collected into an `nn.ModuleDict` keyed by the absolute layer id as a string (required by FSDP wrapping and by weight init).
+- Layers distributed via `layer_partition(config.num_hidden_layers, stage_count, stage_index)` (import from `pithtrain.pipeline.dualpipev`), collected into an `nn.ModuleDict` keyed by the absolute layer id as a string (required by FSDP wrapping and by weight init).
 - First stage (`stage_index == 0`) has `self.embed_tokens`; last stage (`stage_index == stage_count - 1`) has `self.norm` and `self.lm_head`. All other stages set these to `None`.
 - Rotary tables live on a `rotary_emb` submodule; per-forward positions are built in `forward_posemb(S, cu_seqlens)` because they depend on the input seq_len (and on `cu_seqlens` for packed batches). Do not bake them into `__init__`.
 

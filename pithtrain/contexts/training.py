@@ -11,9 +11,9 @@ if TYPE_CHECKING:
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
 
-    from pithtrain.dualpipe import DualPipeV
     from pithtrain.modules.dataset import ConcatDataset
     from pithtrain.operators import grouped_linear, linear
+    from pithtrain.pipeline import DualPipeV
 
 PARAM_DTYPE = torch.bfloat16
 """

@@ -34,8 +34,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from pithtrain.contexts import distributed, training
-from pithtrain.dualpipe.dualpipev import layer_partition
-from pithtrain.dualpipe.execution import ChunkRecord, model_forward
+from pithtrain.pipeline.dualpipev import layer_partition
+from pithtrain.pipeline.execution import ChunkRecord, model_forward
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import prepare_dispatch
