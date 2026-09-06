@@ -18,14 +18,13 @@ if [ $# -ne 1 ]; then
 fi
 
 # Setup distributed.
-LAUNCH_ARGS=()
-LAUNCH_ARGS+=(--nnodes=${SLURM_NNODES:-1} --node-rank=${SLURM_NODEID:-0} --nproc-per-node=gpu)
-RDZV_HOST=$(scontrol show hostnames "${SLURM_STEP_NODELIST:-localhost}" | head -1 || echo localhost)
-LAUNCH_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=$RDZV_HOST:15213)
+TORCHRUN_ARGS=()
+TORCHRUN_ARGS+=(--nnodes=${SLURM_NNODES:-1} --nproc-per-node=gpu)
+TORCHRUN_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=$(scontrol show hostnames "${SLURM_STEP_NODELIST:-localhost}" | head -1):15213)
 
 # Launch the training.
 SCRIPT=examples/pretrain_lm/$1/script.py
 OUTPUT=logging/pretrain_lm/${1}_node${SLURM_NODEID:-0}.log
 
 mkdir -p $(dirname $OUTPUT) && exec > >(tee $OUTPUT) 2>&1
-torchrun ${LAUNCH_ARGS[@]} $SCRIPT
+torchrun ${TORCHRUN_ARGS[@]} $SCRIPT
