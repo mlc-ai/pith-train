@@ -15,3 +15,12 @@ srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.py
 
 STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp1-cp1-ep8-seq3072-bf16
 srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
+
+STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp8-cp1-ep8-seq8192-bf16
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
+STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp4-cp2-ep8-seq16384-bf16
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
+STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp2-cp4-ep8-seq32768-bf16
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
+STEP=benchmarks/pretraining/qwen3.5-35b-a3b/h100-4n8g/pp4-dp1-cp8-ep8-seq65536-bf16
+srun ${SRUN_ARGS[@]} --output logging/$STEP.log $STEP.sh
