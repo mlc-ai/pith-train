@@ -101,6 +101,8 @@ Properties worth remembering: `cp` and `ep` each need only divide the stage size
 
 The same module installs a fail-fast excepthook plus an NCCL heartbeat timeout (driven by `DistributedCfg.timeout`, default 15 min) so a failed rank does not make peers wait on the watchdog.
 
+**Two CP sequence layouts (`pithtrain/operators/cp_sequence.py`).** Softmax attention shards the sequence **zigzag** (rank `r` holds blocks `r` and `2 * cp_size - r - 1` of `2 * cp_size`) to balance causal work; a linear-attention recurrence instead needs **contiguous** (blocks `2r` and `2r + 1`) so that rank order is sequence order. Hybrid models (Qwen3.5) convert with one all-to-all at each boundary between the two kinds of layer, hoisted to the ends of each run of linear-attention layers. The invariant: **hidden states are zigzag at model boundaries and at every attention layer, contiguous within a run of linear-attention layers**; norms, MoE and residuals are per-token and layout-blind. `zigzag_spans(cp_rank, cp_size, seq_len)` is the single definition of the zigzag partition, returning the two global token ranges a rank holds, and both the loader and `forward_posemb` call it. Restating that arithmetic elsewhere mistrains silently rather than raising.
+
 ### Model Layer Protocol (`pithtrain/models/interface.py`)
 
 Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
@@ -120,6 +122,7 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 ### Optimized Operators (`pithtrain/operators/`)
 
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
+- **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans`, converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
 - **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper

@@ -231,7 +231,8 @@ def main(model_name: str):
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
     assert not (packed and cp_size > 1), "CP with packed cu_seqlens is not supported yet."
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
-    num_chunks, sequence_length = 20, 128
+    num_chunks = 20
+    sequence_length = int(os.environ.get("SEQUENCE_LENGTH", "128"))
 
     config_path = Path(__file__).resolve().parent.parent / model_name
     config = AutoConfig.from_pretrained(config_path)

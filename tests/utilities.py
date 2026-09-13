@@ -1,5 +1,6 @@
 """Spawn workers and run them under PithTrain's distributed context."""
 
+import math
 import os
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -39,13 +40,12 @@ def entrypoint(i: int, cfg: DistributedCfg, worker: Callable, *args) -> None:
 
 def launch(cfg: DistributedCfg, worker: Callable, *args) -> None:
     """
-    Spawn workers and call worker(*args) inside each. Skip the test if
-    the distributed runtime cannot provide pp * cp * ep ranks.
+    Spawn workers and call worker(*args) inside each. Skip the test if the distributed
+    runtime cannot provide the ranks the mesh needs.
     """
-    mesh_extent = 1
-    mesh_extent *= cfg.pipeline_parallel_size
-    mesh_extent *= cfg.context_parallel_size
-    mesh_extent *= cfg.expert_parallel_size
+    pp_size = cfg.pipeline_parallel_size
+    stage_extent = math.lcm(cfg.context_parallel_size, cfg.expert_parallel_size)
+    mesh_extent = pp_size * stage_extent
 
     os.environ["WORLD_SIZE"] = LAUNCHER_WORLD_SIZE or str(mesh_extent)
     os.environ["LOCAL_WORLD_SIZE"] = LAUNCHER_LOCAL_WORLD_SIZE or os.environ["WORLD_SIZE"]
@@ -61,8 +61,10 @@ def launch(cfg: DistributedCfg, worker: Callable, *args) -> None:
         pytest.skip(f"require {mesh_extent} ranks, got {world_size}")
     if torch.cuda.device_count() < local_world_size:
         pytest.skip(f"require {local_world_size} GPUs, got {torch.cuda.device_count()}")
-    if world_size % mesh_extent != 0:
-        raise ValueError(f"{world_size=} not divisible by {mesh_extent=}")
+    if world_size % pp_size != 0:
+        raise ValueError(f"{world_size=} not divisible by {pp_size=}")
+    if (world_size // pp_size) % stage_extent != 0:
+        raise ValueError(f"stage_size={world_size // pp_size} not divisible by {stage_extent=}")
     if world_size % local_world_size != 0:
         raise ValueError(f"{world_size=} not divisible by {local_world_size=}")
 

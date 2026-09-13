@@ -8,9 +8,16 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.operators.cp_sequence import (
+    contiguous_to_zigzag,
+    prepend_conv_state,
+    zigzag_spans,
+    zigzag_to_contiguous,
+)
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
+from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -89,11 +96,17 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         B, S, _ = hidden_states.shape
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        mixed_qkv = self.in_proj_qkv(hidden_states)
         z = self.in_proj_z(hidden_states).reshape(B, S, -1, self.head_v_dim)
         b, a = self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
-        # Causal depthwise conv + SiLU, truncated back to S (padding=k-1).
-        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[..., :S]).transpose(1, 2)
+        # Causal depthwise conv + SiLU, truncated back to S (padding=k-1). The prepended state
+        # displaces the zeros conv1d would pad with, shifting the valid window right by offset.
+        offset = 0
+        if distributed.cp_size > 1:
+            offset = self.conv_kernel_size - 1
+            mixed_qkv = prepend_conv_state(mixed_qkv, offset, distributed.cp_group)
+        conv_out = self.conv1d(mixed_qkv.transpose(1, 2))[..., offset : offset + S]
+        mixed_qkv = F.silu(conv_out).transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)  # fmt: skip
         query = F.normalize(query.reshape(B, S, -1, self.head_k_dim), dim=-1)
         key = F.normalize(key.reshape(B, S, -1, self.head_k_dim), dim=-1)
@@ -105,7 +118,10 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
             repeats = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeats, dim=2)
             key = key.repeat_interleave(repeats, dim=2)
-        core_attn_out = gated_delta_rule(query, key, value, g, beta)
+        if distributed.cp_size > 1:
+            core_attn_out = gated_delta_rule(query, key, value, g, beta, distributed.cp_group)
+        else:
+            core_attn_out = gated_delta_rule(query, key, value, g, beta)
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
@@ -157,7 +173,10 @@ class Qwen35MoeAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim))  # fmt: skip
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-        attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)  # fmt: skip
+        if distributed.cp_size > 1:
+            attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)  # fmt: skip
+        else:
+            attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)  # fmt: skip
         attn_output = attn_output.reshape(B, S, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
@@ -277,10 +296,19 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self.input_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # fmt: skip
 
+        # Convert at the ends of each run of linear-attention layers.
+        layer_types = config.layer_types
+        linear_at = lambda i: 0 <= i < len(layer_types) and layer_types[i] == "linear_attention"
+        sharded = distributed.cp_size > 1
+        self.to_contiguous = sharded and self.is_linear and not linear_at(layer_idx - 1)
+        self.to_zigzag = sharded and self.is_linear and not linear_at(layer_idx + 1)
+
     @torch.compile(fullgraph=True)
     def forward_stage1_compute(
         self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
     ):
+        if self.to_contiguous:
+            hidden_states = zigzag_to_contiguous(hidden_states, distributed.cp_group)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear:
@@ -330,17 +358,23 @@ class Qwen35MoeDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if distributed.ep_size == 1:
             weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
-            return residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)
-        permuted_probs = topk_weight.view(-1)[moe_local_idxs]
-        token_indices = moe_local_idxs // topk_weight.shape[1]
-        weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
-        aggregated = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
-        aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
-        return residual + aggregated.view(*residual.shape)
+            hidden_states = residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)  # fmt: skip
+        else:
+            permuted_probs = topk_weight.view(-1)[moe_local_idxs]
+            token_indices = moe_local_idxs // topk_weight.shape[1]
+            weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
+            aggregated = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
+            aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
+            hidden_states = residual + aggregated.view(*residual.shape)
+        if self.to_zigzag:
+            hidden_states = contiguous_to_zigzag(hidden_states, distributed.cp_group)
+        return hidden_states
 
     def reference_forward(
         self, hidden_states: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
+        if self.to_contiguous:
+            hidden_states = zigzag_to_contiguous(hidden_states, distributed.cp_group)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear:
@@ -350,16 +384,15 @@ class Qwen35MoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp.reference_forward(hidden_states)
-        return residual + hidden_states
+        hidden_states = residual + self.mlp.reference_forward(hidden_states)
+        if self.to_zigzag:
+            hidden_states = contiguous_to_zigzag(hidden_states, distributed.cp_group)
+        return hidden_states
 
 
 class Qwen35MoeModel(nn.Module):
     def __init__(self, config: Qwen3_5MoeTextConfig, phase: int):
         super().__init__()
-        if distributed.cp_size > 1:
-            raise NotImplementedError("Qwen35MoeModel doesn't support context parallelism.")
-
         match phase:
             case 0:
                 stage_count = distributed.pp_size * 2
@@ -394,10 +427,12 @@ class Qwen35MoeModel(nn.Module):
     def forward_posemb(
         self, S: int, cu_seqlens: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert cu_seqlens is None, "packed sequences are not yet implemented for Gated DeltaNet"
+        assert cu_seqlens is None
         device = distributed.device
-        position_ids = torch.arange(S, device=device)
-        cos, sin = self.rotary_emb(S)
+        cp_size = distributed.cp_size
+        spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
+        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+        cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 
     def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:

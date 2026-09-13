@@ -36,6 +36,7 @@ from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.training import TrainingCfg, setup_training
+from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
 
@@ -78,18 +79,10 @@ def get_global_batch(cfg: PretrainLMCfg, device: torch.device) -> List[Microbatc
     local_batch_size = global_batch_size // dp_size
     start0 = step * global_batch_size + dp_rank * micro_batch_size
 
-    # Zigzag context-parallel sharding. We split the global sequence into
-    # 2*cp_size equal chunks and assign rank r the pair (r, 2*cp_size-r-1).
-    # The local sequence is the concatenation of the "front" chunk and the
-    # mirror "back" chunk, balancing the causal workload across CP ranks
-    # (see pithtrain/operators/ring_attention.py for the matching attention
-    # implementation). For cp_size == 1 this reduces to a contiguous read.
-    cp_size = distributed.cp_size
-    cp_rank = distributed.cp_rank
-    block = sequence_length // (2 * cp_size)
+    # two blocks per rank under zigzag CP; at cp_size 1 this is one contiguous read
+    front, back = zigzag_spans(distributed.cp_rank, distributed.cp_size, sequence_length)
+    block = len(front)
     local_seq_len = 2 * block
-    front_offset = cp_rank * block
-    back_offset = (2 * cp_size - cp_rank - 1) * block
 
     # single allocation on host, then one HtoD transfer per tensor
     local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
@@ -101,8 +94,8 @@ def get_global_batch(cfg: PretrainLMCfg, device: torch.device) -> List[Microbatc
     for k in range(local_batch_size):
         acc, off = divmod(k, micro_batch_size)
         index = start0 + acc * effective_batch_size + off
-        tokens_a, labels_a = dataset.get_chunk(index, front_offset, block)
-        tokens_b, labels_b = dataset.get_chunk(index, back_offset, block)
+        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
+        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
         local_tokens[k, :block] = tokens_a
         local_tokens[k, block:] = tokens_b
         local_labels[k, :block] = labels_a
