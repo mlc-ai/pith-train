@@ -38,6 +38,7 @@ from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.ring_attention import ring_attention_func
@@ -443,11 +444,9 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
             position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
             cos, sin = self.rotary_emb(S)
             return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
-        cp_size, block_size = distributed.cp_size, S // 2
-        front_start = distributed.cp_rank * block_size
-        back_start = (2 * cp_size - distributed.cp_rank - 1) * block_size
-        front_end, back_end = front_start + block_size, back_start + block_size
-        position_ids = torch.cat([torch.arange(front_start, front_end, device=device), torch.arange(back_start, back_end, device=device)])
+        cp_size = distributed.cp_size
+        spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
+        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

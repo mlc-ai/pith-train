@@ -233,7 +233,7 @@ class <Prefix>Model(nn.Module):
         # ... rest of __init__ ...
 ```
 
-When the dimension *is* implemented (Qwen3, DeepSeek-V2 via ring attention), the context values are consumed normally in `self_attn` and `forward_posemb`. When it is not (GPT-OSS, Qwen3.5), the `NotImplementedError` converts a silent correctness bug into a loud configuration error.
+When the dimension *is* implemented (Qwen3 and DeepSeek-V2 via ring attention, Qwen3.5 via ring attention plus the zigzag/contiguous relayout), the context values are consumed normally in `self_attn` and `forward_posemb`. When it is not (GPT-OSS), the `NotImplementedError` converts a silent correctness bug into a loud configuration error.
 
 **Rule:** when a new model is wired into `setup_model`, walk every parallelism dimension it could see and confirm it is either (a) genuinely used or (b) rejected when `size() > 1`. "Unused but accepted" is the hardest class of silent correctness bug to find.
 
