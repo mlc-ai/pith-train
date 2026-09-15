@@ -1,8 +1,8 @@
 """
 Build tokenized corpus.
 
-Tokenizes a directory of raw text files (JSONL, optionally zstd-compressed) into
-a packed NumPy format suitable for language model training.
+Tokenizes a directory of raw text files into a packed NumPy format suitable for
+language model training.
 
 Parallelism is two-level: launch() spawns several leader processes, each owning
 a pool of workers. Leaders pull files from a shared queue (largest first for
@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
+import pyarrow.parquet as pq
 import zstandard as zstd
 from transformers import AutoTokenizer
 
@@ -73,6 +74,13 @@ def read_file(path: Path):
                 for line in f:
                     data = json.loads(line)
                     yield data["text"]
+        case ".parquet":
+            parquet = pq.ParquetFile(path)
+            if "text" not in parquet.schema_arrow.names:
+                raise ValueError("parquet file does not contain a text column: %s" % path)
+            for batch in parquet.iter_batches(columns=["text"]):
+                for text in batch.column(0).to_pylist():
+                    yield text
         case suffix:
             raise ValueError("unsupported format: %s" % suffix)
 
@@ -223,3 +231,6 @@ def launch(cfg: TokenizeCorpusCfg):
         leaders.append(p)
     for p in leaders:
         p.join()
+    failed = [p.pid for p in leaders if p.exitcode != 0]
+    if failed:
+        raise RuntimeError(f"Tokenization leaders failed: {failed}")
