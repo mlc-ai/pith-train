@@ -214,6 +214,7 @@ class Muon(torch.optim.Optimizer):
         p.add_(orth, alpha=-lr)
 
 
+@torch.no_grad()
 def clip_grad_norm(
     model: torch.nn.Module, max_norm: float, norm_type: float = 2.0, hsdp_replica: int = 1
 ) -> torch.Tensor:

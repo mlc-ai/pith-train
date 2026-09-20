@@ -152,7 +152,6 @@ def objective(
     return loss, loss.detach()
 
 
-@torch.no_grad()
 def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     """
     Execute one step of training.
