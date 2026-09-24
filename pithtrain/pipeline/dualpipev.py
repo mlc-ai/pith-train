@@ -23,7 +23,6 @@ Stage Mapping:
     - Stage 5: Aggregate (Weighted expert output + residual connection)
 """
 
-from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -34,6 +33,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import ModelProtocol
+from pithtrain.modules.microbatch import Microbatch
 from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.pipeline.execution import (
     ChunkRecord,
@@ -93,31 +93,6 @@ def min_chunks(pp_size: int) -> int:
     One pipeline rank is exempt: it is both first and last, so the step posts no point-to-point.
     """
     return 1 if pp_size == 1 else pp_size * 2
-
-
-@dataclass(slots=True, kw_only=True)
-class Microbatch:
-    """
-    One micro-batch of work for DualPipeV.step.
-
-    The caller partitions the global batch into these and hands the same list to every pipeline
-    rank, so each derives its own receive-buffer shapes without a broadcast. Only the first rank
-    reads the tensors: under the V-shape it holds both the model inputs and the final model
-    outputs.
-
-    Attributes:
-        model_inputs: Inputs to the model, for instance the token ids, handed to its first
-            stage positionally. The batch and sequence dimensions of the first one size the
-            activation buffers every pipeline stage receives, so it must lead with those two.
-        cu_seqlens: Document boundaries when this micro-batch packs several sequences, or None
-            when each row holds a single sequence.
-        objective_inputs: Whatever the objective needs for this micro-batch, passed through
-            untouched. The engine never inspects it.
-    """
-
-    model_inputs: Tuple[torch.Tensor, ...]
-    cu_seqlens: Optional[torch.Tensor]
-    objective_inputs: Any
 
 
 class DualPipeV(nn.Module):
@@ -197,6 +172,8 @@ class DualPipeV(nn.Module):
         self.loss_chunks: List[Optional[torch.Tensor]] = []
         self.objective_output_chunks: List[Any] = []
         self.objective: Optional[Callable] = None
+        self.model_context_chunks = []
+        self.cu_seqlens_chunks = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
         self.current_b_chunk_id: List[int] = [0, 0]
@@ -222,6 +199,7 @@ class DualPipeV(nn.Module):
 
         # One shape per micro-batch, so a ragged step sizes each receive buffer correctly.
         self.p2p_shapes = []
+        self.model_context_chunks = [mb.model_context for mb in microbatches]
         for mb in microbatches:
             first_input, *_ = mb.model_inputs
             batch, sequence, *_ = first_input.shape
@@ -254,7 +232,11 @@ class DualPipeV(nn.Module):
         cu_seqlens = (
             self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
         )
-        outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
+        kwargs = dict(cu_seqlens=cu_seqlens)
+        context = self.model_context_chunks[chunk_id]
+        if context is not None:
+            kwargs["model_context"] = context
+        outputs = self.module[phase](*inputs, **kwargs)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage:
@@ -376,6 +358,7 @@ class DualPipeV(nn.Module):
             output_grads1,
             self.chunk_records[phase1][chunk_id1],
             self.comm_stream,
+            model_context=self.model_context_chunks[chunk_id0],
         )
         nvtx.range_pop()
 
@@ -720,6 +703,7 @@ def overlapped_forward_backward(
     output_grads1: Optional[List[torch.Tensor]],
     chunk_record1: ChunkRecord,
     comm_stream: Optional[torch.cuda.Stream],
+    model_context: Optional[dict[str, torch.Tensor]] = None,
 ):
     """
     Interleave the forward pass of one model replica with the backward pass of another.
@@ -762,9 +746,10 @@ def overlapped_forward_backward(
 
     # Module 0 layer 0 stage 1 forward
     if module0.stage_index == 0:
-        hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog)
+        hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog, model_context)
 
-    rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens)
+    kwargs = {} if model_context is None else {"model_context": model_context}
+    rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens, **kwargs)
 
     record, dispatch_tokens, residual, routing = stage1_f(
         ctx, module0_layers[0], hidden_states, rotary_posemb, cu_seqlens

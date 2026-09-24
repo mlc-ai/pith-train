@@ -13,6 +13,9 @@ dependencies = [
     "zstandard",
 ]
 
+[project.optional-dependencies]
+omni-data = ["av", "fsspec", "librosa", "pillow", "pyarrow", "soundfile", "torchvision", "transformers>=5.17,<5.18"]
+
 [dependency-groups]
 dev = ["pre-commit", "pytest", "ruff"]
 
