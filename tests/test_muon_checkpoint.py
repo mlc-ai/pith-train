@@ -5,6 +5,10 @@ Run (needs >=2 GPUs; ep-size must divide the world)::
 
     torchrun --nproc-per-node=8 tests/test_muon_checkpoint.py
     torchrun --nproc-per-node=8 tests/test_muon_checkpoint.py --model gpt-oss-20b
+    torchrun --nproc-per-node=6 tests/test_muon_checkpoint.py --model qwen3-30b-a3b
+
+Six ranks at ep-size 2 leave an expert dp of 3, so FSDP splits each EP rank's 64 qwen3 experts
+unevenly (22, 22, 20), which the saved expert indices and the reloaded shapes must follow.
 
 Builds a real model (``--model``: deepseek-v2-lite, qwen3-30b-a3b, gpt-oss-20b;
 reduced to a few layers) with FSDP2 + DualPipeV, steps the composed
