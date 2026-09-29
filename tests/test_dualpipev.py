@@ -5,6 +5,7 @@ The loss and gradients are compared with the reference implementation.
 
 import argparse
 import os
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Tuple
@@ -69,6 +70,14 @@ def objective(
     (target,) = objective_inputs
     loss = criterion(output, target)
     return loss, loss.detach()
+
+
+def records_empty(model: DualPipeV) -> bool:
+    records = []
+    for chunk in model.chunk_records[0] + model.chunk_records[1]:
+        records += [chunk.prolog, chunk.epilog]
+        records += [getattr(layer, f.name) for layer in chunk.layers for f in fields(layer)]
+    return all(getattr(r, f.name) is None for r in records if r is not None for f in fields(r))
 
 
 def reference_step(chunks, model: DeepSeekV2Model):
@@ -366,6 +375,12 @@ def main(model_name: str):
     # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
 
+    def collect(model_outputs, objective_inputs):
+        # Check before step cleanup can hide retained activations.
+        assert records_empty(dualpipev_model), "a forward-only step kept activations mid-step"
+        (output,), (target,) = model_outputs, objective_inputs
+        return None, criterion(output, target)
+
     # Run the DualPipeV step.
     for step_index, chunks in enumerate(chunk_steps):
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P
@@ -385,7 +400,12 @@ def main(model_name: str):
             print("[INFO] Running DualPipeV step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
+        # Training must safely reuse the forward-only step's records.
+        with torch.no_grad():
+            collected_outputs = dualpipev_model.step(microbatches, collect)
+        assert records_empty(dualpipev_model), "a forward-only step kept activations"
         objective_outputs = dualpipev_model.step(microbatches, objective)
+        assert records_empty(dualpipev_model), "a training step kept activations"
 
         if distributed.rank == 0:
             print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
@@ -394,6 +414,7 @@ def main(model_name: str):
         # Validate the loss.
         if pp_rank == 0:
             loss = torch.stack(objective_outputs)
+            torch.testing.assert_close(torch.stack(collected_outputs), loss, rtol=0, atol=5e-3)
             if cp_size > 1:
                 # Every rank takes the mean over its own S/cp tokens, so the mean over the
                 # whole sequence is the average of those.
@@ -407,7 +428,7 @@ def main(model_name: str):
             )
             assert torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)
         else:
-            assert objective_outputs == []
+            assert collected_outputs == objective_outputs == []
 
         if distributed.rank == 0:
             print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
