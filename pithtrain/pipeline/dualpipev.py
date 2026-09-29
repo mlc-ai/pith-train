@@ -244,6 +244,9 @@ class DualPipeV(nn.Module):
         inputs = self.input_chunks[phase][chunk_id]
         if self.forward_only:
             self.input_chunks[phase][chunk_id] = None
+            if self.is_last_pp_rank and phase == 1:
+                # The local phase handoff has no send to release its output reference.
+                self.output_chunks[0][chunk_id] = None
 
         is_last_stage = self.is_first_pp_rank and phase == 1
 
