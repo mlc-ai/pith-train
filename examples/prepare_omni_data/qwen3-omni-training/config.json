@@ -1,0 +1,58 @@
+{
+  "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+  "stages": {
+    "text": ["text"],
+    "image": ["text", "image"],
+    "audio": ["text", "image", "audio"],
+    "video": ["text", "image", "audio", "video"]
+  },
+  "samples_per_modality": {"train": 16, "validation": 4},
+  "max_scan_per_modality": 1000,
+  "records_per_shard": 10000,
+  "seed": 1234,
+  "sampling_weights": {"text": 1, "image": 1, "audio": 1, "video": 1},
+  "batch": {
+    "max_length": 2048,
+    "min_pixels": 4096,
+    "max_pixels": 65536,
+    "video_fps": 2.0,
+    "max_video_frames": 64,
+    "max_audio_seconds": 30.0
+  },
+  "sources": {
+    "text": {
+      "repo_id": "mlfoundations/dclm-baseline-1.0",
+      "revision": "a3b142c183aebe5af344955ae20836eb34dcf69b",
+      "files": ["global-shard_03_of_10/local-shard_1_of_10/shard_00000000_processed.jsonl.zst"],
+      "validation_fraction": 0.1,
+      "reference": "https://huggingface.co/datasets/mlfoundations/dclm-baseline-1.0"
+    },
+    "image": {
+      "repo_id": "yerevann/coco-karpathy",
+      "revision": "448fdb1bc7b2d09e46881c4541a14d796a3d41e8",
+      "files": {
+        "train": ["data/train-00000-of-00001.parquet"],
+        "validation": ["data/validation-00000-of-00001.parquet"]
+      },
+      "image_base_url": "https://s3.amazonaws.com/images.cocodataset.org/",
+      "reference": "https://huggingface.co/datasets/yerevann/coco-karpathy"
+    },
+    "audio": {
+      "repo_id": "openslr/librispeech_asr",
+      "revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+      "files": {
+        "train": ["clean/train.100/*.parquet"],
+        "validation": ["clean/validation/*.parquet"]
+      },
+      "reference": "https://www.openslr.org/12"
+    },
+    "video": {
+      "repo_id": "VLM2Vec/MSVD",
+      "revision": "558dffda21e648108ebc62047ee06c60d40fa702",
+      "files": {"train": ["msvd_train.json"], "validation": ["msvd_val.json"]},
+      "video_prefix": "raw_videos",
+      "reference": "https://huggingface.co/datasets/VLM2Vec/MSVD"
+    }
+  }
+}

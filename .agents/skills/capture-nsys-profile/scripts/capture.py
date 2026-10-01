@@ -45,7 +45,7 @@ global_batch_size = 32 * dp_size
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path(specs["dataset"])
+cfg.data.dataset = Path(specs["dataset"])
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = pp_size

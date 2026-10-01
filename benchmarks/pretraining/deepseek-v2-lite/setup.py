@@ -41,7 +41,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
+cfg.data.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
 
 training = cfg.training
 training.model = Path("benchmarks/pretraining/deepseek-v2-lite")

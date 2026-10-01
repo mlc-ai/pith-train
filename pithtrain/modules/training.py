@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -332,12 +332,18 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
     else:
         attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
-    mp = MixedPrecisionPolicy(
+    compute_mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
     )
+    # Pipeline activations already have PARAM_DTYPE. Keep root context tensors
+    # (e.g. media timing) in their original precision, consistently with the
+    # overlapped path which calls prolog/posemb directly. Compute children
+    # still cast their floating inputs through their own FSDP policies.
+    root_mp = replace(compute_mp, cast_forward_inputs=False)
+
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
@@ -345,20 +351,29 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         # owns parameters. reshard_after_forward=True since each runs once per step.
         for name, child in model[i].named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
+                fully_shard(
+                    child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
+                )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
                     layer.mlp.experts,
                     mesh=expt_fsdp_mesh,
                     reshard_after_forward=False,
-                    mp_policy=mp,
+                    mp_policy=compute_mp,
                 )
-            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            fully_shard(
+                layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=compute_mp
+            )
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+        fully_shard(
+            model[i],
+            mesh=attn_fsdp_mesh,
+            reshard_after_forward=False,
+            mp_policy=root_mp,
+        )
 
     # Sum gradients instead of the FSDP2 default average. The two classes reduce over groups of
     # different size, attn over dp x cp and expt over the expert dp axis, yet either sum is
@@ -369,6 +384,20 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
     return model
+
+
+def model_class_for_config(module_config):
+    """Resolve a registered pipeline model before allocating any parameters."""
+    if module_config.model_type == "deepseek_v2":
+        return DeepSeekV2Model
+    elif module_config.model_type == "qwen3_moe":
+        return Qwen3MoeModel
+    elif module_config.model_type == "gpt_oss":
+        return GptOssModel
+    elif module_config.model_type == "qwen3_5_moe_text":
+        return Qwen35MoeModel
+    else:
+        raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
 
 def setup_model(
@@ -388,7 +417,8 @@ def setup_model(
 
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)
-    if cfg.sequence_length % (2 * cp_size) != 0:
+    # CP=1 has no sequence sharding, so its length may be odd.
+    if cp_size > 1 and cfg.sequence_length % (2 * cp_size) != 0:
         raise ValueError(
             f"sequence_length ({cfg.sequence_length}) must be divisible by "
             f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
@@ -396,16 +426,7 @@ def setup_model(
         )
 
     # All models read their parallel groups from the distributed context directly.
-    if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
-    elif module_config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
-    elif module_config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
-    elif module_config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen35MoeModel
-    else:
-        raise ValueError(f"Unsupported model_type: {module_config.model_type}")
+    ModelClass = model_class_for_config(module_config)
 
     modules.append(ModelClass(module_config, phase=0))
     modules.append(ModelClass(module_config, phase=1))

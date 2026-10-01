@@ -6,7 +6,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
+cfg.data.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
 
 cfg.distributed.context_parallel_size = 1
 cfg.distributed.pipeline_parallel_size = 4

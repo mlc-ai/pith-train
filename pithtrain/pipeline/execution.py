@@ -497,12 +497,13 @@ class PrologRecord:
     outs: Optional[PrologOuts] = None
 
 
-def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:
+def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord, model_context=None) -> torch.Tensor:
     """
     Prolog forward: embed the input tokens, recording into record for the backward.
     """
     nvtx.range_push("prolog_f")
-    hidden_states = module.forward_prolog(hidden_states)
+    kwargs = {} if model_context is None else {"model_context": model_context}
+    hidden_states = module.forward_prolog(hidden_states, **kwargs)
     record.outs = PrologOuts(hidden_states)
     nvtx.range_pop()
     return hidden_states
@@ -813,6 +814,7 @@ def model_forward(
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor] = None,
+    model_context=None,
 ) -> torch.Tensor:
     """
     Sequential (non-overlapped) forward for one pipeline chunk: prolog -> layers -> epilog.
@@ -820,9 +822,10 @@ def model_forward(
     Records each stage's tensors into chunk_record for the pipeline backward.
     """
     if module.stage_index == 0:
-        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog)
+        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog, model_context)
 
-    rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens)
+    kwargs = {} if model_context is None else {"model_context": model_context}
+    rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens, **kwargs)
     for layer, layer_record in zip(module.layers.values(), chunk_record.layers):
         hidden_states = layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens)
 
