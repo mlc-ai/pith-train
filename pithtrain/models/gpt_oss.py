@@ -1,14 +1,19 @@
 """openai/gpt-oss-20b and openai/gpt-oss-120b."""
 
+import json
 import math
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
+from pithtrain.modules.checkpoint import expand_localized_fqn, find_moe, local_shard_range
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
@@ -17,6 +22,7 @@ from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen
 from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
+from pithtrain.operators.mxfp4 import dequantize_mxfp4
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -427,3 +433,120 @@ class GptOssModel(nn.Module):
         if self.stage_index == self.stage_count - 1:
             hidden_states = self.forward_epilog(hidden_states)
         return hidden_states
+
+
+# ─── HF streaming loader ──────────────────────────────────────────────────────
+
+_GPT_OSS_EXPERT_BIAS_LEAVES = {"gate_up_proj_bias", "down_proj_bias"}
+_GPT_OSS_EXPERT_MXFP4_LEAVES = {"gate_up_proj", "down_proj"}
+
+
+def _parse_expert_key(canon_key: str) -> Tuple[str, int]:
+    """
+    Split ``layers.L.mlp.experts.42.gate_up_proj`` into the fused HF base key
+    (``layers.L.mlp.experts.gate_up_proj``) and the global expert index (42). HF stores
+    every expert projection as a single fused ``[E, ...]`` key with no numeric index.
+    """
+    prefix, _, tail = canon_key.rpartition(".experts.")
+    idx_str, _, suffix = tail.partition(".")
+    if not idx_str.isdigit():
+        raise RuntimeError("expected indexed expert key, got %s" % canon_key)
+    return "%s.experts.%s" % (prefix, suffix), int(idx_str)
+
+
+def _mxfp4_transform(srcs: List[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
+    # srcs are [1, out, G, 16] blocks + [1, out, G] scales; dequant yields [1, out, G*B*2].
+    return dequantize_mxfp4(srcs[0], srcs[1], dtype=dtype)
+
+
+def _gpt_oss_plan_expert(
+    local_fqn: str,
+    param: DTensor,
+    weight_map: Dict[str, str],
+    moe: nn.Module,
+    canon_keys: List[str],
+    *,
+    mxfp4: bool,
+) -> list:
+    from pithtrain.modules.hf_loader import CopyOp  # lazy: avoids hf_loader <-> gpt_oss circular
+    local = param._local_tensor
+    dp_rank = param.device_mesh.get_local_rank()
+    dp_size = param.device_mesh.size()
+    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
+    if dp_len != local.shape[0]:
+        raise RuntimeError(
+            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
+        )
+    base_key, ep_start = _parse_expert_key(canon_keys[0])
+    if mxfp4:
+        blocks_key = base_key + "_blocks"
+        scales_key = base_key + "_scales"
+        for k in (blocks_key, scales_key):
+            if k not in weight_map:
+                raise KeyError("HF checkpoint missing %s for local param %s" % (k, local_fqn))
+        hf_keys: Tuple[str, ...] = (blocks_key, scales_key)
+        shard_files: Tuple[str, ...] = (weight_map[blocks_key], weight_map[scales_key])
+        transform = _mxfp4_transform
+    else:
+        if base_key not in weight_map:
+            raise KeyError("HF checkpoint missing %s for local param %s" % (base_key, local_fqn))
+        hf_keys = (base_key,)
+        shard_files = (weight_map[base_key],)
+        transform = None
+    ops = []
+    for i in range(dp_len):
+        global_idx = ep_start + dp_offset + i
+        ops.append(
+            CopyOp(
+                local_fqn=local_fqn,
+                dst=local[i : i + 1],
+                hf_keys=hf_keys,
+                shard_files=shard_files,
+                row_slice=slice(global_idx, global_idx + 1),
+                transform=transform,
+            )
+        )
+    return ops
+
+
+class GptOssHfLoader:
+    """GPT-OSS: unquantized fused biases + MXFP4-quantized expert weights."""
+
+    name = "gpt_oss"
+
+    def detect_hf(self, hf_root: Path) -> bool:
+        config_path = Path(hf_root, "config.json")
+        if not config_path.is_file():
+            return False
+        with open(config_path) as f:
+            return json.load(f).get("model_type") == "gpt_oss"
+
+    def owns_local(self, local_fqn: str) -> bool:
+        return True
+
+    def plan_param(
+        self,
+        local_fqn: str,
+        param: DTensor,
+        weight_map: Dict[str, str],
+        named_modules: Dict[str, nn.Module],
+    ) -> list:
+        from pithtrain.modules.hf_loader import _generic_plan_param  # lazy: avoids circular
+        moe = find_moe(local_fqn, named_modules)
+        if moe is None:
+            return _generic_plan_param(local_fqn, param, weight_map, named_modules)
+        canon_keys = expand_localized_fqn(local_fqn, named_modules)
+        leaf = canon_keys[0].rsplit(".", 1)[-1]
+        if leaf in _GPT_OSS_EXPERT_BIAS_LEAVES or leaf in _GPT_OSS_EXPERT_MXFP4_LEAVES:
+            return _gpt_oss_plan_expert(
+                local_fqn,
+                param,
+                weight_map,
+                moe,
+                canon_keys,
+                mxfp4=leaf in _GPT_OSS_EXPERT_MXFP4_LEAVES,
+            )
+        return _generic_plan_param(local_fqn, param, weight_map, named_modules)
+
+    def expected_unmapped(self, hf_keys: set) -> set:
+        return {"lm_head.weight"} & hf_keys
