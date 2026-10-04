@@ -32,7 +32,7 @@ pytest tests/operators/test_deepgemm_quantize.py -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
-pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
+pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py -v
 pytest tests/operators/test_ring_attention.py -v
 
 # Single test function
@@ -129,7 +129,7 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
 - **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization, with `fp8_weight_cache.py` holding the per-step version counter that lets the linear layers reuse a quantized weight across micro-batches
-- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`
+- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `log_prob.py`
 
 Each operator ships a PyTorch reference impl for correctness testing.
 
