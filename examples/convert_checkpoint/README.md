@@ -18,11 +18,11 @@ bash examples/convert_checkpoint/launch.sh deepseek-v2-lite
 
 Each model directory contains a `script.py` that downloads the model and runs both conversions. Edit `script.py` to customize.
 
-`hf2dcp` streams weights from safetensors, splitting fused experts before loading
-them and dequantizing GPT-OSS weights one expert at a time. Peak tensor memory
-depends on the largest weight or expert, not the total model size. The output uses
-one DCP data file per canonical tensor, so large MoE models need more filesystem
-inodes. `dcp2hf` still loads the full model into memory.
+`hf2dcp` streams weights in chunks, including GPT-OSS MXFP4 dequantization.
+`max_chunk_size` defaults to 64 MiB and limits each tensor chunk. DCP files are
+packed up to `max_shard_size`, which defaults to 8 GiB and must be at least 4 KiB
+for import. Canonical tensor names and shapes are preserved. `dcp2hf` still loads
+the full model into memory.
 
 ## Checkpoint Layout
 

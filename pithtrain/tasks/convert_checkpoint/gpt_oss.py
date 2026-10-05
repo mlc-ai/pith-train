@@ -82,7 +82,15 @@ class GptOssConverter:
         # fused-expert models (Qwen3.5-MoE also has gate_up_proj but no bias).
         return any("gate_up_proj_bias" in k for k in metadata.state_dict_metadata.keys())
 
-    def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
+    def hf2dcp(
+        self,
+        load_path: Path,
+        save_path: Path,
+        stdout: Logger,
+        *,
+        max_chunk_size: int,
+        max_shard_size: int,
+    ) -> None:
         stdout.info("Converting GPT-OSS HF checkpoint from %s" % load_path)
         checkpoint = HfCheckpoint(load_path, stdout)
         quantized = {
@@ -121,15 +129,29 @@ class GptOssConverter:
                 tensors[canon] = tensor
                 sources[canon] = key, None
 
-        def load_tensor(canon):
+        def load_tensor(canon, slices):
             key, idx = sources[canon]
             if key in quantized:
-                return _dequantize_mxfp4(
-                    checkpoint.load(key + "_blocks", idx), checkpoint.load(key + "_scales", idx)
+                width = checkpoint.tensors[key + "_blocks"].shape[-1] * 2
+                start, stop = slices[-1].start, slices[-1].stop
+                groups = slice(start // width, (stop + width - 1) // width)
+                prefix = slices[:-1]
+                tensor = _dequantize_mxfp4(
+                    checkpoint.load(key + "_blocks", idx, (*prefix, groups, slice(None))),
+                    checkpoint.load(key + "_scales", idx, (*prefix, groups)),
                 )
-            return checkpoint.load(key, idx)
+                offset = start % width
+                return tensor[..., offset : offset + stop - start].contiguous()
+            return checkpoint.load(key, idx, slices)
 
-        save_dcp(tensors, load_tensor, save_path, stdout)
+        save_dcp(
+            tensors,
+            load_tensor,
+            save_path,
+            stdout,
+            max_chunk_size=max_chunk_size,
+            max_shard_size=max_shard_size,
+        )
 
     def postprocess_canonical(
         self, canonical: Dict[str, torch.Tensor], stdout: Logger

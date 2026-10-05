@@ -32,11 +32,12 @@ def _write_hf(path, shards, config=None):
         (path / "config.json").write_text(json.dumps(config))
 
 
-def _convert(load_path, save_path, operation):
+def _convert(load_path, save_path, operation, *, max_chunk_size=24):
     cfg = ConvertCheckpointCfg()
     cfg.load_path = load_path
     cfg.save_path = save_path
-    cfg.max_shard_size = 128
+    cfg.max_shard_size = 8192 if operation is hf2dcp else 128
+    cfg.max_chunk_size = max_chunk_size
     operation(cfg, STDOUT)
 
 
@@ -44,7 +45,7 @@ def _assert_dcp(path, expected):
     metadata = dcp.FileSystemReader(path).read_metadata()
     assert set(metadata.state_dict_metadata) == {"app.model." + key for key in expected}
     assert metadata.planner_data == {"app.model." + key: ("app", "model", key) for key in expected}
-    assert len(list(path.glob("*.distcp"))) == len(expected)
+    assert all(file.stat().st_size <= 8192 for file in path.glob("*.distcp"))
     state = {key: torch.empty_like(tensor) for key, tensor in expected.items()}
     dcp.load({"app": {"model": state}}, checkpoint_id=path, no_dist=True)
     for key, tensor in expected.items():
@@ -101,9 +102,9 @@ def test_qwen35_round_trip(tmp_path, monkeypatch, nested_config):
     loaded = []
     original_load = HfCheckpoint.load
 
-    def load(self, key, expert=None):
+    def load(self, key, expert=None, slices=()):
         loaded.append((key, expert))
-        return original_load(self, key, expert)
+        return original_load(self, key, expert, slices)
 
     monkeypatch.setattr(HfCheckpoint, "load", load)
     _convert(hf, checkpoint, hf2dcp)
@@ -115,7 +116,6 @@ def test_qwen35_round_trip(tmp_path, monkeypatch, nested_config):
                 expected[canon.replace(".experts.", f".experts.{idx}.") + ".weight"] = tensor[idx]
         else:
             expected[canon] = tensor
-    assert len(loaded) == len(expected)
     assert all(key not in dropped for key, _ in loaded)
     assert all(idx is not None for key, idx in loaded if ".experts." in key)
     _assert_dcp(checkpoint, expected)
@@ -155,9 +155,9 @@ def test_gpt_oss_round_trip(tmp_path, monkeypatch, quantized):
     loaded = []
     original_load = HfCheckpoint.load
 
-    def load(self, key, expert=None):
+    def load(self, key, expert=None, slices=()):
         loaded.append((key, expert))
-        return original_load(self, key, expert)
+        return original_load(self, key, expert, slices)
 
     monkeypatch.setattr(HfCheckpoint, "load", load)
     _convert(hf, checkpoint, hf2dcp)
@@ -171,7 +171,6 @@ def test_gpt_oss_round_trip(tmp_path, monkeypatch, quantized):
             canonical[canon] = tensor
         hf_expected[key] = tensor.transpose(-2, -1) if key.endswith("_proj") else tensor
     assert all(idx is not None for key, idx in loaded if ".experts." in key)
-    assert len(loaded) == len(canonical) + (6 if quantized else 0)
     _assert_dcp(checkpoint, canonical)
     _convert(checkpoint, exported, dcp2hf)
     _assert_hf(exported, hf_expected)
@@ -210,17 +209,18 @@ def test_streaming_releases_weights(tmp_path):
     tensors = {f"layers.{i}.weight": torch.empty(8, device="meta") for i in range(8)}
     buffers, loaded = [], []
 
-    def load_tensor(key):
-        # frombuffer keeps its owner alive through detach, unlike a weakref to the tensor.
+    def load_tensor(key, slices):
+        # frombuffer keeps its owner alive through detach.
         assert sum(ref() is not None for ref in buffers) <= 1
         values = array("f", range(8))
         buffers.append(weakref.ref(values))
         loaded.append(key)
         return torch.frombuffer(values, dtype=torch.float32)
 
-    save_dcp(tensors, load_tensor, tmp_path / "dcp", STDOUT)
+    save_dcp(tensors, load_tensor, tmp_path / "dcp", STDOUT, max_shard_size=8192)
     assert sorted(loaded) == sorted(tensors)
     assert all(ref() is None for ref in buffers)
+    assert len(list((tmp_path / "dcp").glob("*.distcp"))) < len(tensors)
     _assert_dcp(tmp_path / "dcp", {key: torch.arange(8).float() for key in tensors})
 
 
@@ -232,9 +232,9 @@ def _load_sharded(rank, checkpoint, port):
     )
     try:
         mesh = init_device_mesh("cpu", (2,))
-        tensor = DTensor.from_local(torch.empty(4, 4), mesh, [Shard(0)])
+        tensor = DTensor.from_local(torch.empty(5, 4), mesh, [Shard(0)])
         dcp.load({"app": {"model": {"embed_tokens.weight": tensor}}}, checkpoint_id=checkpoint)
-        expected = torch.arange(32).reshape(8, 4).float()[rank * 4 : (rank + 1) * 4]
+        expected = torch.arange(40).reshape(10, 4).float()[rank * 5 : (rank + 1) * 5]
         torch.testing.assert_close(tensor.to_local(), expected, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
@@ -242,7 +242,7 @@ def _load_sharded(rank, checkpoint, port):
 
 def test_dcp_reshard(tmp_path):
     hf, checkpoint = tmp_path / "hf", tmp_path / "dcp"
-    _write_hf(hf, [{"model.embed_tokens.weight": torch.arange(32).reshape(8, 4).float()}])
-    _convert(hf, checkpoint, hf2dcp)
+    _write_hf(hf, [{"model.embed_tokens.weight": torch.arange(40).reshape(10, 4).float()}])
+    _convert(hf, checkpoint, hf2dcp, max_chunk_size=48)
     store = torch.distributed.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
     torch.multiprocessing.spawn(_load_sharded, args=(checkpoint, store.port), nprocs=2)

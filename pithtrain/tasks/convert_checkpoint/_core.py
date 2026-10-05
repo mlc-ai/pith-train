@@ -22,7 +22,7 @@ from pithtrain.contexts import logging
 from pithtrain.modules.logging import LoggingCfg, setup_logging
 
 from ._registry import CONVERTERS
-from ._streaming import HfCheckpoint, save_dcp
+from ._streaming import DEFAULT_CHUNK_SIZE, DEFAULT_SHARD_SIZE, HfCheckpoint, save_dcp
 
 
 @dataclass(init=False, slots=True)
@@ -38,8 +38,11 @@ class ConvertCheckpointCfg(SlottedDefault):
     save_path: Path
     """Destination checkpoint directory."""
 
-    max_shard_size: int = 8 * 1024**3
-    """Maximum dcp2hf shard size in bytes (default 8GB)."""
+    max_shard_size: int = DEFAULT_SHARD_SIZE
+    """Output shard size in bytes. DCP import requires at least 4096 bytes."""
+
+    max_chunk_size: int = DEFAULT_CHUNK_SIZE
+    """Maximum tensor chunk size in bytes."""
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
@@ -52,14 +55,27 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     for converter in CONVERTERS:
         if converter.detect_hf(load_path):
             stdout.info("Dispatching hf2dcp to %s converter" % converter.name)
-            converter.hf2dcp(load_path, save_path, stdout)
+            converter.hf2dcp(
+                load_path,
+                save_path,
+                stdout,
+                max_chunk_size=cfg.max_chunk_size,
+                max_shard_size=cfg.max_shard_size,
+            )
             return
 
     stdout.info("Converting HF checkpoint from %s" % load_path)
     checkpoint = HfCheckpoint(load_path, stdout)
     sources = {key.removeprefix("model."): key for key in checkpoint.tensors}
     tensors = {canon: checkpoint.tensors[key] for canon, key in sources.items()}
-    save_dcp(tensors, lambda canon: checkpoint.load(sources[canon]), save_path, stdout)
+    save_dcp(
+        tensors,
+        lambda canon, slices: checkpoint.load(sources[canon], slices=slices),
+        save_path,
+        stdout,
+        max_chunk_size=cfg.max_chunk_size,
+        max_shard_size=cfg.max_shard_size,
+    )
 
 
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:

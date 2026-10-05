@@ -58,7 +58,15 @@ class Qwen35MoeConverter:
             return hf_key.removeprefix(_TEXT_PREFIX)
         return None
 
-    def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
+    def hf2dcp(
+        self,
+        load_path: Path,
+        save_path: Path,
+        stdout: Logger,
+        *,
+        max_chunk_size: int,
+        max_shard_size: int,
+    ) -> None:
         stdout.info("Converting Qwen3.5-MoE HF checkpoint from %s" % load_path)
         checkpoint = HfCheckpoint(load_path, stdout)
         tensors, sources = {}, {}
@@ -78,7 +86,14 @@ class Qwen35MoeConverter:
                 sources[canon] = key, None
 
         stdout.info("Dropped %d non-text keys (vision / mtp)" % dropped)
-        save_dcp(tensors, lambda canon: checkpoint.load(*sources[canon]), save_path, stdout)
+        save_dcp(
+            tensors,
+            lambda canon, slices: checkpoint.load(*sources[canon], slices=slices),
+            save_path,
+            stdout,
+            max_chunk_size=max_chunk_size,
+            max_shard_size=max_shard_size,
+        )
 
     def postprocess_canonical(
         self, canonical: Dict[str, torch.Tensor], stdout: Logger
