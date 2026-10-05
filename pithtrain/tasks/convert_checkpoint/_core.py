@@ -14,7 +14,6 @@ from typing import Dict, List, Literal, Tuple
 
 import torch
 import torch.distributed.checkpoint as dcp
-from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed.checkpoint import FileSystemReader
 
@@ -23,6 +22,7 @@ from pithtrain.contexts import logging
 from pithtrain.modules.logging import LoggingCfg, setup_logging
 
 from ._registry import CONVERTERS
+from ._streaming import HfCheckpoint, save_dcp
 
 
 @dataclass(init=False, slots=True)
@@ -55,22 +55,11 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
             converter.hf2dcp(load_path, save_path, stdout)
             return
 
-    with open(Path(load_path, "model.safetensors.index.json")) as f:
-        weight_map = json.load(f)["weight_map"]
-
-    shard_files = set(weight_map.values())
-    stdout.info("Converting HF checkpoint from %s (%d shards)" % (load_path, len(shard_files)))
-
-    model_state_dict: Dict[str, torch.Tensor] = dict()
-    for i, shard_file in enumerate(sorted(shard_files), start=1):
-        stdout.info("Reading shard %d/%d: %s" % (i, len(shard_files), shard_file))
-        with safe_open(str(Path(load_path, shard_file)), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                model_state_dict[key.removeprefix("model.")] = f.get_tensor(key)
-
-    save_path.mkdir(parents=True, exist_ok=True)
-    dcp.save({"app": {"model": model_state_dict}}, checkpoint_id=save_path, no_dist=True)
-    stdout.info("Saved DCP checkpoint to %s (%d weights)" % (save_path, len(model_state_dict)))
+    stdout.info("Converting HF checkpoint from %s" % load_path)
+    checkpoint = HfCheckpoint(load_path, stdout)
+    sources = {key.removeprefix("model."): key for key in checkpoint.tensors}
+    tensors = {canon: checkpoint.tensors[key] for canon, key in sources.items()}
+    save_dcp(tensors, lambda canon: checkpoint.load(sources[canon]), save_path, stdout)
 
 
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:

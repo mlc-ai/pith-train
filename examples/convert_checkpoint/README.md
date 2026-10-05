@@ -18,6 +18,12 @@ bash examples/convert_checkpoint/launch.sh deepseek-v2-lite
 
 Each model directory contains a `script.py` that downloads the model and runs both conversions. Edit `script.py` to customize.
 
+`hf2dcp` streams weights from safetensors, splitting fused experts before loading
+them and dequantizing GPT-OSS weights one expert at a time. Peak tensor memory
+depends on the largest weight or expert, not the total model size. The output uses
+one DCP data file per canonical tensor, so large MoE models need more filesystem
+inodes. `dcp2hf` still loads the full model into memory.
+
 ## Checkpoint Layout
 
 The DCP checkpoint is saved to `workspace/checkpoints/<model>/torch-dcp/XXXXXXXX`, matching the layout used by the training task. An imported HuggingFace checkpoint at `00000000` is directly loadable by [pretrain_lm](../pretrain_lm/) without any extra steps.

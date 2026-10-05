@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Dict
 
 import torch
-import torch.distributed.checkpoint as dcp
-from safetensors import safe_open
+
+from ._streaming import HfCheckpoint, save_dcp
 
 # HF keys that nest the text tower; stripped to canonical PithTrain keys.
 _TEXT_PREFIX = "model.language_model."
@@ -59,42 +59,26 @@ class Qwen35MoeConverter:
         return None
 
     def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
-        with open(Path(load_path, "model.safetensors.index.json")) as f:
-            weight_map = json.load(f)["weight_map"]
-
-        shard_files = sorted(set(weight_map.values()))
-        stdout.info(
-            "Converting Qwen3.5-MoE HF checkpoint from %s (%d shards)"
-            % (load_path, len(shard_files))
-        )
-
-        model_state_dict: Dict[str, torch.Tensor] = dict()
+        stdout.info("Converting Qwen3.5-MoE HF checkpoint from %s" % load_path)
+        checkpoint = HfCheckpoint(load_path, stdout)
+        tensors, sources = {}, {}
         dropped = 0
-        for i, shard_file in enumerate(shard_files, start=1):
-            stdout.info("Reading shard %d/%d: %s" % (i, len(shard_files), shard_file))
-            with safe_open(str(Path(load_path, shard_file)), framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    canon = self._canonical_key(key)
-                    if canon is None:
-                        dropped += 1
-                        continue
-                    tensor = f.get_tensor(key)
-                    if canon.endswith(_EXPERT_SUFFIXES):
-                        # Fused [E, out, in] -> per-expert [out, in] (no transpose).
-                        # Experts are GroupedLinear submodules at runtime, so the
-                        # canonical key gains a ".weight" suffix vs HF's bare key.
-                        for idx in range(tensor.shape[0]):
-                            expert_key = (
-                                canon.replace(".experts.", ".experts.%d." % idx) + ".weight"
-                            )
-                            model_state_dict[expert_key] = tensor[idx].contiguous()
-                    else:
-                        model_state_dict[canon] = tensor
+        for key, tensor in checkpoint.tensors.items():
+            canon = self._canonical_key(key)
+            if canon is None:
+                dropped += 1
+                continue
+            if canon.endswith(_EXPERT_SUFFIXES):
+                for idx in range(tensor.shape[0]):
+                    expert_key = canon.replace(".experts.", ".experts.%d." % idx) + ".weight"
+                    tensors[expert_key] = tensor[idx]
+                    sources[expert_key] = key, idx
+            else:
+                tensors[canon] = tensor
+                sources[canon] = key, None
 
         stdout.info("Dropped %d non-text keys (vision / mtp)" % dropped)
-        save_path.mkdir(parents=True, exist_ok=True)
-        dcp.save({"app": {"model": model_state_dict}}, checkpoint_id=save_path, no_dist=True)
-        stdout.info("Saved DCP checkpoint to %s (%d weights)" % (save_path, len(model_state_dict)))
+        save_dcp(tensors, lambda canon: checkpoint.load(*sources[canon]), save_path, stdout)
 
     def postprocess_canonical(
         self, canonical: Dict[str, torch.Tensor], stdout: Logger
