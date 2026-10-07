@@ -110,7 +110,9 @@ class Microbatch:
             stage positionally. The batch and sequence dimensions of the first one size the
             activation buffers every pipeline stage receives, so it must lead with those two.
         cu_seqlens: Document boundaries when this micro-batch packs several sequences, or None
-            when each row holds a single sequence.
+            when each row holds a single sequence. Under context parallelism they stay those of
+            the whole packed sample, while the tensors hold this rank's share of every document
+            (cp_sequence.zigzag_varlen_index).
         objective_inputs: Whatever the objective needs for this micro-batch, passed through
             untouched. The engine never inspects it.
     """

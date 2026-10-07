@@ -23,6 +23,7 @@ from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRoute
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.operators.cp_sequence import zigzag_varlen_index
 from pithtrain.operators.grouped_linear import GroupedLinear
 from pithtrain.pipeline import DualPipeV, Microbatch
 
@@ -229,7 +230,6 @@ def main(model_name: str):
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
-    assert not (packed and cp_size > 1), "CP with packed cu_seqlens is not supported yet."
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
     num_chunks = 20
     sequence_length = int(os.environ.get("SEQUENCE_LENGTH", "128"))
@@ -296,12 +296,14 @@ def main(model_name: str):
             chunk_l = label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype)
             chunk_cu = None
             if packed:
-                # Split each sample into documents and check the block-diagonal cu_seqlens path
-                # against the reference (attention only; the MSE loss is unaffected). Under
-                # ragged the document count varies too, so each micro-batch carries a
-                # differently sized cu_seqlens.
+                # Vary document count under ragged. CP documents are multiples of 2 * cp_size;
+                # the first uses single-token blocks (one token total without CP).
                 num_docs = 2 + (j % 2) if ragged else 3
-                bounds = [round(seqlen * k / num_docs) for k in range(num_docs + 1)]
+                unit = 2 * cp_size if cp_size > 1 else 1
+                units = seqlen // unit - 1
+                bounds = [0] + [
+                    unit * (1 + round(units * k / (num_docs - 1))) for k in range(num_docs)
+                ]
                 chunk_cu = torch.tensor(bounds, dtype=torch.int32)
             chunks.append((chunk_x, chunk_l, chunk_cu))
         return chunks
@@ -366,6 +368,12 @@ def main(model_name: str):
     # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
 
+    def shard(x: torch.Tensor, cu: torch.Tensor | None) -> torch.Tensor:
+        # A packed sample is sharded one document at a time; cu_seqlens stays the whole sample's.
+        if cu is None:
+            return zigzag_shard(x, cp_rank, cp_size)
+        return x[:, zigzag_varlen_index(cp_rank, cp_size, cu, x.shape[1])]
+
     # Run the DualPipeV step.
     for step_index, chunks in enumerate(chunk_steps):
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P
@@ -374,9 +382,9 @@ def main(model_name: str):
         local_chunks = chunks[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
         microbatches = [
             Microbatch(
-                model_inputs=(zigzag_shard(x, cp_rank, cp_size),),
+                model_inputs=(shard(x, cu),),
                 cu_seqlens=cu,
-                objective_inputs=(zigzag_shard(lab, cp_rank, cp_size),),
+                objective_inputs=(shard(lab, cu),),
             )
             for x, lab, cu in local_chunks
         ]

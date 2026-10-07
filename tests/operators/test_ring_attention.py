@@ -1,6 +1,7 @@
 """Test the correctness of ring attention under context parallelism."""
 
 from dataclasses import dataclass, fields
+from itertools import accumulate
 
 import pytest
 import torch
@@ -8,8 +9,12 @@ import torch.nn.functional as F
 
 from pithtrain.contexts import distributed
 from pithtrain.modules.distributed import DistributedCfg
-from pithtrain.operators.flash_attn_v4 import flash_attn_func
-from pithtrain.operators.ring_attention import mla_ring_attention_func, ring_attention_func
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.ring_attention import (
+    mla_ring_attention_func,
+    ring_attention_func,
+    ring_attention_varlen_func,
+)
 from tests.utilities import cosine_error, launch
 
 
@@ -100,6 +105,105 @@ def test_ring_attention_vs_dense(cp_size: int, req: Request) -> None:
     cfg = DistributedCfg()
     cfg.context_parallel_size = cp_size
     launch(cfg, verify, req)
+
+
+# ---------------------------------------------------------------------------
+# Packed sequences: every document zigzag-sharded on its own.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VarlenRequest:
+    seqlens: tuple[int, ...]
+    HQ: int
+    HK: int
+    D: int
+    atol: float = 1e-5
+
+
+def extract_zigzag_varlen(x: torch.Tensor, cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int):
+    """
+    Shard each document independently; skip empty documents before chunking.
+    """
+    bounds = cu_seqlens.tolist()
+    docs = [x[start:end].unsqueeze(0) for start, end in zip(bounds[:-1], bounds[1:]) if end > start]
+    return torch.cat([extract_zigzag(doc, cp_rank, cp_size).squeeze(0) for doc in docs])
+
+
+def record_varlen(req: VarlenRequest) -> tuple[Result, Result]:
+    """
+    Compare the packed ring against whole-sample varlen attention with random output gradients.
+    """
+    cp_group = distributed.cp_group
+    cp_rank, cp_size = cp_group.rank(), cp_group.size()
+    device = torch.cuda.current_device()
+    softmax_scale = req.D**-0.5
+    cu_seqlens = torch.tensor([0, *accumulate(req.seqlens)], dtype=torch.int32, device=device)
+    T = sum(req.seqlens)
+
+    torch.manual_seed(42)
+    q_full = torch.randn(T, req.HQ, req.D, device=device, dtype=torch.bfloat16)
+    k_full = torch.randn(T, req.HK, req.D, device=device, dtype=torch.bfloat16)
+    v_full = torch.randn(T, req.HK, req.D, device=device, dtype=torch.bfloat16)
+    grad_out = torch.randn(T, req.HQ, req.D, device=device, dtype=torch.bfloat16)
+
+    def shard(x: torch.Tensor) -> torch.Tensor:
+        return extract_zigzag_varlen(x, cu_seqlens, cp_rank, cp_size)
+
+    q_ref = q_full.clone().requires_grad_(True)
+    k_ref = k_full.clone().requires_grad_(True)
+    v_ref = v_full.clone().requires_grad_(True)
+    out_ref = flash_attn_varlen_func(q_ref, k_ref, v_ref, cu_seqlens, T, softmax_scale, causal=True)
+    out_ref.backward(grad_out)
+    ref = Result(shard(out_ref), shard(q_ref.grad), shard(k_ref.grad), shard(v_ref.grad))
+
+    q_imp = shard(q_full).requires_grad_(True)
+    k_imp = shard(k_full).requires_grad_(True)
+    v_imp = shard(v_full).requires_grad_(True)
+    out_imp = ring_attention_varlen_func(q_imp, k_imp, v_imp, cu_seqlens, softmax_scale, cp_group)
+    out_imp.backward(shard(grad_out))
+    imp = Result(out_imp, q_imp.grad, k_imp.grad, v_imp.grad)
+
+    return ref, imp
+
+
+def verify_varlen(req: VarlenRequest) -> None:
+    ref, imp = record_varlen(req)
+    for f in fields(ref):
+        expected, actual = (getattr(result, f.name).double() for result in (ref, imp))
+        error = float(
+            (expected - actual).square().sum()
+            / (expected.square() + actual.square()).sum().clamp_min(1e-12)
+        )
+        if not error < req.atol:
+            raise AssertionError(f"{f.name} diverged: {error=:.2e} >= {req.atol=}")
+
+
+# Cover single-token blocks, repeated boundaries and multi-tile documents. CP4 exercises
+# front-step updates followed by back-block accumulation on the same rank; CP2 cannot.
+VARLEN_REQUESTS = []
+VARLEN_REQUESTS.append(pytest.param(2, VarlenRequest((1024,), HQ=4, HK=4, D=64), id="CP2-MHA-1doc"))
+VARLEN_REQUESTS.append(
+    pytest.param(2, VarlenRequest((4, 60, 512, 196, 252), HQ=8, HK=2, D=64), id="CP2-GQA-5docs")
+)
+VARLEN_REQUESTS.append(
+    pytest.param(
+        2, VarlenRequest((0, 4, 60, 0, 512, 196, 0, 0), HQ=8, HK=2, D=64), id="CP2-GQA-empty-docs"
+    )
+)
+VARLEN_REQUESTS.append(
+    pytest.param(4, VarlenRequest((8, 120, 1024, 392, 504), HQ=12, HK=4, D=128), id="CP4-GQA-5docs")
+)
+VARLEN_REQUESTS.append(
+    pytest.param(4, VarlenRequest((8,) * 32, HQ=8, HK=2, D=64), id="CP4-GQA-32x8")
+)
+
+
+@pytest.mark.parametrize("cp_size,req", VARLEN_REQUESTS)
+def test_ring_attention_varlen_vs_full(cp_size: int, req: VarlenRequest) -> None:
+    cfg = DistributedCfg()
+    cfg.context_parallel_size = cp_size
+    launch(cfg, verify_varlen, req)
 
 
 # ---------------------------------------------------------------------------

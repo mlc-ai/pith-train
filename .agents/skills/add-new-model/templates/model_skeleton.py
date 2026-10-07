@@ -42,10 +42,10 @@ from pithtrain.modules.load_balance import (
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.operators.cp_sequence import zigzag_spans
+from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -240,7 +240,8 @@ class HFPrefixMoE(nn.Module):  # TODO_HF rename to match HF
 # TODO_HF: copy HF's attention class structure.  The framework is BSHD end
 # to end; only attention reshapes to the kernel's varlen layout.  Pick the
 # kernel dispatch that matches HF's features:
-#   - Context parallelism (cp_size > 1)     -> ring_attention_func
+#   - Context parallelism (cp_size > 1)     -> ring_attention_varlen_func if packed
+#                                             (checked first), else ring_attention_func
 #   - Packed / variable-length (cu_seqlens) -> flash_attn_varlen_func (squeeze
 #                                             batch dim of 1, unsqueeze back)
 #   - Dense causal                          -> flash_attn_func
@@ -292,7 +293,9 @@ class HFPrefixAttention(nn.Module):  # TODO_HF rename to match HF
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         # TODO_HF: apply q_norm/k_norm here if HF has them.
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-        if distributed.cp_size > 1:
+        if distributed.cp_size > 1 and cu_seqlens is not None:
+            attn_output = ring_attention_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, sm_scale=self.scaling, cp_group=distributed.cp_group).unsqueeze(0)
+        elif distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)
         elif cu_seqlens is not None:
             attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True).unsqueeze(0)
@@ -447,15 +450,13 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
         self, S: int, cu_seqlens: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = distributed.device
+        cp_rank, cp_size = distributed.cp_rank, distributed.cp_size
         if cu_seqlens is not None:
-            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
-            lengths = ends - starts
-            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
-            cos, sin = self.rotary_emb(S)
-            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
-        cp_size = distributed.cp_size
-        spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
-        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+            index = zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, S * cp_size)
+            position_ids = index - cu_seqlens[torch.searchsorted(cu_seqlens, index, right=True) - 1]
+        else:
+            spans = zigzag_spans(cp_rank, cp_size, S * cp_size)
+            position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

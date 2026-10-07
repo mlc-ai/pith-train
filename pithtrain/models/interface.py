@@ -101,9 +101,10 @@ class ModelProtocol(Protocol):
         self, S: int, cu_seqlens: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute the (cos, sin) rotary embeddings for a sequence of length S. When
+        Compute the (cos, sin) rotary embeddings for this rank's S tokens. When
         ``cu_seqlens`` is set the sequence is packed, so positions restart at zero
-        at each document boundary.
+        at each document boundary; it holds the boundaries of the whole packed
+        sample, also under context parallelism.
         """
 
     def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:

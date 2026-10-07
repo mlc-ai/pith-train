@@ -27,6 +27,7 @@ from torch.distributed.distributed_c10d import _resolve_process_group
 
 __all__ = [
     "zigzag_spans",
+    "zigzag_varlen_index",
     "zigzag_to_contiguous",
     "contiguous_to_zigzag",
     "prepend_conv_state",
@@ -58,6 +59,34 @@ def zigzag_spans(cp_rank: int, cp_size: int, seq_len: int) -> tuple[range, range
     block = seq_len // (2 * cp_size)
     front, back = _block_ids(cp_rank, cp_size, "zigzag")
     return range(front * block, (front + 1) * block), range(back * block, (back + 1) * block)
+
+
+def zigzag_varlen_index(
+    cp_rank: int, cp_size: int, cu_seqlens: torch.Tensor, seq_len: int
+) -> torch.Tensor:
+    """
+    Global token indices for this rank, with each document's front and back blocks adjacent.
+
+    cu_seqlens and seq_len describe the whole packed sample. Under CP, pad each document to a
+    multiple of 2 * cp_size: every rank then has the same local boundaries, cu_seqlens // cp_size.
+    Passing seq_len separately avoids reading it from the device.
+    """
+    # Checked on the device, since reading cu_seqlens back to the host would sync the stream.
+    valid = (cu_seqlens[0] == 0) & (cu_seqlens.diff() >= 0).all() & (cu_seqlens[-1] == seq_len)
+    if cp_size > 1:
+        valid &= (cu_seqlens % (2 * cp_size) == 0).all()
+    torch._assert_async(
+        valid,
+        "cu_seqlens must be the whole packed sample's boundaries, each document padded to a "
+        "multiple of 2 * cp_size under context parallelism",
+    )
+    cu_local = cu_seqlens // cp_size
+    t = torch.arange(seq_len // cp_size, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    # right=True skips repeated boundaries from empty documents.
+    doc = torch.searchsorted(cu_local, t, right=True) - 1
+    offset, block = t - cu_local[doc], (cu_local[doc + 1] - cu_local[doc]) // 2
+    front, back = _block_ids(cp_rank, cp_size, "zigzag")
+    return cu_seqlens[doc] + torch.where(offset < block, front * block, (back - 1) * block) + offset
 
 
 @lru_cache(maxsize=None)

@@ -81,7 +81,7 @@ def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
 
 ## Attention kernels trace cleanly - no unwrap needed
 
-Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func`) or, under context parallelism, `ring_attention_func`. These are registered as custom ops, so they trace as opaque nodes inside `forward_stage1_compute`'s `fullgraph=True` region: the models decorate that method **unconditionally** and call the kernels inside it, with no conditional unwrap. There is no `flex_attention` in the model path and no `compile-inside-compile` problem to work around.
+Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func`) or, under context parallelism, `ring_attention_func` / `ring_attention_varlen_func`. These are registered as custom ops, so they trace as opaque nodes inside `forward_stage1_compute`'s `fullgraph=True` region: the models decorate that method **unconditionally** and call the kernels inside it, with no conditional unwrap. There is no `flex_attention` in the model path and no `compile-inside-compile` problem to work around.
 
 ### If a future kernel *does* self-compile
 

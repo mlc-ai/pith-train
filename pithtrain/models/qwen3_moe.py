@@ -12,10 +12,10 @@ from pithtrain.modules.load_balance import (
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.operators.cp_sequence import zigzag_spans
+from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -172,7 +172,9 @@ class Qwen3MoeAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-        if distributed.cp_size > 1:
+        if distributed.cp_size > 1 and cu_seqlens is not None:
+            attn_output = ring_attention_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, sm_scale=self.scaling, cp_group=distributed.cp_group).unsqueeze(0)  # fmt: skip
+        elif distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)  # fmt: skip
         elif cu_seqlens is not None:
             attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True).unsqueeze(0)  # fmt: skip
@@ -307,16 +309,13 @@ class Qwen3MoeModel(nn.Module):
         self, S: int, cu_seqlens: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = distributed.device
-        assert cu_seqlens is None or distributed.cp_size == 1
+        cp_rank, cp_size = distributed.cp_rank, distributed.cp_size
         if cu_seqlens is not None:
-            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
-            lengths = ends - starts
-            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
-            cos, sin = self.rotary_emb(S)
-            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
-        cp_size = distributed.cp_size
-        spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
-        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+            index = zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, S * cp_size)
+            position_ids = index - cu_seqlens[torch.searchsorted(cu_seqlens, index, right=True) - 1]
+        else:
+            spans = zigzag_spans(cp_rank, cp_size, S * cp_size)
+            position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

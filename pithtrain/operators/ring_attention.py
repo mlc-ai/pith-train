@@ -46,6 +46,11 @@ of three pictures holds:
 
 Every step costs the same: one causal pass on length 2*block, or one non-causal pass on a
 2*block-by-block rectangle.
+
+Packed sequences use the same schedule per document (cp_sequence.zigzag_varlen_index), with
+one varlen call per step. All ranks share local boundaries cu_seqlens // cp_size. Front/back
+blocks are gathered with boundaries cu_seqlens // (2 * cp_size). Causal calls have equal Q/K
+lengths; padding ensures each non-empty document has tokens in every block.
 """
 
 from typing import List, Optional, Tuple
@@ -397,6 +402,315 @@ def ring_attention_func(
         returned in the same zigzag local layout as q.
     """
     out, _ = _zigzag_ring_fwd(q, k, v, sm_scale, cp_group.group_name)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Packed (varlen) zigzag ring attention: the same schedule, one document at a time.
+# ---------------------------------------------------------------------------
+
+
+def document_blocks(cu_blocks: torch.Tensor, total: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Front/back indices for documents spanning [2 * cu_blocks[d], 2 * cu_blocks[d + 1]).
+    """
+    t = torch.arange(total // 2, device=cu_blocks.device, dtype=cu_blocks.dtype)
+    doc = torch.searchsorted(cu_blocks, t, right=True) - 1
+    front = t + cu_blocks[doc]
+    return front, front + cu_blocks[doc + 1] - cu_blocks[doc]
+
+
+def zigzag_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    sm_scale: float,
+    cp_group: ProcessGroup,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
+    dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
+    src = get_global_rank(cp_group, (cp_rank - 1) % cp_size)
+    cu_local, cu_blocks = cu_seqlens // cp_size, cu_seqlens // (2 * cp_size)
+    front, back = document_blocks(cu_blocks, q.shape[0])
+
+    out: Optional[torch.Tensor] = None
+    lse: Optional[torch.Tensor] = None
+    next_k: Optional[torch.Tensor] = None
+    next_v: Optional[torch.Tensor] = None
+    kv_work: Optional[List[Work]] = None
+
+    for step in range(cp_size):
+        if step + 1 < cp_size:
+            next_k, next_v, kv_work = post_ring_kv(k, v, cp_group, dst, src)
+        if step == 0:
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_local,
+                cu_seqlens_k=cu_local,
+                softmax_scale=sm_scale,
+                causal=True,
+                return_lse=True,
+            )
+            out, lse = combine_partial(out, lse, partial_out, partial_lse)
+        elif step <= cp_rank:
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
+                q,
+                k[front],
+                v[front],
+                cu_seqlens_q=cu_local,
+                cu_seqlens_k=cu_blocks,
+                softmax_scale=sm_scale,
+                causal=False,
+                return_lse=True,
+            )
+            out, lse = combine_partial(out, lse, partial_out, partial_lse)
+        else:
+            # All remaining steps update back blocks only; gather and scatter once.
+            if step == cp_rank + 1:
+                q_back = q[back]
+                out_back, lse_back = out[back], lse[back]
+            partial_out, partial_lse, *_ = _flash_attn_fwd(
+                q_back,
+                k,
+                v,
+                cu_seqlens_q=cu_blocks,
+                cu_seqlens_k=cu_local,
+                softmax_scale=sm_scale,
+                causal=False,
+                return_lse=True,
+            )
+            out_back, lse_back = combine_partial(out_back, lse_back, partial_out, partial_lse)
+        if step + 1 < cp_size:
+            wait_ring(kv_work)
+            k, v = next_k, next_v
+
+    if cp_rank + 1 < cp_size:
+        out[back], lse[back] = out_back, lse_back
+    out = out.to(q.dtype)
+    lse = lse.squeeze(-1).transpose(0, 1).contiguous()
+    return out, lse
+
+
+def zigzag_varlen_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    sm_scale: float,
+    cp_group: ProcessGroup,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
+    dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
+    src = get_global_rank(cp_group, (cp_rank - 1) % cp_size)
+    cu_local, cu_blocks = cu_seqlens // cp_size, cu_seqlens // (2 * cp_size)
+    front, back = document_blocks(cu_blocks, q.shape[0])
+
+    dout = dout.contiguous()
+    if cp_rank + 1 < cp_size:
+        dout_back = dout[back]
+        q_back = q[back]
+        out_back = out[back]
+        lse_back = lse[:, back]
+
+    dq: Optional[torch.Tensor] = None
+    dk: Optional[torch.Tensor] = None
+    dv: Optional[torch.Tensor] = None
+    next_k: Optional[torch.Tensor] = None
+    next_v: Optional[torch.Tensor] = None
+    kv_work: Optional[List[Work]] = None
+    incoming_dk: Optional[torch.Tensor] = None
+    incoming_dv: Optional[torch.Tensor] = None
+    grad_recv_slot_k: Optional[torch.Tensor] = None
+    grad_recv_slot_v: Optional[torch.Tensor] = None
+    grad_work: Optional[List[Work]] = None
+
+    for step in range(cp_size):
+        if step + 1 < cp_size:
+            next_k, next_v, kv_work = post_ring_kv(k, v, cp_group, dst, src)
+        if step == 0:
+            dq_step, dk_step, dv_step = _flash_attn_bwd(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                cu_seqlens_q=cu_local,
+                cu_seqlens_k=cu_local,
+                softmax_scale=sm_scale,
+                causal=True,
+            )
+            dq = dq_step.to(torch.float32)
+            dk = dk_step.to(torch.float32)
+            dv = dv_step.to(torch.float32)
+        else:
+            if step <= cp_rank:
+                dq_step, dk_step, dv_step = _flash_attn_bwd(
+                    q,
+                    k[front],
+                    v[front],
+                    out,
+                    dout,
+                    lse,
+                    cu_seqlens_q=cu_local,
+                    cu_seqlens_k=cu_blocks,
+                    softmax_scale=sm_scale,
+                    causal=False,
+                )
+                dq += dq_step
+            else:
+                dq_step, dk_step, dv_step = _flash_attn_bwd(
+                    q_back,
+                    k,
+                    v,
+                    out_back,
+                    dout_back,
+                    lse_back,
+                    cu_seqlens_q=cu_blocks,
+                    cu_seqlens_k=cu_local,
+                    softmax_scale=sm_scale,
+                    causal=False,
+                )
+                # Accumulate back-block dQ separately, then scatter once.
+                if step == cp_rank + 1:
+                    dq_back = dq_step.to(torch.float32)
+                else:
+                    dq_back += dq_step
+            # Adopt the previous hop's dK/dV as the working accumulator.
+            # The buffers we shipped one hop ago are free to recycle.
+            wait_ring(grad_work)
+            grad_recv_slot_k, grad_recv_slot_v = dk, dv
+            dk, dv = incoming_dk, incoming_dv
+            if step <= cp_rank:
+                dk[front] += dk_step
+                dv[front] += dv_step
+            else:
+                dk += dk_step
+                dv += dv_step
+        if step + 1 < cp_size:
+            wait_ring(kv_work)
+            k, v = next_k, next_v
+        incoming_dk, incoming_dv, grad_work = post_ring_kv(
+            dk, dv, cp_group, dst, src, grad_recv_slot_k, grad_recv_slot_v
+        )
+
+    wait_ring(grad_work)
+    if cp_rank + 1 < cp_size:
+        dq.index_add_(0, back, dq_back)
+    return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype)
+
+
+@torch.library.custom_op("pithtrain::zigzag_ring_varlen_fwd", mutates_args=())
+def _zigzag_ring_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    sm_scale: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not (k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("ring attention requires contiguous k and v")
+    if q.shape[0] % 2:
+        raise ValueError(f"packed zigzag layout needs an even local token count, got {q.shape[0]}")
+    return zigzag_varlen_forward(q, k, v, cu_seqlens, sm_scale, _resolve_process_group(group_name))
+
+
+@_zigzag_ring_varlen_fwd.register_fake
+def _(q, k, v, cu_seqlens, sm_scale, group_name):
+    t, hq, _ = q.shape
+    out = torch.empty((t, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
+    lse = torch.empty((hq, t), dtype=torch.float32, device=q.device)
+    return out, lse
+
+
+@torch.library.custom_op("pithtrain::zigzag_ring_varlen_bwd", mutates_args=())
+def _zigzag_ring_varlen_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    sm_scale: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    group = _resolve_process_group(group_name)
+    return zigzag_varlen_backward(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group)
+
+
+@_zigzag_ring_varlen_bwd.register_fake
+def _(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group_name):
+    return (
+        torch.empty_like(q),
+        torch.empty(k.shape, dtype=q.dtype, device=q.device),
+        torch.empty(v.shape, dtype=q.dtype, device=q.device),
+    )
+
+
+def _zigzag_varlen_setup_context(ctx, inputs, output):
+    q, k, v, cu_seqlens, sm_scale, group_name = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens)
+    ctx.sm_scale = sm_scale
+    ctx.group_name = group_name
+
+
+def _zigzag_varlen_backward(ctx, grad_out, grad_lse):
+    q, k, v, out, lse, cu_seqlens = ctx.saved_tensors
+    dq, dk, dv = _zigzag_ring_varlen_bwd(
+        grad_out, q, k, v, out, lse, cu_seqlens, ctx.sm_scale, ctx.group_name
+    )
+    return dq, dk, dv, None, None, None
+
+
+_zigzag_ring_varlen_fwd.register_autograd(
+    _zigzag_varlen_backward, setup_context=_zigzag_varlen_setup_context
+)
+
+
+def ring_attention_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    sm_scale: float,
+    cp_group: ProcessGroup,
+) -> torch.Tensor:
+    """
+    Causal zigzag ring attention over a packed sequence, block-diagonal by document.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape [S_local, num_q_heads, head_dim]: this rank's tokens of the packed
+        sequence in the order zigzag_varlen_index gives, two blocks of every document.
+    k, v : torch.Tensor
+        Key and value tensors of shape [S_local, num_kv_heads, head_dim(_v)] in the same layout
+        as q. Must be contiguous.
+    cu_seqlens : torch.Tensor
+        int32 boundaries of the documents in the whole packed sequence, not in this rank's
+        share of it. Every document is a multiple of 2 * cp_size tokens long, so that
+        S_local == cu_seqlens[-1] // cp_size.
+    sm_scale : float
+        Softmax scale, typically head_dim ** -0.5.
+    cp_group : torch.distributed.ProcessGroup
+        Context-parallel process group of at least two ranks.
+
+    Returns
+    -------
+    torch.Tensor
+        Attention output of shape [S_local, num_q_heads, head_dim_v] in q.dtype, in the same
+        layout as q.
+    """
+    out, _ = _zigzag_ring_varlen_fwd(q, k, v, cu_seqlens, sm_scale, cp_group.group_name)
     return out
 
 

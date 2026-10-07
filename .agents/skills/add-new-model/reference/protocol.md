@@ -99,7 +99,7 @@ def forward_stage1(self, hidden_states, rotary_posemb, cu_seqlens=None):
 
 ### Attention kernels and compile
 
-Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func` from `pithtrain.operators.flash_attn_v4`) or, under context parallelism, `ring_attention_func` (`pithtrain.operators.ring_attention`). These are registered as custom ops that trace cleanly inside `forward_stage1_compute`'s `fullgraph=True` region, so no unwrap is needed. Attention with learned sinks (GPT-OSS) passes the sink parameter straight to the kernel via `learnable_sink=...`
+Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func` from `pithtrain.operators.flash_attn_v4`) or, under context parallelism, `ring_attention_func` / `ring_attention_varlen_func` (`pithtrain.operators.ring_attention`). These are registered as custom ops that trace cleanly inside `forward_stage1_compute`'s `fullgraph=True` region, so no unwrap is needed. Attention with learned sinks (GPT-OSS) passes the sink parameter straight to the kernel via `learnable_sink=...`
 - do **not** wrap it in a `score_mod` closure. See `compile.md`.
 
 ## Stage 3: `forward_stage3` - grouped expert GEMM
