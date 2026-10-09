@@ -115,17 +115,19 @@ def unwrap_dtensor_experts(value: Any, expected_n: int) -> Optional[Tuple[Any, i
             return None
         if not dt.placements:
             return None
-        if not isinstance(dt.placements[0], Shard):
+        # FSDP shards over the last mesh dim; HSDP replicates over the one before it.
+        shard_dim = dt.device_mesh.ndim - 1
+        if not isinstance(dt.placements[shard_dim], Shard):
             return None
-        if dt.placements[0].dim != 0:
+        if dt.placements[shard_dim].dim != 0:
             return None
         local = dt._local_tensor
         if local.shape[0] >= expected_n:
             return None
-        dp_rank = dt.device_mesh.get_local_rank()
-        dp_size = dt.device_mesh.size()
-        chunk, remainder = divmod(expected_n, dp_size)
-        dp_offset = dp_rank * chunk + min(dp_rank, remainder)
+        dp_rank = dt.device_mesh.get_local_rank(shard_dim)
+        dp_size = dt.device_mesh.size(shard_dim)
+        # FSDP splits like torch.chunk: ceil(n / size) experts per rank until they run out.
+        dp_offset = dp_rank * ((expected_n + dp_size - 1) // dp_size)
         return local, local.shape[0], dp_offset
 
     if isinstance(value, DTensor):
@@ -340,9 +342,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
     are plain rather than DTensors. After repack stacks them the result is a plain tensor whose
     shape equals the FSDP local shard, so [16, ...] when the full stacked parameter is [32, ...].
 
-    model.load_state_dict compares against the DTensor global shape, so these plain tensors must be
-    wrapped back into DTensors with the same mesh and placements as the model parameter. For
-    optimizer state entries, which are dicts of tensors, every tensor with dim() > 0 is wrapped.
+    Preserve the parameter's mesh, placements, global shape and stride: from_local would infer
+    the wrong shape for uneven shards. Wrap non-scalar optimizer state tensors the same way.
     """
     param_dtensors = {n: p for n, p in model.named_parameters() if isinstance(p, DTensor)}
     for name, param in param_dtensors.items():
@@ -355,6 +356,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
                 device_mesh=param.device_mesh,
                 placements=param.placements,
                 run_check=False,
+                shape=param.shape,
+                stride=param.stride(),
             )
         elif isinstance(value, dict):
             for k, v in value.items():
@@ -364,6 +367,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
                         device_mesh=param.device_mesh,
                         placements=param.placements,
                         run_check=False,
+                        shape=param.shape,
+                        stride=param.stride(),
                     )
 
 

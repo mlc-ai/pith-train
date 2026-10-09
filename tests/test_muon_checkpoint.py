@@ -5,6 +5,11 @@ Run (needs >=2 GPUs; ep-size must divide the world)::
 
     torchrun --nproc-per-node=8 tests/test_muon_checkpoint.py
     torchrun --nproc-per-node=8 tests/test_muon_checkpoint.py --model gpt-oss-20b
+    torchrun --nproc-per-node=6 tests/test_muon_checkpoint.py --model qwen3-30b-a3b
+    torchrun --nproc-per-node=8 tests/test_muon_checkpoint.py --hsdp-replica 2
+
+The six-rank Qwen3 case checks a 22/22/20 expert split. The eight-rank HSDP case checks
+replicated expert shards (two replicas of two shards).
 
 Builds a real model (``--model``: deepseek-v2-lite, qwen3-30b-a3b, gpt-oss-20b;
 reduced to a few layers) with FSDP2 + DualPipeV, steps the composed
@@ -137,6 +142,7 @@ def main(cfg: PretrainLMCfg):
 def _entry():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep-size", type=int, default=2)
+    parser.add_argument("--hsdp-replica", type=int, default=1)
     parser.add_argument("--model", choices=list(MODELS), default="deepseek-v2-lite")
     parsed = parser.parse_args()
 
@@ -144,6 +150,7 @@ def _entry():
     cfg.distributed.pipeline_parallel_size = 1
     cfg.distributed.context_parallel_size = 1
     cfg.distributed.expert_parallel_size = parsed.ep_size
+    cfg.distributed.hsdp_replica = parsed.hsdp_replica
     t = cfg.training
     t.optimizer = make_muon_optimizer
     kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.2, final_lr=1.0e-5, decay_ratio=0.8)
@@ -163,7 +170,11 @@ def _entry():
     # Reduced config + checkpoint dir on local scratch (rank 0 writes).
     scratch = Path(tempfile.gettempdir(), "pithtrain_test_muon_checkpoint")
     if torch.distributed.get_rank() == 0:
-        print(f"[INFO] model={parsed.model}, ep={parsed.ep_size}, layers={NUM_LAYERS}", flush=True)
+        print(
+            f"[INFO] model={parsed.model}, ep={parsed.ep_size}, "
+            f"hsdp={parsed.hsdp_replica}, layers={NUM_LAYERS}",
+            flush=True,
+        )
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True)
         src = Path(__file__).resolve().parent.parent / MODELS[parsed.model]
