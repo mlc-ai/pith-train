@@ -26,6 +26,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
+from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
@@ -36,7 +37,13 @@ from pithtrain.pipeline import DualPipeV
 from .distributed import DistributedCfg
 
 # Pipeline-stage model implementations; grows as models are added.
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
+PIPELINE_STAGE_MODELS = (
+    DeepSeekV2Model,
+    GptOssModel,
+    Qwen3MoeModel,
+    Qwen35MoeModel,
+    Qwen3OmniMoeThinkerTextModel,
+)
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -401,6 +408,8 @@ def setup_model(
         ModelClass = DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
+    elif module_config.model_type == "qwen3_omni_moe_text":
+        ModelClass = Qwen3OmniMoeThinkerTextModel
     elif module_config.model_type == "gpt_oss":
         ModelClass = GptOssModel
     elif module_config.model_type == "qwen3_5_moe_text":

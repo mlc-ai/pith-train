@@ -55,6 +55,11 @@ def zigzag_spans(cp_rank: int, cp_size: int, seq_len: int) -> tuple[range, range
     Call this rather than restating the arithmetic: the data loader, every forward_posemb and
     the relayout below must agree on one partition, and a disagreement mistrains silently.
     """
+    if cp_size == 1:
+        # No sequence sharding: retain the last token of odd-length media/text.
+        # Equal-sized blocks are only required by the multi-rank CP collectives.
+        midpoint = seq_len // 2
+        return range(0, midpoint), range(midpoint, seq_len)
     block = seq_len // (2 * cp_size)
     front, back = _block_ids(cp_rank, cp_size, "zigzag")
     return range(front * block, (front + 1) * block), range(back * block, (back + 1) * block)
