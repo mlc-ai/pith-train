@@ -92,6 +92,7 @@ CUDA_VISIBLE_DEVICES=<g0>,<g1>,<g2>,<g3> timeout 180 torchrun --nproc-per-node=4
 
 - **Loss match:** `torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)`.
 - **Gradient match:** `calc_diff < 1e-2` per parameter, where `calc_diff = 1 - 2*(x*y).sum() / (x*x + y*y).sum()` (cosine-ish).
+- **Forward-only step:** each training step is preceded by a `torch.no_grad()` step over the same micro-batches. Its losses must match the training step's (`atol=5e-3`), and every `ChunkRecord` must be empty mid-step (asserted in its objective) and after both kinds of step.
 
 Loss matches, grads don't -> issue in backward. Loss doesn't match -> issue in forward.
 

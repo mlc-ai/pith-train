@@ -817,17 +817,25 @@ def model_forward(
     """
     Sequential (non-overlapped) forward for one pipeline chunk: prolog -> layers -> epilog.
 
-    Records each stage's tensors into chunk_record for the pipeline backward.
+    Without grad, clear records after each layer to bound activation memory and leave the
+    empty records required by the next training step's merged stage-5/stage-1 path.
     """
+    forward_only = not torch.is_grad_enabled()
     if module.stage_index == 0:
         hidden_states = prolog_f(module, hidden_states, chunk_record.prolog)
+        if forward_only:
+            chunk_record.prolog.outs = None
 
     rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens)
     for layer, layer_record in zip(module.layers.values(), chunk_record.layers):
         hidden_states = layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens)
+        if forward_only:
+            clear_layer_records(layer_record)
 
     if module.stage_index == module.stage_count - 1:
         hidden_states = epilog_f(module, hidden_states, chunk_record.epilog)
+        if forward_only:
+            chunk_record.epilog.args = None
 
     return hidden_states
 
