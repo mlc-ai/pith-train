@@ -8,6 +8,7 @@ dependencies = [
     "deep-gemm",
     "flash-attn-4[cu13]==4.0.0b28",
     "flash-linear-attention==0.5.2",
+    "pyarrow",
     "transformers",
     "wandb",
     "zstandard",

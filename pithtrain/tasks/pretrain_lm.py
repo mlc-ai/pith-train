@@ -6,7 +6,7 @@ import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.cuda
@@ -20,7 +20,12 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
+from pithtrain.modules.dataset import (
+    ConcatDataset,
+    MemmapDataset,
+    SourceDataset,
+    WeightedMixtureDataset,
+)
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
@@ -29,6 +34,8 @@ from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
+
+Dataset = ConcatDataset | WeightedMixtureDataset
 
 
 @dataclass(init=False, slots=True)
@@ -52,16 +59,47 @@ class PretrainLMCfg(SlottedDefault):
     Logging configuration.
     """
 
-    dataset: Path
+    dataset: Optional[Path] = None
     """
-    The root directory hosting the tokenized corpus, globbed for *.bin shards.
+    The root directory hosting a single tokenized corpus, globbed for *.bin shards. Ignored when
+    dataset_sources is set.
+    """
+
+    dataset_sources: dict[str, Path] = field(default_factory=dict)
+    """
+    Named tokenized-corpus roots for weighted mixture sampling. When empty, the run uses the single
+    corpus at dataset instead.
+    """
+
+    dataset_mixture: dict[str, float] = field(default_factory=dict)
+    """
+    Sampling weights for dataset_sources, keyed by the same names. Must sum to 1.0.
     """
 
 
-def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
+def setup_dataset(cfg: PretrainLMCfg) -> Dataset:
     """
-    Build the shuffled concatenation of every tokenized shard under the corpus root.
+    Build the training dataset from cfg.
+
+    When dataset_sources is set, sample its named corpora by dataset_mixture with replacement.
+    Otherwise concatenate every tokenized shard under cfg.dataset and shuffle globally.
     """
+    if cfg.dataset_sources:
+        if not cfg.dataset_mixture:
+            raise ValueError("dataset_mixture must be provided when dataset_sources is set.")
+        sources: dict[str, SourceDataset] = {}
+        for name, root in sorted(cfg.dataset_sources.items()):
+            shards = [
+                MemmapDataset(file, cfg.training.sequence_length)
+                for file in sorted(root.rglob("*.bin"))
+            ]
+            if not shards:
+                raise ValueError(f"No tokenized dataset files found under: {root}")
+            sources[name] = SourceDataset(name, shards)
+        return WeightedMixtureDataset(sources, cfg.training.seed, cfg.dataset_mixture)
+
+    if cfg.dataset is None:
+        raise ValueError("Either dataset or dataset_sources must be set.")
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)
@@ -71,7 +109,7 @@ def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
 
 
 def get_global_batch(
-    cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
+    cfg: PretrainLMCfg, dataset: Dataset, step: int, device: torch.device
 ) -> List[Microbatch]:
     """
     Gather the portion of the global batch belonging to this rank, already split into micro-batches.
@@ -152,7 +190,7 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
+def train_step(cfg: PretrainLMCfg, dataset: Dataset, step: int) -> None:
     """
     Execute one step of training.
     """
