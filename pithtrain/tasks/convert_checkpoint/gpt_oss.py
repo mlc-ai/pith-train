@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Dict
 
 import torch
-import torch.distributed.checkpoint as dcp
-from safetensors import safe_open
+
+from ._streaming import HfCheckpoint, save_dcp
 
 
 def _dequantize_mxfp4(
@@ -17,7 +17,7 @@ def _dequantize_mxfp4(
     scales: torch.Tensor,
     *,
     dtype: torch.dtype = torch.bfloat16,
-    rows_per_chunk: int = 32768 * 1024,
+    rows_per_chunk: int = 32768,
 ) -> torch.Tensor:
     """Dequantize MXFP4 blocks (low nibble first, scales biased by 127)."""
     # Adapted from Megatron-Bridge gpt_oss_bridge._dequantize_mxfp4.
@@ -82,44 +82,34 @@ class GptOssConverter:
         # fused-expert models (Qwen3.5-MoE also has gate_up_proj but no bias).
         return any("gate_up_proj_bias" in k for k in metadata.state_dict_metadata.keys())
 
-    def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
-        with open(Path(load_path, "model.safetensors.index.json")) as f:
-            weight_map = json.load(f)["weight_map"]
+    def hf2dcp(
+        self,
+        load_path: Path,
+        save_path: Path,
+        stdout: Logger,
+        *,
+        max_chunk_size: int,
+        max_shard_size: int,
+    ) -> None:
+        stdout.info("Converting GPT-OSS HF checkpoint from %s" % load_path)
+        checkpoint = HfCheckpoint(load_path, stdout)
+        quantized = {
+            key.removesuffix("_blocks")
+            for key in checkpoint.tensors
+            if key.endswith("_blocks")
+            and key.removesuffix("_blocks") + "_scales" in checkpoint.tensors
+        }
+        dequantized = dict(checkpoint.tensors)
+        for key in sorted(quantized):
+            blocks = dequantized.pop(key + "_blocks")
+            scales = dequantized.pop(key + "_scales")
+            assert blocks.shape[:-1] == scales.shape, (
+                f"{blocks.shape=} does not match {scales.shape=}"
+            )
+            shape = (*blocks.shape[:-2], blocks.shape[-2] * blocks.shape[-1] * 2)
+            dequantized[key] = torch.empty(shape, dtype=torch.bfloat16, device="meta")
 
-        shard_files = set(weight_map.values())
-        stdout.info(
-            "Converting GPT-OSS HF checkpoint from %s (%d shards)" % (load_path, len(shard_files))
-        )
-
-        raw: Dict[str, torch.Tensor] = dict()
-        for i, shard_file in enumerate(sorted(shard_files), start=1):
-            stdout.info("Reading shard %d/%d: %s" % (i, len(shard_files), shard_file))
-            with safe_open(str(Path(load_path, shard_file)), framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    raw[key] = f.get_tensor(key)
-
-        # MXFP4 on-disk is [E, out, in] with quant axis along in (32 FP4/block).
-        # Dequant drops the last two dims:
-        #   gate_up_proj_blocks [E, 2*inter, G, 16] -> [E, 2*inter, hidden]
-        #   down_proj_blocks    [E, hidden,  G, 16] -> [E, hidden, inter]
-        dequantized: Dict[str, torch.Tensor] = dict()
-        seen_blocks = set()
-        for key in sorted(raw.keys()):
-            if key.endswith("_blocks"):
-                base = key.removesuffix("_blocks")
-                scales_key = base + "_scales"
-                if scales_key in raw:
-                    stdout.info("Dequantizing MXFP4: %s" % base)
-                    flat = _dequantize_mxfp4(raw[key], raw[scales_key])
-                    dequantized[base] = flat.contiguous()
-                    seen_blocks.add(key)
-                    seen_blocks.add(scales_key)
-
-        for key, tensor in raw.items():
-            if key not in seen_blocks and key not in dequantized:
-                dequantized[key] = tensor
-
-        model_state_dict: Dict[str, torch.Tensor] = dict()
+        tensors, sources = {}, {}
         for key, tensor in dequantized.items():
             canon = key.removeprefix("model.")
 
@@ -133,13 +123,35 @@ class GptOssConverter:
             ):
                 for idx in range(tensor.shape[0]):
                     expert_key = canon.replace(".experts.", ".experts.%d." % idx)
-                    model_state_dict[expert_key] = tensor[idx].contiguous()
+                    tensors[expert_key] = tensor[idx]
+                    sources[expert_key] = key, idx
             else:
-                model_state_dict[canon] = tensor
+                tensors[canon] = tensor
+                sources[canon] = key, None
 
-        save_path.mkdir(parents=True, exist_ok=True)
-        dcp.save({"app": {"model": model_state_dict}}, checkpoint_id=save_path, no_dist=True)
-        stdout.info("Saved DCP checkpoint to %s (%d weights)" % (save_path, len(model_state_dict)))
+        def load_tensor(canon, slices):
+            key, idx = sources[canon]
+            if key in quantized:
+                width = checkpoint.tensors[key + "_blocks"].shape[-1] * 2
+                start, stop = slices[-1].start, slices[-1].stop
+                groups = slice(start // width, (stop + width - 1) // width)
+                prefix = slices[:-1]
+                tensor = _dequantize_mxfp4(
+                    checkpoint.load(key + "_blocks", idx, (*prefix, groups, slice(None))),
+                    checkpoint.load(key + "_scales", idx, (*prefix, groups)),
+                )
+                offset = start % width
+                return tensor[..., offset : offset + stop - start].contiguous()
+            return checkpoint.load(key, idx, slices)
+
+        save_dcp(
+            tensors,
+            load_tensor,
+            save_path,
+            stdout,
+            max_chunk_size=max_chunk_size,
+            max_shard_size=max_shard_size,
+        )
 
     def postprocess_canonical(
         self, canonical: Dict[str, torch.Tensor], stdout: Logger
