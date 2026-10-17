@@ -20,7 +20,13 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from pithtrain.contexts import distributed, training
 from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.checkpoint import expand_localized_fqn, find_moe, local_shard_range
+from pithtrain.modules.checkpoint import (
+    CopyOp,
+    _generic_plan_param,
+    expand_localized_fqn,
+    find_moe,
+    local_shard_range,
+)
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
@@ -674,7 +680,6 @@ def _qwen35_plan_expert(
     moe: nn.Module,
     canon_keys: List[str],
 ) -> list:
-    from pithtrain.modules.hf_loader import CopyOp  # lazy: avoids hf_loader <-> qwen35_moe circular
     local = param._local_tensor
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
@@ -729,7 +734,6 @@ class Qwen35MoeHfLoader:
         weight_map: Dict[str, str],
         named_modules: Dict[str, nn.Module],
     ) -> list:
-        from pithtrain.modules.hf_loader import _generic_plan_param  # lazy: avoids circular
         moe = find_moe(local_fqn, named_modules)
         if moe is not None:
             canon_keys = expand_localized_fqn(local_fqn, named_modules)

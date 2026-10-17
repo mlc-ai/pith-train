@@ -25,7 +25,7 @@ import gc
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -46,6 +46,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from pithtrain.contexts import distributed, logging, training
 
 __all__ = [
+    "CopyOp",
     "expand_localized_fqn",
     "find_checkpoint",
     "find_moe",
@@ -53,7 +54,6 @@ __all__ = [
     "load_checkpoint",
     "local_shard_range",
     "save_checkpoint",
-    "strip_prefix",
     "to_canonical_model",
     "to_canonical_optim",
     "to_localized_model",
@@ -307,6 +307,88 @@ def expand_localized_fqn(localized_fqn: str, named_modules: Dict[str, nn.Module]
         return [canon]
     start, end = expert_range(moe)
     return [canon.replace(".experts.", ".experts.%d." % idx, 1) for idx in range(start, end)]
+
+
+class CopyOp(NamedTuple):
+    """One contiguous write into a local param.
+
+    Non-expert Shard(0): dst is the whole ``param._local_tensor``, ``row_slice`` is this rank's
+    FSDP window on the source, ``transform`` is None.
+    Stacked-expert: dst is ``param._local_tensor[i]`` when the HF key is already per-expert
+    (``row_slice`` is slice(None)), or ``param._local_tensor[i:i+1]`` when ``row_slice`` selects
+    one row of a fused HF expert tensor; ``transform`` runs MXFP4 dequant on the paired
+    ``(blocks, scales)`` slabs when needed.
+    """
+
+    local_fqn: str
+    dst: torch.Tensor
+    hf_keys: Tuple[str, ...]
+    shard_files: Tuple[str, ...]
+    row_slice: slice
+    transform: Optional[Callable[[List[torch.Tensor], torch.dtype], torch.Tensor]]
+
+
+def _generic_plan_param(
+    local_fqn: str,
+    param: DTensor,
+    weight_map: Dict[str, str],
+    named_modules: Dict[str, nn.Module],
+    remap: Callable[[str], str] = lambda k: k,
+) -> List[CopyOp]:
+    """
+    Plan a param the way the generic path handles it, with an optional canonical->HF key remap
+    for prefix-nested checkpoints (e.g. Qwen3.5's ``language_model.``).
+    """
+    local = param._local_tensor
+    canon_keys = expand_localized_fqn(local_fqn, named_modules)
+    moe = find_moe(local_fqn, named_modules)
+    dp_rank = param.device_mesh.get_local_rank()
+    dp_size = param.device_mesh.size()
+
+    if moe is None:
+        (canon,) = canon_keys
+        hf_key = remap(canon)
+        if hf_key not in weight_map:
+            raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
+        start, length = local_shard_range(param.shape[0], dp_rank, dp_size)
+        if length != local.shape[0]:
+            raise RuntimeError(
+                "%s: computed length %d != local shape %d" % (local_fqn, length, local.shape[0])
+            )
+        return [
+            CopyOp(
+                local_fqn=local_fqn,
+                dst=local,
+                hf_keys=(hf_key,),
+                shard_files=(weight_map[hf_key],),
+                row_slice=slice(start, start + length),
+                transform=None,
+            )
+        ]
+
+    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
+    if dp_len != local.shape[0]:
+        raise RuntimeError(
+            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
+        )
+    ops: List[CopyOp] = []
+    for i, canon in enumerate(canon_keys[dp_offset : dp_offset + dp_len]):
+        hf_key = remap(canon)
+        if hf_key not in weight_map:
+            raise KeyError(
+                "HF checkpoint missing %s for local param %s expert %d" % (hf_key, local_fqn, i)
+            )
+        ops.append(
+            CopyOp(
+                local_fqn=local_fqn,
+                dst=local[i],
+                hf_keys=(hf_key,),
+                shard_files=(weight_map[hf_key],),
+                row_slice=slice(None),
+                transform=None,
+            )
+        )
+    return ops
 
 
 def _localized_param_group_fqns(model: nn.Module, optimizers) -> list:

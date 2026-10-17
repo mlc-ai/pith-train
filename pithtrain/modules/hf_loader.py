@@ -16,7 +16,7 @@ import gc
 import json
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, NamedTuple, Optional, Protocol, Tuple
+from typing import Dict, List, Protocol, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,27 +25,11 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from pithtrain.contexts import logging
-from pithtrain.modules.checkpoint import expand_localized_fqn, find_moe, local_shard_range
+from pithtrain.models.gpt_oss import GptOssHfLoader
+from pithtrain.models.qwen35_moe import Qwen35MoeHfLoader
+from pithtrain.modules.checkpoint import CopyOp, _generic_plan_param
 
 __all__ = ["load_hf_into_model"]
-
-
-class CopyOp(NamedTuple):
-    """One contiguous write into a local param.
-
-    Non-expert Shard(0): dst is the whole ``param._local_tensor``, ``row_slice`` is this rank's
-    FSDP window on the source, ``expert_row`` == ``slice(None)`` (unused), ``transform`` is None.
-    Stacked-expert: dst is ``param._local_tensor[i:i+1]``, ``row_slice`` selects one HF expert row
-    (or slice(None) when the HF key is already per-expert), and ``transform`` runs MXFP4 dequant
-    on the paired ``(blocks, scales)`` slabs when needed.
-    """
-
-    local_fqn: str
-    dst: torch.Tensor
-    hf_keys: Tuple[str, ...]
-    shard_files: Tuple[str, ...]
-    row_slice: slice
-    transform: Optional[Callable[[List[torch.Tensor], torch.dtype], torch.Tensor]]
 
 
 class ModelHfLoader(Protocol):
@@ -104,69 +88,6 @@ def _assert_shardable(local_fqn: str, param: DTensor) -> None:
         or param.placements[0].dim != 0
     ):
         raise RuntimeError("%s: only Shard(0) placements are supported" % local_fqn)
-
-
-def _generic_plan_param(
-    local_fqn: str,
-    param: DTensor,
-    weight_map: Dict[str, str],
-    named_modules: Dict[str, nn.Module],
-    remap: Callable[[str], str] = lambda k: k,
-) -> List[CopyOp]:
-    """
-    Plan a param the way the generic path handles it, with an optional canonical->HF key remap
-    for prefix-nested checkpoints (e.g. Qwen3.5's ``language_model.``).
-    """
-    local = param._local_tensor
-    canon_keys = expand_localized_fqn(local_fqn, named_modules)
-    moe = find_moe(local_fqn, named_modules)
-    dp_rank = param.device_mesh.get_local_rank()
-    dp_size = param.device_mesh.size()
-
-    if moe is None:
-        (canon,) = canon_keys
-        hf_key = remap(canon)
-        if hf_key not in weight_map:
-            raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
-        start, length = local_shard_range(param.shape[0], dp_rank, dp_size)
-        if length != local.shape[0]:
-            raise RuntimeError(
-                "%s: computed length %d != local shape %d" % (local_fqn, length, local.shape[0])
-            )
-        return [
-            CopyOp(
-                local_fqn=local_fqn,
-                dst=local,
-                hf_keys=(hf_key,),
-                shard_files=(weight_map[hf_key],),
-                row_slice=slice(start, start + length),
-                transform=None,
-            )
-        ]
-
-    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    if dp_len != local.shape[0]:
-        raise RuntimeError(
-            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
-        )
-    ops: List[CopyOp] = []
-    for i, canon in enumerate(canon_keys[dp_offset : dp_offset + dp_len]):
-        hf_key = remap(canon)
-        if hf_key not in weight_map:
-            raise KeyError(
-                "HF checkpoint missing %s for local param %s expert %d" % (hf_key, local_fqn, i)
-            )
-        ops.append(
-            CopyOp(
-                local_fqn=local_fqn,
-                dst=local[i : i + 1],
-                hf_keys=(hf_key,),
-                shard_files=(weight_map[hf_key],),
-                row_slice=slice(None),
-                transform=None,
-            )
-        )
-    return ops
 
 
 class GenericHfLoader:
@@ -295,13 +216,6 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
         % (filled, len(skipped), dt_min.item(), dt_max.item())
     )
 
-
-# ─── Per-model loaders ────────────────────────────────────────────────────────
-# Imported after all core definitions to allow model files to import CopyOp /
-# _generic_plan_param from this module without hitting a circular import.
-
-from pithtrain.models.gpt_oss import GptOssHfLoader  # noqa: E402
-from pithtrain.models.qwen35_moe import Qwen35MoeHfLoader  # noqa: E402
 
 _LOADERS: List[ModelHfLoader] = [GptOssHfLoader(), Qwen35MoeHfLoader(), GenericHfLoader()]
 

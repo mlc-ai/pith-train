@@ -62,7 +62,7 @@ Adapt from:
 - The model's release repo (OpenAI, Qwen, etc.)
 - TorchTitan if it has a reference
 
-See `_dequantize_mxfp4` in `pithtrain/tasks/convert_checkpoint/gpt_oss.py` for the MXFP4 reference.
+See `dequantize_mxfp4` in `pithtrain/operators/mxfp4.py` for the MXFP4 reference.
 
 ### Step 4 - Verify against HF's live dequant
 

@@ -21,7 +21,13 @@ from pithtrain.kernels import (
     fp8_quant_weight_grouped,
 )
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.checkpoint import expand_localized_fqn, find_moe, local_shard_range
+from pithtrain.modules.checkpoint import (
+    CopyOp,
+    _generic_plan_param,
+    expand_localized_fqn,
+    find_moe,
+    local_shard_range,
+)
 from pithtrain.modules.fp8_param_gather import fp8_param_operands
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
@@ -587,7 +593,6 @@ def _gpt_oss_plan_expert(
     *,
     mxfp4: bool,
 ) -> list:
-    from pithtrain.modules.hf_loader import CopyOp  # lazy: avoids hf_loader <-> gpt_oss circular
     local = param._local_tensor
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
@@ -650,7 +655,6 @@ class GptOssHfLoader:
         weight_map: Dict[str, str],
         named_modules: Dict[str, nn.Module],
     ) -> list:
-        from pithtrain.modules.hf_loader import _generic_plan_param  # lazy: avoids circular
         moe = find_moe(local_fqn, named_modules)
         if moe is None:
             return _generic_plan_param(local_fqn, param, weight_map, named_modules)
