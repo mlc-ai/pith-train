@@ -16,7 +16,7 @@ import json
 import re
 from logging import Logger
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -24,13 +24,7 @@ import torch.nn as nn
 from safetensors import safe_open
 from torch.distributed.tensor import DTensor
 
-from pithtrain.modules.checkpoint import (
-    CopyOp,
-    _generic_plan_param,
-    expand_localized_fqn,
-    find_moe,
-    local_shard_range,
-)
+from pithtrain.modules.checkpoint import CopyOp, find_moe, fused_expert_ops, generic_plan_param
 
 # HF keys that nest the text tower; stripped to canonical PithTrain keys.
 _TEXT_PREFIX = "model.language_model."
@@ -38,57 +32,6 @@ _TEXT_PREFIX = "model.language_model."
 _DROP_PREFIXES = ("model.visual.", "mtp.")
 # Fused expert weights split per-expert in hf2dcp / re-stacked in dcp2hf.
 _EXPERT_SUFFIXES = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
-
-
-def _expert_base(canon_key: str) -> Tuple[str, int]:
-    """
-    Split ``layers.L.mlp.experts.42.gate_up_proj.weight`` into the fused canonical key
-    (``layers.L.mlp.experts.gate_up_proj``) and the global expert start index (42). HF stores
-    all experts fused as ``[E, out, in]`` with no per-expert index; the canonical key carries a
-    per-expert index AND a ``.weight`` GroupedLinear suffix that both must be stripped.
-    """
-    prefix, _, tail = canon_key.rpartition(".experts.")
-    idx_str, _, suffix = tail.partition(".")
-    if not idx_str.isdigit():
-        raise RuntimeError("expected indexed expert key, got %s" % canon_key)
-    return "%s.experts.%s" % (prefix, suffix.removesuffix(".weight")), int(idx_str)
-
-
-def _plan_expert(
-    local_fqn: str,
-    param: DTensor,
-    weight_map: Dict[str, str],
-    moe: nn.Module,
-    canon_keys: List[str],
-    remap: Callable[[str], str],
-) -> List[CopyOp]:
-    local = param._local_tensor
-    dp_rank = param.device_mesh.get_local_rank()
-    dp_size = param.device_mesh.size()
-    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    if dp_len != local.shape[0]:
-        raise RuntimeError(
-            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
-        )
-    fused, ep_start = _expert_base(canon_keys[0])
-    hf_key = remap(fused)
-    if hf_key not in weight_map:
-        raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
-    shard = weight_map[hf_key]
-    ops = []
-    for i in range(dp_len):
-        global_idx = ep_start + dp_offset + i
-        ops.append(
-            CopyOp(
-                local_fqn=local_fqn,
-                dst=local[i : i + 1],
-                hf_keys=(hf_key,),
-                shard_files=(shard,),
-                row_slice=slice(global_idx, global_idx + 1),
-                transform=None,
-            )
-        )
-    return ops
 
 
 class Qwen35MoeConverter:
@@ -208,11 +151,10 @@ class Qwen35MoeConverter:
         named_modules: Dict[str, nn.Module],
     ) -> List[CopyOp]:
         """Streaming load: text tower nested under ``language_model.``, fused experts."""
-        moe = find_moe(local_fqn, named_modules)
-        if moe is not None:
-            canon_keys = expand_localized_fqn(local_fqn, named_modules)
-            return _plan_expert(local_fqn, param, weight_map, moe, canon_keys, self._renest)
-        return _generic_plan_param(local_fqn, param, weight_map, named_modules, remap=self._renest)
+        args = (local_fqn, param, weight_map, named_modules)
+        if find_moe(local_fqn, named_modules) is not None:
+            return fused_expert_ops(*args, lambda k: (self._renest(k),))
+        return generic_plan_param(*args, remap=self._renest)
 
     def expected_unmapped(self, hf_keys: set) -> set:
         """Streaming load: the vision tower and MTP head have no PithTrain counterpart."""

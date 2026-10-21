@@ -45,8 +45,7 @@ def _snapshot_locals(model) -> dict:
 
 
 def _build_model(cfg) -> None:
-    # Match setup_training's RNG reset so both paths produce identical constructor init for any
-    # param a converter's owns_local disowns.
+    # Match setup_training's RNG reset so both paths start from identical constructor init.
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
     setup_model(cfg.training, cfg.distributed)

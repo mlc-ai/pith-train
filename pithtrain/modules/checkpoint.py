@@ -50,6 +50,8 @@ __all__ = [
     "expand_localized_fqn",
     "find_checkpoint",
     "find_moe",
+    "fused_expert_ops",
+    "generic_plan_param",
     "iter_canonical_parameters",
     "load_checkpoint",
     "local_shard_range",
@@ -328,7 +330,7 @@ class CopyOp(NamedTuple):
     transform: Optional[Callable[[List[torch.Tensor], torch.dtype], torch.Tensor]]
 
 
-def _generic_plan_param(
+def generic_plan_param(
     local_fqn: str,
     param: DTensor,
     weight_map: Dict[str, str],
@@ -389,6 +391,48 @@ def _generic_plan_param(
             )
         )
     return ops
+
+
+def fused_expert_ops(
+    local_fqn: str,
+    param: DTensor,
+    weight_map: Dict[str, str],
+    named_modules: Dict[str, nn.Module],
+    hf_keys: Callable[[str], Tuple[str, ...]],
+    transform: Optional[Callable[[List[torch.Tensor], torch.dtype], torch.Tensor]] = None,
+) -> List[CopyOp]:
+    """
+    Plan a stacked-expert param whose HF checkpoint fuses every expert into one ``[E, ...]``
+    tensor (GPT-OSS, Qwen3.5): one CopyOp per local expert, reading that expert's row.
+    ``hf_keys`` maps the fused canonical key (e.g. ``layers.1.mlp.experts.gate_up_proj``) to the
+    HF key(s) read together, which ``transform`` combines (e.g. MXFP4 blocks + scales).
+    """
+    local = param._local_tensor
+    moe = find_moe(local_fqn, named_modules)
+    keys = hf_keys(strip_prefix(local_fqn).removesuffix(".weight"))
+    for key in keys:
+        if key not in weight_map:
+            raise KeyError("HF checkpoint missing %s for local param %s" % (key, local_fqn))
+    dp_rank = param.device_mesh.get_local_rank()
+    dp_size = param.device_mesh.size()
+    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
+    if dp_len != local.shape[0]:
+        raise RuntimeError(
+            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
+        )
+    shard_files = tuple(weight_map[key] for key in keys)
+    first = expert_range(moe)[0] + dp_offset
+    return [
+        CopyOp(
+            local_fqn=local_fqn,
+            dst=local[i : i + 1],
+            hf_keys=keys,
+            shard_files=shard_files,
+            row_slice=slice(first + i, first + i + 1),
+            transform=transform,
+        )
+        for i in range(dp_len)
+    ]
 
 
 def _localized_param_group_fqns(model: nn.Module, optimizers) -> list:

@@ -26,15 +26,15 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from pithtrain.contexts import logging
-from pithtrain.modules.checkpoint import CopyOp, _generic_plan_param
+from pithtrain.modules.checkpoint import CopyOp, generic_plan_param
 from pithtrain.tasks.convert_checkpoint._registry import CONVERTERS, ModelConverter
 
 __all__ = ["load_hf_into_model"]
 
 
-def _read_weight_map(hf_root: Path) -> Tuple[Dict[str, str], Path]:
+def _read_weight_map(hf_root: Path) -> Dict[str, str]:
     """
-    Return ``(weight_map, shards_dir)`` from a sharded (index.json) or single-file HF checkpoint,
+    Return the key -> shard-file map of a sharded (index.json) or single-file HF checkpoint,
     with the ``model.`` prefix stripped from every key so downstream lookups share the same
     canonical namespace as ``expand_localized_fqn``. ``lm_head.weight`` (already top-level) is
     unaffected; ``model.language_model.foo`` becomes ``language_model.foo``.
@@ -49,7 +49,7 @@ def _read_weight_map(hf_root: Path) -> Tuple[Dict[str, str], Path]:
             raise FileNotFoundError("No safetensors index or model.safetensors under %s" % hf_root)
         with safe_open(str(single), framework="pt", device="cpu") as f:
             raw = {k: "model.safetensors" for k in f.keys()}
-    return {k.removeprefix("model."): v for k, v in raw.items()}, hf_root
+    return {k.removeprefix("model."): v for k, v in raw.items()}
 
 
 def _assert_shardable(local_fqn: str, param: DTensor) -> None:
@@ -72,19 +72,14 @@ def _assert_shardable(local_fqn: str, param: DTensor) -> None:
 
 def _plan_copies(
     model: nn.Module, weight_map: Dict[str, str], converter: Optional[ModelConverter]
-) -> Tuple[List[CopyOp], set, List[str]]:
+) -> Tuple[List[CopyOp], set]:
     named_modules = dict(model.named_modules())
     plan: List[CopyOp] = []
     consumed: set = set()
-    skipped: List[str] = []
-    owns_local = getattr(converter, "owns_local", None) or (lambda fqn: True)
-    plan_param = getattr(converter, "plan_param", None) or _generic_plan_param
+    plan_param = getattr(converter, "plan_param", None) or generic_plan_param
 
     for name, param in model.named_parameters():
         _assert_shardable(name, param)
-        if not owns_local(name):
-            skipped.append(name)
-            continue
         ops = plan_param(name, param, weight_map, named_modules)
         # FSDP2 may hand a rank an empty shard (dim 0 smaller than the mesh); nothing to copy.
         if not ops and param._local_tensor.numel() > 0:
@@ -93,16 +88,15 @@ def _plan_copies(
         for op in ops:
             consumed.update(op.hf_keys)
 
-    return plan, consumed, skipped
+    return plan, consumed
 
 
 def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     """
     Copy the HuggingFace safetensors weights under hf_root into model's live DTensor parameters.
 
-    Only Shard(0) DTensor params are supported. Every local parameter is either filled exactly
-    once from HF or, when the selected converter's ``owns_local`` disowns it, left at its
-    module-constructor init.
+    Only Shard(0) DTensor params are supported. Every local parameter is filled exactly once
+    from HF.
     """
     stdout = logging.stdout
     hf_root = Path(hf_root)
@@ -112,10 +106,8 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     converter = next((c for c in CONVERTERS if c.detect_hf(hf_root)), None)
     stdout.info("Selected HF loader: %s" % (converter.name if converter else "generic"))
 
-    weight_map, shards_dir = _read_weight_map(hf_root)
-    plan, consumed, skipped = _plan_copies(model, weight_map, converter)
-    for name in skipped:
-        stdout.info("Leaving %s at constructor init (not in HF)" % name)
+    weight_map = _read_weight_map(hf_root)
+    plan, consumed = _plan_copies(model, weight_map, converter)
 
     by_shard: Dict[str, List[CopyOp]] = {}
     for op in plan:
@@ -126,7 +118,7 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     with contextlib.ExitStack() as stack:
         handles: Dict[str, "safe_open"] = {
             shard: stack.enter_context(
-                safe_open(str(Path(shards_dir, shard)), framework="pt", device="cpu")
+                safe_open(str(Path(hf_root, shard)), framework="pt", device="cpu")
             )  # fmt: skip
             for shard in all_shards
         }
@@ -176,6 +168,6 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     torch.distributed.all_reduce(dt_min, op=torch.distributed.ReduceOp.MIN)
     torch.distributed.all_reduce(dt_max, op=torch.distributed.ReduceOp.MAX)
     stdout.info(
-        "Load HF checkpoint: %d ops, %d skipped, elapsed min=%.1fs, max=%.1fs"
-        % (filled, len(skipped), dt_min.item(), dt_max.item())
+        "Load HF checkpoint: %d ops, elapsed min=%.1fs, max=%.1fs"
+        % (filled, dt_min.item(), dt_max.item())
     )
