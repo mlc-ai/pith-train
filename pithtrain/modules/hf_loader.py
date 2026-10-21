@@ -7,8 +7,9 @@ materialization on any rank. Multi-rank reads of the same shard files are handle
 cache via safetensors' mmap.
 
 Per-model quirks (MXFP4 dequant for GPT-OSS, fused expert layout and vision/mtp drops for
-Qwen3.5-MoE) are delegated to per-model loaders selected by HF ``config.json``. The generic loader
-covers Qwen3 and DeepSeek-V2 verbatim and acts as the fallback for unknown checkpoints.
+Qwen3.5-MoE) are delegated to the optional streaming hooks on the matching converter in
+``pithtrain.tasks.convert_checkpoint._registry.CONVERTERS``. A checkpoint no converter claims
+(Qwen3, DeepSeek-V2), or a hook a converter does not define, gets the generic behavior.
 """
 
 import contextlib
@@ -16,7 +17,7 @@ import gc
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Protocol, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,31 +26,10 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from pithtrain.contexts import logging
-from pithtrain.models.gpt_oss import GptOssHfLoader
-from pithtrain.models.qwen35_moe import Qwen35MoeHfLoader
 from pithtrain.modules.checkpoint import CopyOp, _generic_plan_param
+from pithtrain.tasks.convert_checkpoint._registry import CONVERTERS, ModelConverter
 
 __all__ = ["load_hf_into_model"]
-
-
-class ModelHfLoader(Protocol):
-    """Per-model plan builder for load_hf_into_model."""
-
-    name: str
-
-    def detect_hf(self, hf_root: Path) -> bool: ...
-
-    def owns_local(self, local_fqn: str) -> bool: ...
-
-    def plan_param(
-        self,
-        local_fqn: str,
-        param: DTensor,
-        weight_map: Dict[str, str],
-        named_modules: Dict[str, nn.Module],
-    ) -> List[CopyOp]: ...
-
-    def expected_unmapped(self, hf_keys: set) -> set: ...
 
 
 def _read_weight_map(hf_root: Path) -> Tuple[Dict[str, str], Path]:
@@ -90,50 +70,24 @@ def _assert_shardable(local_fqn: str, param: DTensor) -> None:
         raise RuntimeError("%s: only Shard(0) placements are supported" % local_fqn)
 
 
-class GenericHfLoader:
-    """Fallback loader: bare ``model.`` prefix strip, per-expert HF keys."""
-
-    name = "generic"
-
-    def detect_hf(self, hf_root: Path) -> bool:
-        return True
-
-    def owns_local(self, local_fqn: str) -> bool:
-        return True
-
-    def plan_param(
-        self,
-        local_fqn: str,
-        param: DTensor,
-        weight_map: Dict[str, str],
-        named_modules: Dict[str, nn.Module],
-    ) -> List[CopyOp]:
-        return _generic_plan_param(local_fqn, param, weight_map, named_modules)
-
-    def expected_unmapped(self, hf_keys: set) -> set:
-        # HF may ship a bare lm_head.weight the live model does not carry as a separate parameter
-        # (tied embeddings) — treat as expected, not a warning.
-        return {"lm_head.weight"} & hf_keys
-
-
 def _plan_copies(
-    model: nn.Module, weight_map: Dict[str, str], loader: ModelHfLoader
+    model: nn.Module, weight_map: Dict[str, str], converter: Optional[ModelConverter]
 ) -> Tuple[List[CopyOp], set, List[str]]:
     named_modules = dict(model.named_modules())
     plan: List[CopyOp] = []
     consumed: set = set()
     skipped: List[str] = []
+    owns_local = getattr(converter, "owns_local", None) or (lambda fqn: True)
+    plan_param = getattr(converter, "plan_param", None) or _generic_plan_param
 
     for name, param in model.named_parameters():
         _assert_shardable(name, param)
-        if not loader.owns_local(name):
+        if not owns_local(name):
             skipped.append(name)
             continue
-        ops = loader.plan_param(name, param, weight_map, named_modules)
+        ops = plan_param(name, param, weight_map, named_modules)
         if not ops:
-            raise RuntimeError(
-                "loader %s claims to own %s but returned no CopyOps" % (loader.name, name)
-            )
+            raise RuntimeError("planning %s returned no CopyOps" % name)
         plan.extend(ops)
         for op in ops:
             consumed.update(op.hf_keys)
@@ -146,7 +100,7 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     Copy the HuggingFace safetensors weights under hf_root into model's live DTensor parameters.
 
     Only Shard(0) DTensor params are supported. Every local parameter is either filled exactly
-    once from HF or, when the selected loader disowns it (e.g. Qwen3.5's Gated DeltaNet
+    once from HF or, when the selected converter disowns it (e.g. Qwen3.5's Gated DeltaNet
     ``A_log``/``dt_bias``, which HF does not ship), left at its module-constructor init.
     """
     stdout = logging.stdout
@@ -154,11 +108,11 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     stdout.info("Load HF checkpoint: %s" % hf_root)
     t0 = time.monotonic()
 
-    loader = _select(hf_root)
-    stdout.info("Selected HF loader: %s" % loader.name)
+    converter = next((c for c in CONVERTERS if c.detect_hf(hf_root)), None)
+    stdout.info("Selected HF loader: %s" % (converter.name if converter else "generic"))
 
     weight_map, shards_dir = _read_weight_map(hf_root)
-    plan, consumed, skipped = _plan_copies(model, weight_map, loader)
+    plan, consumed, skipped = _plan_copies(model, weight_map, converter)
     for name in skipped:
         stdout.info("Leaving %s at constructor init (not in HF)" % name)
 
@@ -193,7 +147,11 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
                 filled += 1
 
     unmapped = set(weight_map.keys()) - consumed
-    expected = loader.expected_unmapped(unmapped)
+    # HF may ship a bare lm_head.weight the live model does not carry as a separate parameter
+    # (tied embeddings) — treat as expected, not a warning.
+    expected = {"lm_head.weight"} & unmapped
+    if hasattr(converter, "expected_unmapped"):
+        expected |= converter.expected_unmapped(unmapped)
     for hf_key in sorted(expected):
         if hf_key == "lm_head.weight":
             stdout.info("HF has lm_head.weight; model uses tied embeddings, skipping")
@@ -215,13 +173,3 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
         "Load HF checkpoint: %d ops, %d skipped, elapsed min=%.1fs, max=%.1fs"
         % (filled, len(skipped), dt_min.item(), dt_max.item())
     )
-
-
-_LOADERS: List[ModelHfLoader] = [GptOssHfLoader(), Qwen35MoeHfLoader(), GenericHfLoader()]
-
-
-def _select(hf_root: Path) -> ModelHfLoader:
-    for loader in _LOADERS:
-        if loader.detect_hf(hf_root):
-            return loader
-    raise RuntimeError("No HF loader claimed %s" % hf_root)
