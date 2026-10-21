@@ -45,8 +45,8 @@ def _snapshot_locals(model) -> dict:
 
 
 def _build_model(cfg) -> None:
-    # Match setup_training's RNG reset so both paths produce identical constructor init for
-    # params the loader disowns (Qwen3.5 GDN A_log uses uniform_(0, 16) at __init__ time).
+    # Match setup_training's RNG reset so both paths produce identical constructor init for any
+    # param a converter's owns_local disowns.
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
     setup_model(cfg.training, cfg.distributed)

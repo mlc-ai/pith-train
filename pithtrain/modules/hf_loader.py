@@ -86,7 +86,8 @@ def _plan_copies(
             skipped.append(name)
             continue
         ops = plan_param(name, param, weight_map, named_modules)
-        if not ops:
+        # FSDP2 may hand a rank an empty shard (dim 0 smaller than the mesh); nothing to copy.
+        if not ops and param._local_tensor.numel() > 0:
             raise RuntimeError("planning %s returned no CopyOps" % name)
         plan.extend(ops)
         for op in ops:
@@ -100,8 +101,8 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     Copy the HuggingFace safetensors weights under hf_root into model's live DTensor parameters.
 
     Only Shard(0) DTensor params are supported. Every local parameter is either filled exactly
-    once from HF or, when the selected converter disowns it (e.g. Qwen3.5's Gated DeltaNet
-    ``A_log``/``dt_bias``, which HF does not ship), left at its module-constructor init.
+    once from HF or, when the selected converter's ``owns_local`` disowns it, left at its
+    module-constructor init.
     """
     stdout = logging.stdout
     hf_root = Path(hf_root)
@@ -146,7 +147,11 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
                 op.dst.copy_(src.to(dtype=op.dst.dtype))
                 filled += 1
 
-    unmapped = set(weight_map.keys()) - consumed
+    # Each rank loads only its own PP stage, EP experts and FSDP shard, so a key is unmapped only
+    # when no rank consumed it.
+    gathered: List[Optional[set]] = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, consumed)
+    unmapped = set(weight_map.keys()).difference(*gathered)
     # HF may ship a bare lm_head.weight the live model does not carry as a separate parameter
     # (tied embeddings) — treat as expected, not a warning.
     expected = {"lm_head.weight"} & unmapped
@@ -157,8 +162,9 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
             stdout.info("HF has lm_head.weight; model uses tied embeddings, skipping")
         else:
             stdout.info("Expected unmapped HF key: %s" % hf_key)
-    for hf_key in sorted(unmapped - expected):
-        stdout.warning("Unmapped HF key: %s" % hf_key)
+    if torch.distributed.get_rank() == 0:
+        for hf_key in sorted(unmapped - expected):
+            stdout.warning("Unmapped HF key: %s" % hf_key)
 
     del plan, by_shard
     gc.collect()

@@ -99,12 +99,12 @@ def expert_range(mod: nn.Module) -> Tuple[int, int]:
 
 def local_shard_range(dim0_size: int, dp_rank: int, dp_size: int) -> Tuple[int, int]:
     """
-    Start offset and length of this DP rank's Shard(0) slice, matching FSDP2's even-with-remainder
-    split. Ranks 0..remainder-1 get one extra row.
+    Start offset and length of this DP rank's Shard(0) slice, matching FSDP2's torch.chunk split:
+    every rank gets ceil(dim0_size / dp_size) rows except the tail, which may be short or empty.
     """
-    chunk, remainder = divmod(dim0_size, dp_size)
-    start = dp_rank * chunk + min(dp_rank, remainder)
-    length = chunk + (1 if dp_rank < remainder else 0)
+    chunk = -(-dim0_size // dp_size)
+    start = min(dp_rank * chunk, dim0_size)
+    length = max(0, min(chunk, dim0_size - start))
     return start, length
 
 

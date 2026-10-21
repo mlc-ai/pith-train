@@ -38,8 +38,6 @@ _TEXT_PREFIX = "model.language_model."
 _DROP_PREFIXES = ("model.visual.", "mtp.")
 # Fused expert weights split per-expert in hf2dcp / re-stacked in dcp2hf.
 _EXPERT_SUFFIXES = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
-# Gated DeltaNet params HF does not ship; streaming load leaves them at constructor init.
-_INIT_ONLY_SUFFIXES = (".linear_attn.A_log", ".linear_attn.dt_bias")
 
 
 def _expert_base(canon_key: str) -> Tuple[str, int]:
@@ -201,10 +199,6 @@ class Qwen35MoeConverter:
         if canon == "lm_head.weight":
             return canon
         return "language_model." + canon
-
-    def owns_local(self, local_fqn: str) -> bool:
-        """Streaming load: Gated DeltaNet ``A_log``/``dt_bias`` are not in HF."""
-        return not local_fqn.endswith(_INIT_ONLY_SUFFIXES)
 
     def plan_param(
         self,
