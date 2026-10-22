@@ -4,6 +4,7 @@ The loss and gradients are compared with the reference implementation.
 """
 
 import argparse
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,11 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerTextExperts,
+    Qwen3OmniMoeThinkerTextModel,
+    Qwen3OmniMoeThinkerTextTopKRouter,
+)
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.cp_sequence import zigzag_varlen_index
@@ -37,12 +43,19 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupedLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, GptOssExperts):
+    elif isinstance(module, (GptOssExperts, Qwen3OmniMoeThinkerTextExperts)):
         # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
     elif isinstance(
-        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
+        module,
+        (
+            DeepSeekV2MoEGate,
+            Qwen3MoeGate,
+            GptOssTopKRouter,
+            Qwen35MoeTopKRouter,
+            Qwen3OmniMoeThinkerTextTopKRouter,
+        ),
     ):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
@@ -52,9 +65,18 @@ def fill_weights(module: nn.Module):
 
 
 def calculate_difference(x: torch.Tensor, y: torch.Tensor) -> float:
-    x, y = x.double(), y.double()
-    cos_diff = 1 - 2 * (x * y).sum().item() / (x * x + y * y).sum().item()
-    return cos_diff
+    # Expert tensors contain hundreds of millions of elements in the original Qwen case.
+    # Keep the same FP64 normalized squared-error metric without several full-size copies.
+    assert x.shape == y.shape, f"Gradient shapes differ: {x.shape} != {y.shape}"
+    x, y = x.reshape(-1), y.reshape(-1)
+    dot, squared_norm = 0.0, 0.0
+    for start in range(0, x.numel(), 1 << 20):
+        x_chunk = x[start : start + (1 << 20)].double()
+        y_chunk = y[start : start + (1 << 20)].double()
+        dot += torch.dot(x_chunk, y_chunk).item()
+        squared_norm += torch.dot(x_chunk, x_chunk).item() + torch.dot(y_chunk, y_chunk).item()
+    assert math.isfinite(dot) and math.isfinite(squared_norm), "Non-finite gradient comparison"
+    return 0.0 if squared_norm == 0 else 1 - 2 * dot / squared_norm
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -76,14 +98,13 @@ def objective(
 
 def reference_step(chunks, model: DeepSeekV2Model):
     """Run the reference forward/backward over the same micro-batches DualPipeV will see."""
-    ys, ls = [], []
+    ls = []
     for micro_x, micro_l, cu in chunks:
         micro_y = model.reference_forward(micro_x, cu)
         loss = criterion(micro_y, micro_l)
         loss.backward()
-        ys.append(micro_y)
-        ls.append(loss)
-    return torch.stack(ls), ys
+        ls.append(loss.detach())
+    return torch.stack(ls)
 
 
 def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
@@ -247,6 +268,9 @@ def main(model_name: str):
     elif config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
+    elif config.model_type == "qwen3_omni_moe_text":
+        ModelClass = Qwen3OmniMoeThinkerTextModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
         ModelClass = GptOssModel
         keep = min(config.num_hidden_layers, 8)
@@ -328,7 +352,11 @@ def main(model_name: str):
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
-    loss_refs = [reference_step(chunks, full_modules)[0] for chunks in chunk_steps]
+    loss_refs = [reference_step(chunks, full_modules) for chunks in chunk_steps]
+    # Reference gradients stay available on host for comparison. Keeping both
+    # full copies and their gradients on GPU makes the 8-layer Qwen case OOM.
+    full_modules.cpu()
+    torch.cuda.empty_cache()
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
     distributed.cp_size, distributed.cp_rank = cp_size, cp_rank
 
@@ -340,8 +368,9 @@ def main(model_name: str):
     num_stages = pp_size * 2
     local_full_modules = []
 
-    local_full_modules.append(ModelClass(config, phase=0))
-    local_full_modules.append(ModelClass(config, phase=1))
+    with torch.device("meta"):
+        local_full_modules.append(ModelClass(config, phase=0))
+        local_full_modules.append(ModelClass(config, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
     if pp_rank == 0:
@@ -353,8 +382,9 @@ def main(model_name: str):
         full_modules.layers, num_stages - 1 - pp_rank, num_stages, config
     )
     if ep_size > 1:
-        shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
-        shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
+        with torch.device("cpu"):
+            shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
+            shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
 
     # Create the local modules with the same weights but zero gradients.
     local_modules = []
@@ -427,16 +457,15 @@ def main(model_name: str):
         torch.distributed.barrier()
 
     # Validate the gradients.
+    print(f"[INFO] rank-{distributed.rank}: comparing gradients on CPU.", flush=True)
     eps = 1e-2
     largest_diff = 0
     largest_diff_param = None
     failed = False
 
     for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
-        if p.grad is None:
-            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, n))
-            failed = True
-            continue
+        assert p_ref.grad is not None, f"Reference parameter {n} has no gradient"
+        assert p.grad is not None, f"rank-{distributed.rank}: pipeline lost gradient for {n}"
         # Both parameter classes reduce with a plain sum over their own replica group, and either
         # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
         # and the expt replica group covers all the data too, since every member receives the
@@ -445,6 +474,7 @@ def main(model_name: str):
         p_grad = p.grad
         if isinstance(p_grad, torch.distributed.tensor.DTensor):
             p_grad = p_grad.full_tensor()
+        p_grad = p_grad.cpu()
         if cp_size > 1:
             # Each CP rank takes a mean over S/cp tokens, which is cp times its share of the
             # full-sequence mean, so the summed gradient overshoots the reference by exactly cp.
@@ -511,6 +541,13 @@ def _entry() -> None:
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
+
+    models.extend(
+        [
+            "tests/configs/qwen3_omni_text/tiny.json",
+            "examples/pretrain_lm/qwen3-omni-thinker-text/config.json",
+        ]
+    )
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
