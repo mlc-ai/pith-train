@@ -38,7 +38,7 @@ def forward(self, x, grouped_mm_offs, ks=None, ks_tensor=None):
 
 ```python
 # WRONG - scrambles the memory
-flat = dequantize_mxfp4(blocks, scales)    # [E, out, in]
+flat = _dequantize_mxfp4(blocks, scales)   # [E, out, in]
 # flat.view(E, in, out)                     # <-- this does NOT transpose
 
 # RIGHT - actually swaps the axes

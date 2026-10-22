@@ -6,8 +6,7 @@ Loads the same HF safetensors checkpoint two ways into an FSDP-sharded model:
      the existing dcp.load path.
   B. Under test: every rank streams straight from the HF shards via load_hf_into_model.
 
-Then asserts every local DTensor shard matches per parameter. Skips when the HF checkpoint is not
-present so the test is safe to include in a pytest sweep on a fresh workspace.
+Then asserts every local DTensor shard matches per parameter.
 """
 
 import argparse
@@ -25,19 +24,6 @@ from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.training import TrainingCfg, setup_model
 from pithtrain.tasks.convert_checkpoint._core import ConvertCheckpointCfg, hf2dcp
-
-
-def _hf_present(hf_ckpt: Path) -> bool:
-    return (
-        Path(hf_ckpt, "model.safetensors.index.json").is_file()
-        or Path(hf_ckpt, "model.safetensors").is_file()
-    )
-
-
-def _broadcast_present(present: bool) -> bool:
-    payload = [present]
-    torch.distributed.broadcast_object_list(payload, src=0)
-    return bool(payload[0])
 
 
 def _snapshot_locals(model) -> dict:
@@ -63,12 +49,6 @@ def main(model_config: str, hf_ckpt: Path) -> None:
             % (distributed.pp_size, distributed.ep_size, distributed.cp_size),
             flush=True,
         )
-
-    present = _broadcast_present(distributed.rank == 0 and _hf_present(hf_ckpt))
-    if not present:
-        if distributed.rank == 0:
-            print("[SKIP] HF checkpoint not present at %s" % hf_ckpt, flush=True)
-        return
 
     cfg = SimpleNamespace()
     cfg.distributed = DistributedCfg()

@@ -22,8 +22,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard
 
 from pithtrain.contexts import logging
 from pithtrain.modules.checkpoint import CopyOp, generic_plan_param
@@ -45,29 +43,9 @@ def _read_weight_map(hf_root: Path) -> Dict[str, str]:
             raw = json.load(f)["weight_map"]
     else:
         single = Path(hf_root, "model.safetensors")
-        if not single.is_file():
-            raise FileNotFoundError("No safetensors index or model.safetensors under %s" % hf_root)
         with safe_open(str(single), framework="pt", device="cpu") as f:
             raw = {k: "model.safetensors" for k in f.keys()}
     return {k.removeprefix("model."): v for k, v in raw.items()}
-
-
-def _assert_shardable(local_fqn: str, param: DTensor) -> None:
-    if not isinstance(param, DTensor):
-        raise RuntimeError(
-            "%s is not a DTensor; call load_hf_into_model after apply_fsdp" % local_fqn
-        )
-    if len(param.placements) > 1:
-        raise RuntimeError(
-            "%s: HSDP (hsdp_replica > 1) is not supported by load_hf_into_model; "
-            "use hf2dcp offline conversion instead" % local_fqn
-        )
-    if (
-        not param.placements
-        or not isinstance(param.placements[0], Shard)
-        or param.placements[0].dim != 0
-    ):
-        raise RuntimeError("%s: only Shard(0) placements are supported" % local_fqn)
 
 
 def _plan_copies(
@@ -79,11 +57,7 @@ def _plan_copies(
     plan_param = getattr(converter, "plan_param", None) or generic_plan_param
 
     for name, param in model.named_parameters():
-        _assert_shardable(name, param)
         ops = plan_param(name, param, weight_map, named_modules)
-        # FSDP2 may hand a rank an empty shard (dim 0 smaller than the mesh); nothing to copy.
-        if not ops and param._local_tensor.numel() > 0:
-            raise RuntimeError("planning %s returned no CopyOps" % name)
         plan.extend(ops)
         for op in ops:
             consumed.update(op.hf_keys)

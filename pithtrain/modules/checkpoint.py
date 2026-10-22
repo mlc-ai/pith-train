@@ -350,13 +350,7 @@ def generic_plan_param(
     if moe is None:
         (canon,) = canon_keys
         hf_key = remap(canon)
-        if hf_key not in weight_map:
-            raise KeyError("HF checkpoint missing %s for local param %s" % (hf_key, local_fqn))
         start, length = local_shard_range(param.shape[0], dp_rank, dp_size)
-        if length != local.shape[0]:
-            raise RuntimeError(
-                "%s: computed length %d != local shape %d" % (local_fqn, length, local.shape[0])
-            )
         return [
             CopyOp(
                 local_fqn=local_fqn,
@@ -369,17 +363,9 @@ def generic_plan_param(
         ]
 
     dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    if dp_len != local.shape[0]:
-        raise RuntimeError(
-            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
-        )
     ops: List[CopyOp] = []
     for i, canon in enumerate(canon_keys[dp_offset : dp_offset + dp_len]):
         hf_key = remap(canon)
-        if hf_key not in weight_map:
-            raise KeyError(
-                "HF checkpoint missing %s for local param %s expert %d" % (hf_key, local_fqn, i)
-            )
         ops.append(
             CopyOp(
                 local_fqn=local_fqn,
@@ -410,16 +396,9 @@ def fused_expert_ops(
     local = param._local_tensor
     moe = find_moe(local_fqn, named_modules)
     keys = hf_keys(strip_prefix(local_fqn).removesuffix(".weight"))
-    for key in keys:
-        if key not in weight_map:
-            raise KeyError("HF checkpoint missing %s for local param %s" % (key, local_fqn))
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
     dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
-    if dp_len != local.shape[0]:
-        raise RuntimeError(
-            "%s: expert dp_len %d != local shape %d" % (local_fqn, dp_len, local.shape[0])
-        )
     shard_files = tuple(weight_map[key] for key in keys)
     first = expert_range(moe)[0] + dp_offset
     return [
