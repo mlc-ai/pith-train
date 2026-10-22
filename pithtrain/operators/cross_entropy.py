@@ -24,16 +24,17 @@ def cross_entropy_fwd(
     n_non_ignore_ptr,
     ignore_idx,
     BLOCK_SIZE: tl.constexpr,
+    REDUCTION: tl.constexpr,
 ):
     """
     Fused cross-entropy forward: computes per-row loss and overwrites
-    the logit tensor in-place with mean-reduced gradients.
+    the logit tensor in-place with gradients for the requested reduction.
 
     Each program processes one row (token position). The kernel performs
     two passes over the vocabulary dimension:
       1. Online softmax: numerically stable max (m) and sum-of-exp (d).
-      2. Gradient write: softmax(x_i) / N for all i, then correct the
-         target position to (softmax(x_y) - 1) / N.
+      2. Gradient write: softmax(x_i) minus the target indicator, divided
+         by the valid-token count only for mean reduction.
 
     The per-row loss is stored separately for later summation.
     """
@@ -68,12 +69,21 @@ def cross_entropy_fwd(
         X_offsets = i + tl.arange(0, BLOCK_SIZE)
         X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf"))
         grad_dtype = X_block.dtype
-        X_block = (tl.exp(X_block.to(tl.float32) - m) / d) / n_non_ignore
-        tl.store(X_ptr + X_offsets, X_block.to(grad_dtype), mask=X_offsets < n_cols)
-
-    X_y = tl.load(X_ptr + y)
-    X_y += -1.0 / n_non_ignore
-    tl.store(X_ptr + y, X_y)
+        probability = tl.exp(X_block.to(tl.float32) - m) / d
+        # Correct the target in its owning lane before the only store. A
+        # separate scalar read/modify/write races with the vector stores from
+        # other warps, which can lose the correction or read the old logit.
+        if REDUCTION == "mean":
+            # Preserve the default mean API's existing BF16 rounding.
+            rounded = (probability / n_non_ignore).to(grad_dtype)
+            corrected = rounded.to(tl.float32) - 1.0 / n_non_ignore
+            gradient = tl.where(X_offsets == y, corrected, rounded.to(tl.float32))
+        else:
+            # Sum in FP32 before the single cast to the activation dtype.
+            # A BF16 mean followed by multiplication by the token count cannot
+            # recover the summed gradient that was rounded away.
+            gradient = probability - tl.where(X_offsets == y, 1.0, 0.0)
+        tl.store(X_ptr + X_offsets, gradient.to(grad_dtype), mask=X_offsets < n_cols)
 
     loss = -(ori_X_y - m - tl.log(d))
     tl.store(loss_ptr + row * loss_stride, loss)
@@ -86,7 +96,7 @@ class CrossEntropy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inp, target, ignore_index):
+    def forward(ctx, inp, target, ignore_index, reduction):
         n_rows, n_cols = inp.shape
 
         if inp.stride(-1) != 1 or inp.stride(-2) != n_cols:
@@ -111,10 +121,13 @@ class CrossEntropy(torch.autograd.Function):
             n_non_ignore_ptr=n_non_ignore,
             ignore_idx=ignore_index,
             BLOCK_SIZE=BLOCK_SIZE,
+            REDUCTION=reduction,
             num_warps=32,
         )
 
-        loss = loss_1d.sum() / n_non_ignore.float().squeeze()
+        loss = loss_1d.sum()
+        if reduction == "mean":
+            loss = loss / n_non_ignore.float().squeeze()
         ctx.save_for_backward(inp.detach())
         return loss
 
@@ -122,16 +135,17 @@ class CrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
         (inp,) = ctx.saved_tensors
         inp.mul_(grad_output.to(inp.dtype))
-        return inp, None, None
+        return inp, None, None, None
 
 
 def cross_entropy(
     inp: torch.Tensor,
     target: torch.Tensor,
     ignore_index: int = -100,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
-    In-place fused cross-entropy loss with mean reduction.
+    In-place fused cross-entropy loss with mean (default) or sum reduction.
 
     Overwrites ``inp`` with pre-computed gradients during the forward pass,
     eliminating the need for a separate activation tensor.  All arithmetic
@@ -147,10 +161,15 @@ def cross_entropy(
         Target indices of shape ``(N,)`` with values in ``[0, V-1]``.
     ignore_index : int
         Target value that is ignored in loss and gradient computation.
+    reduction : {"mean", "sum"}
+        Use "sum" for token-weighted training that normalizes accumulated FP32
+        gradients once after the data-parallel reduction.
 
     Returns
     -------
     torch.Tensor
-        Scalar mean cross-entropy loss (float32).
+        Scalar cross-entropy loss (float32).
     """
-    return CrossEntropy.apply(inp, target, ignore_index)
+    if reduction not in ("mean", "sum"):
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    return CrossEntropy.apply(inp, target, ignore_index, reduction)
