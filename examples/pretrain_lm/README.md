@@ -9,9 +9,12 @@ Tokenize the training corpus (one-time step):
 ```bash
 bash examples/tokenize_corpus/launch.sh dclm-qwen3
 bash examples/tokenize_corpus/launch.sh dclm-deepseek-v2
+bash examples/tokenize_corpus/launch.sh nemotron-cc-v2-qwen3
 ```
 
 See [tokenize_corpus](../tokenize_corpus/) for details.
+
+To use Nemotron-CC v2, set `cfg.dataset` in the model script to `workspace/datasets/nemotron-cc-v2/toktxt/<tokenizer>`.
 
 ## Step 2: Launch Training
 
