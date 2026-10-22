@@ -11,7 +11,7 @@ missing hook, or a checkpoint no converter claims, gets the generic
 behavior:
 
 - ``plan_param(local_fqn, param, weight_map, named_modules) -> List[CopyOp]``
-  (default ``checkpoint.generic_plan_param``)
+  (default ``_streaming.generic_plan_param``)
 - ``expected_unmapped(hf_keys) -> set``: HF keys beyond ``lm_head.weight``
   that are fine to leave unloaded (default none)
 """

@@ -24,7 +24,9 @@ import torch.nn as nn
 from safetensors import safe_open
 from torch.distributed.tensor import DTensor
 
-from pithtrain.modules.checkpoint import CopyOp, find_moe, fused_expert_ops, generic_plan_param
+from pithtrain.modules.checkpoint import find_moe
+
+from ._streaming import CopyOp, fused_expert_ops, generic_plan_param
 
 # HF keys that nest the text tower; stripped to canonical PithTrain keys.
 _TEXT_PREFIX = "model.language_model."

@@ -24,8 +24,8 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from pithtrain.contexts import logging
-from pithtrain.modules.checkpoint import CopyOp, generic_plan_param
 from pithtrain.tasks.convert_checkpoint._registry import CONVERTERS, ModelConverter
+from pithtrain.tasks.convert_checkpoint._streaming import CopyOp, generic_plan_param
 
 __all__ = ["load_hf_into_model"]
 
