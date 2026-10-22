@@ -34,7 +34,7 @@ def _read_weight_map(hf_root: Path) -> Dict[str, str]:
     """
     Return the key -> shard-file map of a sharded (index.json) or single-file HF checkpoint,
     with the ``model.`` prefix stripped from every key so downstream lookups share the same
-    canonical namespace as ``expand_localized_fqn``. ``lm_head.weight`` (already top-level) is
+    canonical namespace as ``checkpoint._expand_localized_fqn``. ``lm_head.weight`` (already top-level) is
     unaffected; ``model.language_model.foo`` becomes ``language_model.foo``.
     """
     index = Path(hf_root, "model.safetensors.index.json")

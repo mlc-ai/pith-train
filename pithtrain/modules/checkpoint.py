@@ -47,14 +47,12 @@ from pithtrain.contexts import distributed, logging, training
 
 __all__ = [
     "CopyOp",
-    "expand_localized_fqn",
     "find_checkpoint",
     "find_moe",
     "fused_expert_ops",
     "generic_plan_param",
     "iter_canonical_parameters",
     "load_checkpoint",
-    "local_shard_range",
     "save_checkpoint",
     "to_canonical_model",
     "to_canonical_optim",
@@ -99,17 +97,6 @@ def expert_range(mod: nn.Module) -> Tuple[int, int]:
     return start, start + mod.experts_per_rank
 
 
-def local_shard_range(dim0_size: int, dp_rank: int, dp_size: int) -> Tuple[int, int]:
-    """
-    Start offset and length of this DP rank's Shard(0) slice, matching FSDP2's torch.chunk split:
-    every rank gets ceil(dim0_size / dp_size) rows except the tail, which may be short or empty.
-    """
-    chunk = -(-dim0_size // dp_size)
-    start = min(dp_rank * chunk, dim0_size)
-    length = max(0, min(chunk, dim0_size - start))
-    return start, length
-
-
 def unwrap_dtensor_experts(value: Any, expected_n: int) -> Optional[Tuple[Any, int, int]]:
     """
     Extract local expert data from a DTensor without triggering all_gather.
@@ -141,7 +128,8 @@ def unwrap_dtensor_experts(value: Any, expected_n: int) -> Optional[Tuple[Any, i
             return None
         dp_rank = dt.device_mesh.get_local_rank()
         dp_size = dt.device_mesh.size()
-        dp_offset, _ = local_shard_range(expected_n, dp_rank, dp_size)
+        chunk, remainder = divmod(expected_n, dp_size)
+        dp_offset = dp_rank * chunk + min(dp_rank, remainder)
         return local, local.shape[0], dp_offset
 
     if isinstance(value, DTensor):
@@ -299,7 +287,7 @@ def iter_canonical_parameters() -> Iterator[Tuple[str, torch.Tensor]]:
         yield from unpack({localized_fqn: gathered}, named_modules, lambda v, n, i: v[i]).items()
 
 
-def expand_localized_fqn(localized_fqn: str, named_modules: Dict[str, nn.Module]) -> list:
+def _expand_localized_fqn(localized_fqn: str, named_modules: Dict[str, nn.Module]) -> list:
     """
     Map a localized (runtime) FQN to its canonical (disk) FQN(s), expanding stacked experts.
     """
@@ -342,7 +330,7 @@ def generic_plan_param(
     for prefix-nested checkpoints (e.g. Qwen3.5's ``language_model.``).
     """
     local = param._local_tensor
-    canon_keys = expand_localized_fqn(local_fqn, named_modules)
+    canon_keys = _expand_localized_fqn(local_fqn, named_modules)
     moe = find_moe(local_fqn, named_modules)
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
@@ -350,7 +338,9 @@ def generic_plan_param(
     if moe is None:
         (canon,) = canon_keys
         hf_key = remap(canon)
-        start, length = local_shard_range(param.shape[0], dp_rank, dp_size)
+        chunk, remainder = divmod(param.shape[0], dp_size)
+        start = dp_rank * chunk + min(dp_rank, remainder)
+        length = chunk + (1 if dp_rank < remainder else 0)
         return [
             CopyOp(
                 local_fqn=local_fqn,
@@ -362,7 +352,9 @@ def generic_plan_param(
             )
         ]
 
-    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
+    chunk, remainder = divmod(moe.experts_per_rank, dp_size)
+    dp_offset = dp_rank * chunk + min(dp_rank, remainder)
+    dp_len = chunk + (1 if dp_rank < remainder else 0)
     ops: List[CopyOp] = []
     for i, canon in enumerate(canon_keys[dp_offset : dp_offset + dp_len]):
         hf_key = remap(canon)
@@ -398,7 +390,9 @@ def fused_expert_ops(
     keys = hf_keys(strip_prefix(local_fqn).removesuffix(".weight"))
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
-    dp_offset, dp_len = local_shard_range(moe.experts_per_rank, dp_rank, dp_size)
+    chunk, remainder = divmod(moe.experts_per_rank, dp_size)
+    dp_offset = dp_rank * chunk + min(dp_rank, remainder)
+    dp_len = chunk + (1 if dp_rank < remainder else 0)
     shard_files = tuple(weight_map[key] for key in keys)
     first = expert_range(moe)[0] + dp_offset
     return [
@@ -445,7 +439,7 @@ def to_canonical_optim(optim_state: Dict, model: nn.Module) -> Dict:
     for g in optim_state["param_groups"]:
         group = {k: v for k, v in g.items() if k != "params"}
         group["params"] = [
-            cf for lf in g["params"] for cf in expand_localized_fqn(lf, named_modules)
+            cf for lf in g["params"] for cf in _expand_localized_fqn(lf, named_modules)
         ]
         param_groups.append(group)
     return {"state": state, "param_groups": param_groups}
