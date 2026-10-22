@@ -13,6 +13,7 @@ from typing import Dict, List, Protocol
 import torch
 
 from .gpt_oss import GptOssConverter
+from .qwen3_omni_moe import Qwen3OmniTextConverter
 from .qwen35_moe import Qwen35MoeConverter
 
 
@@ -37,4 +38,8 @@ class ModelConverter(Protocol):
         into the layout HF expects before sharding."""
 
 
-CONVERTERS: List[ModelConverter] = [GptOssConverter(), Qwen35MoeConverter()]
+CONVERTERS: List[ModelConverter] = [
+    GptOssConverter(),
+    Qwen35MoeConverter(),
+    Qwen3OmniTextConverter(),
+]
