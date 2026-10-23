@@ -23,6 +23,24 @@ Pipeline parallelism cuts at layer boundaries, so the tensors crossing between s
 inputs and carry this dtype. DualPipeV allocates its receive buffers with it.
 """
 
+deterministic_attention: bool = False
+"""
+Request FA4's ordered backward reductions for deterministic or strict-resume training.
+
+False preserves the ordinary training default. This controls FA4 itself; the
+PyTorch global deterministic-algorithm switch does not reach its CuTe kernels.
+It does not guarantee whole-model bitwise reproducibility on its own.
+"""
+
+deterministic_token_layout: bool = False
+"""
+Use stable Omni expert/EP token order for the explicit deterministic policy.
+
+Ordinary production uses fused dispatch. setup_training derives this and the
+FA4 policy from the same deterministic/strict_resume configuration. Stable
+reference_forward remains an independent oracle for either production mode.
+"""
+
 fp8: bool
 """
 Whether layers are built for FP8 compute, False for BF16.
