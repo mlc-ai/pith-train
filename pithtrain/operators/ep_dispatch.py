@@ -31,6 +31,7 @@ import triton
 import triton.language as tl
 
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
+from pithtrain.operators.stable_scatter import stable_dedup_prepare_dispatch
 from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
 
 
@@ -571,6 +572,8 @@ def prepare_dispatch(
     ep_size: int,
     experts_per_rank: int,
     ep_group: dist.ProcessGroup,
+    *,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, RoutingInfo]:
     """
     Expert-parallel dispatch with token deduplication.
@@ -578,7 +581,9 @@ def prepare_dispatch(
     When ep_size > 1, deduplicates tokens routed to the same EP rank via
     multiple experts to cut all-to-all volume, and computes expand_idx to
     reconstruct the full mapping on the receiver side. When ep_size == 1,
-    replicates each token once per selected expert.
+    replicates each token once per selected expert. ``deterministic=True`` also
+    fixes dedup and expert-slot order before all-to-all; stable local scatter
+    alone cannot remove ordering variation introduced by dispatch.
     """
 
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -598,7 +603,9 @@ def prepare_dispatch(
         idxs,
         expand_idx,
         send_meta,  # (ep_size, experts_per_rank + 1) interleaved: [tpe_0..., dedup_0, ...]
-    ) = fused_dedup_prepare_dispatch(topk_ids, num_experts, ep_size, experts_per_rank)
+    ) = (stable_dedup_prepare_dispatch if deterministic else fused_dedup_prepare_dispatch)(
+        topk_ids, num_experts, ep_size, experts_per_rank
+    )
 
     # -- Metadata all-to-all (piggyback dedup counts alongside per-expert token counts) --
     recv_meta = send_meta.new_empty(send_meta.shape[0])
