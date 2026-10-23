@@ -69,11 +69,14 @@ def cross_entropy_fwd(
         X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf"))
         grad_dtype = X_block.dtype
         X_block = (tl.exp(X_block.to(tl.float32) - m) / d) / n_non_ignore
+        # Correct the target in its owning lane before the only store. A
+        # separate scalar read/modify/write races with the vector stores from
+        # other warps, which can lose the correction or read the old logit.
+        # Preserve the original probability rounding for low-precision logits.
+        rounded = X_block.to(grad_dtype)
+        corrected = rounded.to(tl.float32) - 1.0 / n_non_ignore
+        X_block = tl.where(X_offsets == y, corrected, rounded.to(tl.float32))
         tl.store(X_ptr + X_offsets, X_block.to(grad_dtype), mask=X_offsets < n_cols)
-
-    X_y = tl.load(X_ptr + y)
-    X_y += -1.0 / n_non_ignore
-    tl.store(X_ptr + y, X_y)
 
     loss = -(ori_X_y - m - tl.log(d))
     tl.store(loss_ptr + row * loss_stride, loss)

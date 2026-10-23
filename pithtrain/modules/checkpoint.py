@@ -440,9 +440,11 @@ class CheckpointState(Stateful):
         optimizers: tuple[Optimizer, ...],
         schedulers: tuple[LRScheduler, ...],
         model_only: bool = False,
+        data_state: Stateful | None = None,
     ):
         self.model, self.optimizers, self.schedulers = model, optimizers, schedulers
         self.model_only = model_only
+        self.data_state = data_state
 
     def state_dict(self):
         """
@@ -463,7 +465,10 @@ class CheckpointState(Stateful):
         model_state = to_canonical_model(model_state, self.model)
         optim_state = to_canonical_optim(optim_state, self.model)
         sched_state = [s.state_dict() for s in self.schedulers]
-        return {"model": model_state, "optimizer": optim_state, "scheduler": sched_state}
+        result = {"model": model_state, "optimizer": optim_state, "scheduler": sched_state}
+        if self.data_state is not None:
+            result["data"] = self.data_state.state_dict()
+        return result
 
     def load_state_dict(self, state_dict):
         """
@@ -476,6 +481,8 @@ class CheckpointState(Stateful):
         Released checkpoints from HuggingFace do not necessarily include optimizer and scheduler
         state, so those are skipped when missing.
         """
+        if self.data_state is not None:
+            self.data_state.load_state_dict(state_dict["data"])
         model_state = to_localized_model(state_dict["model"], self.model)
         optim_state = state_dict.get("optimizer")
         sched_state = state_dict.get("scheduler")
@@ -492,7 +499,7 @@ class CheckpointState(Stateful):
                 scheduler.load_state_dict(st)
 
 
-def save_checkpoint(root: Path, step: int) -> None:
+def save_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None) -> None:
     """
     Save the runtime model, optimizers and schedulers as the step checkpoint under root. The step is
     a count of completed work, the same number find_checkpoint reports and load_checkpoint takes.
@@ -513,6 +520,8 @@ def save_checkpoint(root: Path, step: int) -> None:
     state_dict["app"]["model"] = to_canonical_model(model_state, model)
     state_dict["app"]["optimizer"] = to_canonical_optim(optim_state, model)
     state_dict["app"]["scheduler"] = [s.state_dict() for s in schedulers]
+    if data_state is not None:
+        state_dict["app"]["data"] = data_state.state_dict()
 
     stdout.info("Save checkpoint: %s" % location)
     t0 = time.monotonic()
@@ -530,7 +539,7 @@ def save_checkpoint(root: Path, step: int) -> None:
     stdout.info("Save checkpoint: elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def load_checkpoint(root: Path, step: int) -> None:
+def load_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None) -> None:
     """
     Load the step checkpoint under root into the runtime state: the model, plus the optimizers and
     schedulers when the checkpoint carries them. One converted from HuggingFace carries model keys
@@ -550,7 +559,13 @@ def load_checkpoint(root: Path, step: int) -> None:
     metadata = FileSystemReader(str(location)).read_metadata()
     model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
-    state = CheckpointState(model, optimizers, schedulers, model_only=model_only)
+    if data_state is not None and not any(
+        k.startswith("app.data.") for k in metadata.state_dict_metadata
+    ):
+        raise ValueError("This checkpoint has no data state; it cannot resume prepared Omni data")
+    state = CheckpointState(
+        model, optimizers, schedulers, model_only=model_only, data_state=data_state
+    )
     dcp.load({"app": state}, checkpoint_id=location)
     rank = torch.distributed.get_rank()
     rng_path = Path(location, "rng-rank-%05d.pt" % rank)
