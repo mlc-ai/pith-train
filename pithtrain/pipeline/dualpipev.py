@@ -577,6 +577,9 @@ class DualPipeV(nn.Module):
             detached in place after its backward, so return loss.detach() if the value is needed
             once the step is done.
         """
+        assert not (training.offloaded and self is training.model), (
+            "training state is offloaded; call reload_training_state"
+        )
         self.forward_only = not torch.is_grad_enabled()
 
         # ZeRO-1 for the step: no resharding or gradient sync after backward, and no root

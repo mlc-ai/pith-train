@@ -162,6 +162,8 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 Process-global runtime state, one module per concern (`distributed`, `training`, `logging`). Each holds values that are set once at startup by the matching `setup_*` function and constant thereafter, so code reads them in-line instead of threading them through every constructor and call. Import the module and read fields off it (`distributed.ep_group`), never the bare names — a field does not exist until its `setup_*` runs, so `from ... import ep_group` fails at import and reading it before setup raises `AttributeError`.
 
+The exceptions are two fields in `training` that change during a run: `current_microbatch`, which `DualPipeV.step` sets before each forward, and `offloaded`, which `offload_training_state` sets and `reload_training_state` clears. Both start from a default, so a bare import of either succeeds but freezes the default.
+
 ## Agent Skills
 
 This repository ships agent-native workflows under `.agents/skills/`, loaded automatically. Invoke a skill whenever a request matches one instead of re-deriving the workflow from scratch.
