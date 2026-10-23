@@ -27,7 +27,15 @@ class ModelConverter(Protocol):
     def detect_dcp(self, metadata) -> bool:
         """True if this converter should postprocess the given DCP metadata."""
 
-    def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
+    def hf2dcp(
+        self,
+        load_path: Path,
+        save_path: Path,
+        stdout: Logger,
+        *,
+        max_chunk_size: int,
+        max_shard_size: int,
+    ) -> None:
         """Full HF->DCP conversion (replaces the generic path)."""
 
     def postprocess_canonical(
