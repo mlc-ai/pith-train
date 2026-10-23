@@ -155,6 +155,7 @@ class DeepSeekV2MoEGate(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)  # fmt: skip
         scores = logits.softmax(dim=-1, dtype=torch.float32)
+        unmasked_scores = scores
         if self.topk_method == "group_limited_greedy":
             n_tokens = scores.shape[0]
             group_scores = scores.view(n_tokens, self.num_group, -1).max(dim=-1).values
@@ -165,8 +166,9 @@ class DeepSeekV2MoEGate(nn.Module):
             scores = scores.masked_fill(~score_mask.bool(), 0.0)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         if replay_idx is not None:
+            # Replayed experts outside the live groups retain their unmasked probabilities.
             topk_idx = replay_idx
-            topk_weight = scores.gather(-1, topk_idx)
+            topk_weight = unmasked_scores.gather(-1, topk_idx)
         topk_weight = topk_weight * self.routed_scaling_factor
         if self.load_balance_loss_fn is None:
             return topk_idx, topk_weight, None

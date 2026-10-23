@@ -178,6 +178,7 @@ class HFPrefixGate(nn.Module):  # TODO_HF rename to match HF
         # Replayed indices are resolved in eager by replay_indices and passed in as an input, so
         # the compiled gate never reads self.router_replay.
         if replay_idx is not None:
+            # If the gate masks scores by group, gather replay weights from the unmasked scores.
             topk_idx = replay_idx
             topk_weight = scores.gather(-1, topk_idx)
         if self.norm_topk_prob:

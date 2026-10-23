@@ -86,7 +86,8 @@ def records_empty(model: DualPipeV) -> bool:
 def reference_step(chunks, model: DeepSeekV2Model):
     """Run the reference forward/backward over the same micro-batches DualPipeV will see."""
     ys, ls = [], []
-    for micro_x, micro_l, cu in chunks:
+    for i, (micro_x, micro_l, cu) in enumerate(chunks):
+        training.current_microbatch = i
         micro_y = model.reference_forward(micro_x, cu)
         loss = criterion(micro_y, micro_l)
         loss.backward()
@@ -109,6 +110,41 @@ def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
     front = cp_rank * block
     back = (2 * cp_size - cp_rank - 1) * block
     return torch.cat([x[:, front : front + block], x[:, back : back + block]], dim=1)
+
+
+def replay_store(layer_idx: int, num_experts: int, micro_batch_size: int, offset: int, chunks):
+    """
+    Serve deterministic routes by layer and global micro-batch, cut to this rank's zigzag shard.
+    Exclude the last expert to detect ignored replay, and alternate int64/int32 across layers.
+    """
+
+    def replay(num_tokens: int, top_k: int) -> torch.Tensor:
+        microbatch = offset + training.current_microbatch
+        seq_len = num_tokens // micro_batch_size * distributed.cp_size
+        # A CPU generator draws the same routes on every rank, the reference's included.
+        generator = torch.Generator().manual_seed(microbatch * 1000 + layer_idx)
+        routes = torch.rand(micro_batch_size, seq_len, num_experts - 1, generator=generator, device="cpu")  # fmt: skip
+        routes = routes.topk(top_k).indices
+        cu = chunks[training.current_microbatch][2]
+        if cu is None:
+            routes = zigzag_shard(routes, distributed.cp_rank, distributed.cp_size)
+        else:
+            # Match the actual packed documents used to shard the hidden states.
+            index = zigzag_varlen_index(distributed.cp_rank, distributed.cp_size, cu.cpu(), seq_len)
+            routes = routes[:, index]
+        dtype = torch.int32 if layer_idx % 2 else torch.int64
+        return routes.reshape(num_tokens, top_k).to(distributed.device, dtype)
+
+    return replay
+
+
+def install_router_replay(model: nn.Module, micro_batch_size: int, offset: int, chunks) -> None:
+    for layer in model.layers.values():
+        gate = getattr(layer.mlp, "gate", None) or getattr(layer.mlp, "router", None)
+        if gate is not None:
+            gate.router_replay = replay_store(
+                layer.idx, gate.num_experts, micro_batch_size, offset, chunks
+            )
 
 
 def shard_layers(layers: nn.ModuleDict, stage_id: int, num_stages: int, config):
@@ -257,6 +293,7 @@ def main(model_name: str):
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
+    replay = os.environ.get("ROUTER_REPLAY", "0") == "1"
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
     num_chunks = 20
     sequence_length = int(os.environ.get("SEQUENCE_LENGTH", "128"))
@@ -351,7 +388,18 @@ def main(model_name: str):
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
-    loss_refs = [reference_step(chunks, full_modules)[0] for chunks in chunk_steps]
+    loss_refs = []
+    for step_index, chunks in enumerate(chunk_steps):
+        if replay:
+            install_router_replay(
+                full_modules, micro_batch_size, step_index * num_global_chunks, chunks
+            )
+        loss_refs.append(reference_step(chunks, full_modules)[0])
+    if replay:
+        # Catch replay ignored by both paths: the unused expert must have zero gradient.
+        for n, p in full_modules.named_parameters():
+            if ".experts." in n:
+                assert not p.grad[-1].any(), f"{n}: a layer ignored the replayed routes"
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
     distributed.cp_size, distributed.cp_rank = cp_size, cp_rank
 
@@ -422,6 +470,10 @@ def main(model_name: str):
             )
             for x, lab, cu in local_chunks
         ]
+        if replay:
+            offset = step_index * num_global_chunks + dp_rank * num_chunks
+            for module in local_modules:
+                install_router_replay(module, micro_batch_size, offset, local_chunks)
 
         if distributed.rank == 0:
             print("[INFO] Running DualPipeV step %d." % step_index, flush=True)
