@@ -14,14 +14,9 @@ from pithtrain.modules.checkpoint import _expand_localized_fqn, expert_range, fi
 
 
 class CopyOp(NamedTuple):
-    """One contiguous write into a local param.
-
-    Non-expert Shard(0): dst is the whole ``param._local_tensor``, ``row_slice`` is this rank's
-    FSDP window on the source, ``transform`` is None.
-    Stacked-expert: dst is ``param._local_tensor[i]`` when the HF key is already per-expert
-    (``row_slice`` is slice(None)), or ``param._local_tensor[i:i+1]`` when ``row_slice`` selects
-    one row of a fused HF expert tensor; ``transform`` runs MXFP4 dequant on the paired
-    ``(blocks, scales)`` slabs when needed.
+    """
+    One write into a local param: rows ``row_slice`` of ``hf_keys``, combined by ``transform``
+    when set (MXFP4 dequant), copied into ``dst``.
     """
 
     local_fqn: str
@@ -40,8 +35,8 @@ def generic_plan_param(
     remap: Callable[[str], str] = lambda k: k,
 ) -> List[CopyOp]:
     """
-    Plan a param the way the generic path handles it, with an optional canonical->HF key remap
-    for prefix-nested checkpoints (e.g. Qwen3.5's ``language_model.``).
+    Plan a dense param, or a stacked-expert param whose HF checkpoint stores one tensor per expert
+    (Qwen3, DeepSeek-V2). ``remap`` maps a canonical key to its HF key.
     """
     local = param._local_tensor
     canon_keys = _expand_localized_fqn(local_fqn, named_modules)
@@ -52,9 +47,9 @@ def generic_plan_param(
     if moe is None:
         (canon,) = canon_keys
         hf_key = remap(canon)
-        chunk, remainder = divmod(param.shape[0], dp_size)
-        start = dp_rank * chunk + min(dp_rank, remainder)
-        length = chunk + (1 if dp_rank < remainder else 0)
+        chunk = -(-param.shape[0] // dp_size)
+        start = min(dp_rank * chunk, param.shape[0])
+        length = max(0, min(chunk, param.shape[0] - start))
         return [
             CopyOp(
                 local_fqn=local_fqn,
@@ -66,9 +61,9 @@ def generic_plan_param(
             )
         ]
 
-    chunk, remainder = divmod(moe.experts_per_rank, dp_size)
-    dp_offset = dp_rank * chunk + min(dp_rank, remainder)
-    dp_len = chunk + (1 if dp_rank < remainder else 0)
+    chunk = -(-moe.experts_per_rank // dp_size)
+    dp_offset = min(dp_rank * chunk, moe.experts_per_rank)
+    dp_len = max(0, min(chunk, moe.experts_per_rank - dp_offset))
     ops: List[CopyOp] = []
     for i, canon in enumerate(canon_keys[dp_offset : dp_offset + dp_len]):
         hf_key = remap(canon)
@@ -95,18 +90,17 @@ def fused_expert_ops(
 ) -> List[CopyOp]:
     """
     Plan a stacked-expert param whose HF checkpoint fuses every expert into one ``[E, ...]``
-    tensor (GPT-OSS, Qwen3.5): one CopyOp per local expert, reading that expert's row.
-    ``hf_keys`` maps the fused canonical key (e.g. ``layers.1.mlp.experts.gate_up_proj``) to the
-    HF key(s) read together, which ``transform`` combines (e.g. MXFP4 blocks + scales).
+    tensor (GPT-OSS, Qwen3.5), one CopyOp per local expert. ``hf_keys`` maps the fused canonical
+    key to the HF key(s) read for it.
     """
     local = param._local_tensor
     moe = find_moe(local_fqn, named_modules)
     keys = hf_keys(strip_prefix(local_fqn).removesuffix(".weight"))
     dp_rank = param.device_mesh.get_local_rank()
     dp_size = param.device_mesh.size()
-    chunk, remainder = divmod(moe.experts_per_rank, dp_size)
-    dp_offset = dp_rank * chunk + min(dp_rank, remainder)
-    dp_len = chunk + (1 if dp_rank < remainder else 0)
+    chunk = -(-moe.experts_per_rank // dp_size)
+    dp_offset = min(dp_rank * chunk, moe.experts_per_rank)
+    dp_len = max(0, min(chunk, moe.experts_per_rank - dp_offset))
     shard_files = tuple(weight_map[key] for key in keys)
     first = expert_range(moe)[0] + dp_offset
     return [

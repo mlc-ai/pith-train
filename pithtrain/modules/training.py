@@ -172,10 +172,9 @@ class TrainingCfg(SlottedDefault):
 
     hf_import_path: Optional[Path] = None
     """
-    HuggingFace safetensors directory. Consulted at startup only when no DCP checkpoint exists
-    under save_location: weights stream directly into the FSDP-sharded parameters, bypassing
-    hf2dcp. DCP resume wins when both are set. Supports Qwen3, DeepSeek-V2, GPT-OSS (MXFP4
-    checkpoints only), and Qwen3.5-MoE. Not compatible with hsdp_replica > 1.
+    A HuggingFace safetensors directory to stream the initial weights from, skipping hf2dcp.
+    Used only when save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS
+    (MXFP4) and Qwen3.5-MoE; not compatible with hsdp_replica > 1.
     """
 
     save_interval: Optional[int] = None

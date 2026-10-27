@@ -5,15 +5,9 @@ insufficient (quantized weights, stacked experts with HF-side
 transposes). Converters are tried in order; the first whose detect_*
 returns True wins.
 
-``pithtrain.modules.hf_loader`` (streaming HF -> FSDP load) also dispatches
-over CONVERTERS. A converter may define any of these optional hooks; a
-missing hook, or a checkpoint no converter claims, gets the generic
-behavior:
-
-- ``plan_param(local_fqn, param, weight_map, named_modules) -> List[CopyOp]``
-  (default ``_streaming.generic_plan_param``)
-- ``expected_unmapped(hf_keys) -> set``: HF keys beyond ``lm_head.weight``
-  that are fine to leave unloaded (default none)
+``pithtrain.modules.hf_loader`` also dispatches over CONVERTERS, using two
+optional hooks: ``plan_param`` (default ``_streaming.generic_plan_param``) and
+``expected_unmapped``, the HF keys that are fine to leave unloaded.
 """
 
 from logging import Logger

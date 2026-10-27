@@ -1,15 +1,8 @@
 """
-Stream a HuggingFace safetensors checkpoint into a live FSDP-sharded model.
+Stream a HuggingFace safetensors checkpoint into a live FSDP-sharded model, skipping hf2dcp.
 
-Skips the offline hf2dcp conversion: each rank memmaps only the byte ranges belonging to its own
-DTensor shards and copies them straight into _local_tensor. No GPU all-gather. No full-model
-materialization on any rank. Multi-rank reads of the same shard files are handled by the OS page
-cache via safetensors' mmap.
-
-Per-model quirks (MXFP4 dequant for GPT-OSS, fused expert layout and vision/mtp drops for
-Qwen3.5-MoE) are delegated to the optional streaming hooks on the matching converter in
-``pithtrain.tasks.convert_checkpoint._registry.CONVERTERS``. A checkpoint no converter claims
-(Qwen3, DeepSeek-V2), or a hook a converter does not define, gets the generic behavior.
+Each rank reads only the rows of its own shards from the safetensors files. Per-model quirks live
+in optional hooks on the matching converter in ``convert_checkpoint._registry``.
 """
 
 import contextlib
@@ -28,22 +21,6 @@ from pithtrain.tasks.convert_checkpoint._registry import CONVERTERS, ModelConver
 from pithtrain.tasks.convert_checkpoint._streaming import CopyOp, generic_plan_param
 
 __all__ = ["load_hf_into_model"]
-
-
-def _read_weight_map(hf_root: Path) -> Dict[str, str]:
-    """
-    Return the tensor-name -> shard-file map of a sharded (index.json) or single-file HF
-    checkpoint, keyed by the names stored in the files (e.g. ``model.layers.0...``).
-    """
-    index = Path(hf_root, "model.safetensors.index.json")
-    if index.is_file():
-        with open(index) as f:
-            raw = json.load(f)["weight_map"]
-    else:
-        single = Path(hf_root, "model.safetensors")
-        with safe_open(str(single), framework="pt", device="cpu") as f:
-            raw = {k: "model.safetensors" for k in f.keys()}
-    return raw
 
 
 def _plan_copies(
@@ -66,9 +43,7 @@ def _plan_copies(
 def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     """
     Copy the HuggingFace safetensors weights under hf_root into model's live DTensor parameters.
-
-    Only Shard(0) DTensor params are supported. Every local parameter is filled exactly once
-    from HF.
+    Only Shard(0) params are supported.
     """
     stdout = logging.stdout
     hf_root = Path(hf_root)
@@ -78,9 +53,9 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     converter = next((c for c in CONVERTERS if c.detect_hf(hf_root)), None)
     stdout.info("Selected HF loader: %s" % (converter.name if converter else "generic"))
 
-    raw = _read_weight_map(hf_root)
-    # Planners look keys up without the ``model.`` prefix, in the canonical namespace of
-    # checkpoint._expand_localized_fqn; reads use the name stored in the file.
+    with open(Path(hf_root, "model.safetensors.index.json")) as f:
+        raw = json.load(f)["weight_map"]
+    # Planners look up keys without the "model." prefix; reads use the name stored in the file.
     file_key = {k.removeprefix("model."): k for k in raw}
     weight_map = {k: raw[v] for k, v in file_key.items()}
     plan, consumed = _plan_copies(model, weight_map, converter)
@@ -115,13 +90,11 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
                 op.dst.copy_(src.to(dtype=op.dst.dtype))
                 filled += 1
 
-    # Each rank loads only its own PP stage, EP experts and FSDP shard, so a key is unmapped only
-    # when no rank consumed it.
+    # Each rank loads only its own shards, so a key is unmapped only if no rank consumed it.
     gathered: List[Optional[set]] = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(gathered, consumed)
     unmapped = set(weight_map.keys()).difference(*gathered)
-    # HF may ship a bare lm_head.weight the live model does not carry as a separate parameter
-    # (tied embeddings) — treat as expected, not a warning.
+    # An unloaded lm_head.weight means the model ties embeddings: expected, not a warning.
     expected = {"lm_head.weight"} & unmapped
     if hasattr(converter, "expected_unmapped"):
         expected |= converter.expected_unmapped(unmapped)
