@@ -76,11 +76,6 @@ _EXPERT_BIAS_LEAVES = {"gate_up_proj_bias", "down_proj_bias"}
 _EXPERT_MXFP4_LEAVES = {"gate_up_proj", "down_proj"}
 
 
-def _mxfp4_transform(srcs: List[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
-    # srcs are [1, out, G, 16] blocks + [1, out, G] scales; dequant yields [1, out, G*B*2].
-    return _dequantize_mxfp4(srcs[0], srcs[1], dtype=dtype)
-
-
 class GptOssConverter:
     name: str = "gpt_oss"
 
@@ -203,7 +198,7 @@ class GptOssConverter:
         if find_moe(local_fqn, named_modules) is not None:
             if leaf in _EXPERT_MXFP4_LEAVES:
                 keys = lambda k: (k + "_blocks", k + "_scales")
-                return fused_expert_ops(*args, keys, transform=_mxfp4_transform)
+                return fused_expert_ops(*args, keys, transform=_dequantize_mxfp4)
             if leaf in _EXPERT_BIAS_LEAVES:
                 return fused_expert_ops(*args, lambda k: (k,))
         return generic_plan_param(*args)

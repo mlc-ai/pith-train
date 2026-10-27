@@ -29,7 +29,7 @@ class CopyOp(NamedTuple):
     hf_keys: Tuple[str, ...]
     shard_files: Tuple[str, ...]
     row_slice: slice
-    transform: Optional[Callable[[List[torch.Tensor], torch.dtype], torch.Tensor]]
+    transform: Optional[Callable[..., torch.Tensor]]
 
 
 def generic_plan_param(
@@ -91,7 +91,7 @@ def fused_expert_ops(
     weight_map: Dict[str, str],
     named_modules: Dict[str, nn.Module],
     hf_keys: Callable[[str], Tuple[str, ...]],
-    transform: Optional[Callable[[List[torch.Tensor], torch.dtype], torch.Tensor]] = None,
+    transform: Optional[Callable[..., torch.Tensor]] = None,
 ) -> List[CopyOp]:
     """
     Plan a stacked-expert param whose HF checkpoint fuses every expert into one ``[E, ...]``

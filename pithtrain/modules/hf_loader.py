@@ -104,7 +104,7 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
                     handles[shard].get_slice(key)[op.row_slice]
                     for key, shard in zip(op.hf_keys, op.shard_files)
                 ]
-                src = op.transform(srcs, op.dst.dtype) if op.transform is not None else srcs[0]
+                src = op.transform(*srcs, dtype=op.dst.dtype) if op.transform else srcs[0]
                 if tuple(src.shape) != tuple(op.dst.shape):
                     raise RuntimeError(
                         "%s: shape mismatch, HF %s slice %s vs local %s"
