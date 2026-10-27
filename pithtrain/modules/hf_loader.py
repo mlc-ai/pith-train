@@ -32,10 +32,8 @@ __all__ = ["load_hf_into_model"]
 
 def _read_weight_map(hf_root: Path) -> Dict[str, str]:
     """
-    Return the key -> shard-file map of a sharded (index.json) or single-file HF checkpoint,
-    with the ``model.`` prefix stripped from every key so downstream lookups share the same
-    canonical namespace as ``checkpoint._expand_localized_fqn``. ``lm_head.weight`` (already top-level) is
-    unaffected; ``model.language_model.foo`` becomes ``language_model.foo``.
+    Return the tensor-name -> shard-file map of a sharded (index.json) or single-file HF
+    checkpoint, keyed by the names stored in the files (e.g. ``model.layers.0...``).
     """
     index = Path(hf_root, "model.safetensors.index.json")
     if index.is_file():
@@ -45,7 +43,7 @@ def _read_weight_map(hf_root: Path) -> Dict[str, str]:
         single = Path(hf_root, "model.safetensors")
         with safe_open(str(single), framework="pt", device="cpu") as f:
             raw = {k: "model.safetensors" for k in f.keys()}
-    return {k.removeprefix("model."): v for k, v in raw.items()}
+    return raw
 
 
 def _plan_copies(
@@ -80,7 +78,11 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     converter = next((c for c in CONVERTERS if c.detect_hf(hf_root)), None)
     stdout.info("Selected HF loader: %s" % (converter.name if converter else "generic"))
 
-    weight_map = _read_weight_map(hf_root)
+    raw = _read_weight_map(hf_root)
+    # Planners look keys up without the ``model.`` prefix, in the canonical namespace of
+    # checkpoint._expand_localized_fqn; reads use the name stored in the file.
+    file_key = {k.removeprefix("model."): k for k in raw}
+    weight_map = {k: raw[v] for k, v in file_key.items()}
     plan, consumed = _plan_copies(model, weight_map, converter)
 
     by_shard: Dict[str, List[CopyOp]] = {}
@@ -101,7 +103,7 @@ def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
             stdout.info("Load HF shard: %s (%d ops)" % (shard_name, len(entries)))
             for op in entries:
                 srcs = [
-                    handles[shard].get_slice(key)[op.row_slice]
+                    handles[shard].get_slice(file_key[key])[op.row_slice]
                     for key, shard in zip(op.hf_keys, op.shard_files)
                 ]
                 src = op.transform(*srcs, dtype=op.dst.dtype) if op.transform else srcs[0]
