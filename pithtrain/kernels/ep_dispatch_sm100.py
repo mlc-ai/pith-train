@@ -2,7 +2,8 @@
 Triton kernels of the ep_dispatch feature (SM100 path, and the SM90 fallback). The sender side is
 three launches: a per-CTA bincount (tl.histogram, no atomics), a single-CTA reduce + prefix sum that
 also builds send_meta, and a dedup scatter + counting sort that places rows with atomic_add, so the
-order within a bucket is launch-dependent.
+order within a bucket is launch-dependent. The receiver side is two: a single-CTA prefix sum of the
+received segment counts, then a binary search per slot.
 """
 
 import torch
@@ -242,19 +243,46 @@ def ep_dispatch_send_idx_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size
 
 
 @triton.jit
-def expert_and_expand_idx_kernel(
+def recv_segment_ends_kernel(
     recv_meta_ptr,  # [EP_SIZE * (EXPERTS_PER_RANK + 1)] int64, input
+    seg_end_ptr,  # [EP_SIZE * EXPERTS_PER_RANK] int64, output
+    dedup_start_ptr,  # [EP_SIZE] int64, output
+    EP_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    SEG_PADDED: tl.constexpr,  # next_power_of_2(EP_SIZE * EXPERTS_PER_RANK)
+    EP_PADDED: tl.constexpr,  # next_power_of_2(EP_SIZE)
+):
+    """
+    One CTA: the inclusive cumulative slot count of every (sender, expert) segment, sender-major,
+    and the exclusive cumulative dedup count of every sender.
+    """
+    seg = tl.arange(0, SEG_PADDED)
+    seg_mask = seg < EP_SIZE * EXPERTS_PER_RANK
+    seg_count = tl.load(recv_meta_ptr + seg // EXPERTS_PER_RANK * (EXPERTS_PER_RANK + 1) + seg % EXPERTS_PER_RANK, mask=seg_mask, other=0)
+    tl.store(seg_end_ptr + seg, tl.cumsum(seg_count, 0), mask=seg_mask)
+    sender = tl.arange(0, EP_PADDED)
+    sender_mask = sender < EP_SIZE
+    dedup = tl.load(recv_meta_ptr + sender * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK, mask=sender_mask, other=0)
+    tl.store(dedup_start_ptr + sender, tl.cumsum(dedup, 0) - dedup, mask=sender_mask)
+
+
+@triton.jit
+def expert_and_expand_idx_kernel(
+    seg_end_ptr,  # [NUM_SEGS] int64, input
+    dedup_start_ptr,  # [EP_SIZE] int64, input
     received_expand_idx_ptr,  # [total] int64, input
     expert_idxs_ptr,  # [total] int64, output
     expand_idx_ptr,  # [total] int64, output
     total,
-    EP_SIZE: tl.constexpr,
+    NUM_SEGS: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,  # ceil(log2(NUM_SEGS + 1))
     BLOCK: tl.constexpr,
 ):
     """
-    Per received slot: its local expert, found by an unrolled pass over the (sender, expert)
-    segments, and its expand_idx plus the dedup counts of the preceding senders.
+    Per received slot: its segment, the first whose cumulative end exceeds the slot (a binary
+    search over seg_end, so the cost and the compile time grow with log2 of the segment count),
+    hence its local expert, and its expand_idx plus the dedup counts of the preceding senders.
 
     total is a kernel argument, not a device-side sum, so the store mask and the caller's allocation
     are the same number (a mismatch would write out of bounds).
@@ -262,31 +290,29 @@ def expert_and_expand_idx_kernel(
     pid = tl.program_id(0)
     slot_offs = pid * BLOCK + tl.arange(0, BLOCK)
     slot_mask = slot_offs < total
-
-    expert_idx = tl.zeros([BLOCK], dtype=tl.int64)
-    slot_dedup_start = tl.zeros([BLOCK], dtype=tl.int64)
-    seg_start = tl.zeros([], dtype=tl.int64)
-    dedup_start = tl.zeros([], dtype=tl.int64)
-    for sender_idx in tl.static_range(EP_SIZE):
-        for local_expert_idx in tl.static_range(EXPERTS_PER_RANK):
-            seg_count = tl.load(recv_meta_ptr + sender_idx * (EXPERTS_PER_RANK + 1) + local_expert_idx)
-            is_in_seg = (slot_offs >= seg_start) & (slot_offs < seg_start + seg_count)
-            expert_idx, slot_dedup_start = tl.where(is_in_seg, local_expert_idx, expert_idx), tl.where(is_in_seg, dedup_start, slot_dedup_start)
-            seg_start += seg_count
-        dedup_start += tl.load(recv_meta_ptr + sender_idx * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK)
-
+    lo, hi = tl.zeros([BLOCK], dtype=tl.int64), tl.full([BLOCK], NUM_SEGS, dtype=tl.int64)
+    for _ in tl.static_range(SEARCH_STEPS):
+        mid = (lo + hi) // 2
+        seg_end = tl.load(seg_end_ptr + mid, mask=slot_mask & (mid < NUM_SEGS), other=0)
+        above = seg_end > slot_offs
+        lo, hi = tl.where(above, lo, mid + 1), tl.where(above, mid, hi)
+    seg = tl.minimum(lo, NUM_SEGS - 1)
+    slot_dedup_start = tl.load(dedup_start_ptr + seg // EXPERTS_PER_RANK, mask=slot_mask, other=0)
     received_idx = tl.load(received_expand_idx_ptr + slot_offs, mask=slot_mask)
-    tl.store(expert_idxs_ptr + slot_offs, expert_idx, mask=slot_mask)
+    tl.store(expert_idxs_ptr + slot_offs, seg % EXPERTS_PER_RANK, mask=slot_mask)
     tl.store(expand_idx_ptr + slot_offs, received_idx + slot_dedup_start, mask=slot_mask)
 
 
 def ep_dispatch_recv_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-    # the kernel indexes both inputs with unit stride
+    # the kernels index both inputs with unit stride
     recv_meta, received_expand_idx = recv_meta.contiguous(), received_expand_idx.contiguous()
     total = received_expand_idx.shape[0]
     expert_idxs, expand_idx = torch.empty_like(received_expand_idx), torch.empty_like(received_expand_idx)
     if total == 0:
         return expert_idxs, expand_idx
+    num_segs = ep_size * experts_per_rank
+    seg_end, dedup_start = torch.empty(num_segs, dtype=torch.int64, device=recv_meta.device), torch.empty(ep_size, dtype=torch.int64, device=recv_meta.device)
+    recv_segment_ends_kernel[(1,)](recv_meta, seg_end, dedup_start, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, SEG_PADDED=triton.next_power_of_2(num_segs), EP_PADDED=triton.next_power_of_2(ep_size))
     BLOCK = 1024
-    expert_and_expand_idx_kernel[(triton.cdiv(total, BLOCK),)](recv_meta, received_expand_idx, expert_idxs, expand_idx, total, EP_SIZE=ep_size, EXPERTS_PER_RANK=experts_per_rank, BLOCK=BLOCK)
+    expert_and_expand_idx_kernel[(triton.cdiv(total, BLOCK),)](seg_end, dedup_start, received_expand_idx, expert_idxs, expand_idx, total, NUM_SEGS=num_segs, EXPERTS_PER_RANK=experts_per_rank, SEARCH_STEPS=num_segs.bit_length(), BLOCK=BLOCK)
     return expert_idxs, expand_idx

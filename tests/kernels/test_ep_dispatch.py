@@ -7,8 +7,8 @@ Sender side, where a token routed to several experts of one EP rank is sent to i
 - tokens_per_ep_rank, dedup_tokens_per_gpu and send_meta carry no order and are compared exactly.
 - idxs, expand_idx and dispatch_token_idxs carry an order. On the inputs the H200 path covers they
   are compared exactly with a stable reference (argsort(stable=True), nonzero), since the CuTe
-  kernel places tokens in order within each bucket. Other inputs fall back to atomic placement,
-  where they are compared as per-bucket sets plus the invariant
+  kernel places tokens in order within each bucket. Other inputs, and every input on SM100, take
+  atomic placement, where they are compared as per-bucket sets plus the invariant
   dispatch_token_idxs[rank_start + expand_idx] == idxs // k.
 
 Receiver side, ep_dispatch_recv_idx carries no order and is compared exactly. End-to-end tests
@@ -18,10 +18,12 @@ its token and expert.
 The routing contract: a token's top-k experts are distinct, as torch.topk returns them.
 """
 
+import functools
+
 import pytest
 import torch
 
-from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx
+from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx, fp8_group_indices
 
 # (num_experts, top-k) of the models: deepseek-v2-lite, qwen3-30b-a3b, qwen3.5-35b-a3b,
 # gpt-oss-20b, gpt-oss-120b
@@ -92,10 +94,23 @@ def check_order_free(outs, ref) -> None:
     assert torch.equal(outs[5], ref["send_meta"])
 
 
-def check_stable(outs, ref) -> None:
+@functools.cache
+def cute_kernels() -> bool:
     """
-    Exact: the H200 path places stably.
+    Whether the device runs pithtrain's SM90 CuTe kernels (whose dispatch places stably), told by
+    the library rather than an architecture probe: only there does fp8_group_indices give a hint.
     """
+    offs = torch.tensor([128], dtype=torch.int32, device="cuda")
+    return fp8_group_indices(offs, 128) is not None
+
+
+def check_stable(outs, ref, topk_ids: torch.Tensor, ep: int, epr: int) -> None:
+    """
+    Exact where the H200 path places stably; per-bucket sets plus the invariant elsewhere.
+    """
+    if not cute_kernels():
+        check_any_order(outs, ref, topk_ids, ep, epr)
+        return
     check_order_free(outs, ref)
     total = int(ref["dedup"].sum())
     assert torch.equal(outs[3], ref["idxs"])
@@ -130,9 +145,13 @@ def check_any_order(outs, ref, topk_ids: torch.Tensor, ep: int, epr: int) -> Non
 
 
 def run_dispatch(topk_ids: torch.Tensor, ep: int, epr: int, meta_out=None):
+    """
+    The outputs, send_meta cloned: it is valid only until the next call (it may be reused scratch),
+    and the tests keep several calls' outputs.
+    """
     outs = ep_dispatch_send_idx(topk_ids, ep * epr, ep, epr, meta_out)
     check_shapes(outs, topk_ids.shape[0], topk_ids.shape[1], ep, epr)
-    return outs
+    return (*outs[:5], outs[5].clone())
 
 
 @pytest.mark.parametrize("m", [0, 1, 511, 513, 4133])  # the CuTe kernel's chunk is 512 tokens
@@ -141,7 +160,9 @@ def run_dispatch(topk_ids: torch.Tensor, ep: int, epr: int, meta_out=None):
 def test_dispatch_models(ne: int, k: int, ep: int, m: int) -> None:
     epr = ne // ep
     topk_ids = routing(m, k, ne, epr, seed=m + k + ep)
-    check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids, ep, epr))
+    check_stable(
+        run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids, ep, epr), topk_ids, ep, epr
+    )
 
 
 @pytest.mark.parametrize("k", [1, 2, 4, 6, 8])
@@ -153,7 +174,9 @@ def test_dispatch_odd_experts_per_rank(k: int, ep: int, m: int) -> None:
     """
     epr = 5 if ep <= 4 else 3
     topk_ids = routing(m, k, ep * epr, epr, seed=m + k)
-    check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids, ep, epr))
+    check_stable(
+        run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids, ep, epr), topk_ids, ep, epr
+    )
 
 
 @pytest.mark.parametrize("kind", ["one_expert", "one_rank", "ragged"])
@@ -168,7 +191,7 @@ def test_dispatch_skewed(kind: str, ep: int, epr: int, k: int) -> None:
     if kind == "ragged":
         assert int((ref["send_meta"] == 0).sum()) > 0  # some empty experts
         assert int(ref["dedup"][1]) == 0  # an empty EP rank
-    check_stable(run_dispatch(topk_ids, ep, epr), ref)
+    check_stable(run_dispatch(topk_ids, ep, epr), ref, topk_ids, ep, epr)
 
 
 def test_dispatch_m_zero() -> None:
@@ -196,7 +219,7 @@ def test_dispatch_meta_out() -> None:
         assert torch.equal(meta[:ep], ref["tokens_per_ep_rank"])
         assert torch.equal(meta[ep : 2 * ep], ref["dedup"])
         assert bool((meta[2 * ep :] == -7).all())
-        check_stable(outs, ref)
+        check_stable(outs, ref, topk_ids, ep, epr)
 
 
 def test_dispatch_row_stride() -> None:
@@ -207,7 +230,13 @@ def test_dispatch_row_stride() -> None:
     wide = routing(4096, k + 3, ep * epr, epr, seed=5)
     topk_ids = wide[:, :k]
     assert topk_ids.stride(0) == k + 3
-    check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids.contiguous(), ep, epr))
+    check_stable(
+        run_dispatch(topk_ids, ep, epr),
+        stable_reference(topk_ids.contiguous(), ep, epr),
+        topk_ids,
+        ep,
+        epr,
+    )
 
 
 def test_dispatch_back_to_back() -> None:
@@ -219,7 +248,7 @@ def test_dispatch_back_to_back() -> None:
     cases = [routing(m, k, ep * epr, epr, seed=m) for m in (70000, 1, 4096, 33, 65536, 4096)]
     outs = [run_dispatch(topk_ids, ep, epr) for topk_ids in cases]
     for topk_ids, case_outs in zip(cases, outs):
-        check_stable(case_outs, stable_reference(topk_ids, ep, epr))
+        check_stable(case_outs, stable_reference(topk_ids, ep, epr), topk_ids, ep, epr)
 
 
 def test_dispatch_grid_barrier_stress() -> None:
@@ -233,7 +262,7 @@ def test_dispatch_grid_barrier_stress() -> None:
     refs = {id(topk_ids): stable_reference(topk_ids, ep, epr) for topk_ids in (big, small)}
     for i in range(12):
         topk_ids = big if i % 2 == 0 else small
-        check_stable(run_dispatch(topk_ids, ep, epr), refs[id(topk_ids)])
+        check_stable(run_dispatch(topk_ids, ep, epr), refs[id(topk_ids)], topk_ids, ep, epr)
 
 
 def test_dispatch_stability_is_enforced() -> None:
@@ -367,7 +396,7 @@ def test_dispatch_round_trip(ne: int, k: int, ep: int) -> None:
     for sender, m in enumerate(tokens_per_sender):
         topk_ids = routing(m, k, ne, epr, kind="ragged" if sender % 2 else "random", seed=100 + sender)  # fmt: skip
         outs = run_dispatch(topk_ids, ep, epr)
-        check_stable(outs, stable_reference(topk_ids, ep, epr))
+        check_stable(outs, stable_reference(topk_ids, ep, epr), topk_ids, ep, epr)
         senders.append((topk_ids, outs))
     for recv_rank in range(ep):
         recv_meta = torch.cat([sender_outs[5].view(ep, epr + 1)[recv_rank] for _, sender_outs in senders])  # fmt: skip
@@ -414,7 +443,13 @@ def test_fused_dedup_dispatch(ms: int, k: int, num_experts: int, ep_size: int, s
     torch.manual_seed(seed)
     epr = num_experts // ep_size
     topk_ids = randperm_routing(ms, k, num_experts)
-    check_stable(run_dispatch(topk_ids, ep_size, epr), stable_reference(topk_ids, ep_size, epr))
+    check_stable(
+        run_dispatch(topk_ids, ep_size, epr),
+        stable_reference(topk_ids, ep_size, epr),
+        topk_ids,
+        ep_size,
+        epr,
+    )
 
 
 @pytest.mark.parametrize("ms,k,num_experts,ep_size", SIM_CONFIGS)

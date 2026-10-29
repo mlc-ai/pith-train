@@ -14,8 +14,9 @@ import sys
 import textwrap
 
 import pytest
+import torch
 
-from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
+from pithtrain.kernels import bf16_experts_supported, fp8_group_indices
 
 VALIDATED_QUACK = "0.6.5"
 
@@ -29,9 +30,11 @@ def quack_version() -> str | None:
 
 def h200() -> bool:
     """
-    The H200 (SM90) path, told by a capability query rather than an architecture probe.
+    The H200 (SM90) path, told by the library rather than an architecture probe: only SM90's grouped
+    GEMM takes the fp8_group_indices hint (None elsewhere).
     """
-    return fp8_fused_experts_supported()
+    offs = torch.tensor([128], dtype=torch.int32, device="cuda")
+    return fp8_group_indices(offs, 128) is not None
 
 
 def run(code: str) -> None:

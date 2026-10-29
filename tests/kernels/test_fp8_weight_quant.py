@@ -11,7 +11,8 @@ E8M0 scale per 128x128 tile, from the tile amax).
   weight is packed with its transpose (fp8_pack_transpose). The result must equal the blockwise
   quantization of the full bf16 weight.
 - fp8_shard_amax_multi and fp8_scales_multi return one launch for a list of weights (a callable on
-  the H200) whose results must equal the per-tensor calls.
+  the H200) whose results must equal the per-tensor calls, or None where the device has no such
+  launch, in which case the tests run the per-tensor loop callers fall back to.
 """
 
 import zlib
@@ -420,6 +421,31 @@ GROUP = [
 RANKS = 4
 
 
+def amax_multi_or_loop(shards, amaxes, row_offsets, group_offsets):
+    """
+    fp8_shard_amax_multi's one-launch callable, or, where it returns None (no such path on the
+    device), the per-shard loop over fp8_shard_amax its contract tells callers to run.
+    """
+    launch = fp8_shard_amax_multi(shards, amaxes, row_offsets, group_offsets)
+    if launch is None:
+        args = list(zip(shards, amaxes, row_offsets, group_offsets))
+        return lambda: [fp8_shard_amax(*arg) for arg in args]
+    assert callable(launch)
+    return launch
+
+
+def scales_multi_or_loop(amaxes, scales, scales_t):
+    """
+    fp8_scales_multi's one-launch callable, or the loop over fp8_scales where it returns None.
+    """
+    launch = fp8_scales_multi(amaxes, scales, scales_t)
+    if launch is None:
+        args = list(zip(amaxes, scales, scales_t))
+        return lambda: [fp8_scales(*arg) for arg in args]
+    assert callable(launch)
+    return launch
+
+
 def packed_grids(device: str = "cuda") -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
     Return one zeroed amax buffer holding every weight's grid back to back, as the FP8 parameter
@@ -443,13 +469,12 @@ def test_multi_launch_param_gather() -> None:
     for rank in range(RANKS):
         shards = per_rank[rank]
         buffer, amaxes = packed_grids()
-        launch = fp8_shard_amax_multi(
+        launch = amax_multi_or_loop(
             [shard[0] for shard in shards],
             amaxes,
             [shard[1] for shard in shards],
             [shard[2] for shard in shards],
         )
-        assert launch is not None and callable(launch), "H200 must have a one-launch amax"
         launch()
         for (local, row_offset, group_offset), amax, shape in zip(shards, amaxes, GROUP):
             single = torch.zeros_like(amax)
@@ -466,10 +491,7 @@ def test_multi_launch_param_gather() -> None:
         torch.full(grid_of(shape), -1.0, device="cuda").transpose(1, 2).contiguous()
         for shape in GROUP
     ]
-    scales_launch = fp8_scales_multi(reduced_views, scales, scales_t)
-    assert scales_launch is not None and callable(scales_launch), (
-        "H200 must have a one-launch scales"
-    )
+    scales_launch = scales_multi_or_loop(reduced_views, scales, scales_t)
     scales_launch()
     for master, amax, scale, scale_t, shape in zip(masters, reduced_views, scales, scales_t, GROUP):
         single, single_t = torch.empty_like(scale), torch.empty_like(scale_t)
@@ -518,8 +540,7 @@ def test_scales_multi(grid: tuple) -> None:
     G, R, C = grid
     grids = [amax, amax * 3, amax[:1].contiguous()]
     outs = [(torch.empty_like(grid_amax), torch.empty(grid_amax.shape[0], C, R, device="cuda")) for grid_amax in grids]  # fmt: skip
-    launch = fp8_scales_multi(grids, [out_pair[0] for out_pair in outs], [out_pair[1] for out_pair in outs])  # fmt: skip
-    assert launch is not None and callable(launch)
+    launch = scales_multi_or_loop(grids, [out_pair[0] for out_pair in outs], [out_pair[1] for out_pair in outs])  # fmt: skip
     launch()
     for grid_amax, (scale, scale_t) in zip(grids, outs):
         assert_f32_equal("scale", scale, e8m0_scale(grid_amax))
