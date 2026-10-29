@@ -18,7 +18,7 @@ is bit-identical for every bf16 input (checked exhaustively, including inf and N
 
 N not a multiple of 8 falls back to a non-persistent kernel with narrower predicated loads.
 
-Evolved with TIRx-harness: run silu, frontier member persistent-cpasync (commit 06a8f5d, 3.815x over the
+Evolved with TIRx-harness: run silu, frontier member persistent-cpasync (commit 1cde617, 4.185x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -49,11 +49,11 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
-def lo_f32(w):
+def lo22(w):
     return txl.reinterpret("float32", txl.shift_left(w, txl.uint32(16)))
 
 
-def hi_f32(w):
+def hi22(w):
     return txl.reinterpret("float32", txl.bitwise_and(w, txl.uint32(0xFFFF0000)))
 
 
@@ -61,7 +61,7 @@ def f2(a, b):
     return txl.cuda.make_float2(a, b)
 
 
-class F32Pair:
+class P:
     """
     A packed f32 pair living in one 64-bit register.
     """
@@ -79,25 +79,25 @@ class F32Pair:
 
 
 def unpack(w):
-    p = F32Pair()
-    txl.ptx.mov.b64(p.r, f2(lo_f32(w), hi_f32(w)))
+    p = P()
+    txl.ptx.mov.b64(p.r, f2(lo22(w), hi22(w)))
     return p
 
 
 def mul2(a, b):
-    p = F32Pair()
+    p = P()
     txl.ptx.mul.rn.f32x2(p.r, a, b)
     return p
 
 
 def fma2(a, b, c):
-    p = F32Pair()
+    p = P()
     txl.ptx.fma.rn.f32x2(p.r, a, b, c)
     return p
 
 
 def add2(a, b):
-    p = F32Pair()
+    p = P()
     txl.ptx.add.rn.f32x2(p.r, a, b)
     return p
 
@@ -135,6 +135,18 @@ def scale_rcp(amax):
     sb = txl.local_scalar("uint32")
     txl.assign(sb, txl.Select(e == txl.uint32(0), txl.uint32(1 << 23), txl.shift_left(e, txl.uint32(23))))
     return txl.reinterpret("float32", sb), txl.reinterpret("float32", txl.uint32(254 << 23) - sb)
+
+
+def quant2(dst16, xw, rcp2):
+    """
+    e4m3x2 of a bf16x2 word times a bf16x2 pair of powers of two.
+
+    The bf16 product is exact wherever it is a normal number; where it is not, |x * rcp| is
+    below 2^-126 and both this and the fp32 reference round it to a signed zero byte.
+    """
+    y = txl.local_scalar("uint32")
+    txl.ptx["mul.rn.bf16x2"](y, xw, rcp2)
+    txl.ptx["cvt.rn.satfinite.e4m3x2.bf16x2"](dst16, y)
 
 
 def swiglu(mode_bwd, sel, N, ocol, wg, wu, wd, hw, W):
@@ -212,9 +224,12 @@ def build(mode, N):
             for i in range(RPT):
                 txl.assign(rmax[i], txl.uint32(0))
                 for k in range(4):
-                    av = txl.bitwise_and(x[i * 4 + k], txl.uint32(ABS2))
-                    txl.ptx.max.bf16x2(rmax[i], rmax[i], av)
-                    txl.ptx.max.bf16x2(cmax[k], cmax[k], av)
+                    txl.ptx["max.xorsign.abs.bf16x2"](rmax[i], rmax[i], x[i * 4 + k])
+                    txl.ptx["max.xorsign.abs.bf16x2"](cmax[k], cmax[k], x[i * 4 + k])
+            for i in range(RPT):
+                txl.assign(rmax[i], txl.bitwise_and(rmax[i], txl.uint32(ABS2)))
+            for k in range(4):
+                txl.assign(cmax[k], txl.bitwise_and(cmax[k], txl.uint32(ABS2)))
             # column partials of this warp (rows r0 and r0 ^ 1 of each 32-row band)
             for k in range(4):
                 txl.ptx.shfl_sync.bfly.b32(peer, cmax[k], txl.uint32(16), txl.uint32(31), txl.uint32(FULL))
@@ -244,8 +259,8 @@ def build(mode, N):
                 txl.assign(acc, tmpw[0])
                 for w_ in range(1, NWARP):
                     txl.ptx.max.bf16x2(acc, acc, tmpw[w_])
-                s0, rc0 = scale_rcp(lo_f32(acc))
-                s1, rc1 = scale_rcp(hi_f32(acc))
+                s0, rc0 = scale_rcp(lo22(acc))
+                s1, rc1 = scale_rcp(hi22(acc))
                 sc0 = txl.local_scalar("float32")
                 sc1 = txl.local_scalar("float32")
                 txl.assign(sc0, s0)
@@ -289,29 +304,28 @@ def build(mode, N):
             for i in range(RPT):
                 row = row_base + RSTRIDE * i
                 w = rpk[i // 2]
-                rs, rr = scale_rcp(lo_f32(w) if i % 2 == 0 else hi_f32(w))
-                rr_l = txl.local_scalar("float32")
-                txl.assign(rr_l, rr)
+                rs, rr = scale_rcp(lo22(w) if i % 2 == 0 else hi22(w))
+                rr2 = txl.local_scalar("uint32")
+                txl.ptx["prmt.b32"](rr2, txl.reinterpret("uint32", rr), txl.reinterpret("uint32", rr), txl.uint32(0x7632))
                 with txl.If(cg == 0), txl.Then():
                     txl.ptx.st.global_.f32(s_t.ptr_to([row, cb + blk_off]), rs)
                 qr = txl.alloc_local([4], "uint16")
                 for k in range(4):
-                    xp = unpack(x[i * 4 + k])
-                    pr = mul2(xp.r, f2(rr_l, rr_l))
-                    txl.ptx.cvt.rn.satfinite.e4m3x2.f32(qr[k], pr.y, pr.x)
+                    quant2(qr[k], x[i * 4 + k], rr2)
                 store8(q_t, row, qr)
             txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NTHREADS))
 
-            crcp = txl.alloc_local([8], "float32")
-            txl.ptx.ld.shared.v4.f32(crcp[0], crcp[1], crcp[2], crcp[3], rcp_sm.ptr_to([buf, oi, cg * 8]))
-            txl.ptx.ld.shared.v4.f32(crcp[4], crcp[5], crcp[6], crcp[7], rcp_sm.ptr_to([buf, oi, cg * 8 + 4]))
+            crcp = txl.alloc_local([8], "uint32")
+            txl.ptx.ld.shared.v4.b32(crcp[0], crcp[1], crcp[2], crcp[3], rcp_sm.ptr_to([buf, oi, cg * 8]))
+            txl.ptx.ld.shared.v4.b32(crcp[4], crcp[5], crcp[6], crcp[7], rcp_sm.ptr_to([buf, oi, cg * 8 + 4]))
+            crc2 = txl.alloc_local([4], "uint32")
+            for k in range(4):
+                txl.ptx["prmt.b32"](crc2[k], crcp[2 * k], crcp[2 * k + 1], txl.uint32(0x7632))
             for i in range(RPT):
                 row = row_base + RSTRIDE * i
                 qc = txl.alloc_local([4], "uint16")
                 for k in range(4):
-                    xp = unpack(x[i * 4 + k])
-                    pc = mul2(xp.r, f2(crcp[2 * k], crcp[2 * k + 1]))
-                    txl.ptx.cvt.rn.satfinite.e4m3x2.f32(qc[k], pc.y, pc.x)
+                    quant2(qc[k], x[i * 4 + k], crc2[k])
                 store8(c_t, row, qc)
 
     def tile_coords(t, cg, r0):
