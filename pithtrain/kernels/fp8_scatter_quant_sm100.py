@@ -13,7 +13,7 @@ and cvt.rn.satfinite.e4m3x2.bf16x2.
 The group sizes come in as kernel arguments when there are at most 32 groups (host counts, or
 the one device-to-host copy of the device counts), else from a small counting kernel.
 
-Evolved with TIRx-harness: run scatter, frontier member cluster-sort-balanced (commit 8efa8c6, 5.789x over the
+Evolved with TIRx-harness: run scatter, frontier member cluster-sort-balanced (commit 7c77fc9, 7.423x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -42,7 +42,7 @@ SM_COUNT = 148
 CLUSTER = 8
 CTA_BUDGET = 264  # resident CTAs (2 per SM) at cluster granularity
 KMAX = 4  # row blocks a CTA's tile range may touch
-CACHE_STEPS = 32  # sort steps cached in the (still idle) stage ring: 8 warps x 32 x 32 lanes x 3 words
+CACHE_STEPS = 32  # sort steps cached in the (still idle) stage ring: warps x steps x 32 lanes x 3 words
 COUNT_WARPS = 32
 
 
@@ -171,6 +171,7 @@ def fused_traced(n, gb, from_args, cluster):
         hist = smem.alloc([WARPS * gb], txl.i32)
         sl = smem.alloc([KMAX * BLOCK], txl.i32)
         cm = smem.alloc([2 * WARPS * BLOCK // 2], txl.u32)
+        cmf = smem.alloc([2 * BLOCK // 2], txl.u32, align=16)
         misc = smem.alloc([4 * KMAX], txl.i32)
         rbq = smem.alloc([CLUSTER * KMAX], txl.i32)
         tbs = smem.alloc([CLUSTER + 1], txl.i32)
@@ -258,10 +259,11 @@ def fused_traced(n, gb, from_args, cluster):
             acc = txl.local_scalar("int32", init=incl - run)
             for k in range(gpl):
                 g = lane * gpl + k
+                # every entry is written: the pass B prefix reads all gb groups
+                txl.ptx.st.shared.s32(tstart.ptr_to([g]), acc)
                 with txl.If(g < num_groups), txl.Then():
                     txl.ptx.ld.shared.s32(cval, tcnt.ptr_to([g]))
                     padded = pad(cval)
-                    txl.ptx.st.shared.s32(tstart.ptr_to([g]), acc)
                     if from_args:
                         with txl.If(cid == 0), txl.Then():
                             txl.ptx.st.global_.s32(offs.ptr_to([g]), acc + padded)
@@ -574,13 +576,18 @@ def fused_traced(n, gb, from_args, cluster):
                 for k in range(wpl):
                     txl.ptx.st.shared.u32(cm.ptr_to([cmb + warp * (BLOCK // 2) + cq * wpl + k]), cmax[k])
             cta_sync()
-            for wi in range(WARPS):
-                for k in range(wpl):
-                    txl.ptx.ld.shared.u32(upeer, cm.ptr_to([cmb + wi * (BLOCK // 2) + cq * wpl + k]))
-                    if wi == 0:
-                        txl.assign(cmax[k], upeer)
-                    else:
-                        txl.ptx[MAXABS](cmax[k], cmax[k], upeer)
+            # one thread per column word folds the warps' partial maxima
+            with txl.If(tid < BLOCK // 2), txl.Then():
+                txl.ptx.ld.shared.u32(sendv, cm.ptr_to([cmb + tid]))
+                for wi in range(1, WARPS):
+                    txl.ptx.ld.shared.u32(upeer, cm.ptr_to([cmb + wi * (BLOCK // 2) + tid]))
+                    txl.ptx[MAXABS](sendv, sendv, upeer)
+                txl.ptx.st.shared.u32(cmf.ptr_to([(kk & 1) * (BLOCK // 2) + tid]), sendv)
+            cta_sync()
+            if wpl == 4:
+                txl.ptx.ld.shared.v4.b32(cmax[0], cmax[1], cmax[2], cmax[3], cmf.ptr_to([(kk & 1) * (BLOCK // 2) + cq * 4]))
+            else:
+                txl.ptx.ld.shared.v2.b32(cmax[0], cmax[1], cmf.ptr_to([(kk & 1) * (BLOCK // 2) + cq * 2]))
             for k in range(wpl):
                 cw = txl.bitwise_and(cmax[k], txl.uint32(0x7FFF7FFF))
                 e8m0_pair(e16, bf_hi(cw), bf_lo(cw))
@@ -649,7 +656,7 @@ def bound_groups(num_groups):
     return gb
 
 
-def empty2(n, dev):
+def empty_outputs(n, dev):
     nsc = (n + BLOCK - 1) // BLOCK
     return (
         (
@@ -671,7 +678,7 @@ def scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx=None, padd
     m = expert_idxs.shape[0]
     n = gathered.shape[1]
     if m == 0:
-        return empty2(n, dev)
+        return empty_outputs(n, dev)
     g = num_groups
     gb = bound_groups(g)
     nct = (n + BLOCK - 1) // BLOCK
