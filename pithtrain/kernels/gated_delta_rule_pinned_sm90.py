@@ -22,7 +22,7 @@ from triton import knobs
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["BT", "chunk_gdr_bwd_pinned", "chunk_gdr_fwd_pinned", "gated_delta_rule_pinned_supported", "pinned_launch_supported", "pinned_shapes"]
+__all__ = ["BT", "chunk_gdr_bwd_pinned_sm90", "chunk_gdr_fwd_pinned_sm90", "pinned_launch_supported"]
 
 BT = 64  # chunk size
 BC = 16  # sub-chunk of the fused kkt + triangular solve, fixed by FLA at BT = 64
@@ -142,7 +142,7 @@ def compute_chunk_states(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: t
     return h, v_new
 
 
-def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Dense chunked gated delta rule forward (chunk size 64, scale K ** -0.5, no initial or final
     state): fresh (o, g_cum, A).
@@ -152,7 +152,7 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     j // (HV / H). Inputs are not modified.
 
     o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV), the chunk-local cumulative gate. A: bf16 (B, T,
-    HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned. Bit-identical to
+    HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned_sm90. Bit-identical to
     FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads; deterministic.
     Only where gated_delta_rule_pinned_supported is True.
     """
@@ -170,9 +170,9 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     return o, g_cum, A
 
 
-def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def chunk_gdr_bwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Backward of chunk_gdr_fwd_pinned: fresh (dq, dk, dv, dg, dbeta).
+    Backward of chunk_gdr_fwd_pinned_sm90: fresh (dq, dk, dv, dg, dbeta).
 
     q, k, v, beta: the forward inputs; g_cum, A: the forward outputs; do: bf16 (B, T, HV, V), the
     gradient of o. Inputs are not modified.
@@ -202,24 +202,3 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     dg.add_(dg_wy)
     dg = chunk_cumsum(dg, reverse=True)
     return dq, dk, dv, dg, dbeta
-
-
-def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
-    """
-    Whether a call has the geometry the configs were recorded at: B == 1, HV == 32, HV a multiple of
-    H, K == V == 128, bf16 q / k / v / beta and an fp32 gate. FLA's autotune keys hold B (cumsum),
-    H, HV, K and V, and the backward's single K block needs K <= 128.
-    """
-    B, _, H, K = k.shape
-    HV, V = v.shape[2:]
-    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
-
-
-def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
-    """
-    Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the recorded geometry
-    (pinned_shapes) on SM90 with the recorded FLA and Triton versions (pinned_launch_supported).
-    Otherwise the caller uses FLA's autotuned entry points. Constant per geometry: torch.compile
-    guards on the shape and dtype checks and treats pinned_launch_supported as a constant.
-    """
-    return pinned_shapes(q, k, v, g, beta) and pinned_launch_supported()

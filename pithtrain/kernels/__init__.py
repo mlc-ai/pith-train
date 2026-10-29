@@ -4,7 +4,7 @@ from pithtrain.kernels, never a submodule. Each name's docstring is its contract
 PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100 implementation
 itself; callers that need to know whether a fused path exists use the capability queries
 fp8_fused_experts_supported, bf16_experts_supported and gated_delta_rule_pinned_supported. Importing
-the package never loads cutlass or QuACK.
+the package never loads cutlass, QuACK or tvm.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad
@@ -23,7 +23,7 @@ from pithtrain.kernels.fp8_scale_layout import act_scale_like
 from pithtrain.kernels.fp8_scatter_quant import scatter_quant
 from pithtrain.kernels.fp8_silu_mul_quant import fp8_silu_mul_bwd, fp8_silu_mul_gu_bwd, fp8_silu_mul_fwd, fp8_silu_mul_gu_fwd
 from pithtrain.kernels.fp8_weight_quant import fp8_pack_transpose, fp8_scales, fp8_scales_multi, fp8_shard_amax, fp8_shard_amax_multi, fp8_shard_cast, fp8_quant_weight, fp8_quant_weight_grouped
-from pithtrain.kernels.gated_delta_rule_pinned_sm90 import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned, gated_delta_rule_pinned_supported
+from pithtrain.kernels.gated_delta_rule_pinned import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned, gated_delta_rule_pinned_supported
 from pithtrain.kernels.group_bias_add import group_bias_add
 from pithtrain.kernels.segment_sum import segment_sum
 from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
@@ -102,7 +102,7 @@ __all__.append("bf16_expert_gate_up_wgrad")
 __all__.append("bf16_experts_supported")
 __all__.append("bf16_expert_segment_sum")
 
-# Gated DeltaNet pinned launches (SM90 only)
+# Gated DeltaNet pinned launches (FLA on SM90, TIRx on SM100)
 __all__.append("chunk_gdr_bwd_pinned")
 __all__.append("chunk_gdr_fwd_pinned")
 __all__.append("gated_delta_rule_pinned_supported")

@@ -1,6 +1,7 @@
 """
 Verifier of the pinned dense chunked gated delta rule (gated_delta_rule_pinned_supported,
-chunk_gdr_fwd_pinned, chunk_gdr_bwd_pinned), the H200 path of Qwen3.5's Gated DeltaNet.
+chunk_gdr_fwd_pinned, chunk_gdr_bwd_pinned), the dense path of Qwen3.5's Gated DeltaNet (FLA's
+kernels with pinned launch configs on the H200, TIRx kernels on the B200).
 
 The recurrence, per value head with state S of shape (K, V) and scale = K ** -0.5:
 
@@ -11,14 +12,16 @@ g is the raw (natural-log) gate in fp32 and beta is bf16.
 
 Checked:
 
-- the capability query: True at the Qwen3.5 geometry on the H200 (batch 1, 32 value heads, 16 or
+- the capability query: True at the Qwen3.5 geometry (batch 1, 32 value heads, 16 or
   32 key heads, dim 128, bf16 q / k / v / beta, fp32 gate), False off it;
 - the forward and backward (dq, dk per value head, dv, dg for the raw gate, dbeta) against a naive
   token-by-token fp32 recurrence and its autograd. The kernels keep some chunk intermediates in
   bf16, so the check is calc_diff below 1e-4 (output) and 1e-3 (gradients), plus a max absolute
   error within 2e-2 of the reference's largest magnitude;
-- bit-exactness against FLA's chunked gated delta rule on q / k repeated to the value heads, with
-  FLA's autotuners restricted to the recorded launch configs.
+- where the pinned path runs FLA's kernels (its saved g_cum and A are FLA's bit for bit; their
+  contents are otherwise the implementation's), bit-exactness against FLA's chunked gated delta
+  rule on q / k repeated to the value heads, with FLA's autotuners restricted to the recorded
+  launch configs.
 """
 
 import pytest
@@ -69,14 +72,12 @@ def make_inputs(
     return q, k, v, g, beta, do
 
 
-def h200_path_available() -> bool:
+def pinned_path_available() -> bool:
     q, k, v, g, beta, _ = make_inputs(64)
     return gated_delta_rule_pinned_supported(q, k, v, g, beta)
 
 
-pytestmark = pytest.mark.skipif(
-    not h200_path_available(), reason="the pinned launches run on the H200 path only"
-)
+pytestmark = pytest.mark.skipif(not pinned_path_available(), reason="no pinned path on this device")
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -267,6 +268,18 @@ def pinned_path(q, k, v, g, beta, do):
 NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
 
 
+def skip_unless_fla_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Skip unless the pinned path runs FLA's kernels, told by its saved intermediates: g_cum and A
+    are FLA's bit for bit only there (the contract leaves their contents to the implementation).
+    """
+    pin_fla(monkeypatch, RECORDED)
+    q, k, v, g, beta, do = make_inputs(256, H=16, gate="mild")
+    got, ref = chunk_gdr_fwd_pinned(q, k, v, g, beta), fla_reference(q, k, v, g, beta, do)
+    if not (torch.equal(got[1], ref[1]) and torch.equal(got[2], ref[2])):
+        pytest.skip("the pinned path does not run FLA's kernels")
+
+
 @pytest.mark.parametrize("H", [32, 16])
 @pytest.mark.parametrize(
     "S,resets", [(4096, ()), (1000, ()), (4096, (0, 300, 1777, 2048, 4091)), (8192, ())]
@@ -275,7 +288,7 @@ def test_bit_exact_against_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, 
     """
     H = 16 runs grouped value heads on unrepeated q / k; FLA gets them repeated.
     """
-    pin_fla(monkeypatch, RECORDED)
+    skip_unless_fla_kernels(monkeypatch)
     q, k, v, g, beta, do = make_inputs(S, H=H, gate="mild", seed=S, resets=resets)
     got, ref = pinned_path(q, k, v, g, beta, do), fla_reference(q, k, v, g, beta, do)
     for name, got_part, ref_part in zip(NAMES, got, ref):
@@ -288,6 +301,7 @@ def test_fla_config_drift_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     Another launch config on FLA's side (dqkwg's num_warps) changes the gate gradient, so the exact
     comparison detects config drift.
     """
+    skip_unless_fla_kernels(monkeypatch)
     configs = dict(RECORDED, dqkwg=dict(RECORDED["dqkwg"], num_warps=2))
     pin_fla(monkeypatch, configs)
     q, k, v, g, beta, do = make_inputs(4096, H=32, gate="mild")

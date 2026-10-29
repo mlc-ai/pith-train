@@ -66,6 +66,7 @@ exclude = ["pithtrain/kernels/**"]  # kernel code keeps calls, signatures and ta
 [tool.ruff.lint.per-file-ignores]
 "pithtrain/kernels/**" = ["I001"]  # the import sorter would wrap kernel imports at 100 columns
 "pithtrain/kernels/__init__.py" = ["F401"]  # names re-exported via __all__.append (tests/test_import_layers.py checks them)
+"pithtrain/kernels/gated_delta_rule_pinned_sm100.py" = ["F821", "F841"]  # generated TIRx port of the cuDNN GDN kernels: compile-time-disabled branches name parameters the pinned geometry drops
 
 [tool.ruff.lint]
 ignore = ["E501", "E701", "E731"]
