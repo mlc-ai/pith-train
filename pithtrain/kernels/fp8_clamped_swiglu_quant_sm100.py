@@ -10,7 +10,7 @@ with independent element pairs in f32x2 instructions. Quantization multiplies th
 pairs by the exact power-of-two reciprocal in bf16x2 and converts bf16x2 -> e4m3x2.
 Backward writes fp32 128-row block sums; a second kernel reduces them per group.
 
-Evolved with TIRx-harness: run clamped, frontier member tma-ring-2group (commit 1dfb931, 7.197x over the
+Evolved with TIRx-harness: run clamped, frontier member tma-ring-2group (commit 6525b1e, 7.195x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -527,7 +527,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
         else:
             body(False)
 
-    return compile_kernel(kern)
+    return compile_v(kern)
 
 
 @functools.cache
@@ -567,7 +567,7 @@ def segsum_kernel(C: int):
             txl.ptx.cvt.rn.bf16.f32(h, acc)
             txl.ptx.st.global_.b16(out.ptr_to([txl.Cast("int64", g) * C + txl.Cast("int64", c)]), h)
 
-    return compile_kernel(segsum)
+    return compile_v(segsum)
 
 
 TMA_2D = "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
@@ -594,7 +594,6 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
     C = 2 * N if bwd else N
     assert N % 8 == 0
     n_ct = (C + BLOCK - 1) // BLOCK
-    n_sc = n_ct
     GU_ROW = 512 if not bwd else 256  # smem bytes per row of gate_up per stage
     DH_ROW = 128 if bwd else 0
     BIAS_B = GU_ROW
@@ -663,6 +662,9 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
         rf0 = gid * (GW * BLOCK)
         full = txl.MBarrier(smem, stages)
         full.init(1)
+        # empty[s] completes when the group that consumed the stage's tile has read it
+        empty = txl.MBarrier(smem, stages)
+        empty.init(1)
 
         with txl.serial(txl.truncdiv(num_groups + (PWARPS * 32 - 1), txl.int32(PWARPS * 32))) as it:
             gi = it * (PWARPS * 32) + tid
@@ -745,6 +747,11 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             row0 = rb * BLOCK
             stage = txl.truncmod(k, txl.int32(stages))
             sbase = stage * STAGE
+            # Groups alternate tiles, so with an odd stage count the stage's previous tile
+            # belongs to the other group; until that tile was consumed the full barrier's
+            # parity could alias its still-pending phase. Its release cannot alias.
+            with txl.If(k >= stages), txl.Then():
+                empty.wait(stage, txl.truncmod(txl.truncdiv(k, txl.int32(stages)) + 1, txl.int32(2)))
             full.wait(stage, txl.truncmod(txl.truncdiv(k, txl.int32(stages)), txl.int32(2)))
 
             # validity of this thread's two 4-channel granules
@@ -795,6 +802,8 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             # every thread of the group is done with the stage: refill it
             txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
             with txl.If(wg == 0), txl.Then():
+                with txl.If(lane == 0), txl.Then():
+                    txl.ptx.mbarrier.arrive.shared.b64(empty.buf.ptr_to([stage]), txl.uint32(1))
                 issue(k + stages)
             obase = txl.Cast("int64", row0 + rg) * C
 
@@ -832,7 +841,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                     for half, ee in ((0, ea), (1, eb)):
                         i = 2 * p + half
                         with txl.If(cg == 0), txl.Then():
-                            txl.ptx.st.global_.f32(x_scale.ptr_to([txl.Cast("int64", row0 + rg) * n_sc + (16 * i * n_sc) + txl.Cast("int64", ct)]), scale_of(ee))
+                            txl.ptx.st.global_.f32(x_scale.ptr_to([txl.Cast("int64", ct) * num_rows + txl.Cast("int64", row0 + rg + 16 * i)]), scale_of(ee))
                         rb16 = rcp_bf16(ee)
                         r2 = txl.bitwise_or(rb16, txl.shift_left(rb16, txl.uint32(16)))
                         store(x_fp8, i, fp8x4(ow[4 * i], ow[4 * i + 1], r2, r2), fp8x4(ow[4 * i + 2], ow[4 * i + 3], r2, r2))
@@ -903,10 +912,10 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             if write_col or bwd:
                 txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
 
-    return compile_kernel(kern)
+    return compile_v(kern)
 
 
-def compile_kernel(kernel):
+def compile_v(kernel):
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         return tvm.compile(kernel.mod, target=target, tir_pipeline="tirx")
@@ -947,8 +956,14 @@ def run(kind, gate_up, bias, offs, alpha, limit, dh=None):
         partial.view(-1),
     )
     num_tiles = (M // BLOCK) * n_ct
+    pipe = N % 8 == 0 and G <= MAX_SMEM_GROUPS
+    if pipe:
+        # MN-major rowwise scales (scale strides are unchecked): a tile's 128 row scales
+        # are one contiguous run; returned as the (M, ceil(C/128)) transposed view
+        x_scale = torch.empty((n_ct, M), dtype=torch.float32, device=dev).t()
+        tensors = tensors[:5] + (x_scale.t().reshape(-1),) + tensors[6:]
     with tvm_ffi.use_torch_stream():
-        if N % 8 == 0 and G <= MAX_SMEM_GROUPS:
+        if pipe:
             ker = pipe_kernel(N, bwd, write_row, write_col, bf16_clamp, 4 if bwd else 3)
             ker(*tensors, float(alpha), float(limit), G, num_tiles, min(num_tiles, num_sms()), M)
         else:

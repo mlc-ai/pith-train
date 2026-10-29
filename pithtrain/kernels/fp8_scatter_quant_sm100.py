@@ -13,7 +13,7 @@ and cvt.rn.satfinite.e4m3x2.bf16x2.
 The group sizes come in as kernel arguments when there are at most 32 groups (host counts, or
 the one device-to-host copy of the device counts), else from a small counting kernel.
 
-Evolved with TIRx-harness: run scatter, frontier member cluster-sort-balanced (commit 4f06168, 5.725x over the
+Evolved with TIRx-harness: run scatter, frontier member cluster-sort-balanced (commit 8efa8c6, 5.789x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -31,6 +31,7 @@ __all__ = ["scatter_quant_sm100"]
 
 BLOCK = 128
 FULL = 0xFFFFFFFF
+MAXABS = "max.xorsign.abs.bf16x2"
 ARG_GROUPS = 32
 WARPS = 8
 NTHREADS = WARPS * 32
@@ -473,7 +474,6 @@ def fused_traced(n, gb, from_args, cluster):
             txl.ptx.cp.async_.commit_group()
 
         w = txl.alloc_local([iters * wpl], "uint32")
-        a = txl.alloc_local([wpl], "uint32")
         cmax = txl.alloc_local([wpl], "uint32")
         rmax = txl.alloc_local([iters], "uint32")
         upeer = txl.local_scalar("uint32")
@@ -496,6 +496,9 @@ def fused_traced(n, gb, from_args, cluster):
         def bf_hi(word):
             return txl.reinterpret("float32", txl.bitwise_and(word, txl.uint32(0xFFFF0000)))
 
+        sendv = txl.local_scalar("uint32")
+        rexp = txl.local_scalar("uint32")
+        obase = txl.local_scalar("int64")
         kk = txl.local_scalar("int32", init=0)
         with txl.While(kk < ntile):
             tile = txl.local_scalar("int32", init=tbeg + kk)
@@ -512,26 +515,60 @@ def fused_traced(n, gb, from_args, cluster):
                     txl.ptx.ld.shared.v4.b32(w[j * 4], w[j * 4 + 1], w[j * 4 + 2], w[j * 4 + 3], stage_ptr(s, j))
                 else:
                     txl.ptx.ld.shared.v2.b32(w[j * 2], w[j * 2 + 1], stage_ptr(s, j))
-            col = ct * BLOCK + cq * vec
+            col = txl.local_scalar("int32", init=ct * BLOCK + cq * vec)
             col_ok = col < n
+            # |max| over this thread's rows (columns) and over each row's 8/4 elements; the
+            # xorsign.abs max keeps the magnitude max, its sign bit is dropped at the end
             for k in range(wpl):
-                txl.assign(cmax[k], txl.uint32(0))
-            for j in range(iters):
+                txl.assign(cmax[k], w[k])
+            for j in range(1, iters):
                 for k in range(wpl):
-                    txl.assign(a[k], txl.bitwise_and(w[j * wpl + k], txl.uint32(0x7FFF7FFF)))
-                    txl.ptx.max.bf16x2(cmax[k], cmax[k], a[k])
-                txl.assign(rmax[j], a[0])
+                    txl.ptx[MAXABS](cmax[k], cmax[k], w[j * wpl + k])
+            for j in range(iters):
+                txl.assign(rmax[j], w[j * wpl])
                 for k in range(1, wpl):
-                    txl.ptx.max.bf16x2(rmax[j], rmax[j], a[k])
-                xor = lpr // 2
-                while xor >= 1:
-                    txl.ptx.shfl_sync.bfly.b32(upeer, rmax[j], txl.uint32(xor), txl.uint32(31), txl.uint32(FULL))
-                    txl.ptx.max.bf16x2(rmax[j], rmax[j], upeer)
-                    xor //= 2
+                    txl.ptx[MAXABS](rmax[j], rmax[j], w[j * wpl + k])
+            # transposed butterfly over the lpr lanes of a row: lane ends with row rsel's max
+            cur = [rmax[j] for j in range(iters)]
+            xor = lpr // 2
+            while len(cur) > 1:
+                half = len(cur) // 2
+                bit = (lane & xor) != 0
+                nxt = []
+                for i in range(half):
+                    txl.assign(sendv, txl.Select(bit, cur[i], cur[i + half]))
+                    txl.ptx.shfl_sync.bfly.b32(upeer, sendv, txl.uint32(xor), txl.uint32(31), txl.uint32(FULL))
+                    txl.assign(rmax[i], txl.Select(bit, cur[i + half], cur[i]))
+                    txl.ptx[MAXABS](rmax[i], rmax[i], upeer)
+                    nxt.append(rmax[i])
+                cur = nxt
+                xor //= 2
+            while xor >= 1:
+                txl.ptx.shfl_sync.bfly.b32(upeer, rmax[0], txl.uint32(xor), txl.uint32(31), txl.uint32(FULL))
+                txl.ptx[MAXABS](rmax[0], rmax[0], upeer)
+                xor //= 2
+            # this lane's row: bits of the lane select it
+            rsel = 0
+            span = iters
+            xb = lpr // 2
+            while span > 1:
+                span //= 2
+                rsel = rsel + txl.Select((lane & xb) != 0, span, 0)
+                xb //= 2
+            amaxw = txl.bitwise_and(rmax[0], txl.uint32(0x7FFF7FFF))
+            amax = txl.max(bf_lo(amaxw), bf_hi(amaxw))
+            e8m0_pair(e16, txl.float32(0.0), amax)
+            txl.assign(rexp, txl.bitwise_and(txl.Cast("uint32", e16), txl.uint32(0xFF)))
+            rowbase = row0 + warp * rows_per_warp + sub
+            with txl.If((lane & (lpr // iters - 1)) == 0), txl.Then():
+                txl.ptx.st.global_.f32(
+                    x_scale.ptr_to([(rowbase + rsel * rpi) * nct + ct]),
+                    txl.reinterpret("float32", txl.shift_left(rexp, txl.uint32(23))),
+                )
             if rpi == 2:
                 for k in range(wpl):
                     txl.ptx.shfl_sync.bfly.b32(upeer, cmax[k], txl.uint32(16), txl.uint32(31), txl.uint32(FULL))
-                    txl.ptx.max.bf16x2(cmax[k], cmax[k], upeer)
+                    txl.ptx[MAXABS](cmax[k], cmax[k], upeer)
             cmb = (kk & 1) * (WARPS * BLOCK // 2)
             with txl.If(sub == 0), txl.Then():
                 for k in range(wpl):
@@ -543,9 +580,10 @@ def fused_traced(n, gb, from_args, cluster):
                     if wi == 0:
                         txl.assign(cmax[k], upeer)
                     else:
-                        txl.ptx.max.bf16x2(cmax[k], cmax[k], upeer)
+                        txl.ptx[MAXABS](cmax[k], cmax[k], upeer)
             for k in range(wpl):
-                e8m0_pair(e16, bf_hi(cmax[k]), bf_lo(cmax[k]))
+                cw = txl.bitwise_and(cmax[k], txl.uint32(0x7FFF7FFF))
+                e8m0_pair(e16, bf_hi(cw), bf_lo(cw))
                 e32 = txl.Cast("uint32", e16)
                 txl.assign(cexp[2 * k], txl.bitwise_and(e32, txl.uint32(0xFF)))
                 txl.assign(cexp[2 * k + 1], txl.shift_right(e32, txl.uint32(8)))
@@ -561,18 +599,14 @@ def fused_traced(n, gb, from_args, cluster):
                         x_ch_scale.ptr_to([sbase + q * 4]),
                         *[txl.reinterpret("float32", txl.shift_left(cexp[q * 4 + t], txl.uint32(23))) for t in range(4)],
                     )
+            txl.assign(obase, txl.Cast("int64", rowbase) * (n // 4) + txl.Cast("int64", col // 4))
             for j in range(iters):
-                row = row0 + lrow(j)
-                amax = txl.max(bf_lo(rmax[j]), bf_hi(rmax[j]))
-                e8m0_pair(e16, txl.float32(0.0), amax)
-                re = txl.bitwise_and(txl.Cast("uint32", e16), txl.uint32(0xFF))
-                rh = txl.shift_left(txl.uint32(254) - re, txl.uint32(7))
+                # row j's exponent from the lane that reduced it
+                lg = iters.bit_length() - 1
+                src_lane = (lane & ~(lpr - 1)) + sum(((j >> (lg - 1 - q)) & 1) * (lpr >> (q + 1)) for q in range(lg))
+                txl.ptx.shfl_sync.idx.b32(upeer, rexp, txl.uint32(src_lane) if isinstance(src_lane, int) else txl.Cast("uint32", src_lane), txl.uint32(31), txl.uint32(FULL))
+                rh = txl.shift_left(txl.uint32(254) - upeer, txl.uint32(7))
                 txl.assign(rr, rh | txl.shift_left(rh, txl.uint32(16)))
-                with txl.If(cq == 0), txl.Then():
-                    txl.ptx.st.global_.f32(
-                        x_scale.ptr_to([row * nct + ct]),
-                        txl.reinterpret("float32", txl.shift_left(re, txl.uint32(23))),
-                    )
                 with txl.If(col_ok), txl.Then():
                     for dst, rcp_of in ((x_fp8, lambda k: rr), (x_ch, lambda k: crcp[k])):
                         for k in range(wpl):
@@ -580,7 +614,7 @@ def fused_traced(n, gb, from_args, cluster):
                             txl.ptx.cvt.rn.satfinite.e4m3x2.bf16x2(q16[k], y)
                         for p in range(wpl // 2):
                             txl.ptx.mov.b32(o[p], q16[2 * p], q16[2 * p + 1])
-                        woff = txl.Cast("int64", row) * (n // 4) + txl.Cast("int64", col // 4)
+                        woff = obase + j * rpi * (n // 4)
                         if wpl == 4:
                             txl.ptx.st.global_.v2.b32(dst.ptr_to([woff]), o[0], o[1])
                         else:
@@ -615,7 +649,7 @@ def bound_groups(num_groups):
     return gb
 
 
-def empty_outputs(n, dev):
+def empty2(n, dev):
     nsc = (n + BLOCK - 1) // BLOCK
     return (
         (
@@ -637,7 +671,7 @@ def scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx=None, padd
     m = expert_idxs.shape[0]
     n = gathered.shape[1]
     if m == 0:
-        return empty_outputs(n, dev)
+        return empty2(n, dev)
     g = num_groups
     gb = bound_groups(g)
     nct = (n + BLOCK - 1) // BLOCK
