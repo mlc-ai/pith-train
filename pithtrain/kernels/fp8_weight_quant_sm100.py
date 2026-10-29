@@ -1,212 +1,898 @@
 """
-Triton kernels of the fp8_weight_quant feature: the 128x128 blockwise FP8 of a weight and its
-transpose (2-D, and batched 3-D for grouped experts), and the FP8 parameter all-gather kernels.
+SM100 fp8_weight_quant in TIRx-lite: 128x128 blockwise FP8 of weights and their transposes,
+and the FP8 parameter all-gather kernels (shard amax / cast, E8M0 scales, packed transpose),
+including one-launch multi variants of the shard amax and scales.
+
+Every kernel is a @txl.kernel compiled once per process (functools.cache, keyed only on
+compile-time constants) and launched through tvm-ffi on torch's current stream.
+
+Evolved with TIRx-harness: run weight, frontier member tile-npamax (commit 1864d1d, 1.654x over the
+previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
+tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
-from typing import Optional
+import functools
 
 import torch
-import triton
-import triton.language as tl
+import tvm
+import tvm_ffi
 
-from pithtrain.kernels.arch import NATIVE_E8M0
-from pithtrain.kernels.fp8_scale import compute_fp8_scale
+import tirx_kernels.tirx_lite as txl
 
-__all__ = ["fp8_pack_transpose_sm100", "fp8_scales_sm100", "fp8_shard_amax_sm100", "fp8_shard_cast_sm100", "fp8_quant_weight_grouped_sm100", "fp8_quant_weight_sm100"]
-
-
-@triton.jit
-def fp8cast_blockwise_transpose_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, M, K, stride_x_row, stride_x_col, stride_out_row, scale_cols, stride_out_t_row, scale_t_cols, NATIVE_E8M0: tl.constexpr):
-    BLOCK: tl.constexpr = 128
-
-    pid_row, pid_col = tl.program_id(0), tl.program_id(1)
-    row_start, col_start = pid_row * BLOCK, pid_col * BLOCK
-    row_offs, col_offs = row_start + tl.arange(0, BLOCK), col_start + tl.arange(0, BLOCK)
-
-    x_ptrs = x_ptr + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
-    tile_mask = (row_offs[:, None] < M) & (col_offs[None, :] < K)
-    x_bf16 = tl.load(x_ptrs, mask=tile_mask, other=0.0)
-
-    x_abs = tl.abs(x_bf16)
-    row_amax = tl.max(x_abs, axis=1)
-    block_amax = tl.max(row_amax, axis=0)
-
-    scale, rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)
-
-    x_f32 = x_bf16.to(tl.float32)
-    fp8_tile = (x_f32 * rcp).to(tl.float8e4nv)
-
-    out_ptrs = out_ptr + row_offs[:, None] * stride_out_row + col_offs[None, :]
-    tl.store(out_ptrs, fp8_tile, mask=tile_mask)
-
-    # tl.trans miscompiles fp8 tiles: store the same tile to swapped-index addresses instead.
-    out_t_ptrs = out_t_ptr + col_offs[None, :] * stride_out_t_row + row_offs[:, None]
-    tl.store(out_t_ptrs, fp8_tile, mask=tile_mask)
-
-    scale_offset = pid_row * scale_cols + pid_col
-    tl.store(scale_ptr + scale_offset, scale)
-
-    scale_t_offset = pid_col * scale_t_cols + pid_row
-    tl.store(scale_t_ptr + scale_t_offset, scale)
-
-
-def fp8_quant_weight_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
-    M, K = x.shape
-    BLOCK = 128
-    scale_rows, scale_cols = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-
-    out = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
-    scale = torch.empty((scale_rows, scale_cols), dtype=torch.float32, device=x.device)
-    out_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=x.device)
-    scale_t = torch.empty((scale_cols, scale_rows), dtype=torch.float32, device=x.device)
-
-    grid = (scale_rows, scale_cols)
-
-    fp8cast_blockwise_transpose_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, M=M, K=K, stride_x_row=x.stride(0), stride_x_col=x.stride(1), stride_out_row=K, scale_cols=scale_cols, stride_out_t_row=M, scale_t_cols=scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
-
-    return out, scale, out_t, scale_t
-
-
-@triton.jit
-def fp8cast_blockwise_transpose_batched_kernel(x_ptr, out_ptr, scale_ptr, out_t_ptr, scale_t_ptr, G, N, K, stride_x_g, stride_x_row, stride_x_col, stride_out_g, stride_out_row, scale_cols, stride_scale_g, stride_out_t_g, stride_out_t_row, scale_t_cols, stride_scale_t_g, NATIVE_E8M0: tl.constexpr):
-    BLOCK: tl.constexpr = 128
-
-    pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    row_start, col_start = pid_row * BLOCK, pid_col * BLOCK
-    row_offs, col_offs = row_start + tl.arange(0, BLOCK), col_start + tl.arange(0, BLOCK)
-
-    x_base = x_ptr + pid_g * stride_x_g
-    x_ptrs = x_base + row_offs[:, None] * stride_x_row + col_offs[None, :] * stride_x_col
-    tile_mask = (row_offs[:, None] < N) & (col_offs[None, :] < K)
-    x_bf16 = tl.load(x_ptrs, mask=tile_mask, other=0.0)
-
-    x_abs = tl.abs(x_bf16)
-    row_amax = tl.max(x_abs, axis=1)
-    block_amax = tl.max(row_amax, axis=0)
-
-    scale, rcp = compute_fp8_scale(block_amax, NATIVE_E8M0)
-
-    x_f32 = x_bf16.to(tl.float32)
-    fp8_tile = (x_f32 * rcp).to(tl.float8e4nv)
-
-    out_base = out_ptr + pid_g * stride_out_g
-    out_ptrs = out_base + row_offs[:, None] * stride_out_row + col_offs[None, :]
-    tl.store(out_ptrs, fp8_tile, mask=tile_mask)
-
-    # tl.trans miscompiles fp8 tiles: store the same tile to swapped-index addresses instead.
-    out_t_base = out_t_ptr + pid_g * stride_out_t_g
-    out_t_ptrs = out_t_base + col_offs[None, :] * stride_out_t_row + row_offs[:, None]
-    tl.store(out_t_ptrs, fp8_tile, mask=tile_mask)
-
-    scale_offset = pid_g * stride_scale_g + pid_row * scale_cols + pid_col
-    tl.store(scale_ptr + scale_offset, scale)
-
-    scale_t_offset = pid_g * stride_scale_t_g + pid_col * scale_t_cols + pid_row
-    tl.store(scale_t_ptr + scale_t_offset, scale)
-
-
-def fp8_quant_weight_grouped_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
-    G, N, K = x.shape
-    BLOCK = 128
-    scale_rows, scale_cols = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-
-    out = torch.empty((G, N, K), dtype=torch.float8_e4m3fn, device=x.device)
-    scale = torch.empty((G, scale_rows, scale_cols), dtype=torch.float32, device=x.device)
-    out_t = torch.empty((G, K, N), dtype=torch.float8_e4m3fn, device=x.device)
-    scale_t = torch.empty((G, scale_cols, scale_rows), dtype=torch.float32, device=x.device)
-
-    grid = (scale_rows, scale_cols, G)
-
-    fp8cast_blockwise_transpose_batched_kernel[grid](x_ptr=x, out_ptr=out, scale_ptr=scale, out_t_ptr=out_t, scale_t_ptr=scale_t, G=G, N=N, K=K, stride_x_g=x.stride(0), stride_x_row=x.stride(1), stride_x_col=x.stride(2), stride_out_g=N * K, stride_out_row=K, scale_cols=scale_cols, stride_scale_g=scale_rows * scale_cols, stride_out_t_g=K * N, stride_out_t_row=N, scale_t_cols=scale_rows, stride_scale_t_g=scale_cols * scale_rows, NATIVE_E8M0=NATIVE_E8M0, num_warps=4, num_stages=2)
-
-    return out, scale, out_t, scale_t
-
+__all__ = ["fp8_quant_weight_sm100", "fp8_quant_weight_grouped_sm100", "fp8_shard_amax_sm100", "fp8_shard_cast_sm100", "fp8_scales_sm100", "fp8_pack_transpose_sm100", "fp8_shard_amax_multi_sm100", "fp8_scales_multi_sm100"]
 
 BLOCK = 128
+NT = 256  # threads per CTA
+FULL = 0xFFFFFFFF
+RCP_448 = 1.0 / 448.0
+# Streaming fp32 shard loads: no L1 allocation + 256B L2 prefetch (pure reads 5.0 -> 5.8 TB/s).
+LDG_V4 = "ld.global.nc.L1::no_allocate.L2::256B.v4.b32"
+LDG_B32 = "ld.global.nc.L1::no_allocate.L2::256B.b32"
 
 
-@triton.jit
-def fp8_shard_tile_kernel(x_ptr, amax_ptr, out_ptr, row_offset, local_rows, K, tile_row_start, amax_group_offset, amax_stride_g, amax_cols, CAST: tl.constexpr, NATIVE_E8M0: tl.constexpr):
+def cdiv(a, b):
+    return (a + b - 1) // b
+
+
+def compile_v(kern):
     """
-    One 128x128 tile (global rows [tile_row_idx * 128, tile_row_idx * 128 + 128) of local expert
-    pid(2)) of a row shard holding global rows [row_offset, row_offset + local_rows). CAST False
-    writes the amax of the shard's rows in the tile to the grid; CAST True casts them with the
-    reduced amax grid.
+    Compile once; return a launcher of the module's entry function (calling the module itself
+    looks the entry up on every call, ~4 us of host time) that runs it on torch's current stream.
     """
-    BLOCK: tl.constexpr = 128
-    pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+    with target:
+        mod = tvm.compile(kern.mod, target=target, tir_pipeline="tirx")
+    fn = mod[kern.name]
 
-    tile_row_idx = tile_row_start + pid_row
-    row_offs = tile_row_idx * BLOCK + tl.arange(0, BLOCK) - row_offset
-    col_offs = pid_col * BLOCK + tl.arange(0, BLOCK)
-    tile_mask = (row_offs[:, None] >= 0) & (row_offs[:, None] < local_rows) & (col_offs[None, :] < K)
-    x_offs = pid_g.to(tl.int64) * local_rows * K + row_offs[:, None] * K + col_offs[None, :]
-    # Round to bf16 first, as FSDP's mixed-precision cast does.
-    x_bf16 = tl.load(x_ptr + x_offs, mask=tile_mask, other=0.0).to(tl.bfloat16)
+    def launch(*args):
+        with tvm_ffi.use_torch_stream():
+            fn(*args)
 
-    amax_offset = (amax_group_offset + pid_g) * amax_stride_g + tile_row_idx * amax_cols + pid_col
-    if CAST:
-        amax = tl.load(amax_ptr + amax_offset)
-        _, rcp = compute_fp8_scale(amax, NATIVE_E8M0)
-        x_fp8 = (x_bf16.to(tl.float32) * rcp).to(tl.float8e4nv)
-        tl.store(out_ptr + x_offs, x_fp8, mask=tile_mask)
-    else:
-        amax = tl.max(tl.max(tl.abs(x_bf16), axis=1), axis=0)
-        tl.store(amax_ptr + amax_offset, amax.to(tl.float32))
+    launch.keep_module = mod  # keep the module alive with its function
+    return launch
 
 
-@triton.jit
-def fp8_scale_kernel(amax_ptr, scale_ptr, scale_t_ptr, num_rows, num_cols, NATIVE_E8M0: tl.constexpr):
-    elem_offs = tl.program_id(0) * 1024 + tl.arange(0, 1024)
-    group_idx = tl.program_id(1)
-    elem_mask = elem_offs < num_rows * num_cols
-    amax = tl.load(amax_ptr + group_idx * num_rows * num_cols + elem_offs, mask=elem_mask, other=0.0)
-    scale, _ = compute_fp8_scale(amax, NATIVE_E8M0)
-    tl.store(scale_ptr + group_idx * num_rows * num_cols + elem_offs, scale, mask=elem_mask)
-    row_idx, col_idx = elem_offs // num_cols, elem_offs % num_cols
-    tl.store(scale_t_ptr + group_idx * num_rows * num_cols + col_idx * num_rows + row_idx, scale, mask=elem_mask)
+# ---------------------------------------------------------------- traced helpers
 
 
-@triton.jit
-def fp8_pack_transpose_kernel(x_ptr, out_ptr, out_t_ptr, N, K):
-    BLOCK: tl.constexpr = 128
-    pid_row, pid_col, pid_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    row_offs, col_offs = pid_row * BLOCK + tl.arange(0, BLOCK), pid_col * BLOCK + tl.arange(0, BLOCK)
-    tile_mask = (row_offs[:, None] < N) & (col_offs[None, :] < K)
-    group_base = pid_g.to(tl.int64) * N * K
-    tile = tl.load(x_ptr + group_base + row_offs[:, None] * K + col_offs[None, :], mask=tile_mask)
-    tl.store(out_ptr + group_base + row_offs[:, None] * K + col_offs[None, :], tile, mask=tile_mask)
-    # Swapped-index store, since tl.trans miscompiles fp8 tiles.
-    tl.store(out_t_ptr + group_base + col_offs[None, :] * N + row_offs[:, None], tile, mask=tile_mask)
+def i642(x):
+    return txl.Cast("int64", x)
 
 
-def shard_tiles(shard: torch.Tensor, amax: torch.Tensor, out: Optional[torch.Tensor], row_offset: int, group_offset: int) -> None:
-    num_local_groups, local_rows, K = shard.shape
-    if shard.numel() == 0:
+def scale_bits(amax_f32):
+    """
+    (scale_bits, rcp_bits) of pith-train's compute_fp8_scale (SM100, native E8M0).
+    """
+    amc = txl.local_scalar("float32")
+    txl.ptx.max.f32(amc, amax_f32, txl.float32(1e-4))
+    si = txl.local_scalar("float32")
+    txl.ptx.mul.rn.f32(si, amc, txl.float32(RCP_448))
+    pair = txl.local_scalar("uint16")
+    txl.ptx.cvt.rp.satfinite.ue8m0x2.f32(pair, txl.float32(0.0), si)
+    sb = txl.local_scalar("uint32")
+    txl.ptx.max.u32(sb, (txl.Cast("uint32", pair) & txl.uint32(0xFF)) << txl.uint32(23), txl.uint32(1 << 23))
+    rb = txl.local_scalar("uint32", init=txl.uint32(254 << 23) - sb)
+    return sb, rb
+
+
+def e4m3x22(hi, lo, rcp):
+    """
+    Two f32 values times rcp -> two e4m3 bytes in the low 16 bits of a u32.
+    """
+    a = txl.local_scalar("float32")
+    b = txl.local_scalar("float32")
+    txl.ptx.mul.rn.f32(a, hi, rcp)
+    txl.ptx.mul.rn.f32(b, lo, rcp)
+    p = txl.local_scalar("uint16")
+    txl.ptx.cvt.rn.satfinite.e4m3x2.f32(p, a, b)
+    return txl.Cast("uint32", p)
+
+
+def bf16_word_to_fp8x2(w, rcp):
+    lo = txl.reinterpret("float32", w << txl.uint32(16))
+    hi = txl.reinterpret("float32", w & txl.uint32(0xFFFF0000))
+    return e4m3x22(hi, lo, rcp)
+
+
+def cta_max_u32(m, red_s, warp, lane):
+    """
+    Max of a u32 over the CTA (8 warps); every thread gets the result.
+    """
+    r = txl.local_scalar("uint32")
+    txl.ptx.redux_sync.max.u32(r, m, txl.uint32(FULL))
+    with txl.If(lane == 0), txl.Then():
+        txl.ptx.st.shared.b32(red_s.ptr_to([warp]), r)
+    txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NT))
+    out = txl.local_scalar("uint32", init=txl.uint32(0))
+    for i in range(NT // 32):
+        v = txl.local_scalar("uint32")
+        txl.ptx.ld.shared.b32(v, red_s.ptr_to([i]))
+        txl.ptx.max.u32(out, out, v)
+    return out
+
+
+def prmt2(a, b, sel):
+    d = txl.local_scalar("uint32")
+    txl.ptx.prmt.b32(d, a, b, txl.uint32(sel))
+    return d
+
+
+def t4x4(a, b, c, d):
+    """
+    4x4 byte transpose: rows a..d (4 bytes each) -> columns.
+    """
+    t0 = prmt2(a, b, 0x5140)
+    t1 = prmt2(a, b, 0x7362)
+    t2 = prmt2(c, d, 0x5140)
+    t3 = prmt2(c, d, 0x7362)
+    return (prmt2(t0, t2, 0x5410), prmt2(t0, t2, 0x7632), prmt2(t1, t3, 0x5410), prmt2(t1, t3, 0x7632))
+
+
+def transpose_store(B, t_s, kc, rg):
+    """
+    B[r][h]: 8 rows (n) x 8 bytes (k) as 2 words per row. Writes the 8x8 block transposed into
+    the [128 k][128 n] byte tile t_s (u32 words, 8-byte slots XOR-swizzled by k >> 3).
+    """
+    cols = [[None, None] for _ in range(8)]  # cols[kk][half of n]
+    for h in range(2):
+        for rh in range(2):
+            outs = t4x4(*[B[4 * rh + i][h] for i in range(4)])
+            for j in range(4):
+                cols[4 * h + j][rh] = outs[j]
+    slot = rg ^ kc
+    for kk in range(8):
+        row = kc * 8 + kk
+        txl.ptx.st.shared.v2.b32(t_s.ptr_to([row * 32 + slot * 2]), cols[kk][0], cols[kk][1])
+
+
+def transpose_flush(t_s, tid, out_t_ptr, k_base, n_base, Kd, Nd):
+    """
+    Write the transposed tile from t_s: tile row k (0..127) -> out_t row k_base + k, columns
+    n_base .. n_base + 127 in 16-byte chunks (requires Nd % 16 == 0).
+    """
+    j = tid & 7
+    for p in range(BLOCK // 32):
+        row = p * 32 + (tid >> 3)
+        s = row >> 3
+        pb = ((j * 2) ^ s) & 14
+        y = txl.alloc_local([4], "uint32")
+        txl.ptx.ld.shared.v4.b32(y[0], y[1], y[2], y[3], t_s.ptr_to([row * 32 + pb * 2]))
+        odd = (s & 1) == 1
+        gk = k_base + row
+        gn = n_base + j * 16
+        valid = txl.And(gk < Kd, gn < Nd)
+        txl.ptx.st.global_.v4.b32(
+            out_t_ptr(i642(gk) * i642(Nd) + i642(gn)),
+            txl.Select(odd, y[2], y[0]),
+            txl.Select(odd, y[3], y[1]),
+            txl.Select(odd, y[0], y[2]),
+            txl.Select(odd, y[1], y[3]),
+            pred=valid,
+        )
+
+
+def tile_coords(bid, R, C):
+    tc = txl.local_scalar("int32", init=bid % C)
+    t2 = txl.local_scalar("int32", init=bid // C)
+    tr = txl.local_scalar("int32", init=t2 % R)
+    g = txl.local_scalar("int32", init=t2 // R)
+    return g, tr, tc
+
+
+# ---------------------------------------------------------------- quant_weight (fast path)
+
+
+@functools.cache
+def quant_vec():
+    """
+    bf16, unit column stride, K % 8 == 0, N % 16 == 0, 16-byte aligned rows.
+    """
+
+    @txl.kernel(warps=NT // 32, grid="num_tiles")
+    def fp8_quant_vec(
+        x: txl.gptr[txl.bf16],
+        out: txl.gptr[txl.u8],
+        out_t: txl.gptr[txl.u8],
+        sc: txl.gptr[txl.f32],
+        sct: txl.gptr[txl.f32],
+        N: txl.i32,
+        K: txl.i32,
+        R: txl.i32,
+        C: txl.i32,
+        sxg: txl.i64,
+        sxn: txl.i64,
+        num_tiles: txl.i32,
+    ):
+        tid = txl.thread_id()
+        warp = txl.warp_id()
+        lane = txl.lane_id()
+        g, tr, tc = tile_coords(txl.cta_id(), R, C)
+        smem = txl.smem_pool()
+        t_s = smem.alloc([BLOCK * BLOCK // 4], "uint32")
+        red_s = smem.alloc([NT // 32], "uint32")
+
+        kc = tid & 15
+        rg = tid >> 4
+        n0 = tr * BLOCK + rg * 8
+        k = tc * BLOCK + kc * 8
+        kvalid = k < K
+        xb = txl.local_scalar("int64", init=i642(g) * sxg + i642(n0) * sxn + i642(k))
+        d = txl.alloc_local([32], "uint32")
+
+        def load(r):
+            txl.ptx.ld.global_.nc.v4.b32(d[4 * r], d[4 * r + 1], d[4 * r + 2], d[4 * r + 3], x.ptr_to([xb + sxn * r]))
+
+        with txl.If(txl.And(tc * BLOCK + BLOCK <= K, tr * BLOCK + BLOCK <= N)):
+            with txl.Then():
+                for r in range(8):
+                    load(r)
+            with txl.Else():
+                for r in range(8):
+                    for i in range(4):
+                        txl.ptx.mov.b32(d[4 * r + i], txl.uint32(0))
+                    with txl.If(txl.And(kvalid, n0 + r < N)), txl.Then():
+                        load(r)
+        m = txl.local_scalar("uint32", init=txl.uint32(0))
+        for i in range(32):
+            txl.ptx.max.u16x2(m, m, d[i] & txl.uint32(0x7FFF7FFF))
+        txl.ptx.max.u32(m, m & txl.uint32(0xFFFF), m >> txl.uint32(16))
+        am = cta_max_u32(m, red_s, warp, lane)
+        sb, rb = scale_bits(txl.reinterpret("float32", am << txl.uint32(16)))
+        rcp = txl.reinterpret("float32", rb)
+
+        ob = txl.local_scalar("int64", init=(i642(g) * i642(N) + i642(n0)) * i642(K) + i642(k))
+        B = []
+        for r in range(8):
+            q = [bf16_word_to_fp8x2(d[4 * r + i], rcp) for i in range(4)]
+            w0 = txl.local_scalar("uint32", init=q[0] | (q[1] << txl.uint32(16)))
+            w1 = txl.local_scalar("uint32", init=q[2] | (q[3] << txl.uint32(16)))
+            B.append((w0, w1))
+            txl.ptx.st.global_.v2.b32(
+                out.ptr_to([ob + i642(K) * r]), w0, w1, pred=txl.And(kvalid, n0 + r < N)
+            )
+        transpose_store(B, t_s, kc, rg)
+        with txl.If(tid == 0), txl.Then():
+            sf = txl.reinterpret("float32", sb)
+            txl.ptx.st.global_.f32(sc.ptr_to([(i642(g) * i642(R) + i642(tr)) * i642(C) + i642(tc)]), sf)
+            txl.ptx.st.global_.f32(sct.ptr_to([(i642(g) * i642(C) + i642(tc)) * i642(R) + i642(tr)]), sf)
+        txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NT))
+        tbase = txl.local_scalar("int64", init=i642(g) * i642(K) * i642(N))
+        transpose_flush(
+            t_s, tid, lambda off: out_t.ptr_to([tbase + off]), tc * BLOCK, tr * BLOCK, K, N
+        )
+
+    return compile_v(fp8_quant_vec)
+
+
+# ---------------------------------------------------------------- quant_weight (generic)
+
+
+@functools.cache
+def quant_generic(dtype):
+    """
+    Any dtype (bf16 / f32), any strides, any N, K: one element per thread step.
+    """
+    is_bf16 = dtype == "bfloat16"
+
+    @txl.kernel(warps=NT // 32, grid="num_tiles")
+    def fp8_quant_generic(
+        x: txl.gptr[dtype],
+        out: txl.gptr[txl.u8],
+        out_t: txl.gptr[txl.u8],
+        sc: txl.gptr[txl.f32],
+        sct: txl.gptr[txl.f32],
+        N: txl.i32,
+        K: txl.i32,
+        R: txl.i32,
+        C: txl.i32,
+        sxg: txl.i64,
+        sxn: txl.i64,
+        sxk: txl.i64,
+        num_tiles: txl.i32,
+    ):
+        tid = txl.thread_id()
+        warp = txl.warp_id()
+        lane = txl.lane_id()
+        g, tr, tc = tile_coords(txl.cta_id(), R, C)
+        smem = txl.smem_pool()
+        red_s = smem.alloc([NT // 32], "uint32")
+        c = tid & 127
+        k = tc * BLOCK + c
+        kvalid = k < K
+        r0 = tid >> 7
+        xb = txl.local_scalar("int64", init=i642(g) * sxg + i642(tr * BLOCK + r0) * sxn + i642(k) * sxk)
+        steps = BLOCK // (NT // BLOCK)
+        v = txl.alloc_local([steps], "uint32")
+        m = txl.local_scalar("uint32", init=txl.uint32(0))
+        for i in range(steps):
+            n = tr * BLOCK + r0 + 2 * i
+            txl.ptx.mov.b32(v[i], txl.uint32(0))
+            with txl.If(txl.And(kvalid, n < N)), txl.Then():
+                if is_bf16:
+                    h = txl.local_scalar("uint16")
+                    txl.ptx.ld.global_.nc.b16(h, x.ptr_to([xb + sxn * (2 * i)]))
+                    txl.ptx.mov.b32(v[i], txl.Cast("uint32", h) << txl.uint32(16))
+                else:
+                    txl.ptx.ld.global_.nc.b32(v[i], x.ptr_to([xb + sxn * (2 * i)]))
+            txl.ptx.max.u32(m, m, v[i] & txl.uint32(0x7FFFFFFF))
+        am = cta_max_u32(m, red_s, warp, lane)
+        sb, rb = scale_bits(txl.reinterpret("float32", am))
+        rcp = txl.reinterpret("float32", rb)
+        for i in range(steps):
+            n = tr * BLOCK + r0 + 2 * i
+            q = e4m3x22(txl.float32(0.0), txl.reinterpret("float32", v[i]), rcp)
+            with txl.If(txl.And(kvalid, n < N)), txl.Then():
+                byte = txl.Cast("uint8", q)
+                txl.ptx.st.global_.b8(out.ptr_to([(i642(g) * i642(N) + i642(n)) * i642(K) + i642(k)]), byte)
+                txl.ptx.st.global_.b8(out_t.ptr_to([(i642(g) * i642(K) + i642(k)) * i642(N) + i642(n)]), byte)
+        with txl.If(tid == 0), txl.Then():
+            sf = txl.reinterpret("float32", sb)
+            txl.ptx.st.global_.f32(sc.ptr_to([(i642(g) * i642(R) + i642(tr)) * i642(C) + i642(tc)]), sf)
+            txl.ptx.st.global_.f32(sct.ptr_to([(i642(g) * i642(C) + i642(tc)) * i642(R) + i642(tr)]), sf)
+
+    return compile_v(fp8_quant_generic)
+
+
+def flat_view(x):
+    """
+    A 1-D view over the storage span x addresses (x itself when contiguous).
+    """
+    if x.is_contiguous():
+        return x.view(-1)
+    span = 1 + sum((s - 1) * st for s, st in zip(x.shape, x.stride()))
+    return x.as_strided((span,), (1,))
+
+
+def u82(t):
+    return t.view(torch.uint8).view(-1)
+
+
+def quant(x3, G, N, K, sxg, sxn, sxk, out, scale, out_t, scale_t):
+    R, C = cdiv(N, BLOCK), cdiv(K, BLOCK)
+    tiles = G * R * C
+    if tiles == 0:
         return
-    tile_row_start, tile_row_end = row_offset // BLOCK, (row_offset + local_rows + BLOCK - 1) // BLOCK
-    grid = (tile_row_end - tile_row_start, triton.cdiv(K, BLOCK), num_local_groups)
-    fp8_shard_tile_kernel[grid](shard, amax, out if out is not None else shard, row_offset, local_rows, K, tile_row_start, group_offset, amax.stride(0), amax.shape[2], CAST=out is not None, NATIVE_E8M0=NATIVE_E8M0, num_warps=8)
+    xf = flat_view(x3)
+    fast = (
+        x3.dtype == torch.bfloat16
+        and sxk == 1
+        and K % 8 == 0
+        and N % 16 == 0
+        and sxn % 8 == 0
+        and sxg % 8 == 0
+        and xf.data_ptr() % 16 == 0
+    )
+    if fast:
+        quant_vec()(xf, u82(out), u82(out_t), scale.view(-1), scale_t.view(-1), N, K, R, C, sxg, sxn, tiles)
+    else:
+        dt = "bfloat16" if x3.dtype == torch.bfloat16 else "float32"
+        xf = xf if x3.dtype in (torch.bfloat16, torch.float32) else xf.float()
+        quant_generic(dt)(xf, u82(out), u82(out_t), scale.view(-1), scale_t.view(-1), N, K, R, C, sxg, sxn, sxk, tiles)
 
 
-def fp8_shard_amax_sm100(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
+def fp8_quant_weight_sm100(x: torch.Tensor):
+    assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
+    N, K = x.shape
+    R, C = cdiv(N, BLOCK), cdiv(K, BLOCK)
+    dev = x.device
+    out = torch.empty((N, K), dtype=torch.float8_e4m3fn, device=dev)
+    scale = torch.empty((R, C), dtype=torch.float32, device=dev)
+    out_t = torch.empty((K, N), dtype=torch.float8_e4m3fn, device=dev)
+    scale_t = torch.empty((C, R), dtype=torch.float32, device=dev)
+    if x.numel():
+        quant(x, 1, N, K, 0, x.stride(0), x.stride(1), out, scale, out_t, scale_t)
+    return out, scale, out_t, scale_t
+
+
+def fp8_quant_weight_grouped_sm100(x: torch.Tensor):
+    assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
+    G, N, K = x.shape
+    R, C = cdiv(N, BLOCK), cdiv(K, BLOCK)
+    dev = x.device
+    out = torch.empty((G, N, K), dtype=torch.float8_e4m3fn, device=dev)
+    scale = torch.empty((G, R, C), dtype=torch.float32, device=dev)
+    out_t = torch.empty((G, K, N), dtype=torch.float8_e4m3fn, device=dev)
+    scale_t = torch.empty((G, C, R), dtype=torch.float32, device=dev)
+    if x.numel():
+        quant(x, G, N, K, x.stride(0), x.stride(1), x.stride(2), out, scale, out_t, scale_t)
+    return out, scale, out_t, scale_t
+
+
+# ---------------------------------------------------------------- shard amax / cast
+
+
+def shard_tile_body(tid, warp, lane, red_s, xaddr, oaddr, amax_addr, L, K, row_offset, gl, tr, tc, cast, V, sub=0, RB=BLOCK):
+    """
+    Rows [sub * RB, sub * RB + RB) of one 128x128 tile of a row shard (global rows
+    [row_offset, row_offset + L)). V elements per load (4: K % 4 == 0; 1: any K). cast False
+    writes the tile's bf16 amax (RB must be BLOCK); True casts.
+    """
+    lanes_per_row = BLOCK // V
+    rows_per_pass = NT // lanes_per_row
+    passes = RB // rows_per_pass
+    assert passes >= 1 and (cast or RB == BLOCK)
+    cl = tid % lanes_per_row
+    rl = tid // lanes_per_row
+    k = tc * BLOCK + cl * V
+    kvalid = k < K
+    lr0 = txl.local_scalar("int32", init=tr * BLOCK + sub * RB + rl - row_offset)
+    xb = txl.local_scalar("int64", init=(i642(gl) * i642(L) + i642(lr0)) * i642(K) + i642(k))
+    v = txl.alloc_local([passes * V], "uint32")
+
+    def load(p, addr):
+        if V == 4:
+            txl.ptx[LDG_V4](v[4 * p], v[4 * p + 1], v[4 * p + 2], v[4 * p + 3], addr)
+        else:
+            txl.ptx[LDG_B32](v[p], addr)
+
+    # CTA-uniform: the whole tile lies inside the shard (most tiles). Unpredicated loads let
+    # ptxas keep all of them in flight.
+    full = txl.And(
+        txl.And(tc * BLOCK + BLOCK <= K, tr * BLOCK + sub * RB - row_offset >= 0), tr * BLOCK + sub * RB + RB - row_offset <= L
+    )
+    with txl.If(full):
+        with txl.Then():
+            for p in range(passes):
+                load(p, xaddr(xb + i642(K) * (p * rows_per_pass)))
+        with txl.Else():
+            for p in range(passes):
+                lr = lr0 + p * rows_per_pass
+                valid = txl.And(kvalid, txl.And(lr >= 0, lr < L))
+                for i in range(V):
+                    txl.ptx.mov.b32(v[p * V + i], txl.uint32(0))
+                with txl.If(valid), txl.Then():
+                    load(p, xaddr(xb + i642(K) * (p * rows_per_pass)))
+    if not cast:
+        m = txl.local_scalar("uint32", init=txl.uint32(0))
+        for i in range(passes * V):
+            txl.ptx.max.u32(m, m, v[i] & txl.uint32(0x7FFFFFFF))
+        am = cta_max_u32(m, red_s, warp, lane)
+        with txl.If(tid == 0), txl.Then():
+            h = txl.local_scalar("uint16")
+            txl.ptx.cvt.rn.bf16.f32(h, txl.reinterpret("float32", am))
+            txl.ptx.st.global_.f32(amax_addr, txl.reinterpret("float32", txl.Cast("uint32", h) << txl.uint32(16)))
+        return
+    a = txl.local_scalar("float32")
+    txl.ptx.ld.global_.f32(a, amax_addr)
+    _, rb = scale_bits(a)
+    rcp = txl.reinterpret("float32", rb)
+    ob = txl.local_scalar("int64", init=(i642(gl) * i642(L) + i642(lr0)) * i642(K) + i642(k))
+    for p in range(passes):
+        lr = lr0 + p * rows_per_pass
+        valid = txl.And(kvalid, txl.And(lr >= 0, lr < L))
+        addr = oaddr(ob + i642(K) * (p * rows_per_pass))
+        if V == 4:
+            bw = []
+            for i in range(2):
+                w = txl.local_scalar("uint32")
+                txl.ptx.cvt.rn.bf16x2.f32(
+                    w, txl.reinterpret("float32", v[4 * p + 2 * i + 1]), txl.reinterpret("float32", v[4 * p + 2 * i])
+                )
+                bw.append(bf16_word_to_fp8x2(w, rcp))
+            txl.ptx.st.global_.b32(addr, bw[0] | (bw[1] << txl.uint32(16)), pred=valid)
+        else:
+            h = txl.local_scalar("uint16")
+            txl.ptx.cvt.rn.bf16.f32(h, txl.reinterpret("float32", v[p]))
+            q = e4m3x22(txl.float32(0.0), txl.reinterpret("float32", txl.Cast("uint32", h) << txl.uint32(16)), rcp)
+            txl.ptx.st.global_.b8(addr, txl.Cast("uint8", q), pred=valid)
+
+
+CAST_SPLIT = 4
+CAST_SPLIT_BELOW = 1 << 62  # always split (measured faster at every size)
+
+
+def flat_addr(buf, nd, esize):
+    """
+    Element-offset addressing into a contiguous rank-nd buffer.
+    """
+    base = buf.ptr_to([0] * nd)
+    return lambda off: txl.ptx.addr(base, off * esize)
+
+
+@functools.cache
+def shard_kernel(cast, V, amax_nd, split=1):
+    """
+    Shard tile amax (cast False) or cast (True). shard (g, L, K) and out contiguous; amax
+    rank-3 contiguous (amax_nd 3) or a 1-D span with group stride asg (amax_nd 1).
+    """
+
+    def body(x, amax, out, L, K, row_offset, tr0, NTR, C, go, asg):
+        tid = txl.thread_id()
+        smem = txl.smem_pool()
+        red_s = smem.alloc([NT // 32], "uint32")
+        bid = txl.cta_id()
+        gl, trl, tc = tile_coords(bid // split if split > 1 else bid, NTR, C)
+        tr = tr0 + trl
+        amax_addr = flat_addr(amax, amax_nd, 4)(i642(go + gl) * asg + i642(tr) * i642(C) + i642(tc))
+        shard_tile_body(
+            tid, txl.warp_id(), txl.lane_id(), red_s,
+            flat_addr(x, 3, 4), None if out is None else flat_addr(out, 3, 1),
+            amax_addr, L, K, row_offset, gl, tr, tc, cast, V,
+            sub=bid % split if split > 1 else 0, RB=BLOCK // split,
+        )
+
+    if cast:
+
+        @txl.kernel(warps=NT // 32, grid="num_tiles")
+        def fp8_shard_cast(
+            x: txl.gptr[txl.f32, 3],
+            amax: txl.gptr[txl.f32, amax_nd],
+            out: txl.gptr[txl.f8e4m3, 3],
+            L: txl.i32, K: txl.i32, row_offset: txl.i32, tr0: txl.i32, NTR: txl.i32, C: txl.i32,
+            go: txl.i32, asg: txl.i64, num_tiles: txl.i32,
+        ):
+            body(x, amax, out, L, K, row_offset, tr0, NTR, C, go, asg)
+
+        return compile_v(fp8_shard_cast)
+
+    @txl.kernel(warps=NT // 32, grid="num_tiles")
+    def fp8_shard_amax(
+        x: txl.gptr[txl.f32, 3],
+        amax: txl.gptr[txl.f32, amax_nd],
+        L: txl.i32, K: txl.i32, row_offset: txl.i32, tr0: txl.i32, NTR: txl.i32, C: txl.i32,
+        go: txl.i32, asg: txl.i64, num_tiles: txl.i32,
+    ):
+        body(x, amax, None, L, K, row_offset, tr0, NTR, C, go, asg)
+
+    return compile_v(fp8_shard_amax)
+
+
+def shard_geom(shard, amax, row_offset):
+    gl, L, K = shard.shape
+    tr0 = row_offset // BLOCK
+    ntr = (row_offset + L + BLOCK - 1) // BLOCK - tr0
+    return gl, L, K, tr0, ntr, amax.shape[2]
+
+
+def shard_tiles(shard, amax, out, row_offset, group_offset):
+    gl, L, K = shard.shape
+    if gl == 0 or L == 0 or K == 0:
+        return
+    tr0 = row_offset // BLOCK
+    ntr = (row_offset + L + BLOCK - 1) // BLOCK - tr0
+    C = amax.shape[2]
+    V = 4 if K % 4 == 0 and shard.data_ptr() % 16 == 0 and (out is None or out.data_ptr() % 4 == 0) else 1
+    if amax.is_contiguous():
+        a, nd = amax, 3
+    else:
+        a, nd = flat_view(amax), 1
+    if out is None:
+        shard_kernel(False, V, nd)(shard, a, L, K, row_offset, tr0, ntr, C, group_offset, amax.stride(0), gl * ntr * C)
+    else:
+        tiles = gl * ntr * C
+        split = CAST_SPLIT if V == 4 and tiles < CAST_SPLIT_BELOW else 1
+        shard_kernel(True, V, nd, split)(shard, a, out, L, K, row_offset, tr0, ntr, C, group_offset, amax.stride(0), tiles * split)
+
+
+def fp8_shard_amax_sm100(shard, amax, row_offset, group_offset):
     shard_tiles(shard, amax, None, row_offset, group_offset)
 
 
-def fp8_shard_cast_sm100(shard: torch.Tensor, amax: torch.Tensor, out: torch.Tensor, row_offset: int, group_offset: int) -> None:
+def fp8_shard_cast_sm100(shard, amax, out, row_offset, group_offset):
     shard_tiles(shard, amax, out, row_offset, group_offset)
 
 
-def fp8_scales_sm100(amax: torch.Tensor, scale: torch.Tensor, scale_t: torch.Tensor) -> None:
-    G, num_rows, num_cols = amax.shape
-    grid = (triton.cdiv(num_rows * num_cols, 1024), G)
-    fp8_scale_kernel[grid](amax, scale, scale_t, num_rows, num_cols, NATIVE_E8M0=NATIVE_E8M0)
+# ---------------------------------------------------------------- scales
 
 
-def fp8_pack_transpose_sm100(x: torch.Tensor, out: torch.Tensor) -> None:
+def scale_elem(i, R, C, amax_addr, sc_addr, sct_addr):
+    RC = R * C
+    g = i // RC
+    rem = i % RC
+    r = rem // C
+    c = rem % C
+    a = txl.local_scalar("float32")
+    txl.ptx.ld.global_.f32(a, amax_addr(i))
+    sb, _ = scale_bits(a)
+    sf = txl.reinterpret("float32", sb)
+    txl.ptx.st.global_.f32(sc_addr(i), sf)
+    txl.ptx.st.global_.f32(sct_addr(g * RC + c * R + r), sf)
+
+
+@functools.cache
+def scales_kernel():
+    @txl.kernel(warps=NT // 32, grid="num_ctas")
+    def fp8_scales(
+        amax: txl.gptr[txl.f32, 3],
+        sc: txl.gptr[txl.f32, 3],
+        sct: txl.gptr[txl.f32, 3],
+        R: txl.i32,
+        C: txl.i32,
+        total: txl.i32,
+        num_ctas: txl.i32,
+    ):
+        i = txl.cta_id() * NT + txl.thread_id()
+        with txl.If(i < total), txl.Then():
+            scale_elem(
+                i, R, C,
+                flat_addr(amax, 3, 4), flat_addr(sc, 3, 4), flat_addr(sct, 3, 4),
+            )
+
+    return compile_v(fp8_scales)
+
+
+def fp8_scales_sm100(amax, scale, scale_t):
+    G, R, C = amax.shape
+    total = G * R * C
+    if total == 0:
+        return
+    scales_kernel()(amax, scale, scale_t, R, C, total, (total + NT - 1) // NT)
+
+
+# ---------------------------------------------------------------- pack transpose
+
+
+@functools.cache
+def pack_vec(dtype):
+    """
+    K % 8 == 0, N % 16 == 0.
+    """
+
+    @txl.kernel(warps=NT // 32, grid="num_tiles")
+    def fp8_pack_vec(
+        x: txl.gptr[dtype, 3],
+        out: txl.gptr[txl.u8],
+        N: txl.i32,
+        K: txl.i32,
+        R: txl.i32,
+        C: txl.i32,
+        total: txl.i64,
+        num_tiles: txl.i32,
+    ):
+        tid = txl.thread_id()
+        g, tr, tc = tile_coords(txl.cta_id(), R, C)
+        smem = txl.smem_pool()
+        t_s = smem.alloc([BLOCK * BLOCK // 4], "uint32")
+        kc = tid & 15
+        rg = tid >> 4
+        n0 = tr * BLOCK + rg * 8
+        k = tc * BLOCK + kc * 8
+        kvalid = k < K
+        xb = txl.local_scalar("int64", init=(i642(g) * i642(N) + i642(n0)) * i642(K) + i642(k))
+        xa = flat_addr(x, 3, 1)
+        B = [(txl.local_scalar("uint32"), txl.local_scalar("uint32")) for _ in range(8)]
+        with txl.If(txl.And(tc * BLOCK + BLOCK <= K, tr * BLOCK + BLOCK <= N)):
+            with txl.Then():
+                for r in range(8):
+                    txl.ptx.ld.global_.nc.v2.b32(B[r][0], B[r][1], xa(xb + i642(K) * r))
+            with txl.Else():
+                for r in range(8):
+                    txl.ptx.mov.b32(B[r][0], txl.uint32(0))
+                    txl.ptx.mov.b32(B[r][1], txl.uint32(0))
+                    with txl.If(txl.And(kvalid, n0 + r < N)), txl.Then():
+                        txl.ptx.ld.global_.nc.v2.b32(B[r][0], B[r][1], xa(xb + i642(K) * r))
+        for r in range(8):
+            txl.ptx.st.global_.v2.b32(out.ptr_to([xb + i642(K) * r]), B[r][0], B[r][1], pred=txl.And(kvalid, n0 + r < N))
+        transpose_store(B, t_s, kc, rg)
+        txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NT))
+        tbase = txl.local_scalar("int64", init=total + i642(g) * i642(K) * i642(N))
+        transpose_flush(t_s, tid, lambda off: out.ptr_to([tbase + off]), tc * BLOCK, tr * BLOCK, K, N)
+
+    return compile_v(fp8_pack_vec)
+
+
+@functools.cache
+def pack_generic(dtype):
+    @txl.kernel(warps=NT // 32, grid="num_tiles")
+    def fp8_pack_generic(
+        x: txl.gptr[dtype, 3],
+        out: txl.gptr[txl.u8],
+        N: txl.i32,
+        K: txl.i32,
+        R: txl.i32,
+        C: txl.i32,
+        total: txl.i64,
+        num_tiles: txl.i32,
+    ):
+        tid = txl.thread_id()
+        g, tr, tc = tile_coords(txl.cta_id(), R, C)
+        c = tid & 127
+        k = tc * BLOCK + c
+        r0 = tid >> 7
+        for i in range(BLOCK // 2):
+            n = tr * BLOCK + r0 + 2 * i
+            with txl.If(txl.And(k < K, n < N)), txl.Then():
+                b = txl.local_scalar("uint8")
+                off = (i642(g) * i642(N) + i642(n)) * i642(K) + i642(k)
+                txl.ptx.ld.global_.nc.u8(b, flat_addr(x, 3, 1)(off))
+                txl.ptx.st.global_.b8(out.ptr_to([off]), b)
+                txl.ptx.st.global_.b8(out.ptr_to([total + (i642(g) * i642(K) + i642(k)) * i642(N) + i642(n)]), b)
+
+    return compile_v(fp8_pack_generic)
+
+
+ONE_BYTE = {torch.float8_e4m3fn: "float8_e4m3fn", torch.uint8: "uint8", torch.int8: "int8", torch.float8_e5m2: "float8_e5m2"}
+
+
+def fp8_pack_transpose_sm100(x, out):
     G, N, K = x.shape
-    x, out = x.view(torch.uint8), out.view(torch.uint8)
-    grid = (triton.cdiv(N, BLOCK), triton.cdiv(K, BLOCK), G)
-    fp8_pack_transpose_kernel[grid](x, out, out[x.numel() :], N, K, num_warps=4)
+    tiles = G * ((N + BLOCK - 1) // BLOCK) * ((K + BLOCK - 1) // BLOCK)
+    if tiles == 0:
+        return
+    if out.dtype != torch.uint8 or out.dim() != 1:
+        out = out.view(torch.uint8).view(-1)
+    dt = ONE_BYTE.get(x.dtype)
+    if dt is None:
+        x, dt = x.view(torch.uint8), "uint8"
+    fast = K % 8 == 0 and N % 16 == 0 and x.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0
+    (pack_vec(dt) if fast else pack_generic(dt))(x, out, N, K, (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK, G * N * K, tiles)
+
+
+# ---------------------------------------------------------------- multi launchers
+
+# Descriptor table fields (int64) of the shard-amax multi launch.
+SA_FIELDS = 12
+(SA_X, SA_AMAX, SA_L, SA_K, SA_RO, SA_GO, SA_TR0, SA_NTR, SA_C, SA_ASG, SA_START, SA_PAD) = range(SA_FIELDS)
+
+
+NUM_SMS = 148
+
+
+def load_table(table, nw, fields, cap):
+    """
+    Stage the int64 descriptor table in smem (once per CTA).
+    """
+    smem = txl.smem_pool()
+    t_s = smem.alloc([cap * fields], "int64")
+    red_s = smem.alloc([NT // 32], "uint32")
+    tid = txl.thread_id()
+    with txl.serial((cap * fields + NT - 1) // NT) as it:
+        i = it * NT + tid
+        with txl.If(i < nw * fields), txl.Then():
+            v = txl.local_scalar("int64")
+            txl.ptx.ld.global_.nc.s64(v, table.ptr_to([i642(i)]))
+            txl.ptx.st.shared.s64(t_s.ptr_to([i]), v)
+    txl.ptx.bar.sync(txl.uint32(2), txl.uint32(NT))
+    return t_s, red_s
+
+
+def find_entry(t_s, nw, fields, start_field, key):
+    """
+    Index of the last table entry whose start <= key (entries sorted by start).
+    """
+    w = txl.local_scalar("int32", init=txl.int32(0))
+    with txl.serial(nw) as i:
+        s = txl.local_scalar("int64")
+        txl.ptx.ld.shared.s64(s, t_s.ptr_to([i * fields + start_field]))
+        with txl.If(s <= key), txl.Then():
+            txl.assign(w, i)
+    return w
+
+
+def field(t_s, w, fields, f, dtype="int32"):
+    s = txl.local_scalar("int64")
+    txl.ptx.ld.shared.s64(s, t_s.ptr_to([w * fields + f]))
+    return txl.local_scalar(dtype, init=txl.Cast(dtype, s)) if dtype != "int64" else s
+
+
+def handle(base, off, elem_bytes):
+    return txl.reinterpret("handle", txl.Cast("uint64", base) + txl.Cast("uint64", off * elem_bytes))
+
+
+def cap2(n):
+    c = 8
+    while c < n:
+        c *= 2
+    return c
+
+
+def gfield(table, w, f, dtype="int32"):
+    s = txl.local_scalar("int64")
+    txl.ptx.ld.global_.nc.s64(s, table.ptr_to([i642(w * SA_FIELDS + f)]))
+    return txl.local_scalar(dtype, init=txl.Cast(dtype, s)) if dtype != "int64" else s
+
+
+@functools.cache
+def shard_amax_multi_kernel(V):
+    """
+    One CTA per tile over all shards; the CTA finds its shard descriptor in the (L1/L2-resident)
+    table with broadcast loads. Beats a persistent tile loop by 3-8 us per precompute row: the
+    hardware CTA scheduler keeps every SM busy to the end.
+    """
+
+    @txl.kernel(warps=NT // 32, grid="total")
+    def fp8_shard_amax_multi(table: txl.gptr[txl.i64], nw: txl.i32, total: txl.i32):
+        tid = txl.thread_id()
+        smem = txl.smem_pool()
+        red_s = smem.alloc([NT // 32], "uint32")
+        t = txl.cta_id()
+        w = txl.local_scalar("int32", init=txl.int32(0))
+        with txl.serial(nw) as i:
+            st = gfield(table, i, SA_START, "int64")
+            with txl.If(st <= i642(t)), txl.Then():
+                txl.assign(w, i)
+        xp = gfield(table, w, SA_X, "int64")
+        ap = gfield(table, w, SA_AMAX, "int64")
+        L = gfield(table, w, SA_L)
+        K = gfield(table, w, SA_K)
+        ro = gfield(table, w, SA_RO)
+        go = gfield(table, w, SA_GO)
+        tr0 = gfield(table, w, SA_TR0)
+        ntr = gfield(table, w, SA_NTR)
+        C = gfield(table, w, SA_C)
+        asg = gfield(table, w, SA_ASG, "int64")
+        start = gfield(table, w, SA_START)
+        gl, trl, tc = tile_coords(t - start, ntr, C)
+        tr = tr0 + trl
+        amax_addr = handle(ap, i642(go + gl) * asg + i642(tr) * i642(C) + i642(tc), 4)
+        shard_tile_body(
+            tid, txl.warp_id(), txl.lane_id(), red_s,
+            lambda off: handle(xp, off, 4), None,
+            amax_addr, L, K, ro, gl, tr, tc, False, V,
+        )
+
+    return compile_v(fp8_shard_amax_multi)
+
+
+def fp8_shard_amax_multi_sm100(shards, amaxes, row_offsets, group_offsets):
+    rows, start, V = [], 0, 4
+    for shard, amax, ro, go in zip(shards, amaxes, row_offsets, group_offsets):
+        if shard.numel() == 0:
+            continue
+        gl, L, K, tr0, ntr, C = shard_geom(shard, amax, ro)
+        if K % 4 or shard.data_ptr() % 16:
+            V = 1
+        rows.append([shard.data_ptr(), amax.data_ptr(), L, K, ro, go, tr0, ntr, C, amax.stride(0), start, 0])
+        start += gl * ntr * C
+    if start == 0:
+        return lambda: None
+    dev = shards[0].device
+    table = torch.tensor(rows, dtype=torch.int64, device=dev).view(-1)
+    kern, nw, tiles = shard_amax_multi_kernel(V), len(rows), start
+    keep = (list(shards), list(amaxes))
+
+    def launch():
+        _ = keep
+        kern(table, nw, tiles)
+
+    return launch
+
+
+SC_FIELDS = 6
+(SC_AMAX, SC_SC, SC_SCT, SC_R, SC_C, SC_START) = range(SC_FIELDS)
+
+
+@functools.cache
+def scales_multi_kernel(cap):
+    @txl.kernel(warps=NT // 32, grid="num_ctas")
+    def fp8_scales_multi(table: txl.gptr[txl.i64], nw: txl.i32, total: txl.i32, num_ctas: txl.i32):
+        t_s, _ = load_table(table, nw, SC_FIELDS, cap)
+        gi = txl.local_scalar("int32", init=txl.cta_id() * NT + txl.thread_id())
+        with txl.While(gi < total):
+            w = find_entry(t_s, nw, SC_FIELDS, SC_START, i642(gi))
+            ap = field(t_s, w, SC_FIELDS, SC_AMAX, "int64")
+            sp = field(t_s, w, SC_FIELDS, SC_SC, "int64")
+            tp = field(t_s, w, SC_FIELDS, SC_SCT, "int64")
+            R = field(t_s, w, SC_FIELDS, SC_R)
+            C = field(t_s, w, SC_FIELDS, SC_C)
+            start = field(t_s, w, SC_FIELDS, SC_START)
+            i = txl.local_scalar("int32", init=gi - start)
+            scale_elem(
+                i, R, C,
+                lambda j: handle(ap, i642(j), 4), lambda j: handle(sp, i642(j), 4), lambda j: handle(tp, i642(j), 4),
+            )
+            txl.assign(gi, gi + num_ctas * NT)
+
+    return compile_v(fp8_scales_multi)
+
+
+def fp8_scales_multi_sm100(amaxes, scales, scales_t):
+    rows, start = [], 0
+    for amax, scale, scale_t in zip(amaxes, scales, scales_t):
+        G, R, C = amax.shape
+        if G * R * C == 0:
+            continue
+        rows.append([amax.data_ptr(), scale.data_ptr(), scale_t.data_ptr(), R, C, start])
+        start += G * R * C
+    if start == 0:
+        return lambda: None
+    table = torch.tensor(rows, dtype=torch.int64, device=amaxes[0].device).view(-1)
+    kern, nw, total = scales_multi_kernel(cap2(len(rows))), len(rows), start
+    ctas = min((total + NT - 1) // NT, NUM_SMS)
+    keep = (list(amaxes), list(scales), list(scales_t))
+
+    def launch():
+        _ = keep
+        kern(table, nw, total, ctas)
+
+    return launch

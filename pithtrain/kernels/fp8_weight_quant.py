@@ -2,10 +2,11 @@
 Picker of the weight-side 128x128 blockwise FP8 quantization: the blockwise transposes of a weight
 and the FP8 parameter all-gather kernels.
 
-The blockwise transposes run the Triton kernel on both architectures: they are called inside
-torch.compile regions, which cannot trace the CuTe-DSL launchers. The all-gather kernels run the
-CuTe-DSL port on SM90 and the Triton kernel on SM100. Every scale is row-major: the E8M0
-2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
+The blockwise transposes are also called inside torch.compile regions. SM90 runs the Triton kernel
+there (fp8_blockwise_transpose), which torch.compile traces; SM100 runs the TIRx kernel through a
+torch.library custom op with a fake implementation, so a compiled region calls it as an opaque
+op. The all-gather kernels run the CuTe-DSL port on SM90 and the TIRx kernels on SM100. Every scale
+is row-major: the E8M0 2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
 """
 
 from typing import Any, Optional, Sequence
@@ -13,9 +14,41 @@ from typing import Any, Optional, Sequence
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_quant_weight_grouped_sm100, fp8_quant_weight_sm100
+from pithtrain.kernels.fp8_blockwise_transpose import fp8cast_blockwise_transpose, fp8cast_blockwise_transpose_grouped
 
 __all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8_quant_weight", "fp8_quant_weight_grouped"]
+
+
+@torch.library.custom_op("pithtrain::fp8_quant_weight_sm100", mutates_args=())
+def fp8_quant_weight_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    The SM100 fp8_quant_weight as an op torch.compile does not trace into.
+    """
+    from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_quant_weight_sm100
+    return fp8_quant_weight_sm100(x)
+
+
+@fp8_quant_weight_op.register_fake
+def fp8_quant_weight_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    N, K = x.shape
+    rows, cols = (N + 127) // 128, (K + 127) // 128
+    return x.new_empty((N, K), dtype=torch.float8_e4m3fn), x.new_empty((rows, cols), dtype=torch.float32), x.new_empty((K, N), dtype=torch.float8_e4m3fn), x.new_empty((cols, rows), dtype=torch.float32)
+
+
+@torch.library.custom_op("pithtrain::fp8_quant_weight_grouped_sm100", mutates_args=())
+def fp8_quant_weight_grouped_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    The SM100 fp8_quant_weight_grouped as an op torch.compile does not trace into.
+    """
+    from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_quant_weight_grouped_sm100
+    return fp8_quant_weight_grouped_sm100(x)
+
+
+@fp8_quant_weight_grouped_op.register_fake
+def fp8_quant_weight_grouped_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    G, N, K = x.shape
+    rows, cols = (N + 127) // 128, (K + 127) // 128
+    return x.new_empty((G, N, K), dtype=torch.float8_e4m3fn), x.new_empty((G, rows, cols), dtype=torch.float32), x.new_empty((G, K, N), dtype=torch.float8_e4m3fn), x.new_empty((G, cols, rows), dtype=torch.float32)
 
 
 def fp8_quant_weight(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -25,8 +58,16 @@ def fp8_quant_weight(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     x is 2-D (N, K) bf16 (or fp32), any N, K and strides (a partial tile is quantized over its valid
     elements). w_fp8 is e4m3 (N, K), w_scale fp32 (ceil(N / 128), ceil(K / 128)); wt_fp8 is e4m3
     (K, N), exactly w_fp8.T, and wt_scale is w_scale.T. All outputs are fresh and contiguous.
+    Callable inside torch.compile regions.
     """
-    return fp8_quant_weight_sm100(x)
+    match ARCH_MAJOR:
+        case 9:
+            return fp8cast_blockwise_transpose(x)
+        case 10:
+            # detached: the custom op has no autograd formula, and the outputs carry no gradient
+            return fp8_quant_weight_op(x.detach())
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def fp8_quant_weight_grouped(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -34,9 +75,15 @@ def fp8_quant_weight_grouped(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     fp8_quant_weight of each expert of a grouped weight x, 3-D (G, N, K) bf16 (or fp32),
     any strides. Returns w_fp8 e4m3 (G, N, K), w_scale fp32 (G, ceil(N / 128), ceil(K / 128)),
     wt_fp8 e4m3 (G, K, N) and wt_scale fp32 (G, ceil(K / 128), ceil(N / 128)), all contiguous.
-    Tiles never straddle experts.
+    Tiles never straddle experts. Callable inside torch.compile regions.
     """
-    return fp8_quant_weight_grouped_sm100(x)
+    match ARCH_MAJOR:
+        case 9:
+            return fp8cast_blockwise_transpose_grouped(x)
+        case 10:
+            return fp8_quant_weight_grouped_op(x.detach())
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def fp8_shard_amax(shard: torch.Tensor, amax: torch.Tensor, row_offset: int, group_offset: int) -> None:
@@ -117,7 +164,7 @@ def fp8_pack_transpose(x: torch.Tensor, out: torch.Tensor) -> None:
 def fp8_shard_amax_multi(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.Tensor], row_offsets: Sequence[int], group_offsets: Sequence[int]) -> Optional[Any]:
     """
     A callable that runs fp8_shard_amax for every (shard, amax, row_offset, group_offset) of the
-    lists in one launch, or None on SM100, where the caller loops over fp8_shard_amax itself.
+    lists in one launch.
 
     It records the tensors' addresses, so it stays valid only while none of them is reallocated.
     """
@@ -126,22 +173,23 @@ def fp8_shard_amax_multi(shards: Sequence[torch.Tensor], amaxes: Sequence[torch.
             from pithtrain.kernels.fp8_weight_quant_sm90 import fp8_shard_amax_multi_sm90
             return fp8_shard_amax_multi_sm90(shards, amaxes, row_offsets, group_offsets)
         case 10:
-            return None
+            from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_shard_amax_multi_sm100
+            return fp8_shard_amax_multi_sm100(shards, amaxes, row_offsets, group_offsets)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def fp8_scales_multi(amaxes: Sequence[torch.Tensor], scales: Sequence[torch.Tensor], scales_t: Sequence[torch.Tensor]) -> Optional[Any]:
     """
-    A callable that runs fp8_scales for every (amax, scale, scale_t) of the lists in one launch,
-    or None on SM100, where the caller loops over fp8_scales itself. Same address
-    caveat as fp8_shard_amax_multi.
+    A callable that runs fp8_scales for every (amax, scale, scale_t) of the lists in one launch.
+    Same address caveat as fp8_shard_amax_multi.
     """
     match ARCH_MAJOR:
         case 9:
             from pithtrain.kernels.fp8_weight_quant_sm90 import fp8_scales_multi_sm90
             return fp8_scales_multi_sm90(amaxes, scales, scales_t)
         case 10:
-            return None
+            from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_scales_multi_sm100
+            return fp8_scales_multi_sm100(amaxes, scales, scales_t)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
