@@ -409,10 +409,11 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         shared = self.shared_expert(hidden_states)
         return torch.sigmoid(self.shared_expert_gate(hidden_states)) * shared
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def reference_forward(
+        self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None
+    ) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
-        replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
         topk_idx, topk_weight, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
@@ -470,13 +471,22 @@ class Qwen35MoeDecoderLayer(nn.Module):
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
         return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
+    def resolve_replay(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """
+        Convert the store's zigzag routes to contiguous order for linear-attention gates.
+        """
+        replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        if replay_idx is not None and self.is_linear and distributed.cp_size > 1:
+            replay_idx = zigzag_to_contiguous(replay_idx.unflatten(0, hidden_states.shape[:2]), distributed.cp_group).flatten(0, 1)  # fmt: skip
+        return replay_idx
+
     def forward_stage1(
         self,
         hidden_states: torch.Tensor,
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
-        replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        replay_idx = self.resolve_replay(hidden_states)
         hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
@@ -553,7 +563,8 @@ class Qwen35MoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp.reference_forward(hidden_states)
+        replay_idx = self.resolve_replay(hidden_states)
+        hidden_states = residual + self.mlp.reference_forward(hidden_states, replay_idx)
         if self.to_zigzag:
             hidden_states = contiguous_to_zigzag(hidden_states, distributed.cp_group)
         return hidden_states
