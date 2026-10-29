@@ -5,10 +5,13 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.13.0,<2.14",
+    "apache-tvm==0.27.0.post1",
+    "apache-tvm-ffi==0.1.14.post0",
     "deep-gemm",
     "flash-attn-4[cu13]==4.0.0b28",
     "flash-linear-attention==0.5.2",
     "quack-kernels==0.6.5",
+    "tirx-kernels==0.1.2.post1",
     "transformers",
     "wandb",
     "zstandard",
@@ -26,6 +29,7 @@ include = ["pithtrain*"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+constraint-dependencies = ["kcoral==0.1.0"]  # the version the TIRx SM100 kernels were evolved with
 
 [[tool.uv.index]]
 name = "torch-cu130"

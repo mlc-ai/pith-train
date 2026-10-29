@@ -12,6 +12,12 @@ This file provides guidance to coding agents (Claude Code and other assistants) 
 uv sync
 ```
 
+On Blackwell (SM100) the TIRx kernels compile at first use with TVM, which needs the CUDA 13.3 `nvcc` and nvcc mode (see Kernels → SM100):
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.3 PATH=/usr/local/cuda-13.3/bin:$PATH TVM_CUDA_COMPILE_MODE=nvcc
+```
+
 ## Common Commands
 
 ### Linting & Formatting (Ruff)
