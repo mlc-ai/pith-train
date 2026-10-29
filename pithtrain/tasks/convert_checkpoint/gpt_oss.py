@@ -5,11 +5,17 @@ import math
 import re
 from logging import Logger
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import torch
 import torch.distributed.checkpoint as dcp
+import torch.nn as nn
 from safetensors import safe_open
+from torch.distributed.tensor import DTensor
+
+from pithtrain.modules.checkpoint import find_moe
+
+from ._streaming import CopyOp, fused_expert_ops, generic_plan_param
 
 
 def _dequantize_mxfp4(
@@ -64,6 +70,10 @@ def _dequantize_mxfp4(
         del idx_lo, idx_hi, blk, exp
 
     return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+
+
+_EXPERT_BIAS_LEAVES = {"gate_up_proj_bias", "down_proj_bias"}
+_EXPERT_MXFP4_LEAVES = {"gate_up_proj", "down_proj"}
 
 
 class GptOssConverter:
@@ -174,3 +184,21 @@ class GptOssConverter:
             % (sum(len(v) for v in to_stack.values()), len(to_stack))
         )
         return result
+
+    def plan_param(
+        self,
+        local_fqn: str,
+        param: DTensor,
+        weight_map: Dict[str, str],
+        named_modules: Dict[str, nn.Module],
+    ) -> List[CopyOp]:
+        """Streaming load: fused expert biases + MXFP4-quantized expert weights."""
+        args = (local_fqn, param, weight_map, named_modules)
+        leaf = local_fqn.rsplit(".", 1)[-1]
+        if find_moe(local_fqn, named_modules) is not None:
+            if leaf in _EXPERT_MXFP4_LEAVES:
+                keys = lambda k: (k + "_blocks", k + "_scales")
+                return fused_expert_ops(*args, keys, transform=_dequantize_mxfp4)
+            if leaf in _EXPERT_BIAS_LEAVES:
+                return fused_expert_ops(*args, lambda k: (k,))
+        return generic_plan_param(*args)

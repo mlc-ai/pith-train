@@ -22,6 +22,7 @@ from pithtrain.modules.checkpoint import (
 )
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm
@@ -335,6 +336,8 @@ def launch(cfg: PretrainLMCfg) -> None:
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(cfg.training.save_location, step)
+    elif cfg.training.hf_import_path is not None:
+        load_hf_into_model(cfg.training.hf_import_path, training.model)
     step = step or 0
     gc.disable()
     while step < cfg.training.max_steps:
