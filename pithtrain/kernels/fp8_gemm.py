@@ -84,15 +84,9 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
 
 
 def m_grouped_fp8_gemm_nt(a, b, out, grouped_mm_offs, M, group_indices=None):
-    match ARCH_MAJOR:
-        case 9:
-            if group_indices is None:
-                group_indices = fp8_group_indices(grouped_mm_offs, M)
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, out, group_indices)
-        case 10:
-            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, out, grouped_mm_offs, use_psum_layout=True, expected_m_for_psum_layout=M)
-        case _:
-            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
+    if group_indices is None:
+        group_indices = fp8_group_indices(grouped_mm_offs, M)
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, out, group_indices)
 
 
 K_GROUPED_MAX_ROWS = 65536
@@ -238,8 +232,8 @@ def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tens
                 k_grouped_fp8_gemm_nt(a, b, d_padded, ks, ks_tensor)
                 d.add_(d_padded[:, :N, :K])
         case 10:
-            deep_gemm.k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c=d)
-            return
+            from pithtrain.kernels.fp8_grouped_gemm_sm100 import k_grouped_fp8_gemm_sm100
+            k_grouped_fp8_gemm_sm100((a[0], a[1].contiguous()), (b[0], b[1].contiguous()), d, ks, ks_tensor)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
@@ -301,10 +295,18 @@ def fp8_grouped_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor
     - grouped_mm_offs: int32 (G,) cumulative group ends, each group a multiple of 128 rows.
     - group_indices: optional hint from fp8_group_indices, computed when None.
     """
-    M = a[0].shape[0]
-    out = torch.empty((M, n), device=a[0].device, dtype=torch.bfloat16)
-    m_grouped_fp8_gemm_nt(a, b, out, grouped_mm_offs, M, group_indices=group_indices)
-    return out
+    match ARCH_MAJOR:
+        case 9:
+            M = a[0].shape[0]
+            out = torch.empty((M, n), device=a[0].device, dtype=torch.bfloat16)
+            m_grouped_fp8_gemm_nt(a, b, out, grouped_mm_offs, M, group_indices=group_indices)
+            return out
+        case 10:
+            from pithtrain.kernels.fp8_grouped_gemm_sm100 import fp8_grouped_gemm_sm100
+            # The TIRx kernel reads row-major scales; a fused op's MN-major scale is copied.
+            return fp8_grouped_gemm_sm100((a[0], a[1].contiguous()), b, n, grouped_mm_offs)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def k_grouped_safe_size(n: int) -> int:
