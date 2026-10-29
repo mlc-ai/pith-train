@@ -10,7 +10,6 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.kernels.fp8_rowwise_blockwise_transpose import fp8_quant_act
-from pithtrain.kernels.fp8_rowwise_colwise import fp8cast_rowwise_colwise
 from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.kernels.fp8_rowwise_transpose import fp8_quant_grad
 
@@ -285,7 +284,8 @@ def fp8_quant_grouped(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tup
         case 9:
             return fp8cast_rowwise_kmajor(input, grouped_mm_offs)
         case 10:
-            return fp8cast_rowwise_colwise(input)
+            from pithtrain.kernels.fp8_rowwise_colwise_sm100 import fp8_quant_grouped_sm100
+            return fp8_quant_grouped_sm100(input, grouped_mm_offs)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
