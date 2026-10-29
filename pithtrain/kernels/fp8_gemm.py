@@ -14,20 +14,38 @@ from pithtrain.kernels.fp8_rowwise_colwise import fp8cast_rowwise_colwise
 from pithtrain.kernels.fp8_rowwise_kmajor import fp8cast_rowwise_kmajor
 from pithtrain.kernels.fp8_rowwise_transpose import fp8_quant_grad
 
-__all__ = ["fp8_gemm_fwd", "fp8_gemm_bwd", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_empty", "fp8_grouped_gemm", "k_grouped_fp8_gemm", "k_grouped_safe_size", "fp8_group_indices", "fp8_quant_grouped"]
+__all__ = ["fp8_channels_as_rows", "fp8_gemm_fwd", "fp8_gemm_bwd", "fp8_fused_experts_supported", "fp8_gemm_nt", "fp8_grouped_wgrad_empty", "fp8_grouped_gemm", "k_grouped_fp8_gemm", "k_grouped_safe_size", "fp8_group_indices", "fp8_quant_grouped"]
 
 
 def fp8_gemm_nt(a_fp8: torch.Tensor, a_scale: torch.Tensor, b_fp8: torch.Tensor, b_scale: torch.Tensor, m: int, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """
     out = a @ b.T, fresh, fp32 accumulation. dtype must be bf16 (DeepGEMM on SM90 rejects others).
 
-    - a_fp8: e4m3 (m, K) row-major; a_scale: its 1x128 scale, fp32 (m, ceil(K / 128)), any strides.
+    - a_fp8: e4m3 (m, K) row-major, or as fp8_channels_as_rows returns it; a_scale: its 1x128
+      scale, fp32 (m, ceil(K / 128)), any strides.
     - b_fp8: e4m3 (n, K) row-major; b_scale: its 128x128 scale, fp32 (ceil(n / 128), ceil(K / 128))
       row-major, as fp8_quant_weight returns it.
     """
     out = torch.empty((m, n), device=device, dtype=dtype)
     deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
     return out
+
+
+def fp8_channels_as_rows(x_ch: torch.Tensor, x_ch_scale: torch.Tensor, num_rows: int, num_channels: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The per-channel pair of fp8_quant_grouped (or of a fused quantization op) over a single group
+    of num_rows rows and num_channels channels, as the a operand of fp8_gemm_nt with the channels
+    as rows: (e4m3 (num_channels, num_rows), 1x128 scale (num_channels, num_rows / 128)). Views, no
+    copy: SM90's K-major data as it lies, SM100's (num_rows, num_channels) data transposed (the
+    MN-major operand DeepGEMM's SM100 GEMM reads); strides are unspecified.
+    """
+    match ARCH_MAJOR:
+        case 9:
+            return x_ch.view(num_channels, num_rows), x_ch_scale
+        case 10:
+            return x_ch.view(num_rows, num_channels).T, x_ch_scale.T
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def fp8_gemm_fwd(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -243,9 +261,9 @@ def fp8_grouped_wgrad_empty(size: torch.Size, device: torch.device) -> torch.Ten
 def fp8_fused_experts_supported() -> bool:
     """
     Whether the fused FP8 expert ops run on this device (the activation-fused quantizations,
-    scatter_quant, the fused dense SwiGLU MLP): True on SM90 only.
+    scatter_quant, the fused dense SwiGLU MLP): True on SM90 and SM100.
     """
-    return ARCH_MAJOR == 9
+    return ARCH_MAJOR in (9, 10)
 
 
 def fp8_quant_grouped(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

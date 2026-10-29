@@ -1,8 +1,19 @@
 """
 Verifies the fp8_gemm feature of pithtrain.kernels against PyTorch: quantizations by exact FP8
 bytes and E8M0 scale values, GEMMs against fp32 matmuls of the dequantized FP8 operands.
+
+fp8_quant_grouped's per-channel pair is K-major per group on SM90 and (M, K) with scale (M / 128, K)
+on SM100; the checks read the layout the output has (kmajor_layout), and the cases only the K-major
+layout has (padded operands, the SM90 k-grouped deadlock guard and its transposed wgrad buffer) run
+only there.
+
+Known SM100 difference: in a block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf
+(reciprocal -inf, bytes -/+448), SM100's native cvt.rp.satfinite.ue8m0x2 saturates the scale to
+2^127 (bytes +/-0). Inputs with inf mean training has already diverged, so either is accepted,
+element by element, in such blocks only; everywhere else the bytes and scales must match exactly.
 """
 
+import functools
 import json
 import os
 import subprocess
@@ -12,6 +23,7 @@ import pytest
 import torch
 
 from pithtrain.kernels import (
+    fp8_channels_as_rows,
     fp8_fused_experts_supported,
     fp8_gemm_bwd,
     fp8_gemm_fwd,
@@ -26,11 +38,6 @@ from pithtrain.kernels import (
     k_grouped_fp8_gemm,
 )
 
-pytestmark = pytest.mark.skipif(
-    not fp8_fused_experts_supported(),
-    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
-)
-
 DEV = "cuda"
 BLOCK = 128
 
@@ -43,22 +50,34 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     return (1 - 2 * (x * y).sum() / den).item()
 
 
-def e8m0_scale(amax: torch.Tensor) -> torch.Tensor:
+def e8m0_scale(amax: torch.Tensor, native: bool = False) -> torch.Tensor:
     """
     2 ** ceil(log2(max(amax, 1e-4) / 448)) as an exact fp32 power of two, dividing by 448 as the
-    kernels do (a multiply by fp32(1 / 448)) and taking the power-of-two ceil on the bits.
+    kernels do (a multiply by fp32(1 / 448)) and taking the power-of-two ceil on the bits. An
+    infinite amax gives inf, or with native 2^127 (SM100's saturating cvt).
     """
     raw_scale = amax.float().clamp(min=1e-4) * torch.tensor(1.0 / 448.0, dtype=torch.float32)
     bits = raw_scale.view(torch.int32)
     exponent_bump = torch.where((bits & 0x007FFFFF) != 0, 0x00800000, 0).to(torch.int32)
-    return ((bits & 0x7F800000) + exponent_bump).view(torch.float32)
+    scale = ((bits & 0x7F800000) + exponent_bump).view(torch.float32)
+    return scale.clamp(max=2.0**127) if native else scale
 
 
 def cast(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    """
+    x times the exact reciprocal of the power-of-two scale, as the kernels compute it (an infinite
+    scale gives the reciprocal -inf).
+    """
+    rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
+    return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
 
-def ref_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def nan_free_abs(x: torch.Tensor) -> torch.Tensor:
+    x_abs = x.abs()
+    return torch.where(torch.isnan(x_abs), torch.zeros_like(x_abs), x_abs)
+
+
+def ref_rowwise(x: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     1x128 along each row: fp8 (M, K), scale (M, ceil(K / 128)).
     """
@@ -67,18 +86,18 @@ def ref_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     x_padded = torch.zeros(M, num_kblocks * BLOCK, dtype=torch.float32, device=x.device)
     x_padded[:, :K] = x.float()
     x_blocks = x_padded.view(M, num_kblocks, BLOCK)
-    scale = e8m0_scale(x_blocks.abs().amax(-1))
+    scale = e8m0_scale(nan_free_abs(x_blocks).amax(-1), native)
     q = cast(x_blocks, scale[..., None]).view(M, num_kblocks * BLOCK)[:, :K].contiguous()
     return q, scale
 
 
-def ref_channelwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def ref_channelwise(x: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     128x1 along the rows (M a multiple of 128): fp8 (M, K), scale (K, M / 128).
     """
     M, K = x.shape
     x_blocks = x.float().view(M // BLOCK, BLOCK, K)
-    scale = e8m0_scale(x_blocks.abs().amax(1))
+    scale = e8m0_scale(nan_free_abs(x_blocks).amax(1), native)
     q = cast(x_blocks, scale[:, None, :]).view(M, K)
     return q, scale.T
 
@@ -120,15 +139,30 @@ def dq_blockwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def dq_kmajor(data: torch.Tensor, scale: torch.Tensor, ks: list[int], ch: int) -> list:
     """
-    Per group (ch, ks[g]) fp32 from the K-major flat data and (ch, M / 128) scales.
+    Per group (ch, ks[g]) fp32 from fp8_quant_grouped's per-channel pair: K-major flat data with
+    (ch, M / 128) scales, or (M, ch) data with (M / 128, ch) scales.
     """
     out, row = [], 0
     for k in ks:
-        block = data[row * ch : (row + k) * ch].view(ch, k).float()
-        block_scale = scale[:, row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=1)
-        out.append(block * block_scale)
+        if data.ndim == 1:
+            block = data[row * ch : (row + k) * ch].view(ch, k).float()
+            block_scale = scale[:, row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=1)  # fmt: skip
+            out.append(block * block_scale)
+        else:
+            block = data[row : row + k].float()
+            block_scale = scale[row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=0)
+            out.append((block * block_scale).T)
         row += k
     return out
+
+
+@functools.cache
+def kmajor_layout() -> bool:
+    """
+    Whether fp8_quant_grouped returns the per-channel FP8 K-major per group (flat), as on SM90.
+    """
+    x = torch.zeros(BLOCK, BLOCK, dtype=torch.bfloat16, device=DEV)
+    return fp8_quant_grouped(x, torch.tensor([BLOCK], dtype=torch.int32, device=DEV))[2].ndim == 1
 
 
 def offsets(ks: list[int]) -> torch.Tensor:
@@ -202,6 +236,7 @@ def test_wgrad_buffer_layout(size: tuple) -> None:
     assert buf.dtype == torch.float32 and buf.device.type == "cuda"
     assert buf.shape == size and buf.contiguous().shape == size
     transposed = len(size) == 3 and blocks(size[1]) % 2 == 1 and blocks(size[2]) % 2 == 0
+    transposed = transposed and kmajor_layout()  # only SM90's k-grouped GEMM runs transposed
     if transposed:
         _, n, k = size
         assert not buf.is_contiguous() and buf.stride() == (n * k, 1, n)
@@ -210,16 +245,43 @@ def test_wgrad_buffer_layout(size: tuple) -> None:
         assert buf.is_contiguous()
 
 
+def assert_fp8_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor, name: str) -> None:
+    """
+    Bytes equal to ref or to alt, element by element; a NaN may carry either sign.
+    """
+    assert got.dtype == torch.float8_e4m3fn and got.shape == ref.shape, (name, got.shape)
+    got_bytes = got.view(torch.uint8)
+    ok = torch.zeros_like(got_bytes, dtype=torch.bool)
+    for want in (ref.view(torch.uint8), alt.view(torch.uint8)):
+        ok |= (got_bytes == want) | (((want & 0x7F) == 0x7F) & ((got_bytes & 0x7F) == 0x7F))
+    assert bool(ok.all()), f"{name}: {(~ok).sum().item()} bytes differ"
+
+
+def assert_scale_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor, name: str) -> None:
+    assert got.dtype == torch.float32 and got.shape == ref.shape, (name, got.shape, ref.shape)
+    ok = (got == ref) | (got == alt)
+    assert bool(ok.all()), f"{name}: {(~ok).sum().item()} scales differ"
+
+
 def check_grouped_input(x: torch.Tensor, ks: list[int]) -> None:
+    """
+    fp8_quant_grouped against the reference in the output's per-channel layout, the SM100-native
+    E8M0 accepted element by element (it differs only in blocks whose amax is infinite).
+    """
     M, K = x.shape
     x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(x, offsets(ks))
-    row_q, row_scale = ref_rowwise(x)
-    assert_fp8_equal(x_fp8, row_q, "x_fp8")
-    assert_scale_equal(x_scale, row_scale, "x_scale")
-    ch_q, ch_ref_scale = ref_channelwise(x)
-    assert ch_fp8.shape == (M * K,)
-    assert_fp8_equal(ch_fp8, to_kmajor(ch_q, ks), "x_ch_fp8")
-    assert_scale_equal(ch_scale, ch_ref_scale, "x_ch_scale")
+    (row_q, row_scale), (row_q_alt, row_scale_alt) = ref_rowwise(x), ref_rowwise(x, native=True)
+    assert_fp8_either(x_fp8, row_q, row_q_alt, "x_fp8")
+    assert_scale_either(x_scale, row_scale, row_scale_alt, "x_scale")
+    (ch_q, ch_s), (ch_q_alt, ch_s_alt) = ref_channelwise(x), ref_channelwise(x, native=True)
+    if ch_fp8.ndim == 1:  # K-major per group
+        assert ch_fp8.shape == (M * K,)
+        ch_q, ch_q_alt = to_kmajor(ch_q, ks), to_kmajor(ch_q_alt, ks)
+    else:
+        assert ch_fp8.shape == (M, K)
+        ch_s, ch_s_alt = ch_s.T, ch_s_alt.T
+    assert_fp8_either(ch_fp8, ch_q, ch_q_alt, "x_ch_fp8")
+    assert_scale_either(ch_scale, ch_s, ch_s_alt, "x_ch_scale")
 
 
 BALANCED = [2048] * 16
@@ -273,7 +335,20 @@ def test_fp8_quant_grouped_many_groups() -> None:
 def test_fp8_quant_grouped_empty() -> None:
     x = torch.empty(0, 2048, dtype=torch.bfloat16, device=DEV)
     out = fp8_quant_grouped(x, torch.zeros(16, dtype=torch.int32, device=DEV))
-    assert [tuple(t.shape) for t in out] == [(0, 2048), (0, 16), (0,), (2048, 0)]
+    shapes = [(0,), (2048, 0)] if kmajor_layout() else [(0, 2048), (0, 2048)]
+    assert [tuple(t.shape) for t in out] == [(0, 2048), (0, 16)] + shapes
+
+
+@pytest.mark.parametrize("ks,K", [([256, 0, 384], 768), ([128, 128], 200)])
+def test_fp8_quant_grouped_inf_nan(ks: list[int], K: int) -> None:
+    """
+    NaN is ignored by the amax; a block whose amax is infinite takes either E8M0 result.
+    """
+    x = make_input(sum(ks), K, seed=8)
+    inf, nan = float("inf"), float("nan")
+    x[3, 5], x[130, 7], x[131, K - 1], x[200, 129 % K] = inf, -inf, inf, -inf
+    x[9, 1], x[140, 2], x[sum(ks) - 1, K - 2] = nan, nan, nan
+    check_grouped_input(x, ks)
 
 
 def ref_group_indices(offs: torch.Tensor, M: int) -> torch.Tensor:
@@ -283,8 +358,13 @@ def ref_group_indices(offs: torch.Tensor, M: int) -> torch.Tensor:
 
 
 def check_group_indices(offs: torch.Tensor, M: int) -> None:
+    """
+    The hint is None where the device's grouped GEMM needs none (SM100), else exact.
+    """
     group_idx = fp8_group_indices(offs, M)
-    assert group_idx is not None and group_idx.dtype == torch.int32 and group_idx.shape == (M,)
+    if group_idx is None:
+        return
+    assert group_idx.dtype == torch.int32 and group_idx.shape == (M,)
     assert torch.equal(group_idx, ref_group_indices(offs, M))
 
 
@@ -313,14 +393,16 @@ def test_group_indices_uncovered_offsets() -> None:
 
 def test_group_indices_empty() -> None:
     offs = torch.tensor([0, 0, 0], dtype=torch.int32, device=DEV)
-    assert fp8_group_indices(offs, 0).shape == (0,)
+    hint = fp8_group_indices(offs, 0)
+    assert hint is None or hint.shape == (0,)
     check_group_indices(offs, 7)
 
 
 def test_group_indices_example() -> None:
     offs = torch.tensor([128, 256, 384, 512], dtype=torch.int32, device=DEV)
     ref = torch.arange(4, dtype=torch.int32, device=DEV).repeat_interleave(128)
-    assert torch.equal(fp8_group_indices(offs, 512), ref)
+    hint = fp8_group_indices(offs, 512)
+    assert hint is None or torch.equal(hint, ref)
 
 
 @pytest.mark.parametrize(
@@ -453,11 +535,15 @@ KGROUPED_CASES = [
 
 
 def needs_guard(N: int, NA: int | None) -> bool:
-    return blocks(NA or N) % 2 == 1
+    return blocks(NA or N) % 2 == 1 and kmajor_layout()
 
 
 @pytest.mark.parametrize("ks,N,K,NA,KB", KGROUPED_CASES)
 def test_k_grouped_gemm(ks: list[int], N: int, K: int, NA: int | None, KB: int | None) -> None:
+    if (NA or KB) and not kmajor_layout():
+        pytest.skip(
+            "padded per-channel operands come only from the SM90 fused ops (K-major layout)"
+        )
     if not needs_guard(N, NA):
         run_kgrouped_case(ks, N, K, NA, KB)
         return
@@ -532,3 +618,27 @@ def test_act_weight_gemm_and_dgrad_wgrad(M: int, K: int, N: int) -> None:
     assert calc_diff(weight_grad, ref_wg) < 1e-3
     assert calc_diff(grad_input, dy.float() @ w.float()) < 1e-2
     assert calc_diff(weight_grad, dy.float().T @ x.float()) < 1e-2
+
+
+@pytest.mark.parametrize(
+    "M,inter,hidden", [(4096, 10944, 2048), (2048, 1408, 2048), (128, 256, 128)]
+)
+def test_fp8_channels_as_rows(M: int, inter: int, hidden: int) -> None:
+    """
+    The dense SwiGLU MLP's weight gradient: dg.T @ x from the per-channel pair of one group of all
+    M rows (as rows of inter channels) and fp8_quant_act's x.T.
+    """
+    dg = make_input(M, inter, seed=21)
+    x = make_input(M, hidden, seed=22)
+    one_group = torch.tensor([M], dtype=torch.int32, device=DEV)
+    _, _, ch_fp8, ch_scale = fp8_quant_grouped(dg, one_group)
+    a_fp8, a_scale = fp8_channels_as_rows(ch_fp8, ch_scale, M, inter)
+    assert a_fp8.shape == (inter, M) and a_scale.shape == (inter, M // BLOCK)
+    assert a_fp8.untyped_storage().data_ptr() == ch_fp8.untyped_storage().data_ptr()  # a view
+    ch_q, ch_s = ref_channelwise(dg)
+    assert_fp8_equal(a_fp8.contiguous(), ch_q.T.contiguous(), "a_fp8")
+    assert_scale_equal(a_scale.contiguous(), ch_s.contiguous(), "a_scale")
+    _, _, xt_fp8, xt_scale = fp8_quant_act(x)
+    out = fp8_gemm_nt(a_fp8, a_scale, xt_fp8, xt_scale, inter, hidden, torch.device(DEV), torch.bfloat16)  # fmt: skip
+    ref = dq_rowwise(ch_q.T.contiguous(), ch_s) @ dq_blockwise(xt_fp8, xt_scale).T
+    assert out.shape == (inter, hidden) and calc_diff(out, ref) < 1e-3

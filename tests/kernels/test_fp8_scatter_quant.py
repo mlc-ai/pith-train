@@ -1,41 +1,46 @@
 """
 Contract: expand the deduplicated rows (gathered[expand_idx]), scatter the tokens into per-expert
 groups padded with zero rows to a multiple of 128, and quantize the result as fp8_quant_grouped
-does on SM90 (rowwise 1x128 plus the per-channel FP8 K-major per group). Returns (quantized 4-tuple,
+does (rowwise 1x128 plus the per-channel FP8 in fp8_quant_grouped's layout: K-major per group on
+SM90, (M, N) with scale (M / 128, N) on SM100; the check reads the layout the output has). Returns (quantized 4-tuple,
 reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor).
 
 Row placement within a group is the kernel's choice, so reverse_shuffle_idxs only has to be a valid
 placement: each token inside its expert's rows, all rows distinct. The reference scatters the
 tokens through it into a zero bf16 matrix and quantizes that in PyTorch; every quantized output,
-padding rows included (zero bytes), must match exactly. On SM90 the placement is also checked to
-keep token order within each expert.
+padding rows included (zero bytes), must match exactly. Where the op documents a stable placement
+(SM100, and SM90's fused kernels) it is also checked to keep token order within each expert.
 
 Recipe: per 128-element block, scale = 2^ceil(log2(max(amax, 1e-4) / 448)), at least 2^-126, and
-fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even.
+fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even; amax ignores NaN.
+
+Known SM100 difference: in a block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf
+(reciprocal -inf, bytes -/+448), SM100's native cvt.rp.satfinite.ue8m0x2 saturates the scale to
+2^127 (bytes +/-0). Inputs with inf mean training has already diverged, so either is accepted,
+element by element, in such blocks only; everywhere else the bytes and scales must match exactly.
 """
 
 import pytest
 import torch
 
-from pithtrain.kernels import fp8_fused_experts_supported, scatter_quant
-
-pytestmark = pytest.mark.skipif(
-    not fp8_fused_experts_supported(),
-    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
-)
+from pithtrain.kernels import scatter_quant
 
 BLOCK = 128
 
 
-def e8m0_scale_rcp(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def e8m0_scale_rcp(amax: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Return the recipe's power-of-two scale of an fp32 amax, and its exact reciprocal.
+    Return the recipe's power-of-two scale of an fp32 amax, and its exact reciprocal. native
+    saturates the scale of an infinite amax to 2^127 as SM100's cvt does (the SM90 arithmetic gives
+    inf); the two agree on every finite amax.
     """
     clamped = torch.maximum(amax, torch.full_like(amax, 1e-4))
     ratio = clamped * torch.full_like(clamped, 1.0 / 448.0)
     bits = ratio.view(torch.int32)
     bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
     scale = torch.maximum(bits.view(torch.float32), torch.full_like(clamped, 2.0**-126))
+    if native:
+        scale = torch.minimum(scale, torch.full_like(scale, 2.0**127))
     rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
     return scale, rcp
 
@@ -44,20 +49,28 @@ def quantize_bytes(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
     return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def absmax_input(x: torch.Tensor) -> torch.Tensor:
+    magnitude = x.abs()
+    return torch.where(torch.isnan(magnitude), torch.zeros_like(magnitude), magnitude)
+
+
+def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor, kmajor: bool = True, native: bool = False) -> tuple[torch.Tensor, ...]:  # fmt: skip
     """
-    Return fp8_quant_grouped on SM90 in PyTorch: x_fp8 (M, K) as uint8, x_scale (M,
-    ceil(K/128)), x_ch flat (M*K,) uint8 K-major per group, and x_ch_scale (K, M/128).
+    Return fp8_quant_grouped in PyTorch: x_fp8 (M, K) as uint8, x_scale (M, ceil(K/128)), and the
+    per-channel pair, K-major (x_ch flat (M*K,) uint8 K-major per group, x_ch_scale (K, M/128)) or
+    not ((M, K) uint8, (M/128, K)). native: the SM100 E8M0 of an infinite amax (e8m0_scale_rcp).
     """
     M, K = x.shape
     num_blocks = -(-K // BLOCK)
     x_pad = torch.zeros(M, num_blocks * BLOCK, dtype=torch.float32, device=x.device)
     x_pad[:, :K] = x.float()
-    scale_row, rcp_row = e8m0_scale_rcp(x_pad.abs().view(M, num_blocks, BLOCK).amax(-1))
+    scale_row, rcp_row = e8m0_scale_rcp(absmax_input(x_pad).view(M, num_blocks, BLOCK).amax(-1), native)  # fmt: skip
     fp8_row = quantize_bytes(x_pad.view(M, num_blocks, BLOCK), rcp_row[..., None]).view(M, num_blocks * BLOCK)[:, :K]  # fmt: skip
     x_col = x_pad[:, :K].reshape(M // BLOCK, BLOCK, K)
-    scale_ch, rcp_ch = e8m0_scale_rcp(x_col.abs().amax(1))
+    scale_ch, rcp_ch = e8m0_scale_rcp(absmax_input(x_col).amax(1), native)
     fp8_ch = quantize_bytes(x_col, rcp_ch[:, None, :]).view(M, K)
+    if not kmajor:
+        return fp8_row.contiguous(), scale_row, fp8_ch.contiguous(), scale_ch
     flat = torch.zeros(M * K, dtype=torch.uint8, device=x.device)
     start = 0
     for end in offs.tolist():
@@ -68,6 +81,16 @@ def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Ten
 
 def as_bytes(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
+
+
+def match(got: torch.Tensor, want: torch.Tensor) -> torch.Tensor:
+    """
+    Elementwise equality of FP8 bytes (a NaN may carry either sign) or of scale values.
+    """
+    if got.dtype != torch.float8_e4m3fn:
+        return got == want
+    got = as_bytes(got)
+    return (got == want) | (((want & 0x7F) == 0x7F) & ((got & 0x7F) == 0x7F))
 
 
 def make_routing(
@@ -142,14 +165,17 @@ def check(
 
     dense = torch.zeros(M, N, dtype=torch.bfloat16, device=gathered.device)
     dense[reverse_idxs] = x
-    ref = quantize_grouped_ref(dense, ref_offs)
-    shapes = [(M, N), (M, -(-N // BLOCK)), (M * N,), (N, M // BLOCK)]
+    kmajor = quantized[2].ndim == 1
+    ref, alt = (quantize_grouped_ref(dense, ref_offs, kmajor, native) for native in (False, True))
+    shapes = [(M, N), (M, -(-N // BLOCK))]
+    shapes += [(M * N,), (N, M // BLOCK)] if kmajor else [(M, N), (M // BLOCK, N)]
     names = ("x_fp8", "x_scale", "x_ch_fp8", "x_ch_scale")
-    for name, got, want, shape in zip(names, quantized, ref, shapes):
+    for name, got, want, want_alt, shape in zip(names, quantized, ref, alt, shapes):
         assert tuple(got.shape) == shape, (name, got.shape, shape)
         assert got.dtype == (torch.float8_e4m3fn if name.endswith("fp8") else torch.float32), name
-        if not torch.equal(as_bytes(got), want):
-            raise AssertionError(f"{name}: {(as_bytes(got) != want).sum().item()} mismatches")
+        ok = match(got, want) | match(got, want_alt)
+        if not bool(ok.all()):
+            raise AssertionError(f"{name}: {(~ok).sum().item()} mismatches")
     pad = torch.ones(M, dtype=torch.bool, device=gathered.device)
     pad[reverse_idxs] = False
     assert not bool(as_bytes(quantized[0])[pad].any()), "padding rows must be zero bytes"
@@ -157,7 +183,7 @@ def check(
 
 def check_stable(expert_idxs: torch.Tensor, G: int, reverse_idxs: torch.Tensor, offs: torch.Tensor) -> None:  # fmt: skip
     """
-    Check that tokens keep their order within each expert (the SM90 placement).
+    Check that tokens keep their order within each expert (the stable placement).
     """
     ks_tensor = torch.diff(offs, prepend=offs.new_zeros(1))
     starts = (offs - ks_tensor).long()
@@ -284,3 +310,18 @@ def test_scatter_quant_zeros() -> None:
     check(gathered, expert_idxs, len(RAGGED), expand, None, out)
     floor = e8m0_scale_rcp(torch.zeros(1, device="cuda"))[0].item()
     assert bool((out[0][1] == floor).all()) and bool((out[0][3] == floor).all())
+
+
+def test_scatter_quant_inf_nan() -> None:
+    """
+    Tokens holding inf or NaN: NaN is ignored by the amax, an infinite amax takes either E8M0
+    result (see the module docstring), every other block is exact.
+    """
+    sizes, G, N = IMBALANCED, len(IMBALANCED), 2048
+    expert_idxs, expand, m_src = make_routing(sizes, 2, True, 13)
+    gathered = make_tokens(m_src, N, 13)
+    inf, nan = float("inf"), float("nan")
+    gathered[1, 5], gathered[2, 300], gathered[40, 2047], gathered[41, 0] = inf, -inf, inf, nan
+    gathered[100, 129], gathered[m_src - 1, 7] = nan, -inf
+    out = scatter_quant(gathered, expert_idxs, G, expand, group_counts=sizes)
+    check(gathered, expert_idxs, G, expand, sizes, out)

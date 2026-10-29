@@ -1,7 +1,8 @@
 """
 Contract: the SwiGLU silu(g) * u (or its two gradients), rounded to bf16 as the plain kernels
-silu_mul_fwd and silu_mul_bwd round it, then quantized as fp8_quant_grouped does on SM90:
-rowwise 1x128 FP8 plus the per-channel FP8 laid out K-major per group.
+silu_mul_fwd and silu_mul_bwd round it, then quantized as fp8_quant_grouped does:
+rowwise 1x128 FP8 plus the per-channel FP8 in fp8_quant_grouped's layout (K-major per group on SM90,
+(M, N) with scale (M / 128, N) on SM100; the reference takes the layout the output has).
 
 The kernels' sigmoid uses ex2.approx, which PyTorch cannot reproduce bit for bit, so the test checks
 that the FP8 bytes and scale values equal, exactly, a PyTorch quantization of the bf16 output of
@@ -10,13 +11,17 @@ a float64 PyTorch evaluation of the same formula.
 
 Recipe: per 128-element block, amax = max |x| ignoring NaN, scale = 2^ceil(log2(max(amax, 1e-4) /
 448)) and fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even.
+
+Known SM100 difference: in a block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf
+(reciprocal -inf, bytes -/+448), SM100's native cvt.rp.satfinite.ue8m0x2 saturates the scale to
+2^127 (bytes +/-0). Inputs with inf mean training has already diverged, so either is accepted,
+element by element, in such blocks only; everywhere else the bytes and scales must match exactly.
 """
 
 import pytest
 import torch
 
 from pithtrain.kernels import (
-    fp8_fused_experts_supported,
     fp8_silu_mul_bwd,
     fp8_silu_mul_fwd,
     fp8_silu_mul_gu_bwd,
@@ -25,23 +30,22 @@ from pithtrain.kernels import (
     silu_mul_fwd,
 )
 
-pytestmark = pytest.mark.skipif(
-    not fp8_fused_experts_supported(),
-    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
-)
-
 BLOCK = 128
 
 
-def e8m0_scale_rcp(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def e8m0_scale_rcp(amax: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Return the recipe's power-of-two scale of an fp32 amax, and its exact reciprocal.
+    Return the recipe's power-of-two scale of an fp32 amax, and its exact reciprocal. native
+    saturates the scale of an infinite amax to 2^127 as SM100's cvt does (the SM90 arithmetic gives
+    inf); the two agree on every finite amax.
     """
     clamped = torch.maximum(amax, torch.full_like(amax, 1e-4))
     ratio = clamped * torch.full_like(clamped, 1.0 / 448.0)
     bits = ratio.view(torch.int32)
     bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
     scale = torch.maximum(bits.view(torch.float32), torch.full_like(clamped, 2.0**-126))
+    if native:
+        scale = torch.minimum(scale, torch.full_like(scale, 2.0**127))
     rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
     return scale, rcp
 
@@ -55,20 +59,25 @@ def quantize_bytes(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
     return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor, kmajor: bool = True, native: bool = False) -> tuple[torch.Tensor, ...]:  # fmt: skip
     """
-    Return fp8_quant_grouped on SM90 in PyTorch: x_fp8 (M, K) as uint8, x_scale (M,
-    ceil(K/128)), x_ch flat (M*K,) uint8 K-major per group, and x_ch_scale (K, M/128).
+    Return fp8_quant_grouped in PyTorch: x_fp8 (M, K) as uint8, x_scale (M, ceil(K/128)), and the
+    per-channel pair, K-major (x_ch flat (M*K,) uint8 K-major per group, x_ch_scale (K, M/128)) or
+    not ((M, K) uint8, (M/128, K)). native: the SM100 E8M0 of an infinite amax (e8m0_scale_rcp).
     """
     M, K = x.shape
     num_blocks = -(-K // BLOCK)
     x_pad = torch.zeros(M, num_blocks * BLOCK, dtype=torch.float32, device=x.device)
     x_pad[:, :K] = x.float()
-    scale_row, rcp_row = e8m0_scale_rcp(absmax_input(x_pad).view(M, num_blocks, BLOCK).amax(-1))
+    scale_row, rcp_row = e8m0_scale_rcp(
+        absmax_input(x_pad).view(M, num_blocks, BLOCK).amax(-1), native
+    )
     fp8_row = quantize_bytes(x_pad.view(M, num_blocks, BLOCK), rcp_row[..., None]).view(M, num_blocks * BLOCK)[:, :K]  # fmt: skip
     x_col = x_pad[:, :K].reshape(M // BLOCK, BLOCK, K)
-    scale_ch, rcp_ch = e8m0_scale_rcp(absmax_input(x_col).amax(1))
+    scale_ch, rcp_ch = e8m0_scale_rcp(absmax_input(x_col).amax(1), native)
     fp8_ch = quantize_bytes(x_col, rcp_ch[:, None, :]).view(M, K)
+    if not kmajor:
+        return fp8_row.contiguous(), scale_row, fp8_ch.contiguous(), scale_ch
     flat = torch.zeros(M * K, dtype=torch.uint8, device=x.device)
     start = 0
     for end in offs.tolist():
@@ -77,31 +86,36 @@ def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Ten
     return fp8_row.contiguous(), scale_row, flat, scale_ch.T.contiguous()
 
 
-def assert_bytes_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
+def bytes_match(got: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
     A NaN may carry either sign.
     """
     got = got.view(torch.uint8)
     nan = (ref & 0x7F) == 0x7F
-    ok = (got == ref) | (nan & ((got & 0x7F) == 0x7F))
-    if not bool(ok.all()):
-        bad = (~ok).nonzero()
-        raise AssertionError(f"{name}: {bad.shape[0]} byte mismatches, first at {bad[:4].tolist()}")
+    return (got == ref) | (nan & ((got & 0x7F) == 0x7F))
 
 
-def assert_quant_equal(got: tuple, ref: tuple) -> None:
+def assert_quant_equal(got: tuple, x: torch.Tensor, offs: torch.Tensor) -> None:
+    """
+    Check got, the 4-tuple of a fused op, against quantize_grouped_ref(x) in got's per-channel
+    layout, accepting the SM100-native E8M0 variant element by element (it differs only in blocks
+    whose amax is infinite).
+    """
     names = ("x_fp8", "x_scale", "x_ch_fp8", "x_ch_scale")
     assert len(got) == 4
-    for name, got_part, ref_part in zip(names, got, ref):
+    kmajor = got[2].ndim == 1
+    ref, alt = (quantize_grouped_ref(x, offs, kmajor, native) for native in (False, True))
+    for name, got_part, ref_part, alt_part in zip(names, got, ref, alt):
         assert got_part.shape == ref_part.shape, (name, got_part.shape, ref_part.shape)
         if name.endswith("fp8"):
             assert got_part.dtype == torch.float8_e4m3fn, name
-            assert_bytes_equal(got_part, ref_part, name)
+            ok = bytes_match(got_part, ref_part) | bytes_match(got_part, alt_part)
         else:
             assert got_part.dtype == torch.float32, name
-            if not torch.equal(got_part, ref_part):
-                bad = (got_part != ref_part).nonzero()
-                raise AssertionError(f"{name}: {bad.shape[0]} mismatches, first {bad[:4].tolist()}")
+            ok = (got_part == ref_part) | (got_part == alt_part)
+        if not bool(ok.all()):
+            bad = (~ok).nonzero()
+            raise AssertionError(f"{name}: {bad.shape[0]} mismatches, first at {bad[:4].tolist()}")
 
 
 def assert_bf16_close(
@@ -213,7 +227,7 @@ def test_fp8_silu_mul_fwd(groups: str, N: int, kind: str) -> None:
     offs, _, g, u = make_case(groups, N, kind, seed=0)
     h = silu_mul_fwd(g, u)
     check_fwd_activation(g, u, h)
-    assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), quantize_grouped_ref(h, offs))
+    assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), h, offs)
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
@@ -221,7 +235,7 @@ def test_fp8_silu_mul_gu_fwd(groups: str, N: int, kind: str) -> None:
     offs, _, g, u = make_case(groups, N, kind, seed=1)
     gu = torch.cat([g, u], 1).contiguous()
     h = silu_mul_fwd(g, u)
-    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), quantize_grouped_ref(h, offs))
+    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), h, offs)
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
@@ -230,8 +244,8 @@ def test_fp8_silu_mul_bwd(groups: str, N: int, kind: str) -> None:
     dg, du = silu_mul_bwd(dh, g, u)
     check_bwd_activation(dh, g, u, dg, du)
     got_g, got_u = fp8_silu_mul_bwd(dh, g, u, offs)
-    assert_quant_equal(got_g, quantize_grouped_ref(dg, offs))
-    assert_quant_equal(got_u, quantize_grouped_ref(du, offs))
+    assert_quant_equal(got_g, dg, offs)
+    assert_quant_equal(got_u, du, offs)
 
 
 @pytest.mark.parametrize("groups,N,kind", CASES)
@@ -240,7 +254,7 @@ def test_fp8_silu_mul_gu_bwd(groups: str, N: int, kind: str) -> None:
     gu = torch.cat([g, u], 1).contiguous()
     dg, du = silu_mul_bwd(dh, g, u)
     got = fp8_silu_mul_gu_bwd(dh, gu, offs)
-    assert_quant_equal(got, quantize_grouped_ref(torch.cat([dg, du], 1), offs))
+    assert_quant_equal(got, torch.cat([dg, du], 1), offs)
 
 
 def test_exhaustive_bf16_gate() -> None:
@@ -264,16 +278,15 @@ def test_exhaustive_bf16_gate() -> None:
         gu = torch.cat([g, u], 1).contiguous()
         h = silu_mul_fwd(g, u)
         check_fwd_activation(g, u, h)
-        ref_h = quantize_grouped_ref(h, offs)
-        assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), ref_h)
-        assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), ref_h)
+        assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), h, offs)
+        assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), h, offs)
         dg, du = silu_mul_bwd(dh, g, u)
         check_bwd_activation(dh, g, u, dg, du)
         got_g, got_u = fp8_silu_mul_bwd(dh, g, u, offs)
-        assert_quant_equal(got_g, quantize_grouped_ref(dg, offs))
-        assert_quant_equal(got_u, quantize_grouped_ref(du, offs))
+        assert_quant_equal(got_g, dg, offs)
+        assert_quant_equal(got_u, du, offs)
         got = fp8_silu_mul_gu_bwd(dh, gu, offs)
-        assert_quant_equal(got, quantize_grouped_ref(torch.cat([dg, du], 1), offs))
+        assert_quant_equal(got, torch.cat([dg, du], 1), offs)
 
 
 def test_zeros() -> None:
@@ -307,7 +320,7 @@ def test_empty_input() -> None:
         assert out[0].shape == (0, K) and out[0].dtype == torch.float8_e4m3fn
         assert out[1].shape == (0, -(-K // BLOCK)) and out[1].dtype == torch.float32
         assert out[2].numel() == 0 and out[2].dtype == torch.float8_e4m3fn
-        assert out[3].shape == (K, 0) and out[3].dtype == torch.float32
+        assert out[3].shape in ((K, 0), (0, K)) and out[3].dtype == torch.float32
 
     shapes(fp8_silu_mul_fwd(g, g, offs), N)
     shapes(fp8_silu_mul_gu_fwd(gu, offs), N)
@@ -332,8 +345,36 @@ def test_gu_qwen35_cases(counts: list[int], N: int) -> None:
     g, u = gu[:, :N].contiguous(), gu[:, N:].contiguous()
     h = silu_mul_fwd(g, u)
     check_fwd_activation(g, u, h)
-    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), quantize_grouped_ref(h, offs))
+    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), h, offs)
     dg, du = silu_mul_bwd(dh, g, u)
     check_bwd_activation(dh, g, u, dg, du)
     got = fp8_silu_mul_gu_bwd(dh, gu, offs)
-    assert_quant_equal(got, quantize_grouped_ref(torch.cat([dg, du], 1), offs))
+    assert_quant_equal(got, torch.cat([dg, du], 1), offs)
+
+
+@pytest.mark.parametrize("N", [768, 200])
+def test_inf_nan_blocks(N: int) -> None:
+    """
+    Blocks holding inf or NaN on every entry point: NaN is ignored by the amax, an infinite amax
+    takes either E8M0 result (see the module docstring), every other block is exact.
+    """
+    offs = make_offs([256, 0, 384])
+    M = 640
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    dh, g, u = (
+        torch.randn(M, N, device="cuda", generator=gen).to(torch.bfloat16) for _ in range(3)
+    )
+    inf, nan = float("inf"), float("nan")
+    u[3, 5], u[200, 130 % N], g[300, 7], g[301, 9] = inf, -inf, inf, -inf
+    u[129, 1], g[400, 60], g[401, 61], u[517, N - 1] = nan, nan, nan, nan
+    dh[10, 11], dh[450, 2], dh[600, N - 2] = inf, nan, -inf
+    gu = torch.cat([g, u], 1).contiguous()
+    h = silu_mul_fwd(g, u)
+    assert not bool(torch.isfinite(h).all())
+    assert_quant_equal(fp8_silu_mul_fwd(g, u, offs), h, offs)
+    assert_quant_equal(fp8_silu_mul_gu_fwd(gu, offs), h, offs)
+    dg, du = silu_mul_bwd(dh, g, u)
+    got_g, got_u = fp8_silu_mul_bwd(dh, g, u, offs)
+    assert_quant_equal(got_g, dg, offs)
+    assert_quant_equal(got_u, du, offs)
+    assert_quant_equal(fp8_silu_mul_gu_bwd(dh, gu, offs), torch.cat([dg, du], 1), offs)

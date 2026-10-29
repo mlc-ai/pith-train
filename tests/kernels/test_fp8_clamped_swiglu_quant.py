@@ -1,10 +1,11 @@
 """
 Contract: gpt-oss's clamped SwiGLU of gate_up + bias[group] (gate at even and up at odd columns; the
 bf16 bias added in fp32 and rounded to bf16), rounded to bf16 as clamped_swiglu_fwd /
-clamped_swiglu_bwd round it, then quantized as fp8_quant_grouped does on SM90: rowwise 1x128
-plus per-channel FP8 K-major per group. With padded=True the K-major pair has ceil(C / 256) * 256
-channels (C = N forward, 2N backward) where the fused kernel runs and C on the unfused fallback; the
-extra channels are unwritten. The backward also returns the per-group bias gradient: fp32 sums of
+clamped_swiglu_bwd round it, then quantized as fp8_quant_grouped does: rowwise 1x128 plus
+per-channel FP8 in fp8_quant_grouped's layout (K-major per group on SM90, (M, C) with scale (M / 128,
+C) on SM100; the checks read the layout the output has). With padded=True the K-major pair has
+ceil(C / 256) * 256 channels (C = N forward, 2N backward) where the fused SM90 kernel runs and C
+elsewhere; the extra channels are unwritten. The backward also returns the per-group bias gradient: fp32 sums of
 each 128-row block of the bf16 gradient, added in block order and rounded once to the bias dtype.
 
 Reference: the kernels' sigmoid (Triton's 1 / (1 + ex2.approx(...))) cannot be reproduced bit for
@@ -18,6 +19,11 @@ Recipe: per 128-element block amax = max |x| (NaN ignored),
 scale = 2^ceil(log2(max(amax, 1e-4) / 448)) computed as the kernels do (an fp32 product with
 1 / 448, then a power-of-two ceil by bit arithmetic), and q = e4m3_satfinite(x * (1 / scale))
 rounding to nearest even.
+
+Known SM100 difference: in a block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf
+(reciprocal -inf, bytes -/+448), SM100's native cvt.rp.satfinite.ue8m0x2 saturates the scale to
+2^127 (bytes +/-0). Inputs with inf mean training has already diverged, so either is accepted,
+element by element, in such blocks only; everywhere else the bytes and scales must match exactly.
 """
 
 import pytest
@@ -29,23 +35,18 @@ from pithtrain.kernels import (
     fp8_clamped_swiglu_bwd,
     fp8_clamped_swiglu_kmajor,
     fp8_clamped_swiglu_rowwise,
-    fp8_fused_experts_supported,
     fp8_quant_grouped,
     k_grouped_fp8_gemm,
-)
-
-pytestmark = pytest.mark.skipif(
-    not fp8_fused_experts_supported(),
-    reason="needs the fused FP8 expert path (fp8_fused_experts_supported)",
 )
 
 BLOCK = 128
 ALPHA, LIMIT = 1.702, 7.0
 
 
-def e8m0_scale(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def e8m0_scale(amax: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    The recipe's power-of-two scale of an fp32 amax, and its exact reciprocal.
+    The recipe's power-of-two scale of an fp32 amax, and its exact reciprocal. native saturates the
+    scale of an infinite amax to 2^127 as SM100's cvt does (the SM90 arithmetic gives inf).
     """
     amax_floor = torch.maximum(amax, torch.full_like(amax, 1e-4))
     raw_scale = amax_floor * torch.full_like(amax_floor, 1.0 / 448.0)
@@ -53,6 +54,8 @@ def e8m0_scale(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # round up to a power of two: keep the exponent, bump it when any mantissa bit is set
     bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
     scale = torch.maximum(bits.view(torch.float32), torch.full_like(amax_floor, 2.0**-126))
+    if native:
+        scale = torch.minimum(scale, torch.full_like(scale, 2.0**127))
     rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
     return scale, rcp
 
@@ -66,57 +69,57 @@ def quantize_e4m3(x: torch.Tensor, rcp: torch.Tensor) -> torch.Tensor:
     return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """
-    fp8_quant_grouped on SM90 in PyTorch: (x_fp8 (M, K) as uint8, x_scale (M, ceil(K / 128)),
-    x_ch flat (M * K,) uint8 K-major per group, x_ch_scale (K, M / 128)).
-    """
+def quantize_ref(x: torch.Tensor, native: bool) -> tuple[torch.Tensor, ...]:
     M, K = x.shape
     nb = -(-K // BLOCK)
     xf = torch.zeros(M, nb * BLOCK, dtype=torch.float32, device=x.device)
     xf[:, :K] = x.float()
-    s_row, r_row = e8m0_scale(nan_free_abs(xf).view(M, nb, BLOCK).amax(-1))
+    s_row, r_row = e8m0_scale(nan_free_abs(xf).view(M, nb, BLOCK).amax(-1), native)
     q_row = quantize_e4m3(xf.view(M, nb, BLOCK), r_row[..., None]).view(M, nb * BLOCK)[:, :K]
     xc = xf[:, :K].reshape(M // BLOCK, BLOCK, K)
-    s_ch, r_ch = e8m0_scale(nan_free_abs(xc).amax(1))
+    s_ch, r_ch = e8m0_scale(nan_free_abs(xc).amax(1), native)
     q_ch = quantize_e4m3(xc, r_ch[:, None, :]).view(M, K)
-    flat = torch.zeros(M * K, dtype=torch.uint8, device=x.device)
-    start = 0
-    for end in offs.tolist():
-        flat[start * K : end * K].view(K, end - start).copy_(q_ch[start:end].T)
-        start = end
-    return q_row.contiguous(), s_row, flat, s_ch.T.contiguous()
+    return q_row.contiguous(), s_row, q_ch.contiguous(), s_ch
 
 
-def assert_bytes(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
+def quantize_grouped_ref(x: torch.Tensor, offs: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], ...]:  # fmt: skip
+    """
+    fp8_quant_grouped in PyTorch, in logical form: x_fp8 (M, K) as uint8, x_scale (M, ceil(K /
+    128)), x_ch (M, K) uint8 (128x1 blocks), x_ch_scale (M / 128, K). Each entry is a pair (the SM90
+    E8M0 arithmetic, the SM100-native variant), which differ only in blocks whose amax is infinite.
+    """
+    return tuple(zip(quantize_ref(x, False), quantize_ref(x, True)))
+
+
+def bytes_match(got: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
     A NaN may carry either sign.
     """
     got = got.view(torch.uint8)
     nan = (ref & 0x7F) == 0x7F
-    ok = (got == ref) | (nan & ((got & 0x7F) == 0x7F))
-    if not bool(ok.all()):
-        bad = (~ok).nonzero()
-        raise AssertionError(f"{name}: {bad.shape[0]} byte mismatches, first at {bad[:4].tolist()}")
+    return (got == ref) | (nan & ((got & 0x7F) == 0x7F))
 
 
 def assert_quant_equal(got: tuple, ref: tuple, names: tuple[str, ...]) -> None:
+    """
+    ref holds a pair per output (see quantize_grouped_ref); either is accepted element by element.
+    """
     assert len(got) == len(ref) == len(names)
-    for name, a, b in zip(names, got, ref):
+    for name, a, (b, b_alt) in zip(names, got, ref):
         assert a.shape == b.shape, (name, a.shape, b.shape)
         if name.endswith("fp8"):
             assert a.dtype == torch.float8_e4m3fn, name
-            assert_bytes(a, b, name)
+            ok = bytes_match(a, b) | bytes_match(a, b_alt)
         else:
             assert a.dtype == torch.float32, name
-            if not torch.equal(a, b):
-                bad = (a != b).nonzero()
-                raise AssertionError(f"{name}: {bad.shape[0]} mismatches, first {bad[:4].tolist()}")
+            ok = (a == b) | (a == b_alt)
+        if not bool(ok.all()):
+            bad = (~ok).nonzero()
+            raise AssertionError(f"{name}: {bad.shape[0]} mismatches, first at {bad[:4].tolist()}")
 
 
 ROW = ("x_fp8", "x_scale")
 KMAJOR = ("x_ch_fp8", "x_ch_scale")
-ALL = ROW + KMAJOR
 
 
 def padded_channels(c: int) -> int:
@@ -125,24 +128,29 @@ def padded_channels(c: int) -> int:
 
 def assert_kmajor(got: tuple, ref: tuple, offs: torch.Tensor, K: int, padded: bool = False) -> None:
     """
-    Assert the K-major pair got, laid out with K channels (or, when padded, K or padded_channels(K)
-    as the scale's row count says), equals the unpadded ref exactly in its first K channels. Extra
-    channels are unspecified.
+    Assert the per-channel pair got equals ref exactly. In the K-major layout (flat data) it is laid
+    out with K channels (or, when padded, K or padded_channels(K) as the scale's row count says) and
+    compared in its first K channels, the extra ones unspecified; otherwise it is (M, K) with scale
+    (M / 128, K) whether padded or not.
     """
     fp8, scale = got
+    if fp8.ndim == 2:
+        assert fp8.shape[1] == K and scale.shape == (fp8.shape[0] // BLOCK, K), (fp8.shape, scale.shape)  # fmt: skip
+        assert_quant_equal(got, ref, KMAJOR)
+        return
     KP = scale.shape[0] if scale.ndim == 2 else K
     assert KP in ((K, padded_channels(K)) if padded else (K,)), (scale.shape, K, padded)
     M = scale.shape[1] * BLOCK if scale.ndim == 2 else 0
     assert fp8.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
     assert fp8.numel() == M * KP, (fp8.shape, scale.shape, KP)
     raw = fp8.view(torch.uint8)
-    real = torch.empty(M * K, dtype=torch.uint8, device=raw.device)
+    real = torch.empty(M, K, dtype=torch.uint8, device=raw.device)
     start = 0
     for end in offs.tolist():
         blk = raw[start * KP : end * KP].view(KP, end - start)
-        real[start * K : end * K].view(K, end - start).copy_(blk[:K])
+        real[start:end].copy_(blk[:K].T)
         start = end
-    assert_quant_equal((real.view(torch.float8_e4m3fn), scale[:K]), ref, KMAJOR)
+    assert_quant_equal((real.view(torch.float8_e4m3fn), scale[:K].T), ref, KMAJOR)
 
 
 def group_ids(offs: torch.Tensor, M: int) -> torch.Tensor:
@@ -315,7 +323,10 @@ def test_padded_layout_feeds_k_grouped_gemm(backward: bool) -> None:
         C = N
         pad = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=True)
         flat = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT)
-    assert pad[1].shape[0] == padded_channels(C) and flat[1].shape[0] == C
+    if pad[0].ndim == 1:  # K-major: the fused SM90 kernels pad
+        assert pad[1].shape[0] == padded_channels(C) and flat[1].shape[0] == C
+    else:  # padded is ignored
+        assert pad[1].shape == flat[1].shape == (M // BLOCK, C)
     other = torch.randn(M, 2048, device="cuda").to(torch.bfloat16)
     b = fp8_quant_grouped(other, offs)[2:]
     ks = [int(size) for size in torch.diff(offs, prepend=offs.new_zeros(1)).tolist()]
@@ -353,7 +364,9 @@ def test_every_bf16_gate_and_up(backward: bool) -> None:
     dh = torch.randn(M, N, generator=gen).to(torch.bfloat16).cuda()
     dgu = clamped_swiglu_bwd(dh, x, ALPHA, LIMIT)
     out, _ = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
-    assert_quant_equal(out, quantize_grouped_ref(dgu, offs), ALL)
+    ref = quantize_grouped_ref(dgu, offs)
+    assert_quant_equal(out[:2], ref[:2], ROW)
+    assert_kmajor(out[2:], ref[2:], offs, 2 * N)
 
 
 def test_zeros() -> None:
@@ -388,7 +401,35 @@ def test_empty_input() -> None:
     q, s = fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT)
     assert q.shape == (0, N) and s.shape == (0, -(-N // BLOCK))
     km, kms = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT)
-    assert km.numel() == 0 and kms.shape == (N, 0)
+    assert km.numel() == 0 and kms.shape in ((N, 0), (0, N))
     out, d_bias = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
-    assert out[0].shape == (0, 2 * N) and out[2].numel() == 0 and out[3].shape == (2 * N, 0)
+    assert out[0].shape == (0, 2 * N) and out[2].numel() == 0
+    assert out[3].shape in ((2 * N, 0), (0, 2 * N))
     assert d_bias.shape == bias.shape and d_bias.dtype == bias.dtype and not bool(d_bias.any())
+
+
+@pytest.mark.parametrize("N", [2880, 136])
+def test_inf_nan_blocks(N: int) -> None:
+    """
+    inf and NaN in gate_up and dh through every entry point: NaN is ignored by the amax, an infinite
+    amax takes either E8M0 result (see the module docstring), every other block is exact.
+    """
+    M, G = 512, 3
+    gu, bias, dh, offs = make_inputs(M, N, G, seed=29)
+    inf, nan = float("inf"), float("nan")
+    gu[3, 1], gu[130, 4], gu[260, 9], gu[261, 2 * N - 1] = inf, -inf, inf, -inf  # up, gate
+    gu[7, 0], gu[300, 3], gu[400, 2 * N - 2] = nan, nan, nan
+    dh[11, 5], dh[290, N - 1], dh[450, 0], dh[451, 1] = inf, -inf, nan, nan
+    x = biased_ref(gu, bias, offs)
+    h = clamped_swiglu_fwd(x, ALPHA, LIMIT)
+    ref = quantize_grouped_ref(h, offs)
+    assert_quant_equal(fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT), ref[:2], ROW)
+    for padded in (False, True):
+        got = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=padded)
+        assert_kmajor(got, ref[2:], offs, N, padded)
+    dgu = clamped_swiglu_bwd(dh, x, ALPHA, LIMIT)
+    assert not bool(torch.isfinite(dgu).all())
+    ref = quantize_grouped_ref(dgu, offs)
+    out, _ = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
+    assert_quant_equal(out[:2], ref[:2], ROW)
+    assert_kmajor(out[2:], ref[2:], offs, 2 * N)

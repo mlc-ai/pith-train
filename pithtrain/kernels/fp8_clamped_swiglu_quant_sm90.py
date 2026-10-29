@@ -10,8 +10,7 @@ are bit-identical to the unfused sequence: the bias add is one fp32 add rounded 
 activation replays the Triton clamped_swiglu kernels' PTX. Both scales come back MN-major.
 
 Only N % 8 == 0 with 1 to 1024 groups and a bf16 bias runs fused; anything else takes the unfused
-sequence (the fp8_clamped_swiglu_quant_sm100 helpers, clamped_swiglu_fwd and
-fp8cast_rowwise_kmajor_sm90).
+sequence (biased_gate_up, the clamped_swiglu kernels and fp8cast_rowwise_kmajor_sm90).
 """
 
 from __future__ import annotations
@@ -26,16 +25,36 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.arch import SM_COUNT
-from pithtrain.kernels.clamped_swiglu import clamped_swiglu_fwd
+from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, ld_v4, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
-from pithtrain.kernels.fp8_clamped_swiglu_quant_sm100 import biased_gate_up, clamped_swiglu_bwd_biased
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, ptx_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.segment_sum import block_segment_sum
 
 __all__ = ["ClampedSwiGLUQuant", "fp8_clamped_swiglu_bwd_sm90", "clamped_swiglu_quant_fusable", "clamped_swiglu_quant_fwd_sm90", "fp8_clamped_swiglu_kmajor_sm90", "fp8_clamped_swiglu_rowwise_sm90"]
+
+
+def find_row_groups(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor:
+    """
+    The group of each of the M rows, int64 (M,); rows past the last group end take the last group.
+    """
+    row_idx = torch.arange(M, device=grouped_mm_offs.device, dtype=torch.int64)
+    group_ends = grouped_mm_offs.to(torch.int64)
+    return torch.searchsorted(group_ends, row_idx, right=True).clamp_(max=group_ends.shape[0] - 1)
+
+
+def biased_gate_up(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> torch.Tensor:
+    return gate_up + bias[find_row_groups(grouped_mm_offs, gate_up.shape[0])]
+
+
+def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    """
+    bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does.
+    """
+    x = biased_gate_up(gate_up, bias, grouped_mm_offs)
+    return clamped_swiglu_bwd(dh.to(x.dtype), x, alpha, limit)
 
 BLOCK = 128  # rows per quantization group and output columns per CTA tile
 THREADS = 512
