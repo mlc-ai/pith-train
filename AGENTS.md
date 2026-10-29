@@ -208,6 +208,8 @@ Process-global runtime state, one module per concern (`distributed`, `training`,
 
 Two per-step stores are the exception to "constant after setup": `weight_grad_store.py` (`WeightGradStore`, the deferred weight-gradient closures of the zero-bubble W phase) and `fp8_weight_cache.py` (`FP8WeightCacheControl`, the version counter that lets FP8 layers reuse a quantized weight across the micro-batches of a step). `DualPipeV.step` drives both; import them by class name.
 
+Two fields in `training` also change during a run: `current_microbatch`, which `DualPipeV.step` sets before each forward, and `offloaded`, which `offload_training_state` sets and `reload_training_state` clears. Both start from a default, so a bare import of either succeeds but freezes the default.
+
 ## Agent Skills
 
 This repository ships agent-native workflows under `.agents/skills/`, loaded automatically. Invoke a skill whenever a request matches one instead of re-deriving the workflow from scratch.

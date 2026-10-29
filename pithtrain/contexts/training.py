@@ -62,3 +62,11 @@ tell the micro-batch from the layer alone: DualPipeV interleaves a rank's two ch
 micro-batches. It is set before each forward only, which suffices because the backward replays the
 saved graph without re-entering module code.
 """
+
+offloaded: bool = False
+"""
+True between offload_training_state and reload_training_state.
+
+Tensors keep their shapes over zero-byte device storages, so model.step, save_checkpoint,
+load_checkpoint and iter_canonical_parameters reject this state.
+"""

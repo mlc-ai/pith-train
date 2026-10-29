@@ -534,6 +534,9 @@ class DualPipeV(nn.Module):
         elsewhere. Each loss is detached in place after its backward, so an objective_output that
         needs the loss value must hold loss.detach().
         """
+        assert not (training.offloaded and self is training.model), (
+            "training state is offloaded; call reload_training_state"
+        )
         # A step whose signature already ran with full Dynamo guards skips evaluating them; see
         # guard_skip for why that is safe.
         return self.guard_skip.run(self, microbatches, self.run_step, microbatches, objective)

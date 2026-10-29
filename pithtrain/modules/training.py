@@ -475,9 +475,10 @@ def offload_training_state() -> None:
     """
     Copy this rank's parameter shards and optimizer state to pinned host memory and free their
     GPU storages. Tensors keep their identity, so reload_training_state restores them in place.
-    Gradients stay on the GPU. A no-op while already offloaded.
+    Gradients stay on the GPU. Nothing may read or write the state until reload_training_state
+    clears training.offloaded. A no-op while already offloaded.
     """
-    if offloaded_state:
+    if training.offloaded:
         return
 
     # An unsharded parameter is a separate allocation that the storage walk would miss.
@@ -485,20 +486,23 @@ def offload_training_state() -> None:
         if isinstance(module, FSDPModule):
             module.reshard()
 
+    evicted = []
     for storage in training_state_storages():
         host = take_pinned_buffer(storage.size())
         host.copy_(storage_bytes(storage), non_blocking=True)
-        offloaded_state.append((storage, host))
+        evicted.append((storage, host))
 
-    # The copies are asynchronous, so nothing may be freed until they land.
+    # Publish and free only after all copies finish; a pinning failure must allow retry.
     torch.cuda.synchronize()
+    offloaded_state.extend(evicted)
+    training.offloaded = True
     for storage, _ in offloaded_state:
         storage.resize_(0)
     torch.cuda.empty_cache()
 
 
 def reload_training_state() -> None:
-    if not offloaded_state:
+    if not training.offloaded:
         return
 
     for storage, host in offloaded_state:
@@ -510,6 +514,7 @@ def reload_training_state() -> None:
     for _, host in offloaded_state:
         offload_buffer_pool[host.numel()].append(host)
     offloaded_state.clear()
+    training.offloaded = False
 
 
 def setup_training(cfg: object) -> None:
