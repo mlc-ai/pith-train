@@ -50,8 +50,6 @@ KERNELS = PKG / "kernels"
 # SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
 SM90_ONLY = {
     "group_indices_sm90",
-    "bf16_expert_gemm_sm90",
-    "bf16_expert_slots_sm90",
     "gated_delta_rule_pinned_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).

@@ -89,7 +89,7 @@ __all__.append("scatter_by_expert")
 # FlashAttention-4 launch memoization
 __all__.append("memoized_launch")
 
-# BF16 CuTe experts (SM90 only)
+# BF16 fused experts (CuTe on SM90, TIRx on SM100)
 __all__.append("bf16_expert_down_dgrad")
 __all__.append("bf16_expert_gate_up_dgrad")
 __all__.append("bf16_expert_down_fwd")

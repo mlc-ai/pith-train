@@ -1,12 +1,15 @@
 """
-Slot maps, row gathers and segment sums around the fused BF16 experts' grouped GEMMs. SM90 only:
-callers check bf16_experts_supported first. Each function imports its SM90 implementation (cutlass)
-on first call, so importing this module does not load cutlass.
+Slot maps, row gathers and segment sums around the fused BF16 experts' grouped GEMMs: the CuTe-DSL
+kernels on SM90, the TIRx kernels on SM100. Callers check bf16_experts_supported first. Each
+function imports its implementation (cutlass, or tvm) on first call, so importing this module loads
+neither.
 """
 
 from typing import NamedTuple
 
 import torch
+
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["bf16_expert_gather_rows", "bf16_expert_gather_sum", "bf16_expert_group_slots", "bf16_expert_segment_sum"]
 
@@ -28,8 +31,15 @@ def bf16_expert_group_slots(expert_idxs: torch.Tensor, expand_idx: torch.Tensor 
       without expand_idx).
     - Exact and deterministic; no host sync. S == 0 gives zero cu_seqlens (and mask).
     """
-    from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_group_slots_sm90
-    return bf16_expert_group_slots_sm90(expert_idxs, expand_idx, num_groups, num_tokens)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_group_slots_sm90
+            return bf16_expert_group_slots_sm90(expert_idxs, expand_idx, num_groups, num_tokens)
+        case 10:
+            from pithtrain.kernels.bf16_expert_slots_sm100 import bf16_expert_group_slots_sm100
+            return bf16_expert_group_slots_sm100(expert_idxs, expand_idx, num_groups, num_tokens)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -37,8 +47,15 @@ def bf16_expert_gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     x[idx] as a fresh bf16 (len(idx), N) exact row copy, for a contiguous bf16 (rows, N) x (N a
     multiple of 8) and int32 row indices idx.
     """
-    from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_gather_rows_sm90
-    return bf16_expert_gather_rows_sm90(x, idx)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_gather_rows_sm90
+            return bf16_expert_gather_rows_sm90(x, idx)
+        case 10:
+            from pithtrain.kernels.bf16_expert_slots_sm100 import bf16_expert_gather_rows_sm100
+            return bf16_expert_gather_rows_sm100(x, idx)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int, max_slots: int) -> torch.Tensor:
@@ -53,8 +70,15 @@ def bf16_expert_gather_sum(grad: torch.Tensor, maps: NamedTuple, num_groups: int
 
     Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_gather_sum_sm90
-    return bf16_expert_gather_sum_sm90(grad, maps, num_groups, max_slots)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_gather_sum_sm90
+            return bf16_expert_gather_sum_sm90(grad, maps, num_groups, max_slots)
+        case 10:
+            from pithtrain.kernels.bf16_expert_slots_sm100 import bf16_expert_gather_sum_sm100
+            return bf16_expert_gather_sum_sm100(grad, maps, num_groups, max_slots)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
@@ -68,5 +92,12 @@ def bf16_expert_segment_sum(x: torch.Tensor, cu_host: list[int], cu: torch.Tenso
     - Order: each segment is cut into 256-row chunks from its start, each chunk summed row by row in
       fp32, then the chunk sums added in order; deterministic. An empty segment sums to zero.
     """
-    from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_segment_sum_sm90
-    return bf16_expert_segment_sum_sm90(x, cu_host, cu, idx)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_slots_sm90 import bf16_expert_segment_sum_sm90
+            return bf16_expert_segment_sum_sm90(x, cu_host, cu, idx)
+        case 10:
+            from pithtrain.kernels.bf16_expert_slots_sm100 import bf16_expert_segment_sum_sm100
+            return bf16_expert_segment_sum_sm100(x, cu_host, cu, idx)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

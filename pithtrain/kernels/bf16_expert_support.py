@@ -1,6 +1,7 @@
 """
-Capability query for the fused BF16 routed experts (the SM90 CuTe-DSL bf16_expert_* kernels, built
-on QuACK). Never imports QuACK or cutlass, so it is safe to call on every architecture.
+Capability query for the fused BF16 routed experts (the bf16_expert_* kernels: CuTe-DSL built on
+QuACK on SM90, TIRx on SM100). Never imports QuACK, cutlass or tvm, so it is safe to call on every
+architecture.
 """
 
 import importlib.metadata
@@ -33,8 +34,10 @@ def quack_version() -> str | None:
 
 @lru_cache(maxsize=None)
 def runtime_supported() -> bool:
+    if ARCH_MAJOR == 10:
+        return True
     if ARCH_MAJOR != 9:
-        reason = f"needs SM90, not compute capability {ARCH_MAJOR}.x"
+        reason = f"needs SM90 or SM100, not compute capability {ARCH_MAJOR}.x"
     elif (version := quack_version()) != QUACK_VERSION:
         reason = f"needs quack-kernels=={QUACK_VERSION}, found {version}"
     else:
@@ -46,7 +49,8 @@ def runtime_supported() -> bool:
 def bf16_experts_supported(num_groups: int | None = None) -> bool:
     """
     Whether BF16 routed experts with num_groups local experts (any count when None) can use the
-    fused bf16_expert_* kernels in this process: needs SM90, quack-kernels exactly QUACK_VERSION,
-    and at most MAX_GROUPS local experts. Warns once when the GPU or the QuACK version rules it out.
+    fused bf16_expert_* kernels in this process: needs SM100, or SM90 with quack-kernels exactly
+    QUACK_VERSION, and at most MAX_GROUPS local experts. Warns once when the GPU or the QuACK version
+    rules it out.
     """
     return runtime_supported() and (num_groups is None or num_groups <= MAX_GROUPS)
