@@ -419,7 +419,13 @@ class FP8ClampedSwiGLUExpertsFunc(torch.autograd.Function):
         y = fp8_grouped_gemm(
             (h_fp8, h_scale), quantized_down[:2], hidden, grouped_mm_offs, group_indices
         )
-        group_bias_add(y, b_down, group_indices)
+        # The bias add needs every row's expert, also where the GEMM takes no group_indices hint.
+        row_groups = group_indices
+        if row_groups is None:
+            rows = torch.arange(y.shape[0], device=y.device, dtype=torch.int64)
+            row_groups = torch.searchsorted(grouped_mm_offs.to(torch.int64), rows, right=True)
+            row_groups.clamp_(max=b_down.shape[0] - 1)
+        group_bias_add(y, b_down, row_groups)
         ctx.save_for_backward(
             b_gate_up, x_kmajor, x_kmajor_scale, grouped_mm_offs, ks_tensor,
             quantized_gate_up[2], quantized_gate_up[3], quantized_down[2], quantized_down[3],
