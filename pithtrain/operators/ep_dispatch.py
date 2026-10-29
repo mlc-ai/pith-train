@@ -31,6 +31,7 @@ import triton
 import triton.language as tl
 
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
+from pithtrain.operators.stable_scatter import stable_dedup_prepare_dispatch
 from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
 
 
@@ -571,6 +572,9 @@ def prepare_dispatch(
     ep_size: int,
     experts_per_rank: int,
     ep_group: dist.ProcessGroup,
+    *,
+    deterministic: bool = False,
+    deduplicate: bool = True,
 ) -> tuple[torch.Tensor, RoutingInfo]:
     """
     Expert-parallel dispatch with token deduplication.
@@ -578,16 +582,27 @@ def prepare_dispatch(
     When ep_size > 1, deduplicates tokens routed to the same EP rank via
     multiple experts to cut all-to-all volume, and computes expand_idx to
     reconstruct the full mapping on the receiver side. When ep_size == 1,
-    replicates each token once per selected expert.
+    replicates each token once per selected expert. ``deterministic=True`` also
+    fixes dedup and expert-slot order before all-to-all; stable local scatter
+    alone cannot remove ordering variation introduced by dispatch.
+
+    ``deduplicate=False`` accepts already-expanded (tokens, K, hidden)
+    input slots and preserves their independent backward lanes. This is
+    used by Talker to join expert and shared-branch BF16 derivatives at
+    the source; it trades token deduplication for that arithmetic contract.
     """
 
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     k = topk_ids.shape[1]
+    if not deduplicate and (hidden_states.ndim != 3 or hidden_states.shape[:2] != topk_ids.shape):
+        raise ValueError("Independent dispatch lanes must have shape (tokens, K, hidden)")
+    hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     expert_idxs = topk_ids.view(-1)
 
     if ep_size == 1:
         dispatch_tokens = (
             hidden_states.unsqueeze(1).expand(-1, k, -1).reshape(-1, hidden_states.shape[-1])
+            if deduplicate
+            else hidden_states
         )
         return dispatch_tokens, RoutingInfo(topk_weight, expert_idxs)
 
@@ -598,7 +613,9 @@ def prepare_dispatch(
         idxs,
         expand_idx,
         send_meta,  # (ep_size, experts_per_rank + 1) interleaved: [tpe_0..., dedup_0, ...]
-    ) = fused_dedup_prepare_dispatch(topk_ids, num_experts, ep_size, experts_per_rank)
+    ) = (stable_dedup_prepare_dispatch if deterministic else fused_dedup_prepare_dispatch)(
+        topk_ids, num_experts, ep_size, experts_per_rank
+    )
 
     # -- Metadata all-to-all (piggyback dedup counts alongside per-expert token counts) --
     recv_meta = send_meta.new_empty(send_meta.shape[0])
@@ -636,6 +653,20 @@ def prepare_dispatch(
     # decided by the senders, never by this rank's own token count.
     total_output = sum(output_splits)
     expert_idxs = build_expert_idxs(tokens_per_expert_group, experts_per_rank, total_output)
+
+    if not deduplicate:
+        # idxs is a permutation of token/slot identities, so its backward
+        # never combines two expert derivatives before the source join.
+        dispatch_tokens = padded_index_gather(hidden_states, idxs)
+        splits = AllToAllSplits(input_splits, output_splits)
+        return dispatch_tokens, RoutingInfo(
+            topk_weight,
+            expert_idxs,
+            idxs,
+            torch.arange(total_output, device=hidden_states.device),
+            splits,
+            splits,
+        )
 
     # -- expand_idx all-to-all + adjustment --
     received_expand_idx = expand_idx.new_empty(total_output)

@@ -135,7 +135,7 @@ Each operator ships a PyTorch reference impl for correctness testing.
 
 ### Training Orchestration (`pithtrain/tasks/pretrain_lm.py`)
 
-`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg` and `LoggingCfg`, plus a `dataset` path of its own. `launch(cfg)` calls `setup_logging`, `setup_distributed` and `setup_training` in turn, each of which populates its runtime context (see Runtime Contexts below). The corpus and the step counter are neither context nor shared config: only a task that reads a corpus has any use for them, so `setup_dataset` lives in `pretrain_lm.py`, returns the dataset, and `launch` owns it alongside the step counter.
+`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg`, `LoggingCfg` and `DataCfg`. `cfg.data` holds the dataset path, storage format, modalities and sampling options for both dense token and prepared-bundle sources. `launch(cfg)` calls `setup_logging`, `setup_distributed` and `setup_training` in turn, each of which populates its runtime context (see Runtime Contexts below). The corpus and the step counter are neither context nor shared config: only a task that reads a corpus has any use for them, so `setup_dataset` lives in `pretrain_lm.py`, returns the dataset, and `launch` owns it alongside the step counter.
 
 ### Task Module Convention (`pithtrain/tasks/`)
 
