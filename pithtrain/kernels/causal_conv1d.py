@@ -29,7 +29,8 @@ def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Te
     1) + k, c], taps at negative positions skipped.
 
     x: bf16 (B, offset + S, C) contiguous, its first offset rows history. w: (C, 1, K) or (C, K)
-    contiguous, any float dtype (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
+    contiguous with K <= 8 (SM90 raises ValueError beyond; SM100 does not check), any float dtype
+    (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
     in the layout of causal_conv1d_empty, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2),
     w, padding=K - 1, groups=C)[..., offset:offset + S].transpose(1, 2).
     """

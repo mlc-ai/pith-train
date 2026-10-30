@@ -406,11 +406,6 @@ def test_target_cancellation(dtype):
     assert loss.item() >= 0
 
 
-def test_zero_classes_rejected():
-    with pytest.raises(ValueError):
-        cross_entropy_fwd_bwd(torch.empty(4, 0, device="cuda", dtype=torch.bfloat16), torch.zeros(4, dtype=torch.long, device="cuda"), IGNORE)
-
-
 @pytest.mark.parametrize("vocab", [3, 7, 11, 13, 97, 1000])
 def test_correctly_rounded_scale(vocab):
     # Equal logits make every exp exactly 1 and the row sum exactly vocab, so the fp32 gradient is

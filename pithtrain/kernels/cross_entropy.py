@@ -10,8 +10,9 @@ def cross_entropy_fwd_bwd(inp: torch.Tensor, target: torch.Tensor, ignore_index:
     Mean cross-entropy of the logits inp against target, overwriting the logits with the gradient of
     that mean. Returns (loss, grad).
 
-    inp: (N, V) bf16, fp16 or fp32 logits with V >= 1, overwritten in place when row-contiguous
-    (otherwise a contiguous copy is overwritten and inp is left alone). target: integer (N,), any
+    inp: (N, V) bf16, fp16 or fp32 logits with V >= 1 (SM90 raises ValueError for V == 0; SM100 does
+    not check), overwritten in place when row-contiguous (otherwise a contiguous copy is overwritten
+    and inp is left alone). target: integer (N,), any
     stride, each in [0, V) or ignore_index (any other value reads out of bounds); not modified.
 
     loss: fp32 scalar, the sum over non-ignored rows of logsumexp(x) - x[target] divided by n =

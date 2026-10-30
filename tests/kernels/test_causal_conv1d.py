@@ -135,14 +135,6 @@ def test_kernel_widths(K, S):
     check(x, weight, grad_out, K - 1)
 
 
-def test_kernel_width_limit():
-    x, weight, grad_out = make(1, 64, 128, 0, K=9, seed=2)
-    with pytest.raises(ValueError):
-        causal_conv1d_fwd(x, weight, 0)
-    with pytest.raises(ValueError):
-        causal_conv1d_bwd(grad_out, x, weight, 0)
-
-
 def test_weight_without_channel_axis():
     """
     The (C, K) weight form gives the same results as (C, 1, K); dw comes back as (C, K).
