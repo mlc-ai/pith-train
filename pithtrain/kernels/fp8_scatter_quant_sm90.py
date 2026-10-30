@@ -349,7 +349,8 @@ def compile_main(N: int, G: int, pdl: bool) -> Callable:
 
 def run_unfused(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
     """
-    The unfused path for inputs the fused kernels do not cover (rows in atomic_add order).
+    The unfused path for inputs the fused kernels do not cover (rows in token order, as
+    scatter_by_expert places them on SM90).
     """
     x = gathered if expand_idx is None else gathered[expand_idx]
     out, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
