@@ -1,18 +1,13 @@
+"""
+Picker of group_bias_add: the SM90 implementation in group_bias_add_sm90, the TIRx kernel in
+group_bias_add_sm100 on SM100.
+"""
+
 import torch
-import triton
-import triton.language as tl
+
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["group_bias_add"]
-
-
-@triton.jit
-def group_bias_add_kernel(y_ptr, bias_ptr, group_idx_ptr, H, BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
-    row_offs, h_offs = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M), tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    h_mask = h_offs[None, :] < H
-    group_idx = tl.load(group_idx_ptr + row_offs).to(tl.int64)
-    y_offs = row_offs.to(tl.int64)[:, None] * H + h_offs[None, :]
-    y, bias = tl.load(y_ptr + y_offs, mask=h_mask).to(tl.float32), tl.load(bias_ptr + group_idx[:, None] * H + h_offs[None, :], mask=h_mask).to(tl.float32)
-    tl.store(y_ptr + y_offs, (y + bias).to(y_ptr.dtype.element_ty), mask=h_mask)
 
 
 def group_bias_add(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Tensor) -> None:
@@ -23,8 +18,12 @@ def group_bias_add(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Ten
     Each sum is computed in fp32 and rounded once to y's dtype, bit-identical to the PyTorch
     fallback y.copy_(y + bias[group_indices]). Deterministic.
     """
-    M, H = y.shape
-    if y.dtype != bias.dtype or M % 128 != 0 or not y.is_contiguous() or not bias.is_contiguous():
-        y.copy_(y + bias[group_indices])
-        return
-    group_bias_add_kernel[(M // 32, triton.cdiv(H, 256))](y, bias, group_indices, H, BLOCK_M=32, BLOCK_H=256)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.group_bias_add_sm90 import group_bias_add_sm90
+            group_bias_add_sm90(y, bias, group_indices)
+        case 10:
+            from pithtrain.kernels.group_bias_add_sm100 import group_bias_add_sm100
+            group_bias_add_sm100(y, bias, group_indices)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
