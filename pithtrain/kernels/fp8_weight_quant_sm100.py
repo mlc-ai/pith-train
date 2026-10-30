@@ -6,7 +6,7 @@ including one-launch multi variants of the shard amax and scales.
 Every kernel is a @txl.kernel compiled once per process (functools.cache, keyed only on
 compile-time constants) and launched through tvm-ffi on torch's current stream.
 
-Evolved with TIRx-harness: run weight, frontier member tile-npamax (commit 1864d1d, 1.654x over the
+Evolved with TIRx-harness: run weight, frontier member tile-pdl (commit 24e4366, 4102 us vs 5452 us, 1.329x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -23,11 +23,16 @@ __all__ = ["fp8_quant_weight_sm100", "fp8_quant_weight_grouped_sm100", "fp8_shar
 
 BLOCK = 128
 NT = 256  # threads per CTA
+NTQ = 128  # small-grid quant: four resident 4-warp CTAs instead of three 8-warp CTAs
 FULL = 0xFFFFFFFF
 RCP_448 = 1.0 / 448.0
 # Streaming fp32 shard loads: no L1 allocation + 256B L2 prefetch (pure reads 5.0 -> 5.8 TB/s).
 LDG_V4 = "ld.global.nc.L1::no_allocate.L2::256B.v4.b32"
 LDG_B32 = "ld.global.nc.L1::no_allocate.L2::256B.b32"
+
+
+# Every kernel is launched with programmatic stream serialization and starts with _pdl().
+PDL_LAUNCH = ["blockIdx.x", "threadIdx.x", "tirx.use_programtic_dependent_launch", "tirx.use_dyn_shared_memory"]
 
 
 def cdiv(a, b):
@@ -40,8 +45,9 @@ def compile_v(kern):
     looks the entry up on every call, ~4 us of host time) that runs it on torch's current stream.
     """
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+    func = kern.func.with_attr("tirx.kernel_launch_params", PDL_LAUNCH)
     with target:
-        mod = tvm.compile(kern.mod, target=target, tir_pipeline="tirx")
+        mod = tvm.compile(tvm.IRModule({"main": func}), target=target, tir_pipeline="tirx")
     fn = mod[kern.name]
 
     def launch(*args):
@@ -53,6 +59,15 @@ def compile_v(kern):
 
 
 # ---------------------------------------------------------------- traced helpers
+
+
+def pdl():
+    """
+    Programmatic dependent launch: let the next kernel in the stream get scheduled now, and
+    wait for the previous one (completion + memory flush) before touching global memory.
+    """
+    txl.ptx.griddepcontrol.wait()
+    txl.ptx.griddepcontrol.launch_dependents()
 
 
 def i642(x):
@@ -111,6 +126,23 @@ def cta_max_u32(m, red_s, warp, lane):
     return out
 
 
+def cta_max_u32_q128(m, red_s, warp, lane):
+    """
+    Max of a u32 over the four-warp small-grid quant CTA.
+    """
+    r = txl.local_scalar("uint32")
+    txl.ptx.redux_sync.max.u32(r, m, txl.uint32(FULL))
+    with txl.If(lane == 0), txl.Then():
+        txl.ptx.st.shared.b32(red_s.ptr_to([warp]), r)
+    txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NTQ))
+    out = txl.local_scalar("uint32", init=txl.uint32(0))
+    for i in range(NTQ // 32):
+        v = txl.local_scalar("uint32")
+        txl.ptx.ld.shared.b32(v, red_s.ptr_to([i]))
+        txl.ptx.max.u32(out, out, v)
+    return out
+
+
 def prmt2(a, b, sel):
     d = txl.local_scalar("uint32")
     txl.ptx.prmt.b32(d, a, b, txl.uint32(sel))
@@ -145,6 +177,26 @@ def transpose_store(B, t_s, kc, rg):
         txl.ptx.st.shared.v2.b32(t_s.ptr_to([row * 32 + slot * 2]), cols[kk][0], cols[kk][1])
 
 
+def transpose_store_q128(B, t_s, kc, rg):
+    """
+    Transpose one 16x8 byte register block into the same swizzled tile as
+    _transpose_store.  A four-warp CTA gives each thread twice as many rows, but
+    preserves the exact shared layout consumed by the vectorized flush.
+    """
+    cols = [[None, None, None, None] for _ in range(8)]
+    for h in range(2):
+        for rh in range(4):
+            outs = t4x4(*[B[4 * rh + i][h] for i in range(4)])
+            for j in range(4):
+                cols[4 * h + j][rh] = outs[j]
+    for kk in range(8):
+        row = kc * 8 + kk
+        slot0 = (rg * 2) ^ kc
+        slot1 = (rg * 2 + 1) ^ kc
+        txl.ptx.st.shared.v2.b32(t_s.ptr_to([row * 32 + slot0 * 2]), cols[kk][0], cols[kk][1])
+        txl.ptx.st.shared.v2.b32(t_s.ptr_to([row * 32 + slot1 * 2]), cols[kk][2], cols[kk][3])
+
+
 def transpose_flush(t_s, tid, out_t_ptr, k_base, n_base, Kd, Nd):
     """
     Write the transposed tile from t_s: tile row k (0..127) -> out_t row k_base + k, columns
@@ -153,6 +205,31 @@ def transpose_flush(t_s, tid, out_t_ptr, k_base, n_base, Kd, Nd):
     j = tid & 7
     for p in range(BLOCK // 32):
         row = p * 32 + (tid >> 3)
+        s = row >> 3
+        pb = ((j * 2) ^ s) & 14
+        y = txl.alloc_local([4], "uint32")
+        txl.ptx.ld.shared.v4.b32(y[0], y[1], y[2], y[3], t_s.ptr_to([row * 32 + pb * 2]))
+        odd = (s & 1) == 1
+        gk = k_base + row
+        gn = n_base + j * 16
+        valid = txl.And(gk < Kd, gn < Nd)
+        txl.ptx.st.global_.v4.b32(
+            out_t_ptr(i642(gk) * i642(Nd) + i642(gn)),
+            txl.Select(odd, y[2], y[0]),
+            txl.Select(odd, y[3], y[1]),
+            txl.Select(odd, y[0], y[2]),
+            txl.Select(odd, y[1], y[3]),
+            pred=valid,
+        )
+
+
+def transpose_flush_q128(t_s, tid, out_t_ptr, k_base, n_base, Kd, Nd):
+    """
+    Four-warp distribution of the unchanged 128x128 shared transpose.
+    """
+    j = tid & 7
+    for p in range(BLOCK // 16):
+        row = p * 16 + (tid >> 3)
         s = row >> 3
         pb = ((j * 2) ^ s) & 14
         y = txl.alloc_local([4], "uint32")
@@ -203,6 +280,7 @@ def quant_vec():
         sxn: txl.i64,
         num_tiles: txl.i32,
     ):
+        pdl()
         tid = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -264,6 +342,93 @@ def quant_vec():
     return compile_v(fp8_quant_vec)
 
 
+@functools.cache
+def quant_vec_q128():
+    """
+    Four-warp quant tile for moderate grids.  Each thread owns 16x8 bf16
+    values instead of 8x8.  The larger per-thread register tile is intended to
+    raise resident CTAs from three to four, reducing wave quantization on the
+    dense rows while retaining 16-byte global loads and the existing transpose
+    layout.
+    """
+
+    @txl.kernel(warps=NTQ // 32, grid="num_tiles")
+    def fp8_quant_vec_q128(
+        x: txl.gptr[txl.bf16],
+        out: txl.gptr[txl.u8],
+        out_t: txl.gptr[txl.u8],
+        sc: txl.gptr[txl.f32],
+        sct: txl.gptr[txl.f32],
+        N: txl.i32,
+        K: txl.i32,
+        R: txl.i32,
+        C: txl.i32,
+        sxg: txl.i64,
+        sxn: txl.i64,
+        num_tiles: txl.i32,
+    ):
+        pdl()
+        tid = txl.thread_id()
+        warp = txl.warp_id()
+        lane = txl.lane_id()
+        g, tr, tc = tile_coords(txl.cta_id(), R, C)
+        smem = txl.smem_pool()
+        t_s = smem.alloc([BLOCK * BLOCK // 4], "uint32")
+        red_s = smem.alloc([NTQ // 32], "uint32")
+
+        kc = tid & 15
+        rg = tid >> 4
+        n0 = tr * BLOCK + rg * 16
+        k = tc * BLOCK + kc * 8
+        kvalid = k < K
+        xb = txl.local_scalar("int64", init=i642(g) * sxg + i642(n0) * sxn + i642(k))
+        d = txl.alloc_local([64], "uint32")
+
+        def load(r):
+            txl.ptx.ld.global_.nc.v4.b32(d[4 * r], d[4 * r + 1], d[4 * r + 2], d[4 * r + 3], x.ptr_to([xb + sxn * r]))
+
+        with txl.If(txl.And(tc * BLOCK + BLOCK <= K, tr * BLOCK + BLOCK <= N)):
+            with txl.Then():
+                for r in range(16):
+                    load(r)
+            with txl.Else():
+                for r in range(16):
+                    for i in range(4):
+                        txl.ptx.mov.b32(d[4 * r + i], txl.uint32(0))
+                    with txl.If(txl.And(kvalid, n0 + r < N)), txl.Then():
+                        load(r)
+        m = txl.local_scalar("uint32", init=txl.uint32(0))
+        for i in range(64):
+            txl.ptx.max.u16x2(m, m, d[i] & txl.uint32(0x7FFF7FFF))
+        txl.ptx.max.u32(m, m & txl.uint32(0xFFFF), m >> txl.uint32(16))
+        am = cta_max_u32_q128(m, red_s, warp, lane)
+        sb, rb = scale_bits(txl.reinterpret("float32", am << txl.uint32(16)))
+        rcp = txl.reinterpret("float32", rb)
+
+        ob = txl.local_scalar("int64", init=(i642(g) * i642(N) + i642(n0)) * i642(K) + i642(k))
+        B = []
+        for r in range(16):
+            q = [bf16_word_to_fp8x2(d[4 * r + i], rcp) for i in range(4)]
+            w0 = txl.local_scalar("uint32", init=q[0] | (q[1] << txl.uint32(16)))
+            w1 = txl.local_scalar("uint32", init=q[2] | (q[3] << txl.uint32(16)))
+            B.append((w0, w1))
+            txl.ptx.st.global_.v2.b32(
+                out.ptr_to([ob + i642(K) * r]), w0, w1, pred=txl.And(kvalid, n0 + r < N)
+            )
+        transpose_store_q128(B, t_s, kc, rg)
+        with txl.If(tid == 0), txl.Then():
+            sf = txl.reinterpret("float32", sb)
+            txl.ptx.st.global_.f32(sc.ptr_to([(i642(g) * i642(R) + i642(tr)) * i642(C) + i642(tc)]), sf)
+            txl.ptx.st.global_.f32(sct.ptr_to([(i642(g) * i642(C) + i642(tc)) * i642(R) + i642(tr)]), sf)
+        txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NTQ))
+        tbase = txl.local_scalar("int64", init=i642(g) * i642(K) * i642(N))
+        transpose_flush_q128(
+            t_s, tid, lambda off: out_t.ptr_to([tbase + off]), tc * BLOCK, tr * BLOCK, K, N
+        )
+
+    return compile_v(fp8_quant_vec_q128)
+
+
 # ---------------------------------------------------------------- quant_weight (generic)
 
 
@@ -290,6 +455,7 @@ def quant_generic(dtype):
         sxk: txl.i64,
         num_tiles: txl.i32,
     ):
+        pdl()
         tid = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -363,7 +529,8 @@ def quant(x3, G, N, K, sxg, sxn, sxk, out, scale, out_t, scale_t):
         and xf.data_ptr() % 16 == 0
     )
     if fast:
-        quant_vec()(xf, u82(out), u82(out_t), scale.view(-1), scale_t.view(-1), N, K, R, C, sxg, sxn, tiles)
+        kern = quant_vec_q128() if G == 1 else quant_vec()
+        kern(xf, u82(out), u82(out_t), scale.view(-1), scale_t.view(-1), N, K, R, C, sxg, sxn, tiles)
     else:
         dt = "bfloat16" if x3.dtype == torch.bfloat16 else "float32"
         xf = xf if x3.dtype in (torch.bfloat16, torch.float32) else xf.float()
@@ -521,6 +688,7 @@ def shard_kernel(cast, V, amax_nd, split=1):
             L: txl.i32, K: txl.i32, row_offset: txl.i32, tr0: txl.i32, NTR: txl.i32, C: txl.i32,
             go: txl.i32, asg: txl.i64, num_tiles: txl.i32,
         ):
+            pdl()
             body(x, amax, out, L, K, row_offset, tr0, NTR, C, go, asg)
 
         return compile_v(fp8_shard_cast)
@@ -532,6 +700,7 @@ def shard_kernel(cast, V, amax_nd, split=1):
         L: txl.i32, K: txl.i32, row_offset: txl.i32, tr0: txl.i32, NTR: txl.i32, C: txl.i32,
         go: txl.i32, asg: txl.i64, num_tiles: txl.i32,
     ):
+        pdl()
         body(x, amax, None, L, K, row_offset, tr0, NTR, C, go, asg)
 
     return compile_v(fp8_shard_amax)
@@ -601,6 +770,7 @@ def scales_kernel():
         total: txl.i32,
         num_ctas: txl.i32,
     ):
+        pdl()
         i = txl.cta_id() * NT + txl.thread_id()
         with txl.If(i < total), txl.Then():
             scale_elem(
@@ -639,6 +809,7 @@ def pack_vec(dtype):
         total: txl.i64,
         num_tiles: txl.i32,
     ):
+        pdl()
         tid = txl.thread_id()
         g, tr, tc = tile_coords(txl.cta_id(), R, C)
         smem = txl.smem_pool()
@@ -684,6 +855,7 @@ def pack_generic(dtype):
         total: txl.i64,
         num_tiles: txl.i32,
     ):
+        pdl()
         tid = txl.thread_id()
         g, tr, tc = tile_coords(txl.cta_id(), R, C)
         c = tid & 127
@@ -701,7 +873,7 @@ def pack_generic(dtype):
     return compile_v(fp8_pack_generic)
 
 
-ONE_BYTE = {torch.float8_e4m3fn: "float8_e4m3fn", torch.uint8: "uint8", torch.int8: "int8", torch.float8_e5m2: "float8_e5m2"}
+ONE_BYTE = {torch.float8_e4m3fn: txl.f8e4m3, torch.uint8: txl.u8, torch.int8: "int8", torch.float8_e5m2: "float8_e5m2"}
 
 
 def fp8_pack_transpose_sm100(x, out):
@@ -792,6 +964,7 @@ def shard_amax_multi_kernel(V):
 
     @txl.kernel(warps=NT // 32, grid="total")
     def fp8_shard_amax_multi(table: txl.gptr[txl.i64], nw: txl.i32, total: txl.i32):
+        pdl()
         tid = txl.thread_id()
         smem = txl.smem_pool()
         red_s = smem.alloc([NT // 32], "uint32")
@@ -856,6 +1029,7 @@ SC_FIELDS = 6
 def scales_multi_kernel(cap):
     @txl.kernel(warps=NT // 32, grid="num_ctas")
     def fp8_scales_multi(table: txl.gptr[txl.i64], nw: txl.i32, total: txl.i32, num_ctas: txl.i32):
+        pdl()
         t_s, _ = load_table(table, nw, SC_FIELDS, cap)
         gi = txl.local_scalar("int32", init=txl.cta_id() * NT + txl.thread_id())
         with txl.While(gi < total):
