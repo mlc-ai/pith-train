@@ -5,11 +5,14 @@ The output is cut into 128-row x 128-column tiles: one tile holds whole 1x128 ro
 (x_fp8 / x_scale) and whole 128x1 column blocks (x_ch_fp8 / x_ch_scale), because groups are
 128-row aligned (grouped_mm_offs is therefore not needed for the SM100 layout).
 
-Persistent schedule: 512-thread CTAs walk tiles round-robin. Each thread owns the same
+Persistent schedule: 512-thread CTAs (one per SM) walk tiles round-robin. Each thread owns the same
 4 rows x 8 columns of every tile and prefetches them with cp.async into its own slots of a
-shared-memory ring a tile ahead, so the HBM stream overlaps the arithmetic without any
-producer/consumer barrier (a thread only ever reads bytes it copied itself). The one CTA-wide
-exchange is the column amax: per-warp partials, 64 reducer threads, an rcp broadcast.
+shared-memory ring, so the HBM stream overlaps the arithmetic without any producer/consumer
+barrier (a thread only ever reads bytes it copied itself). A tile load is split into row parts
+(halves or quarters) that form a unit ring of per-mode depth: the forward keeps 1.5 tiles in
+flight (three half-tile units), N=512 backward a quarter-tile ring one tile deep, N=1408 backward a
+half-tile ring. The one CTA-wide exchange is the column amax: per-warp partials, 64 reducer
+threads, an rcp broadcast.
 
 Arithmetic runs on packed pairs (f32x2 / bf16x2). Triton's sigmoid, 1 / (1 + ex2.approx(x)) with
 div.full.f32, is reproduced as 0.25 * rcp.approx.ftz(fma(ex2.approx.ftz(x), 0.25, 0.25)): this
@@ -17,11 +20,13 @@ is bit-identical for every bf16 input (checked exhaustively, including inf and N
 1 + e absorbs any subnormal e and the 0.25 pre-scale reproduces div.full's large-divisor path.
 
 gu_bwd with N % 128 != 0 (dg and du blocks offset by N % 128 columns) keeps one load and one
-sigmoid per element by walking contiguous window ranges per CTA (body_run).
+sigmoid per element by walking short ranges of consecutive 128-column windows (body_runL): CTA c
+takes ranges c, c + G, ... so concurrent CTAs read adjacent columns of the same rows, carries
+du of the previous window in thread-private shared memory and recomputes it (halo) at range starts.
 
 N not a multiple of 8 falls back to a non-persistent kernel with narrower predicated loads.
 
-Evolved with TIRx-harness: run silu, frontier member persistent-cpasync (commit 6c08709, 2201.6 us vs 8716.5 us, 3.959x over the
+Evolved with TIRx-harness: run silu, frontier member persistent-cpasync (commit 23cc854, 2126.9 us vs 8709.9 us, 4.095x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -45,7 +50,13 @@ ABS2 = 0x7FFF7FFF
 # Persistent schedule (measured best on B200): 512-thread CTAs, a one-tile cp.async lookahead
 # (the tile is copied to registers before the next one is issued, so one ring slot suffices),
 # two CTAs per SM for the forward (64 registers), one for the heavier backward.
-CFG = {"threads": 512, "stages_fwd": 1, "occ_fwd": 2, "threads_bwd": 512, "stages_bwd": 1, "occ_bwd": 1}
+CFG = {"threads": 512, "stages_fwd": 1, "occ_fwd": 1, "threads_bwd": 512, "stages_bwd": 1, "occ_bwd": 1,
+       # cp.async unit ring per mode[:N]: a tile load is split into hp row parts, hu units in flight
+       "hu": {"fwd": 3, "gu_fwd": 3, "bwd:1408": 2, "gu_bwd_pair:1408": 2, "bwd:512": 4, "gu_bwd_pair:512": 4},
+       "hp": {"bwd:512": 4, "gu_bwd_pair:512": 4},
+       "signed": ["bwd:1408", "gu_bwd_pair:1408", "bwd:512", "gu_bwd_pair:512"],
+       # gu_bwd with N % 128 != 0: windows per interleaved range
+       "run_l": 3}
 
 
 def cdiv(a, b):
@@ -357,7 +368,7 @@ def build(mode, N):
                 store8(c_t, row, qc)
 
     def tile_coords(t, cg, r0):
-        if bwd and N == 1408:
+        if f"{mode}:{N}" in CFG["signed"] or mode in CFG["signed"]:
             # Preserve the older signed coordinate expression for the half-tile
             # specialization.  Although it emits more address instructions, it
             # changes register scheduling materially for this pipeline.
@@ -386,10 +397,11 @@ def build(mode, N):
         # while the first half is copied to registers, without changing tile ownership
         # or the quantization protocol.  Other compile-time widths retain the frontier
         # schedule because the same split regressed qwen and dense rows.
-        HU = 2 if bwd and N == 1408 else 0
-        HR2 = RPT // 2
+        HU = CFG["hu"].get(f"{mode}:{N}", CFG["hu"].get(mode, 0))
+        HP = CFG["hp"].get(f"{mode}:{N}", CFG["hp"].get(mode, 2))  # row parts per tile load
+        HR2 = RPT // HP
         if HU:
-            ring = smem.alloc([HU, n_in, BLOCK // 2, BLOCK], "bfloat16", align=128)
+            ring = smem.alloc([HU, n_in, BLOCK // HP, BLOCK], "bfloat16", align=128)
         else:
             ring = smem.alloc([STAGES, n_in, BLOCK, BLOCK], "bfloat16", align=128)
         sm = (smem.alloc([2, n_out, NWARP, BLOCK // 2], "uint32"), smem.alloc([2, n_out, BLOCK], "float32", align=16))
@@ -399,8 +411,8 @@ def build(mode, N):
             """
             Issue half-tile unit uu = 2 * tile_step + row_half.
             """
-            t = cta + (uu // 2) * G
-            hh = uu % 2
+            t = cta + (uu // HP) * G
+            hh = uu % HP
             slot = uu % HU
             with txl.If(t < ntiles), txl.Then():
                 rb, cb, ocol, row_base = tile_coords(t, cg, r0)
@@ -453,8 +465,8 @@ def build(mode, N):
         with txl.While(cta + j * G < ntiles):
             t = cta + j * G
             if HU:
-                for hh in range(2):
-                    uu = 2 * j + hh
+                for hh in range(HP):
+                    uu = HP * j + hh
                     txl.ptx["cp.async.wait_group"](HU - 1)
                     for i2 in range(HR2):
                         i = hh * HR2 + i2
@@ -713,7 +725,188 @@ def build(mode, N):
             txl.assign(fc, nf)
         txl.ptx["cp.async.wait_group"](0)
 
-    body = (body_run if run else body_persistent) if persistent else body_simple
+    def body_runL(dh, g, u, outs, MB, G):
+        """
+        gu_bwd, N % 128 = HR != 0, short interleaved window ranges. Each row block's NT windows are cut
+        into R ranges of about RUN_L windows; CTA c walks ranges q = c, c + G, ... (consecutive CTAs take
+        adjacent ranges of the same rows, so concurrent loads share DRAM pages) with one continuous
+        cp.async pipeline across range boundaries. Per window as body_run: dg block k, and du block HQ + k
+        from du_k (lanes < HS) and the thread's carried du_{k-1} (lanes >= HS); the first window of a
+        range with k > 0 recomputes du_{k-1} from a g/dh halo load of window k - 1.
+        """
+        tid = txl.thread_id()
+        lane = tid & 31
+        warp = tid >> 5
+        cg = tid & 15
+        r0 = tid >> 4
+        cta = txl.cta_id()
+        Q = MB * RUN_R
+        smem = txl.smem_pool()
+        ring = smem.alloc([5, BLOCK, BLOCK], "bfloat16", align=128)
+        sm = (smem.alloc([2, 2, NWARP, BLOCK // 2], "uint32"), smem.alloc([2, 2, BLOCK], "float32", align=16))
+        out = outs[0]
+        c8 = cg * 8
+        isL = c8 < HS
+
+        def lv(e, dt="int32"):
+            v = txl.local_scalar(dt)
+            txl.assign(v, e)
+            return v
+
+        def cut(p):
+            c = txl.min(p * RUN_L, NT)
+            if HQ > 0:
+                c = c + txl.Select(c == HQ, 1, 0)
+            return c
+
+        def rng(q):
+            qu = lv(txl.cast(q, "uint32"), "uint32")
+            rb = lv(txl.cast(qu // txl.uint32(RUN_R), "int32"))
+            p = lv(txl.cast(qu % txl.uint32(RUN_R), "int32"))
+            return rb, p
+
+        def issue_main(rb, k, ok_q):
+            with txl.If(ok_q), txl.Then():
+                row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
+                ocol = k * BLOCK + c8
+                ok = ocol < N
+                col = txl.Select(ok, ocol, 0)
+                for i in range(RPT):
+                    rl = r0 + RSTRIDE * i
+                    row = row_base + RSTRIDE * i
+                    for kk, src, cc in ((0, g, col), (1, u, col + U_OFF), (2, dh, col)):
+                        txl.ptx["cp.async.cg.shared.global"](ring.ptr_to([kk, rl, c8]), src.ptr_to([row, cc]), 16, txl.ptx.pred(txl.Not(ok)))
+            txl.ptx["cp.async.commit_group"]()
+
+        def aux_of(first, k):
+            # halo (first window of a range, k > 0): window k - 1, columns >= HS; window HQ: window 0, columns < HS
+            halo_ = txl.And(first == 1, k > 0)
+            last = k == HQ
+            col = txl.Select(halo_, (k - 1) * BLOCK + c8, c8 - HR)
+            ok = txl.Select(halo_, txl.Not(isL), txl.And(last, c8 >= HR))
+            ok = txl.And(ok, col < N)
+            return txl.Select(ok, col, 0), ok, txl.Or(halo_, last)
+
+        def issue_aux(rb, k, first, ok_q):
+            with txl.If(ok_q), txl.Then():
+                row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
+                col, ok, need = aux_of(first, k)
+                col = lv(col)
+                okv = lv(txl.Select(ok, 1, 0))
+                ok = okv == 1
+                with txl.If(need), txl.Then():
+                    for i in range(RPT):
+                        rl = r0 + RSTRIDE * i
+                        row = row_base + RSTRIDE * i
+                        for kk, src in ((3, g), (4, dh)):
+                            txl.ptx["cp.async.cg.shared.global"](ring.ptr_to([kk, rl, c8]), src.ptr_to([row, col]), 16, txl.ptx.pred(txl.Not(ok)))
+            txl.ptx["cp.async.commit_group"]()
+
+        def ld(regs, ks):
+            for i in range(RPT):
+                rl = r0 + RSTRIDE * i
+                for dst, kk in zip(regs, ks):
+                    txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], ring.ptr_to([kk, rl, c8]))
+
+        def du_only(t_, wg, wd):
+            gp = unpack(wg[t_])
+            dp = unpack(wd[t_])
+            sg = mul2(sigmoid(gp), c2(0.25))
+            du = mul2(mul2(sg.r, gp.r).r, dp.r)
+            dw = txl.local_scalar("uint32")
+            txl.ptx.cvt.rn.bf16x2.f32(dw, du.y, du.x)
+            return dw
+
+        def g_lin(k):
+            return {"ocol": k * BLOCK + c8, "sblk": k, "ccol": k * BLOCK + 2 * tid, "sguard": None, "olim": K}
+
+        def g_du(b1):
+            pos = lambda c: txl.bitwise_and(c + HR, BLOCK - 1)
+            return {"ocol": b1 * BLOCK + pos(c8), "sblk": b1, "ccol": b1 * BLOCK + pos(2 * tid), "sguard": b1 < KB, "olim": K}
+
+        # walk state: range q, window k, range end k1, first window of its range
+        q = txl.local_scalar("int32")
+        k = txl.local_scalar("int32")
+        k1 = txl.local_scalar("int32")
+        first = txl.local_scalar("int32")
+        rbv = txl.local_scalar("int32")
+        txl.assign(q, cta)
+        rb0, p0 = rng(cta)
+        txl.assign(rbv, rb0)
+        txl.assign(k, cut(p0))
+        txl.assign(k1, cut(p0 + 1))
+        txl.assign(first, 1)
+        issue_main(rbv, k, q < Q)
+        issue_aux(rbv, k, first, q < Q)
+        hw = [txl.alloc_local([W], "uint32") for _ in range(2)]
+        prev_sm = smem.alloc([W // 4, NTHREADS, 4], "uint32", align=16)
+
+        def prev_st(x):
+            for q4 in range(W // 4):
+                txl.ptx.st.shared.v4.b32(prev_sm.ptr_to([q4, tid, 0]), x[4 * q4], x[4 * q4 + 1], x[4 * q4 + 2], x[4 * q4 + 3])
+
+        def prev_ld(x):
+            for q4 in range(W // 4):
+                txl.ptx.ld.shared.v4.b32(x[4 * q4], x[4 * q4 + 1], x[4 * q4 + 2], x[4 * q4 + 3], prev_sm.ptr_to([q4, tid, 0]))
+
+        wg = txl.alloc_local([W], "uint32")
+        wu = txl.alloc_local([W], "uint32")
+        wd = txl.alloc_local([W], "uint32")
+        with txl.While(q < Q):
+            rb = rbv
+            row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
+            # next window of this CTA's walk
+            cont = lv(txl.Select(k + 1 < k1, 1, 0))
+            nq = lv(txl.Select(cont == 1, q, q + G))
+            nrb, np_ = rng(nq)
+            nrb = lv(txl.Select(cont == 1, rb, nrb))
+            nk = lv(txl.Select(cont == 1, k + 1, cut(np_)))
+            nk1 = lv(txl.Select(cont == 1, k1, cut(np_ + 1)))
+            nfirst = lv(1 - cont)
+            txl.ptx["cp.async.wait_group"](1)
+            ld([wg, wu, wd], [0, 1, 2])
+            issue_main(nrb, nk, nq < Q)
+            swiglu(True, False, N, 0, wg, wu, wd, [hw[0], hw[1]], W)
+            prev_ld(wu)
+            for t_ in range(W):
+                txl.assign(wu[t_], txl.Select(isL, hw[1][t_], wu[t_]))
+            prev_st(hw[1])
+            txl.ptx["cp.async.wait_group"](1)
+            acol, aok, need = aux_of(first, k)
+            ld([wg, wd], [3, 4])
+            issue_aux(nrb, nk, nfirst, nq < Q)
+            last = k == HQ
+            halo_ = txl.And(first == 1, k > 0)
+            with txl.If(need), txl.Then():
+                for t_ in range(W):
+                    dw = du_only(t_, wg, wd)
+                    txl.assign(wu[t_], txl.Select(txl.And(halo_, txl.Not(isL)), dw, wu[t_]))
+                    txl.assign(hw[0][t_], txl.Select(txl.And(last, c8 >= HR), dw, hw[0][t_]))
+            gd = g_du(k + HQ)
+            has = k > 0
+            gd = dict(gd, ocol=txl.Select(has, gd["ocol"], K), ccol=txl.Select(has, gd["ccol"], K), sguard=txl.And(gd["sguard"], has))
+            quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 0,
+                        geo=[(hw[0], out, g_lin(k)), (wu, out, gd)])
+            if HR > 64:
+                with txl.If(last), txl.Then():
+                    prev_ld(wg)
+                    for t_ in range(W):
+                        txl.assign(wg[t_], txl.Select(isL, txl.uint32(0), wg[t_]))
+                    quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 1,
+                                geo=[(wg, out, g_du(2 * HQ + 1))])
+            txl.assign(q, nq)
+            txl.assign(rbv, nrb)
+            txl.assign(k, nk)
+            txl.assign(k1, nk1)
+            txl.assign(first, nfirst)
+        txl.ptx["cp.async.wait_group"](0)
+
+    RUN_L = CFG["run_l"]
+    if run and RUN_L:
+        cuts = sorted({min(p * RUN_L, NT) + (1 if HQ > 0 and min(p * RUN_L, NT) == HQ else 0) for p in range(NT // RUN_L + 2)})
+        RUN_R = len(cuts) - 1  # non-empty ranges per row block (the formula is monotone; empty ones only at the end)
+        assert all(cuts[i] == min(i * RUN_L, NT) + (1 if HQ > 0 and min(i * RUN_L, NT) == HQ else 0) for i in range(RUN_R + 1))
+    body = ((body_runL if RUN_L else body_run) if run else body_persistent) if persistent else body_simple
 
     def T(dt, f):
         return txl.gptr(dt, shape=f)
@@ -779,7 +972,7 @@ def build(mode, N):
             body(dh, g, u, [o, o] if pair else [o], MB, G)
 
     ex = kern.compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}))
-    return ex, persistent, NT, OCC
+    return ex, persistent, NT, OCC, (RUN_R if run and RUN_L else 0)
 
 
 @functools.cache
@@ -796,10 +989,12 @@ def grid2(ntiles, occ, sms):
 
 
 def launch(mode, N, M, device, *args):
-    ex, persistent, nt, occ = build(mode, N)
+    ex, persistent, nt, occ, run_r = build(mode, N)
     MB = M // BLOCK
     G = grid2(MB * nt, occ, num_sms(device.index)) if persistent else MB * nt
-    if mode == "gu_bwd_run":
+    if run_r:
+        G = grid2(MB * run_r, 1, num_sms(device.index))
+    elif mode == "gu_bwd_run":
         sms = num_sms(device.index)
         G = MB * (sms // MB) if MB <= sms else G  # whole row-block parts (see body_run)
     with tvm_ffi.use_torch_stream():
