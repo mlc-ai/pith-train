@@ -502,10 +502,10 @@ def fp8_quant_act_sm100(x: torch.Tensor):
     dev = x.device
     fast = M > 0 and K > 0 and is_fast(x)
     q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=dev)
-    # x_scale strides are unspecified by the contract; the fast path stores it column-major so that
-    # each tile's 128 row scales are one contiguous run.
+    # x_scale is returned column-major (act_scale_like's SM100 layout): the fast path stores it so,
+    # each tile's 128 row scales one contiguous run; the generic kernel's row-major store is copied.
     s_store = torch.empty((nkb, M) if fast else (M, nkb), dtype=torch.float32, device=dev)
-    s = s_store.T if fast else s_store
+    s = s_store.T if fast else torch.empty((nkb, M), dtype=torch.float32, device=dev).T
     qt = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=dev)
     st = torch.empty((nkb, nmb), dtype=torch.float32, device=dev)
     if M == 0 or K == 0:
@@ -525,4 +525,6 @@ def fp8_quant_act_sm100(x: torch.Tensor):
             oneshot_kernel(ONESHOT_CTAS_PER_SM, persistent, not persistent)(flat, *outs, M, K, nmb, nkb, sr, grid_n)
         else:
             generic_kernel(DT[x.dtype])(flat, *outs, M, K, nmb, nkb, sr, sc)
+    if not fast:
+        s.copy_(s_store)
     return q, s, qt, st

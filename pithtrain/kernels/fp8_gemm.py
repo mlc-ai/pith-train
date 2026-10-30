@@ -1,6 +1,7 @@
 """
 Every 1x128 activation scale is fp32 of logical shape (rows, ceil(K / 128)) with unspecified strides
-(MN-major on SM90, row-major on SM100); the GEMMs take either.
+(MN-major on SM90; on SM100 column-major from fp8_quant_act / fp8_quant_grad, row-major from the
+grouped and fused quantizations); the GEMMs take either.
 """
 
 from typing import Tuple
