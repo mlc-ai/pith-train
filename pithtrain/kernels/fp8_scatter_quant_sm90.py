@@ -30,7 +30,7 @@ from pithtrain.kernels.cute_ptx_sm90 import asm, atom_add_u64, fence_gpu, lanema
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import THREADS, TILE, RowwiseKmajor, fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.host_transfer import get_pinned_buffer
-from pithtrain.kernels.token_scatter import scatter_by_expert
+from pithtrain.kernels.token_scatter_sm90 import scatter_by_expert_sm90
 
 __all__ = ["Prep", "ScatterQuant", "scatter_quant_sm90", "supports_scatter_quant"]
 
@@ -352,7 +352,7 @@ def run_unfused(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: i
     The unfused path for inputs the fused kernels do not cover (rows in atomic_add order).
     """
     x = gathered if expand_idx is None else gathered[expand_idx]
-    out, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
+    out, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert_sm90(x, expert_idxs, num_groups, group_counts=group_counts)
     return fp8cast_rowwise_kmajor_sm90(out, grouped_mm_offs), reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor
 
 

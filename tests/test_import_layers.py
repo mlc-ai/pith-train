@@ -59,6 +59,7 @@ SM90_CROSS_EDGES = {
     ("fp8_clamped_swiglu_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_clamped_swiglu_quant_sm90", "segment_sum_sm90"),
+    ("fp8_scatter_quant_sm90", "token_scatter_sm90"),
 }
 # What models/ may import from modules/ (from kernels/ only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}
