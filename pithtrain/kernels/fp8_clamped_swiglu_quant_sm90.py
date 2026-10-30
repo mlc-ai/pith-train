@@ -31,7 +31,7 @@ from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_l
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, ptx_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
-from pithtrain.kernels.segment_sum import block_segment_sum
+from pithtrain.kernels.segment_sum_sm90 import block_segment_sum
 
 __all__ = ["ClampedSwiGLUQuant", "fp8_clamped_swiglu_bwd_sm90", "clamped_swiglu_quant_fusable", "clamped_swiglu_quant_fwd_sm90", "fp8_clamped_swiglu_kmajor_sm90", "fp8_clamped_swiglu_rowwise_sm90"]
 
