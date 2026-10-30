@@ -1022,7 +1022,6 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False):
     ):
         a_map, b_map, d_map = host
         rank = txl.cta_id_in_cluster([2])
-        cluster = txl.cta_id() // 2
         warp = txl.warp_id()
         lane = txl.lane_id()
         tid = txl.thread_id()

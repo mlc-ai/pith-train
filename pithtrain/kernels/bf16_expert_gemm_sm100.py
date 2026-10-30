@@ -756,7 +756,6 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
             w16 = txl.alloc_local((16,), "uint32")
             w8 = txl.alloc_local((8,), "uint32")
             ld = txl.alloc_local((32,), "uint32")
-            ld2 = None
             dst = txl.local_scalar("int32")
 
             xb = (warp - EPI_WARP0) * XWORDS
@@ -1097,7 +1096,6 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
                                     txl.ptx.cp.async_.bulk.commit_group()
                                 txl.cuda.warp_sync()
                             else:
-                                cur = ld
                                 if XSTAGE:
                                     rb = walk.lo + walk.mt * BMC + cbx * BM + ew * 32
                                     ok = lambda row: rb + row < walk.hi  # noqa: E731
