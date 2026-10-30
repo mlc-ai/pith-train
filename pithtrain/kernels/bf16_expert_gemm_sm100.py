@@ -17,9 +17,13 @@ The wgrads read pre-gathered rows and accumulate the fp32 main grads by TMA redu
 The two gate / up weights are read through one rank-4 tensor map (H, 2, I, G) whose second mode
 strides between the two weights in address order, so the MMA sees the interleaved
 [w_lo[0]; w_hi[0]; w_lo[1]; ...] rows: the accumulator columns are the interleaved preact
-pairs, and the gate_up dgrad contracts the interleaved dpre directly.
+pairs, and the gate_up dgrad contracts the interleaved dpre directly. TMA strides stop below
+2^40 bytes, so two independent allocations farther apart than that (separate parameters in
+training) take the far-pair variants instead: the gate_up fwd / dgrad weight rows come in through
+the cp.async gather warps with 64-bit addresses (same interleaved smem rows, same epilogues), and
+the gate_up wgrad reduces each main grad through its own tensor map.
 
-Evolved with TIRx-harness: run bf16gemm, frontier member cluster2-cpasync-tmareduce (commit a9a4335, 16151 us vs 281141 us, 17.407x over the
+Evolved with TIRx-harness: run bf16gemm, frontier member cluster2-cpasync-tmareduce (commit c2b333c, 16183 us vs 268442 us, 16.588x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -140,7 +144,7 @@ def dact(g, u, dh, clamped, alpha, limit):
     return dg, du
 
 
-def params2(kind, has_bias, clamped):
+def params2(kind, has_bias, clamped, far=False):
     i32, i64, f32 = "int32", "int64", "float32"
     bf = txl.gptr[txl.bf16]
     u32 = txl.gptr[txl.u32]
@@ -161,8 +165,8 @@ def params2(kind, has_bias, clamped):
         p += [("dpre", bf), ("w", bf), ("wdiff", i64), ("ws0", i64), ("ws1", i64), ("dx", u32)]
     elif kind == "gu_wgrad":
         p += [("dpre", bf), ("x", bf), ("T", i32), ("a_idx", txl.gptr[txl.i32]),
-              ("mg", txl.gptr[txl.f32]), ("mgdiff", i64), ("ms0", i64), ("ms1", i64),
-              ("flip", i32)]
+              ("mg", txl.gptr[txl.f32])] + ([("mg2", txl.gptr[txl.f32])] if far else []) + [
+              ("mgdiff", i64), ("ms0", i64), ("ms1", i64), ("flip", i32)]
     elif kind == "down_wgrad":
         p += [("dy", bf), ("T", i32), ("slot_of", txl.gptr[txl.i32]), ("hin", bf),
               ("mg", txl.gptr[txl.f32])]
@@ -194,7 +198,7 @@ def use_materialized_gu_fwd(M, G, H, inter):
 
 
 @functools.cache
-def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
+def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far=False):
     k_grouped, a_major, b_major, a_gather = KINDS[kind]
     # Problem geometry per kind: (K, N) for M-grouped; (Mo, No) for K-grouped.
     if kind == "gu_fwd":
@@ -220,9 +224,15 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
     MAT_GU = materialized and kind == "gu_fwd"
     if MAT_GU:
         a_gather = False
-    GATHER = kind in ("gu_fwd", "down_dgrad", "gu_wgrad", "down_wgrad") and not MAT_GU
-    # the gathered operand: A for gu_fwd / down_dgrad / down_wgrad, B for gu_wgrad
-    TMA_BYTES = (A_BYTES + B_BYTES) - ((B_BYTES if kind == "gu_wgrad" else A_BYTES) if GATHER else 0)
+    # far-pair gate / up weights (more than 2^40 bytes apart): no tensor map spans both, so the
+    # gather warps load the interleaved weight rows (B) with plain 64-bit addresses
+    WFAR = far and kind in ("gu_fwd", "gu_dgrad")
+    MG2 = far and kind == "gu_wgrad"  # far-pair main grads: one reduce tensor map per buffer
+    # the gathered operand(s): A for gu_fwd / down_dgrad / down_wgrad, B for gu_wgrad and WFAR
+    A_GATH = kind in ("gu_fwd", "down_dgrad", "down_wgrad") and not MAT_GU
+    B_GATH = kind == "gu_wgrad" or WFAR
+    GATHER = A_GATH or B_GATH
+    TMA_BYTES = (0 if A_GATH else A_BYTES) + (0 if B_GATH else B_BYTES)
     # the SwiGLU-heavy epilogues get two warps per TMEM lane quadrant (column halves)
     NEPI = 8 if kind in ("gu_fwd", "down_dgrad") else 4
     # longest-group-first tile order (helps down_wgrad's tail; measured worse for gu_wgrad)
@@ -252,7 +262,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
     b_shape = (NST, HN, BK) if b_major == "k" else (NST, BK, HN)
     a_idesc_trans = a_major == "mn"
     b_idesc_trans = b_major == "mn"
-    params = params2(kind, has_bias, clamped)
+    params = params2(kind, has_bias, clamped, MG2)
     names = [n for n, _ in params]
 
     def enc(m, rank, data, *ops, dtype="bfloat16"):
@@ -264,9 +274,12 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["x"].data, H, p["T"], H * 2, 64,
                 BM if MAT_GU else 1, 1, 1, 0, 3, 2, 0)
-            maps["b"] = txl.stack_alloca("tensormap", 1)
-            enc(maps["b"], 4, p["w"].data, H, 2, inter, p["G"], p["wdiff"] * 2, p["ws1"] * 2,
-                p["ws0"] * 2, 64, 2, HN // 2, 1, 1, 1, 1, 1, 0, 3, 2, 0)
+            if WFAR:
+                maps["b"] = maps["a"]  # unused: the gather warps load the weights
+            else:
+                maps["b"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["b"], 4, p["w"].data, H, 2, inter, p["G"], p["wdiff"] * 2, p["ws1"] * 2,
+                    p["ws0"] * 2, 64, 2, HN // 2, 1, 1, 1, 1, 1, 0, 3, 2, 0)
         elif kind == "down_fwd":
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["hin"].data, inter, p["M"], inter * 2, 64, BM, 1, 1, 0, 3, 2, 0)
@@ -282,9 +295,12 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
         elif kind == "gu_dgrad":
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["dpre"].data, 2 * inter, p["M"], 4 * inter, 64, BM, 1, 1, 0, 3, 2, 0)
-            maps["b"] = txl.stack_alloca("tensormap", 1)
-            enc(maps["b"], 4, p["w"].data, H, 2, inter, p["G"], p["wdiff"] * 2, p["ws1"] * 2,
-                p["ws0"] * 2, 64, 2, BK // 2, 1, 1, 1, 1, 1, 0, 3, 2, 0)
+            if WFAR:
+                maps["b"] = maps["a"]  # unused: the gather warps load the weights
+            else:
+                maps["b"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["b"], 4, p["w"].data, H, 2, inter, p["G"], p["wdiff"] * 2, p["ws1"] * 2,
+                    p["ws0"] * 2, 64, 2, BK // 2, 1, 1, 1, 1, 1, 0, 3, 2, 0)
         elif kind == "gu_wgrad":
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["dpre"].data, 2 * inter, p["M"], 4 * inter, 64, BK, 1, 1, 0, 3, 2, 0)
@@ -292,8 +308,17 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
             enc(maps["b"], 2, p["x"].data, H, p["T"], H * 2, 64, 1, 1, 1, 0, 3, 2, 0)
             # main grads as (H, 2, I, G) over the lower buffer: rows (i, address lane)
             maps["c"] = txl.stack_alloca("tensormap", 1)
-            enc(maps["c"], 4, p["mg"].data, H, 2, inter, p["G"], p["mgdiff"] * 4, p["ms1"] * 4,
-                p["ms0"] * 4, 32, 2, 16, 1, 1, 1, 1, 1, 0, 3, 2, 0, dtype="float32")
+            if MG2:
+                # far pair: each buffer as (H, I, G), the staging tile's lane-0 rows reduce into
+                # the lower buffer, its lane-1 rows into the upper one
+                enc(maps["c"], 3, p["mg"].data, H, inter, p["G"], p["ms1"] * 4, p["ms0"] * 4,
+                    32, 16, 1, 1, 1, 1, 0, 3, 2, 0, dtype="float32")
+                maps["c2"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["c2"], 3, p["mg2"].data, H, inter, p["G"], p["ms1"] * 4, p["ms0"] * 4,
+                    32, 16, 1, 1, 1, 1, 0, 3, 2, 0, dtype="float32")
+            else:
+                enc(maps["c"], 4, p["mg"].data, H, 2, inter, p["G"], p["mgdiff"] * 4, p["ms1"] * 4,
+                    p["ms0"] * 4, 32, 2, 16, 1, 1, 1, 1, 1, 0, 3, 2, 0, dtype="float32")
         else:  # down_wgrad
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["dy"].data, H, p["T"], H * 2, 64, 1, 1, 1, 0, 3, 2, 0)
@@ -491,8 +516,10 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
             return txl.cuda.cvta_generic_to_shared(full_cta0.ptr_to([stage]))
 
         # ------------------------------------------------------------ TMA producer
-        # (the non-gathered operand(s); the gathered one is the cp.async role below)
-        with txl.If(warp == 0), txl.Then():
+        # (the non-gathered operand(s); the gathered one is the cp.async role below). With both
+        # gathered (far-pair gate_up fwd) only CTA0's runs: its zero-byte arrive on the full
+        # barrier keeps the stage protocol; CTA1's would wait on empty phases nothing gates.
+        with txl.If((warp == 0) & (cbx == 0) if TMA_BYTES == 0 else (warp == 0)), txl.Then():
             set_regs(0)
             walk = TileWalk()
             st = txl.PipelineState(NST, 1)
@@ -524,7 +551,9 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
                                     a_base, txl.address_of(a_map), i32(k), i32(mrow), full_bar(s)
                                 )
                             n0 = walk.nt * BN + cbx * HN
-                            if kind == "gu_fwd":
+                            if B_GATH:
+                                pass
+                            elif kind == "gu_fwd":
                                 txl.ptx[TMA.format(4)](
                                     b_base, txl.address_of(b_map), i32(k), i32(0), i32(n0 // 2),
                                     i32(walk.g), full_bar(s),
@@ -574,8 +603,9 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
                 gw = warp - GW0
                 walk = TileWalk()
                 st = txl.PipelineState(NST, 1)
-                src = p["x"] if kind in ("gu_fwd", "gu_wgrad") else p["dy"]
-                ids = p["a_idx"] if kind in ("gu_fwd", "gu_wgrad") else p["slot_of"]
+                if kind != "gu_dgrad":
+                    src = p["x"] if kind in ("gu_fwd", "gu_wgrad") else p["dy"]
+                    ids = p["a_idx"] if kind in ("gu_fwd", "gu_wgrad") else p["slot_of"]
                 my = txl.local_scalar("int32")  # this lane's row index (-1: zero row)
                 cur_row = txl.local_scalar("int32")
                 row = txl.local_scalar("int32")
@@ -599,21 +629,61 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
                         txl.Select(ok, txl.uint32(16), txl.uint32(0)),
                     )
 
+                def wcopy(dst, r, col, ok):
+                    """
+                    16 B at column col of interleaved weight row r = (i, address lane): lane 1
+                    is the upper buffer, wdiff elements above (64-bit, no TMA stride limit).
+                    """
+                    off = (txl.Cast("int64", r % 2) * p["wdiff"] + txl.Cast("int64", walk.g) * p["ws0"]
+                           + txl.Cast("int64", r // 2) * p["ws1"] + txl.Cast("int64", col))
+                    txl.ptx[CP16](
+                        dst, p["w"].ptr_to([txl.Select(ok, off, txl.Cast("int64", 0))]), 16,
+                        txl.Select(ok, txl.uint32(16), txl.uint32(0)),
+                    )
+
                 with txl.While(walk.t < total):
                     walk.locate()
-                    if not k_grouped:
-                        # K-major A: warp gw owns tile rows 32 gw .. + 31; 8 lanes per row
-                        load_index(walk.lo + walk.mt * BMC + cbx * (walk.nn // 2) + gw * 32 + lane, walk.hi)
+                    if kind == "gu_dgrad":
+                        # far-pair MN-major weights: warp gw owns K rows 16 gw .. + 15 of the stage
+                        nseg = HN // 64
+                        wcol0 = walk.nt * BN + cbx * HN
                         with txl.serial(KT) as kt:
                             tk = range_v("g-wait-empty")
                             ab_pipe.empty.wait(st.stage, st.phase)
                             end(tk)
                             txl.ptx.fence.proxy.async_.shared__cta()
                             s = st.stage
-                            for i in range(8):
-                                txl.ptx.shfl_sync.idx.b32(row, my, txl.uint32(i * 4) + txl.Cast("uint32", sub), txl.uint32(31), FULLM)
-                                trow = gw * 32 + i * 4 + sub
-                                copy(a_tile[s].ptr_to(trow, chunk * 8), kt * BK + chunk * 8, True)
+                            for i in range(4 * nseg):
+                                pair = i * 4 + sub
+                                rr = pair // nseg
+                                seg = pair % nseg
+                                col = seg * 64 + chunk * 8
+                                wcopy(b_tile[s].ptr_to(gw * 16 + rr, col), kt * BK + gw * 16 + rr,
+                                      wcol0 + col, wcol0 + col < H)
+                            txl.ptx["cp.async.mbarrier.arrive.noinc.shared.b64"](gfull.ptr_to([s]))
+                            st.advance()
+                    elif not k_grouped:
+                        # K-major A: warp gw owns tile rows 32 gw .. + 31; 8 lanes per row
+                        # (far pair: likewise B's weight rows)
+                        if A_GATH:
+                            load_index(walk.lo + walk.mt * BMC + cbx * (walk.nn // 2) + gw * 32 + lane, walk.hi)
+                        wn0 = walk.nt * BN + cbx * HN
+                        with txl.serial(KT) as kt:
+                            tk = range_v("g-wait-empty")
+                            ab_pipe.empty.wait(st.stage, st.phase)
+                            end(tk)
+                            txl.ptx.fence.proxy.async_.shared__cta()
+                            s = st.stage
+                            if A_GATH:
+                                for i in range(8):
+                                    txl.ptx.shfl_sync.idx.b32(row, my, txl.uint32(i * 4) + txl.Cast("uint32", sub), txl.uint32(31), FULLM)
+                                    trow = gw * 32 + i * 4 + sub
+                                    copy(a_tile[s].ptr_to(trow, chunk * 8), kt * BK + chunk * 8, True)
+                            if WFAR:
+                                for i in range(8):
+                                    trow = gw * 32 + i * 4 + sub
+                                    wcopy(b_tile[s].ptr_to(trow, chunk * 8), wn0 + trow,
+                                          kt * BK + chunk * 8, wn0 + trow < 2 * inter)
                             txl.ptx["cp.async.mbarrier.arrive.noinc.shared.b64"](gfull.ptr_to([s]))
                             st.advance()
                     else:
@@ -1035,7 +1105,11 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
                     else:
                         j = walk.mt * BMC + cbx * BM + m
                         valid = j < MO
-                        srow = (lane ^ p["flip"]) if kind == "gu_wgrad" else lane
+                        if MG2:
+                            # address lane a = dpre lane ^ flip: rows 0-15 lane 0, 16-31 lane 1
+                            srow = ((lane % 2) ^ p["flip"]) * 16 + lane // 2
+                        else:
+                            srow = (lane ^ p["flip"]) if kind == "gu_wgrad" else lane
                         j0 = walk.mt * BMC + cbx * BM + ew * 32
                     # runtime chunk loop: one copy of the chunk body keeps the epilogue in the I-cache
                     with txl.serial(CH) as c:
@@ -1081,7 +1155,14 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False):
                                 txl.ptx.fence.proxy.async_.shared__cta()
                                 txl.cuda.warp_sync()
                                 with txl.If(lane == 0), txl.Then():
-                                    if kind == "gu_wgrad":
+                                    if MG2:
+                                        for half, cm in ((0, maps["c"]), (1, maps["c2"])):
+                                            txl.ptx["cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.tile.bulk_group"](
+                                                txl.address_of(cm), txl.Cast("int32", n0),
+                                                txl.Cast("int32", j0 // 2), txl.Cast("int32", walk.g),
+                                                cbuf.ptr_to([slot * 1024 + half * 512]),
+                                            )
+                                    elif kind == "gu_wgrad":
                                         txl.ptx["cp.reduce.async.bulk.tensor.4d.global.shared::cta.add.tile.bulk_group"](
                                             txl.address_of(maps["c"]), txl.Cast("int32", n0), txl.int32(0),
                                             txl.Cast("int32", j0 // 2), txl.Cast("int32", walk.g),
@@ -1314,14 +1395,22 @@ def flat(t):
     return t.as_strided((span,), (1,))
 
 
+TMA_STRIDE_LIMIT = 1 << 40  # cuTensorMapEncodeTiled: every global stride below 2^40 bytes
+
+
 def pair2(a, b):
     """
-    (lo, hi, diff_elems, swapped): b below a -> swapped.
+    (lo, hi, diff_elems, swapped, far): b below a -> swapped; far when the two buffers are too
+    far apart for one tensor map to stride between them (independent allocations).
     """
+    if a.stride() != b.stride() or a.stride(-1) != 1:
+        raise NotImplementedError("the gate / up pair must share strides, unit-stride rows")
     swapped = b.data_ptr() < a.data_ptr()
     lo, hi = (b, a) if swapped else (a, b)
-    diff = (hi.data_ptr() - lo.data_ptr()) // hi.element_size()
-    return lo, hi, diff, swapped
+    nbytes = hi.data_ptr() - lo.data_ptr()
+    if nbytes % 16 or lo.data_ptr() % 16:
+        raise NotImplementedError("the gate / up pair must be 16-byte aligned, a multiple of 16 bytes apart")
+    return lo, hi, nbytes // hi.element_size(), swapped, nbytes >= TMA_STRIDE_LIMIT
 
 
 def grid2(M, G, k_grouped, per_group_tiles, NT):
@@ -1355,11 +1444,11 @@ def bf16_expert_gate_up_fwd_sm100(x, w_gate, w_up, cu, a_idx, bias=None, act=())
     if M == 0:
         return preact, h
     check_shapes(H, inter)
-    lo, hi2, diff, swapped = pair2(w_gate, w_up)
+    lo, hi2, diff, swapped, far = pair2(w_gate, w_up)
     clamped = bool(act)
     materialized = use_materialized_gu_fwd(M, G, H, inter)
     fn = build("gu_fwd", H, inter, bias is not None, clamped,
-                use_swap(M, G) and swap_ok("gu_fwd", inter), materialized)
+                use_swap(M, G) and swap_ok("gu_fwd", inter), materialized, far)
     NT = -(-2 * inter // BN)
     xsrc = gather(x, a_idx) if materialized else x
     args = [cu, G, M, grid2(M, G, False, 0, NT), xsrc.reshape(-1), xsrc.shape[0], a_idx, flat(lo),
@@ -1418,10 +1507,11 @@ def bf16_expert_gate_up_dgrad_sm100(dpre, w_gate, w_up, cu, dpre_swapped):
     if M == 0:
         return dx
     check_shapes(H, inter)
-    lo, hi2, diff, swapped = pair2(w_gate, w_up)
+    lo, hi2, diff, swapped, far = pair2(w_gate, w_up)
     if bool(swapped) != bool(dpre_swapped):
         raise NotImplementedError("dpre pair order must follow the weights' address order")
-    fn = build("gu_dgrad", H, inter, False, False, use_swap(M, G) and swap_ok("gu_dgrad", inter))
+    fn = build("gu_dgrad", H, inter, False, False, use_swap(M, G) and swap_ok("gu_dgrad", inter),
+                False, far)
     NT = -(-H // BN)
     args = [cu, G, M, grid2(M, G, False, 0, NT), dpre.reshape(-1), flat(lo), diff,
             lo.stride(0), lo.stride(1), u322(dx)]
@@ -1436,14 +1526,14 @@ def bf16_expert_gate_up_wgrad_sm100(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a
         return None
     G, inter, H = mg_gate.shape
     check_shapes(H, inter)
-    fn = build("gu_wgrad", H, inter, False, False)
+    lo, hi, diff, mg_swapped, far = pair2(mg_gate, mg_up)
+    fn = build("gu_wgrad", H, inter, False, False, False, False, far)
     MT, NT = -(-2 * inter // BMC), -(-H // BN)
-    lo, hi2, diff, mg_swapped = pair2(mg_gate, mg_up)
     # dpre lane l is the gate iff l == dpre_swapped; main-grad address lane a is the gate iff
     # a == mg_swapped, so a = l ^ flip
     flip = int(bool(dpre_swapped)) ^ int(mg_swapped)
     args = [cu, G, M, grid2(M, G, True, MT * NT, NT), dpre.reshape(-1), x.reshape(-1), x.shape[0],
-            a_idx, flat(lo), diff, lo.stride(0), lo.stride(1), flip]
+            a_idx, flat(lo)] + ([flat(hi)] if far else []) + [diff, lo.stride(0), lo.stride(1), flip]
     with tvm_ffi.use_torch_stream():
         fn(*args)
     return None
