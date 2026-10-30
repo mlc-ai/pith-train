@@ -1,15 +1,13 @@
 """
 fp8_quant_act on SM100 in TIRx-lite.
 
-Fast path (bf16, unit column stride, 16 B aligned base and rows, K % 16 == 0, M % 16 == 0): a
-persistent warp-specialized kernel. One producer warp streams 128x128 bf16 tiles with TMA into a
-multi-stage mbarrier ring; eight compute warps quantize each tile with packed bf16x2 math (the
-power-of-two reciprocal multiply is exact), stage the rowwise FP8 tile in smem for a TMA store,
-write the transposed FP8 through an XOR-swizzled smem tile as 16 B rows, and store the row scales
-column-major (x_scale strides are unspecified by the contract). Everything else runs a generic
-scalar kernel (any stride / dtype / alignment).
+Fast path (bf16, unit column stride, 16 B aligned base and rows, K % 16 == 0, M % 16 == 0): 8-warp
+CTAs, 3 per SM. One-wave grids load coalesced 128-bit chunks straight into registers; multi-wave
+grids remain persistent and load 128x128 tiles with TMA as 8 row parts, with each warp reloading its
+own next row part after reading the current one. Each tile uses packed bf16x2 quantization, TMA stores
+for both FP8 layouts, and column-major row scales. Everything else runs a generic scalar kernel.
 
-Evolved with TIRx-harness: run act, frontier member hybrid-persistent-oneshot (commit e9efe2b, 1.263x over the
+Evolved with TIRx-harness: run act, frontier member selfprod-persistent (commit 1ef3160, 226.061 us vs 289.362 us, 1.28x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -24,7 +22,7 @@ import tirx_kernels.tirx_lite as txl
 __all__ = ["fp8_quant_act_sm100"]
 
 BLOCK = 128
-DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
+DT = {torch.bfloat16: txl.bf16, torch.float16: txl.f16, torch.float32: "float32"}
 RCP_448 = 1.0 / 448.0
 FULL = 0xFFFFFFFF
 
@@ -186,27 +184,30 @@ def bf16x2_of(f32):
     return txl.bitwise_or(txl.shift_right(u, txl.uint32(16)), txl.bitwise_and(u, txl.uint32(0xFFFF0000)))
 
 
-CFG = dict(stages=2, ctas_per_sm=2)
 ONESHOT_CTAS_PER_SM = 3
 
 
 @functools.cache
-def fast_kernel(stages: int, ctas_per_sm: int):
-    return fast_func(stages, ctas_per_sm).compile()
+def oneshot_kernel(ctas_per_sm: int, persistent: bool, direct: bool = False):
+    return oneshot_func(ctas_per_sm, persistent, direct).compile()
 
 
-def fast_func(stages: int, ctas_per_sm: int):
-    WARPS = 9  # 8 compute warps + 1 TMA producer warp
-    S = stages
+class Zero:
+    def __and__(self, o):
+        return 0
+
+
+def oneshot_func(ctas_per_sm: int, persistent: bool = True, direct: bool = False):
+    NC = 256
     TILE_BYTES = BLOCK * BLOCK * 2
-    NP = 8  # TMA row parts per tile: part w holds compute warp w's 16 rows
 
     def host_prelude(params):
-        x_map = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            x_map, "bfloat16", 2, params["x"].data,
-            params["K"], params["M"], params["sr"] * 2, BLOCK, BLOCK // NP, 1, 1, 0, 0, 2, 0,
-        )  # fmt: skip
+        if not direct:
+            x_map = txl.stack_alloca("tensormap", 1)
+            txl.cu_tensor_map_encode_tiled(
+                x_map, "bfloat16", 2, params["x"].data,
+                params["K"], params["M"], params["sr"] * 2, BLOCK, BLOCK // 8, 1, 1, 0, 0, 2, 0,
+            )  # fmt: skip
         q_map = txl.stack_alloca("tensormap", 1)
         txl.cu_tensor_map_encode_tiled(
             q_map, "uint8", 2, params["q"].data,
@@ -217,10 +218,10 @@ def fast_func(stages: int, ctas_per_sm: int):
             qt_map, "uint8", 2, params["qt"].data,
             params["M"], params["K"], params["M"], BLOCK, BLOCK, 1, 1, 0, 3, 2, 0,
         )  # fmt: skip
-        return x_map, q_map, qt_map
+        return (q_map, qt_map) if direct else (x_map, q_map, qt_map)
 
-    @txl.kernel(warps=WARPS, arch="sm_100a", min_blocks_per_sm=ctas_per_sm, grid="grid_n", host_prelude=host_prelude)
-    def fp8_quant_act_tma(
+    @txl.kernel(warps=8, arch="sm_100a", min_blocks_per_sm=ctas_per_sm, grid="grid_n", host_prelude=host_prelude)
+    def fp8_quant_act_self(
         x: txl.gptr[txl.bf16],
         q: txl.gptr[txl.u8],
         s: txl.gptr[txl.f32],
@@ -235,156 +236,68 @@ def fast_func(stages: int, ctas_per_sm: int):
         *,
         host,
     ):
-        x_map, q_map, qt_map = host
+        if direct:
+            q_map, qt_map = host
+        else:
+            x_map, q_map, qt_map = host
         b = txl.cta_id()
         t = txl.thread_id()
         lane = t & 31
         warp = txl.warp_id()
         smem = txl.smem_pool()
-        xs = smem.alloc([S * BLOCK * 64], txl.u32, align=1024)  # [stage][row][64 words]
-        qs = smem.alloc([2 * BLOCK * 32], txl.u32, align=1024)  # [buf][row][32 words] rowwise FP8
-        tile = smem.alloc([BLOCK * 32], txl.u32, align=1024)  # [k][128 B of m] FP8, TMA 128B swizzle
-        red = smem.alloc([8], txl.f32, align=16)
-        full = smem.alloc([S * NP], "uint64", align=8)
-        empty = smem.alloc([S], "uint64", align=8)
-        ntiles = nmb * nkb
-
-        # The producer thread initializes the barriers and issues the first loads before the
-        # CTA-wide prologue barrier, so the first TMA is not delayed by the compute warps' arrival.
-        with txl.If(t == 8 * 32), txl.Then():
-            for i in range(S):
-                for pp in range(NP):
-                    txl.ptx.mbarrier.init.shared.b64(full.ptr_to([i * NP + pp]), txl.uint32(1))
-                txl.ptx.mbarrier.init.shared.b64(empty.ptr_to([i]), txl.uint32(8))
-            txl.ptx.fence.mbarrier_init.release.cluster()
-
-        stage = txl.local_scalar("int32", init=txl.int32(0))
-        phase = txl.local_scalar("int32", init=txl.int32(0))
-        tid = txl.local_scalar("int32", init=b)
-        it_n = txl.local_scalar("int32", init=txl.int32(0))
-
-        def advance():
-            txl.assign(tid, tid + grid_n)
-            txl.assign(it_n, it_n + 1)
-            txl.assign(stage, stage + 1)
-            with txl.If(stage == S), txl.Then():
-                txl.assign(stage, txl.int32(0))
-                txl.assign(phase, phase ^ 1)
-
-        def produce(cond):
-            with txl.While(cond()):
-                tp = range_v("wait-empty")
-                txl.cuda.mbarrier_wait(empty.ptr_to([stage]), phase ^ 1)
-                end(tp)
-                tm = txl.truncdiv(tid, nkb)
-                tk = txl.truncmod(tid, nkb)
-                for pp in range(NP):
-                    txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([stage * NP + pp]), txl.uint32(TILE_BYTES // NP))
-                    txl.ptx[TMA_G2S](
-                        xs.ptr_to([stage * (BLOCK * 64) + pp * (BLOCK // NP) * 64]),
-                        txl.address_of(x_map),
-                        txl.Cast("int32", tk * BLOCK),
-                        txl.Cast("int32", tm * BLOCK + pp * (BLOCK // NP)),
-                        txl.cuda.cvta_generic_to_shared(full.ptr_to([stage * NP + pp])),
-                    )
-                advance()
-
-        with txl.If(warp == 8):
-            with txl.Then():
-                with txl.If(lane == 0), txl.Then():
-                    produce(lambda: (tid < ntiles) & (it_n < S))
-                txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-                txl.ptx["bar.arrive"](txl.uint32(0), txl.uint32(WARPS * 32))
-                with txl.If(lane == 0), txl.Then():
-                    produce(lambda: tid < ntiles)
-            with txl.Else():
-                txl.ptx.bar.sync(txl.uint32(0), txl.uint32(WARPS * 32))
-                consume(xs, qs, tile, red, full, empty, stage, phase, tid, it_n, advance, q_map, qt_map, s, st, M, K, nmb, nkb, ntiles, t, lane, warp)
-
-    return fp8_quant_act_tma
-
-
-@functools.cache
-def oneshot_kernel(ctas_per_sm: int):
-    return oneshot_func(ctas_per_sm).compile()
-
-
-class Zero:
-    def __and__(self, o):
-        return 0
-
-
-def oneshot_func(ctas_per_sm: int):
-    NC = 256
-    TILE_BYTES = BLOCK * BLOCK * 2
-
-    def host_prelude(params):
-        x_map = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            x_map, "bfloat16", 2, params["x"].data,
-            params["K"], params["M"], params["sr"] * 2, BLOCK, BLOCK // 8, 1, 1, 0, 0, 2, 0,
-        )  # fmt: skip
-        q_map = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            q_map, "uint8", 2, params["q"].data,
-            params["K"], params["M"], params["K"], BLOCK, BLOCK, 1, 1, 0, 0, 2, 0,
-        )  # fmt: skip
-        qt_map = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            qt_map, "uint8", 2, params["qt"].data,
-            params["M"], params["K"], params["M"], BLOCK, BLOCK, 1, 1, 0, 3, 2, 0,
-        )  # fmt: skip
-        return x_map, q_map, qt_map
-
-    @txl.kernel(warps=8, arch="sm_100a", min_blocks_per_sm=ctas_per_sm, grid=lambda p: p["nmb"] * p["nkb"], host_prelude=host_prelude)
-    def fp8_quant_act_oneshot(
-        x: txl.gptr[txl.bf16],
-        q: txl.gptr[txl.u8],
-        s: txl.gptr[txl.f32],
-        qt: txl.gptr[txl.u8],
-        st: txl.gptr[txl.f32],
-        M: txl.i32,
-        K: txl.i32,
-        nmb: txl.i32,
-        nkb: txl.i32,
-        sr: txl.i64,
-        *,
-        host,
-    ):
-        x_map, q_map, qt_map = host
-        b = txl.cta_id()
-        t = txl.thread_id()
-        lane = t & 31
-        warp = txl.warp_id()
-        smem = txl.smem_pool()
-        xs = smem.alloc([BLOCK * 64], txl.u32, align=1024)  # [row][64 words] bf16 tile
+        if not direct:
+            xs = smem.alloc([BLOCK * 64], txl.u32, align=1024)  # [row][64 words] bf16 tile
         qs = smem.alloc([BLOCK * 32], txl.u32, align=1024)  # [row][32 words] rowwise FP8
         tile = smem.alloc([BLOCK * 32], txl.u32, align=1024)  # [k][128 B of m] FP8, TMA 128B swizzle
         red = smem.alloc([8], txl.f32, align=16)
-        full = smem.alloc([8], "uint64", align=8)
-        tm = txl.truncdiv(b, nkb)
-        tk = txl.truncmod(b, nkb)
-        with txl.If(t == 0), txl.Then():
-            for pp in range(8):
-                txl.ptx.mbarrier.init.shared.b64(full.ptr_to([pp]), txl.uint32(1))
-            txl.ptx.fence.mbarrier_init.release.cluster()
-            for pp in range(8):
-                txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([pp]), txl.uint32(TILE_BYTES // 8))
-                txl.ptx[TMA_G2S](
-                    xs.ptr_to([pp * 16 * 64]),
-                    txl.address_of(x_map),
-                    txl.Cast("int32", tk * BLOCK),
-                    txl.Cast("int32", tm * BLOCK + pp * 16),
-                    txl.cuda.cvta_generic_to_shared(full.ptr_to([pp])),
-                )
-        txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NC))
+        if not direct:
+            full = smem.alloc([8], "uint64", align=8)
+            tm = txl.truncdiv(b, nkb)
+            tk = txl.truncmod(b, nkb)
+            with txl.If(t == 0), txl.Then():
+                for pp in range(8):
+                    txl.ptx.mbarrier.init.shared.b64(full.ptr_to([pp]), txl.uint32(1))
+                txl.ptx.fence.mbarrier_init.release.cluster()
+                for pp in range(8):
+                    txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([pp]), txl.uint32(TILE_BYTES // 8))
+                    txl.ptx[TMA_G2S](
+                        xs.ptr_to([pp * 16 * 64]),
+                        txl.address_of(x_map),
+                        txl.Cast("int32", tk * BLOCK),
+                        txl.Cast("int32", tm * BLOCK + pp * 16),
+                        txl.cuda.cvta_generic_to_shared(full.ptr_to([pp])),
+                    )
+            txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NC))
         tid = txl.local_scalar("int32", init=b)
-        consume(xs, qs, tile, red, full, None, txl.int32(0), txl.int32(0), tid, Zero(), None, q_map, qt_map, s, st, M, K, nmb, nkb, b + 1, t, lane, warp, oneshot=True)
+        phase = txl.local_scalar("int32", init=txl.int32(0))
 
-    return fp8_quant_act_oneshot
+        def advance():
+            txl.assign(tid, tid + grid_n)
+            if not direct:
+                txl.assign(phase, phase ^ 1)
+
+        def reload():
+            # this warp's 16 rows of its next tile go into the part it has just read
+            nt = tid + grid_n
+            with txl.If(nt < nmb * nkb), txl.Then():
+                txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([warp]), txl.uint32(TILE_BYTES // 8))
+                txl.ptx[TMA_G2S](
+                    xs.ptr_to([warp * 16 * 64]),
+                    txl.address_of(x_map),
+                    txl.Cast("int32", txl.truncmod(nt, nkb) * BLOCK),
+                    txl.Cast("int32", txl.truncdiv(nt, nkb) * BLOCK + warp * 16),
+                    txl.cuda.cvta_generic_to_shared(full.ptr_to([warp])),
+                )
+
+        if persistent:
+            consume(x, sr, xs if not direct else None, qs, tile, red, full if not direct else None, None, txl.int32(0), phase, tid, Zero(), advance, q_map, qt_map, s, st, M, K, nmb, nkb, nmb * nkb, t, lane, warp, direct=direct, reload=None if direct else reload, has_next=lambda: tid + grid_n < nmb * nkb)
+        else:  # grid_n == ntiles: one tile per CTA
+            consume(x, sr, xs if not direct else None, qs, tile, red, full if not direct else None, None, txl.int32(0), txl.int32(0), tid, Zero(), None, q_map, qt_map, s, st, M, K, nmb, nkb, b + 1, t, lane, warp, oneshot=True, direct=direct)
+
+    return fp8_quant_act_self
 
 
-def consume(xs, qs, tile, red, full, empty, stage, phase, tid, it_n, advance, q_map, qt_map, s, st, M, K, nmb, nkb, ntiles, t, lane, warp, oneshot=False):
+def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, advance, q_map, qt_map, s, st, M, K, nmb, nkb, ntiles, t, lane, warp, oneshot=False, direct=False, reload=None, has_next=None):
     NC = 256
     rg = lane >> 3  # row group within the warp
     cc = lane & 7  # 16 B column chunk within each 64-column half
@@ -417,23 +330,42 @@ def consume(xs, qs, tile, red, full, empty, stage, phase, tid, it_n, advance, q_
         txl.assign(qb, (it_n & 1) * (BLOCK * 32))
         # x_scale stored column-major: element (m, kb) at kb * M + m
         txl.assign(sbase, txl.cast(tk, "int64") * txl.cast(M, "int64") + txl.cast(m0, "int64"))
-        tk0 = range_v("wait-full")
-        txl.cuda.mbarrier_wait(full.ptr_to([stage * 8 + warp]), phase)
-        end(tk0)
         tk1 = range_v("rowwise")
-        for h in range(2):
-            for r in range(4):
-                base = h * 16 + r * 4
-                txl.ptx["ld.shared.v4.b32"](
-                    data[base], data[base + 1], data[base + 2], data[base + 3],
-                    xs.ptr_to([stage * (BLOCK * 64) + (g * 4 + r) * 64 + h * 32 + cc * 4]),
-                )
-        if not oneshot:
-            # order this thread's generic-proxy reads of the stage before the producer's next TMA write
-            txl.ptx.fence.proxy.async_.shared__cta()
-            txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-            with txl.If(lane == 0), txl.Then():
-                txl.ptx.mbarrier.arrive.shared.b64(empty.ptr_to([stage]), txl.uint32(1))
+        if direct:
+            for h in range(2):
+                for r in range(4):
+                    base = h * 16 + r * 4
+                    for u in range(4):
+                        txl.assign(data[base + u], txl.uint32(0))
+                    col = tk * BLOCK + h * 64 + cc * 8
+                    row = m0 + g * 4 + r
+                    with txl.If((row < M) & (col < K)), txl.Then():
+                        txl.ptx["ld.global.nc.L1::no_allocate.v4.b32"](
+                            data[base], data[base + 1], data[base + 2], data[base + 3],
+                            x.ptr_to([txl.cast(row, "int64") * sr + txl.cast(col, "int64")]),
+                        )
+        else:
+            tk0 = range_v("wait-full")
+            txl.cuda.mbarrier_wait(full.ptr_to([stage * 8 + warp]), phase)
+            end(tk0)
+            for h in range(2):
+                for r in range(4):
+                    base = h * 16 + r * 4
+                    txl.ptx["ld.shared.v4.b32"](
+                        data[base], data[base + 1], data[base + 2], data[base + 3],
+                        xs.ptr_to([stage * (BLOCK * 64) + (g * 4 + r) * 64 + h * 32 + cc * 4]),
+                    )
+            if reload is not None:
+                txl.ptx.fence.proxy.async_.shared__cta()
+                txl.ptx["bar.warp.sync"](txl.uint32(FULL))
+                with txl.If(lane == 0), txl.Then():
+                    reload()
+            elif not oneshot:
+                # order this thread's generic-proxy reads before the producer's next TMA write
+                txl.ptx.fence.proxy.async_.shared__cta()
+                txl.ptx["bar.warp.sync"](txl.uint32(FULL))
+                with txl.If(lane == 0), txl.Then():
+                    txl.ptx.mbarrier.arrive.shared.b64(empty.ptr_to([stage]), txl.uint32(1))
 
         for r in range(4):
             m01 = txl.local_scalar("uint32")
@@ -529,6 +461,10 @@ def consume(xs, qs, tile, red, full, empty, stage, phase, tid, it_n, advance, q_
                 jc = (step + cc) & 7
                 k = h * 64 + cc * 8 + jc
                 txl.ptx["st.shared.b32"](tile.ptr_to([k * 32 + txl.bitwise_xor(warp, jc) * 4 + rg]), tw[step])
+        if reload is not None:
+            # single qs buffer: the rowwise store must have read it before the next tile rewrites it
+            with txl.If((t == 0) & has_next()), txl.Then():
+                txl.ptx.cp.async_.bulk.wait_group.read(0)
         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NC))
         with txl.If(t == 0), txl.Then():
             txl.ptx.fence.proxy.async_.shared__cta()
@@ -581,12 +517,12 @@ def fp8_quant_act_sm100(x: torch.Tensor):
     with tvm_ffi.use_torch_stream():
         if fast:
             ntiles = nmb * nkb
-            if ntiles <= ONESHOT_CTAS_PER_SM * num_sms():
-                # one resident wave: one CTA per tile, all loads in flight at launch
-                oneshot_kernel(ONESHOT_CTAS_PER_SM)(flat, *outs, M, K, nmb, nkb, sr)
-            else:
-                grid_n = min(ntiles, CFG["ctas_per_sm"] * num_sms())
-                fast_kernel(CFG["stages"], CFG["ctas_per_sm"])(flat, *outs, M, K, nmb, nkb, sr, grid_n)
+            # one CTA per tile when the grid fits one resident wave, else persistent CTAs
+            grid_n = min(ntiles, ONESHOT_CTAS_PER_SM * num_sms())
+            persistent = grid_n < ntiles
+            # Direct register loads win consistently when every tile fits in one resident wave;
+            # the self-producing TMA path remains faster once CTAs iterate persistently.
+            oneshot_kernel(ONESHOT_CTAS_PER_SM, persistent, not persistent)(flat, *outs, M, K, nmb, nkb, sr, grid_n)
         else:
             generic_kernel(DT[x.dtype])(flat, *outs, M, K, nmb, nkb, sr, sc)
     return q, s, qt, st
