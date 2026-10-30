@@ -873,7 +873,7 @@ def pack_generic(dtype):
     return compile_v(fp8_pack_generic)
 
 
-ONE_BYTE = {torch.float8_e4m3fn: txl.f8e4m3, torch.uint8: txl.u8, torch.int8: "int8", torch.float8_e5m2: "float8_e5m2"}
+ONE_BYTE = {torch.float8_e4m3fn: "float8_e4m3fn", torch.uint8: "uint8", torch.int8: "int8", torch.float8_e5m2: "float8_e5m2"}
 
 
 def fp8_pack_transpose_sm100(x, out):

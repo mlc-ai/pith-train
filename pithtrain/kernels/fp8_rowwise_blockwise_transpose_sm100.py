@@ -22,7 +22,7 @@ import tirx_kernels.tirx_lite as txl
 __all__ = ["fp8_quant_act_sm100"]
 
 BLOCK = 128
-DT = {torch.bfloat16: txl.bf16, torch.float16: txl.f16, torch.float32: "float32"}
+DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 RCP_448 = 1.0 / 448.0
 FULL = 0xFFFFFFFF
 

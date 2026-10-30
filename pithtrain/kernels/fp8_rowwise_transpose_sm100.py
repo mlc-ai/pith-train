@@ -546,7 +546,7 @@ def generic_kernel(dtype):
     return fp8_quant_grad_generic.compile()
 
 
-GENERIC_DTYPES = {torch.bfloat16: txl.bf16, torch.float16: txl.f16, torch.float32: "float32"}
+GENERIC_DTYPES = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 
 
 def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
