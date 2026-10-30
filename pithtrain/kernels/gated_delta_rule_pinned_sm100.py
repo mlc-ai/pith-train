@@ -20975,12 +20975,12 @@ def make_tpre2(k_heads, n_sms):
                                         C__t_ldmatrix_x4(sm, m_ * 16, j * 16, lane, False, la)
                                         acc = t2_frag(8, "float32")
                                         t2_unpack(acc, la, neg=True)
-                                        for l in range(j + 1, m_):
+                                        for ll in range(j + 1, m_):
                                             al = t2_frag(4, "uint32")
-                                            C__t_ldmatrix_x4(sm, m_ * 16, l * 16, lane, False, al)
+                                            C__t_ldmatrix_x4(sm, m_ * 16, ll * 16, lane, False, al)
                                             t2_neg(al, al)
                                             nacc = t2_frag(8, "float32")
-                                            t2_prod(nacc, al, yb[(l, j)], init=acc)
+                                            t2_prod(nacc, al, yb[(ll, j)], init=acc)
                                             for i in range(8):
                                                 txl.assign(acc[i], nacc[i])
                                         ya = t2_frag(4, "uint32")
@@ -20992,9 +20992,9 @@ def make_tpre2(k_heads, n_sms):
                                 z = t2_frag(8, "float32")
                                 for i in range(8):
                                     txl.assign(z[i], m32[j][i])
-                                for l in range(j + 1, W):
+                                for ll in range(j + 1, W):
                                     nz = t2_frag(8, "float32")
-                                    t2_prod(nz, ma[l], yb[(l, j)], init=z)
+                                    t2_prod(nz, ma[ll], yb[(ll, j)], init=z)
                                     for i in range(8):
                                         txl.assign(z[i], nz[i])
                                 za = t2_frag(4, "uint32")
@@ -21273,12 +21273,12 @@ def make_tpre3(k_heads, n_sms, ctas_per_sm=3, head_bars=False):
                                         C__t_ldmatrix_x4(sm, m_ * 16, j * 16, lane, False, la)
                                         acc = t2_frag(8, "float32")
                                         t2_unpack(acc, la, neg=True)
-                                        for l in range(j + 1, m_):
+                                        for ll in range(j + 1, m_):
                                             al = t2_frag(4, "uint32")
-                                            C__t_ldmatrix_x4(sm, m_ * 16, l * 16, lane, False, al)
+                                            C__t_ldmatrix_x4(sm, m_ * 16, ll * 16, lane, False, al)
                                             t2_neg(al, al)
                                             nacc = t2_frag(8, "float32")
-                                            t2_prod(nacc, al, yb[(l, j)], init=acc)
+                                            t2_prod(nacc, al, yb[(ll, j)], init=acc)
                                             for i in range(8):
                                                 txl.assign(acc[i], nacc[i])
                                         ya = t2_frag(4, "uint32")
@@ -21290,9 +21290,9 @@ def make_tpre3(k_heads, n_sms, ctas_per_sm=3, head_bars=False):
                                 z = t2_frag(8, "float32")
                                 for i in range(8):
                                     txl.assign(z[i], m32[j][i])
-                                for l in range(j + 1, W):
+                                for ll in range(j + 1, W):
                                     nz = t2_frag(8, "float32")
-                                    t2_prod(nz, ma[l], yb[(l, j)], init=z)
+                                    t2_prod(nz, ma[ll], yb[(ll, j)], init=z)
                                     for i in range(8):
                                         txl.assign(z[i], nz[i])
                                 za = t2_frag(4, "uint32")
