@@ -10,7 +10,7 @@ with independent element pairs in f32x2 instructions. Quantization multiplies th
 pairs by the exact power-of-two reciprocal in bf16x2 and converts bf16x2 -> e4m3x2.
 Backward writes fp32 128-row block sums; a second kernel reduces them per group.
 
-Evolved with TIRx-harness: run clamped, frontier member tma-ring-2group (commit 0647acc, 7.515x over the
+Evolved with TIRx-harness: run clamped, frontier member tma-ring-2group (commit 2a97db0, 1790.8 us vs 14083.7 us, 7.865x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -554,15 +554,15 @@ def segsum_kernel(C: int):
         b = txl.local_scalar("int32", init=txl.truncdiv(start, txl.int32(128)))
         with txl.If(c < C), txl.Then():
             nb = txl.truncdiv(end, txl.int32(128))
-            tv = txl.alloc_local([8], "float32")
+            tv = txl.alloc_local([32], "float32")
             with txl.While(b < nb):
-                for u in range(8):
+                for u in range(32):
                     txl.ptx.mov.b32(tv[u], txl.float32(0.0))
                     with txl.If(b + u < nb), txl.Then():
                         txl.ptx.ld.global_.f32(tv[u], partial.ptr_to([txl.Cast("int64", b + u) * C + txl.Cast("int64", c)]))
-                for u in range(8):
+                for u in range(32):
                     txl.assign(acc, f("add.rn.f32", acc, tv[u]))
-                txl.assign(b, b + 8)
+                txl.assign(b, b + 32)
             h = txl.local_scalar("uint16")
             txl.ptx.cvt.rn.bf16.f32(h, acc)
             txl.ptx.st.global_.b16(out.ptr_to([txl.Cast("int64", g) * C + txl.Cast("int64", c)]), h)
@@ -572,7 +572,7 @@ def segsum_kernel(C: int):
 
 TMA_2D = "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
 PWARPS = 16
-MAX_SMEM_GROUPS = 1024
+MAX_SMEM_GROUPS = 512
 
 
 @functools.cache
@@ -600,7 +600,14 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
     STAGE = BLOCK * (GU_ROW + DH_ROW) + BIAS_B
     RPT = 8  # rows per thread (rows rg + 16 i)
     has_tail = C % BLOCK != 0
-    GW = PWARPS // 2
+    # Backward uses two independent 8-warp CTAs per SM.  Each CTA has one
+    # consumer group and two ring stages; together the pair has the same
+    # 16-warps/four-stages capacity as the frontier's single 16-warp CTA.
+    P_WARPS = 8 if bwd else PWARPS
+    NGROUPS = 1 if bwd else 2
+    GW = P_WARPS // NGROUPS
+    NSLOTS = 2 * NGROUPS
+    SPLIT = (not bwd) and write_col and not write_row
 
     GU_BOX = GU_ROW // 2  # bf16 columns per tile row
 
@@ -622,7 +629,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             encode(dh_map, params["gu"].data, 2 * N, rows, 4 * N, GU_BOX, BLOCK)
         return gu_map, dh_map, b_map
 
-    @txl.kernel(warps=PWARPS, arch="sm_100a", grid="num_ctas", min_blocks_per_sm=1, host_prelude=host_prelude)
+    @txl.kernel(warps=P_WARPS, arch="sm_100a", grid="num_ctas", min_blocks_per_sm=2 if bwd else 1, host_prelude=host_prelude)
     def kern(
         gu: txl.gptr[txl.bf16],
         bias: txl.gptr[txl.bf16],
@@ -656,50 +663,79 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
         smem = txl.smem_pool()
         ring = smem.alloc([stages * STAGE], txl.u8, align=1024)
         offs_s = smem.alloc([MAX_SMEM_GROUPS], txl.i32, align=16)
-        redw_all = smem.alloc([2 * GW * 64], txl.u32, align=16)
-        red_all = smem.alloc([2 * GW * BLOCK], txl.f32, align=16)
-        rcpw_all = smem.alloc([2 * 64], txl.u32, align=16)
-        rw0 = gid * (GW * 64)
-        rf0 = gid * (GW * BLOCK)
+        # column-reduction buffers per (group, tile parity): a tile's buffers are rewritten two
+        # tiles later, after barriers that order the earlier reads, so no end-of-tile barrier
+        redw_all = smem.alloc([NSLOTS * GW * 64], txl.u32, align=16)
+        red_all = smem.alloc([NSLOTS * GW * BLOCK if bwd else 4], txl.f32, align=16)
+        rcpw_all = smem.alloc([NSLOTS * 64], txl.u32, align=16)
         full = txl.MBarrier(smem, stages)
         full.init(1)
         # empty[s] completes when the group that consumed the stage's tile has read it
         empty = txl.MBarrier(smem, stages)
         empty.init(1)
 
-        with txl.serial(txl.truncdiv(num_groups + (PWARPS * 32 - 1), txl.int32(PWARPS * 32))) as it:
-            gi = it * (PWARPS * 32) + tid
+        with txl.serial(txl.truncdiv(num_groups + (P_WARPS * 32 - 1), txl.int32(P_WARPS * 32))) as it:
+            gi = it * (P_WARPS * 32) + tid
             with txl.If(gi < num_groups), txl.Then():
                 ov = txl.local_scalar("int32")
                 txl.ptx.ld.global_.nc.b32(ov, offs.ptr_to([txl.Cast("int64", gi)]))
                 txl.ptx.st.shared.b32(offs_s.ptr_to([gi]), ov)
         txl.ptx.fence.proxy.async_.shared__cta()
-        txl.ptx.bar.sync(txl.uint32(0), txl.uint32(PWARPS * 32))
+        txl.ptx.bar.sync(txl.uint32(0), txl.uint32(P_WARPS * 32))
+
+        # per-warp monotonic cursor: an issuing warp's tiles have non-decreasing row0, so the
+        # count of group ends <= row0 never decreases; scan on from the previous count
+        gcur = txl.local_scalar("int32", init=txl.int32(0))
 
         def group_of(row0):
             """
             #(group ends <= row0) clamped to G-1, by one warp (all lanes return it).
             """
-            grp = txl.local_scalar("int32", init=txl.int32(0))
-            base = txl.local_scalar("int32", init=txl.int32(0))
+            grp = txl.local_scalar("int32", init=gcur)
+            base = txl.local_scalar("int32", init=gcur)
+            go = txl.local_scalar("int32", init=txl.int32(1))
             oi = txl.local_scalar("int32")
             bal = txl.local_scalar("uint32")
-            with txl.While(base < num_groups):
+            with txl.While(go == 1):
                 txl.assign(oi, row0 + 1)
                 with txl.If(base + lane < num_groups), txl.Then():
                     txl.ptx.ld.shared.b32(oi, offs_s.ptr_to([base + lane]))
                 txl.ptx.vote_sync.ballot.b32(bal, txl.ptx.pred(oi <= row0), txl.uint32(FULL))
-                txl.assign(grp, grp + txl.Cast("int32", txl.popcount(bal)))
+                cnt = txl.local_scalar("int32", init=txl.Cast("int32", txl.popcount(bal)))
+                txl.assign(grp, grp + cnt)
                 txl.assign(base, base + 32)
+                txl.assign(go, txl.int32(0))
+                with txl.If(txl.And(cnt == 32, base < num_groups)), txl.Then():
+                    txl.assign(go, txl.int32(1))
+            txl.assign(gcur, grp)
             with txl.If(grp > num_groups - 1), txl.Then():
                 txl.assign(grp, num_groups - 1)
             return grp
+
+        # Tail split (forward, one quantization): the last partial wave's r tiles are split in
+        # halves between 2r CTAs (rows for rowwise, columns for kmajor) when 2r <= num_ctas, so the
+        # longest CTA does F + 1/2 tiles instead of F + 1. Both CTAs load the whole tile.
+        F = txl.local_scalar("int32", init=txl.truncdiv(num_tiles, num_ctas))
+        rem = txl.local_scalar("int32", init=num_tiles - F * num_ctas)
+        if SPLIT:
+            split_on = txl.local_scalar("int32", init=txl.Select(txl.And(rem > 0, 2 * rem <= num_ctas), txl.int32(1), txl.int32(0)))
+
+        def tile_of(k):
+            """
+            (tile index, part) of local tile k: part 0 = whole, 1 / 2 = first / second half.
+            """
+            if not SPLIT:
+                return cta + k * num_ctas, None
+            tail = txl.And(split_on == 1, k == F)
+            t = txl.Select(tail, F * num_ctas + txl.truncdiv(cta, txl.int32(2)), cta + k * num_ctas)
+            part = txl.Select(tail, 1 + txl.truncmod(cta, txl.int32(2)), txl.int32(0))
+            return t, part
 
         def issue(k):
             """
             Warp 0: bulk-load this CTA's k-th tile into stage k % stages.
             """
-            t = cta + k * num_ctas
+            t, _ = tile_of(k)
             with txl.If(t < num_tiles), txl.Then():
                 rb = txl.truncdiv(t, txl.int32(n_ct))
                 ct = txl.truncmod(t, txl.int32(n_ct))
@@ -740,12 +776,35 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
         ow = txl.alloc_local([4 * RPT], "uint32")
 
         n_my = txl.truncdiv(num_tiles - cta + num_ctas - 1, num_ctas)
-        with txl.serial(txl.truncdiv(n_my - gid + 1, txl.int32(2))) as kk2:
-            k = gid + 2 * kk2
-            t = cta + k * num_ctas
-            rb = txl.truncdiv(t, txl.int32(n_ct))
-            ct = txl.truncmod(t, txl.int32(n_ct))
-            row0 = rb * BLOCK
+        if SPLIT:
+            n_my = txl.Select(split_on == 1, F + txl.Select(cta < 2 * rem, txl.int32(1), txl.int32(0)), n_my)
+        with txl.serial(n_my if bwd else txl.truncdiv(n_my - gid + 1, txl.int32(2))) as kk2:
+            k = kk2 if bwd else gid + 2 * kk2
+            gp = txl.truncmod(kk2, txl.int32(2)) if bwd else gid * 2 + txl.truncmod(kk2, txl.int32(2))  # (group, tile parity)
+            rw0 = gp * (GW * 64)
+            rf0 = gp * (GW * BLOCK)
+            t0, part0 = tile_of(k)
+            t = txl.local_scalar("int32", init=t0)
+            if SPLIT:
+                part = txl.local_scalar("int32", init=part0)
+                actA = part != 2  # rows 0..3 (rowwise) / channels ca (kmajor) are this CTA's
+                actB = part != 1
+            if bwd:
+                # (backward measured faster with these left inline: 50.0 vs 50.6-51.9 us)
+                rb = txl.truncdiv(t, txl.int32(n_ct))
+                ct = txl.truncmod(t, txl.int32(n_ct))
+                row0 = rb * BLOCK
+                obase = txl.Cast("int64", row0 + rg) * C
+                sbase_row = txl.Cast("int64", ct) * num_rows + txl.Cast("int64", row0 + rg)
+            else:
+                # per-tile indices computed once in int32 (inlined, every int64 use re-expanded
+                # them into a 64-bit division: ~5% of the loop's instructions)
+                rb = txl.local_scalar("int32", init=txl.truncdiv(t, txl.int32(n_ct)))
+                ct = txl.local_scalar("int32", init=t - rb * n_ct)
+                row0 = txl.local_scalar("int32", init=rb * BLOCK)
+                # int64 bases of this thread's first output row and of its tile's row-scale run
+                obase = txl.local_scalar("int64", init=txl.Cast("int64", row0 + rg) * C)
+                sbase_row = txl.local_scalar("int64", init=txl.Cast("int64", ct) * num_rows + txl.Cast("int64", row0 + rg))
             stage = txl.truncmod(k, txl.int32(stages))
             sbase = stage * STAGE
             # Groups alternate tiles, so with an odd stage count the stage's previous tile
@@ -761,6 +820,8 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             else:
                 ca, cb = ct * BLOCK + cg * 4, ct * BLOCK + 64 + cg * 4
             va, vb = ca < C, cb < C
+            if SPLIT and write_col:
+                va, vb = txl.And(va, actA), txl.And(vb, actB)
 
             # bias row (same for every row of the tile)
             bb = sbase + BLOCK * (GU_ROW + DH_ROW)
@@ -775,8 +836,8 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             dbase = sbase + BLOCK * GU_ROW + rg * DH_ROW + cg * 8
             for i in range(RPT):
                 # rows are read from the stage just before their math (few live registers)
-                txl.ptx.ld.shared.v4.b32(iw[0], iw[1], iw[2], iw[3], ring.ptr_to([rbase + 16 * i * GU_ROW]))
                 if bwd:
+                    txl.ptx.ld.shared.v4.b32(iw[0], iw[1], iw[2], iw[3], ring.ptr_to([rbase + 16 * i * GU_ROW]))
                     txl.ptx.ld.shared.v2.b32(dw[0], dw[1], ring.ptr_to([dbase + 16 * i * DH_ROW]))
                     for kk in range(2):
                         x0 = u2("add.rn.bf16x2", iw[2 * kk], bw[2 * kk])
@@ -792,15 +853,29 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                             txl.ptx["add.rn.f32.bf16"](cs[2 * jj], hl, cs[2 * jj])
                             txl.ptx["add.rn.f32.bf16"](cs[2 * jj + 1], hh, cs[2 * jj + 1])
                 else:
-                    txl.ptx.ld.shared.v4.b32(iw[4], iw[5], iw[6], iw[7], ring.ptr_to([rbase + 16 * i * GU_ROW + 256]))
-                    for kk in range(4):
-                        x0 = u2("add.rn.bf16x2", iw[2 * kk], bw[2 * kk])
-                        x1 = u2("add.rn.bf16x2", iw[2 * kk + 1], bw[2 * kk + 1])
-                        if bf16_clamp:
-                            w = fwd_pair_bf16(clamp_bf16(x0, lim2, neg2), clamp_bf16(x1, lim2, neg2), alpha2, consts)
-                        else:
-                            w = fwd_pair(x0, x1, alpha2, limit, neg_limit, consts)
-                        txl.ptx.mov.b32(ow[4 * i + kk], w)
+                    def fwd_math(i=i, kks=range(4)):
+                        if 0 in kks:
+                            txl.ptx.ld.shared.v4.b32(iw[0], iw[1], iw[2], iw[3], ring.ptr_to([rbase + 16 * i * GU_ROW]))
+                        if 2 in kks:
+                            txl.ptx.ld.shared.v4.b32(iw[4], iw[5], iw[6], iw[7], ring.ptr_to([rbase + 16 * i * GU_ROW + 256]))
+                        for kk in kks:
+                            x0 = u2("add.rn.bf16x2", iw[2 * kk], bw[2 * kk])
+                            x1 = u2("add.rn.bf16x2", iw[2 * kk + 1], bw[2 * kk + 1])
+                            if bf16_clamp:
+                                w = fwd_pair_bf16(clamp_bf16(x0, lim2, neg2), clamp_bf16(x1, lim2, neg2), alpha2, consts)
+                            else:
+                                w = fwd_pair(x0, x1, alpha2, limit, neg_limit, consts)
+                            txl.ptx.mov.b32(ow[4 * i + kk], w)
+                    if not SPLIT:
+                        fwd_math()
+                    elif write_row:
+                        with txl.If(actA if i < RPT // 2 else actB), txl.Then():
+                            fwd_math()
+                    else:
+                        with txl.If(actA), txl.Then():
+                            fwd_math(kks=(0, 1))
+                        with txl.If(actB), txl.Then():
+                            fwd_math(kks=(2, 3))
                 if has_tail:
                     with txl.If(ca >= C), txl.Then():
                         txl.ptx.mov.b32(ow[4 * i + 0], txl.uint32(0))
@@ -808,53 +883,6 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                     with txl.If(cb >= C), txl.Then():
                         txl.ptx.mov.b32(ow[4 * i + 2], txl.uint32(0))
                         txl.ptx.mov.b32(ow[4 * i + 3], txl.uint32(0))
-            # every thread of the group is done with the stage: refill it
-            txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
-            with txl.If(wg == 0), txl.Then():
-                with txl.If(lane == 0), txl.Then():
-                    txl.ptx.mbarrier.arrive.shared.b64(empty.buf.ptr_to([stage]), txl.uint32(1))
-                issue(k + stages)
-            obase = txl.Cast("int64", row0 + rg) * C
-
-            def store(buf, i, w0, w1):
-                off = obase + 16 * i * C
-                if not has_tail:
-                    if bwd:
-                        txl.ptx.st.global_.v2.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0, w1)
-                    else:
-                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
-                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", cb)]), w1)
-                elif bwd:
-                    with txl.If(vb):
-                        with txl.Then():
-                            txl.ptx.st.global_.v2.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0, w1)
-                        with txl.Else():
-                            with txl.If(va), txl.Then():
-                                txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
-                else:
-                    with txl.If(va), txl.Then():
-                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
-                    with txl.If(vb), txl.Then():
-                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", cb)]), w1)
-
-            if write_row:
-                for p in range(RPT // 2):
-                    ma = amax2(amax2(ow[8 * p], ow[8 * p + 1]), amax2(ow[8 * p + 2], ow[8 * p + 3]))
-                    mb = amax2(amax2(ow[8 * p + 4], ow[8 * p + 5]), amax2(ow[8 * p + 6], ow[8 * p + 7]))
-                    m = amax2(u2("prmt.b32", ma, mb, txl.uint32(0x5410)), u2("prmt.b32", ma, mb, txl.uint32(0x7632)))
-                    for x in (1, 2, 4, 8):
-                        m = amax2(m, shfl(m, x))
-                    e = e8_pair(abs2(m))
-                    ea = txl.bitwise_and(e, txl.uint32(0xFF))
-                    eb = txl.shift_right(e, txl.uint32(8))
-                    for half, ee in ((0, ea), (1, eb)):
-                        i = 2 * p + half
-                        with txl.If(cg == 0), txl.Then():
-                            txl.ptx.st.global_.f32(x_scale.ptr_to([txl.Cast("int64", ct) * num_rows + txl.Cast("int64", row0 + rg + 16 * i)]), scale_of(ee))
-                        rb16 = rcp_bf16(ee)
-                        r2 = txl.bitwise_or(rb16, txl.shift_left(rb16, txl.uint32(16)))
-                        store(x_fp8, i, fp8x4(ow[4 * i], ow[4 * i + 1], r2, r2), fp8x4(ow[4 * i + 2], ow[4 * i + 3], r2, r2))
-
             tig = wg * 32 + lane  # thread index within the group
 
             def col_of_word(w):
@@ -883,8 +911,34 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                 with txl.If(lane < 16), txl.Then():
                     txl.ptx.st.shared.v4.f32(red_all.ptr_to([rf0 + wg * BLOCK + cg * 8]), cs[0], cs[1], cs[2], cs[3])
                     txl.ptx.st.shared.v4.f32(red_all.ptr_to([rf0 + wg * BLOCK + cg * 8 + 4]), cs[4], cs[5], cs[6], cs[7])
-            if write_col or bwd:
-                txl.ptx.bar.sync(txl.Cast("uint32", gbar + 1), txl.uint32(GW * 32))
+            # every thread of the group is done with the stage: refill it
+            txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
+            with txl.If(wg == 0), txl.Then():
+                with txl.If(lane == 0), txl.Then():
+                    txl.ptx.mbarrier.arrive.shared.b64(empty.buf.ptr_to([stage]), txl.uint32(1))
+                issue(k + stages)
+
+            def store(buf, i, w0, w1):
+                off = obase + 16 * i * C
+                if not has_tail and not (SPLIT and write_col):
+                    if bwd:
+                        txl.ptx.st.global_.v2.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0, w1)
+                    else:
+                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
+                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", cb)]), w1)
+                elif bwd:
+                    with txl.If(vb):
+                        with txl.Then():
+                            txl.ptx.st.global_.v2.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0, w1)
+                        with txl.Else():
+                            with txl.If(va), txl.Then():
+                                txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
+                else:
+                    with txl.If(va), txl.Then():
+                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
+                    with txl.If(vb), txl.Then():
+                        txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", cb)]), w1)
+
             if write_col:
                 # one thread per amax word: 8 warp partials -> E8M0 scales (stored) and the
                 # bf16x2 reciprocals every thread of the group needs (broadcast through smem)
@@ -898,9 +952,13 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                     e = e8_pair(abs2(mw))
                     ea = txl.bitwise_and(e, txl.uint32(0xFF))
                     eb = txl.shift_right(e, txl.uint32(8))
-                    txl.ptx.st.shared.b32(rcpw_all.ptr_to([gid * 64 + tig]), txl.bitwise_or(rcp_bf16(ea), txl.shift_left(rcp_bf16(eb), txl.uint32(16))))
+                    txl.ptx.st.shared.b32(rcpw_all.ptr_to([gp * 64 + tig]), txl.bitwise_or(rcp_bf16(ea), txl.shift_left(rcp_bf16(eb), txl.uint32(16))))
                     col = col_of_word(tig)
-                    with txl.If(col < C), txl.Then():
+                    cok = col < C
+                    if SPLIT:
+                        # words cg*4 + 0..1 hold the first-half channels (ca), 2..3 the second
+                        cok = txl.And(cok, txl.Select(txl.truncmod(tig, txl.int32(4)) < 2, txl.Cast("int32", actA), txl.Cast("int32", actB)) == 1)
+                    with txl.If(cok), txl.Then():
                         txl.ptx.st.global_.v2.f32(x_ch_scale.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", col)]), scale_of(ea), scale_of(eb))
             if bwd:
                 # one thread per column: the 128-row block sum over the group's 8 warp partials
@@ -914,16 +972,36 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                         txl.assign(acc, f("add.rn.f32", acc, tv))
                     with txl.If(ct * BLOCK + j < C), txl.Then():
                         txl.ptx.st.global_.f32(partial.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", ct * BLOCK + j)]), acc)
+            if write_row:
+                for p in range(RPT // 2):
+                    def row_quant(p=p):
+                        ma = amax2(amax2(ow[8 * p], ow[8 * p + 1]), amax2(ow[8 * p + 2], ow[8 * p + 3]))
+                        mb = amax2(amax2(ow[8 * p + 4], ow[8 * p + 5]), amax2(ow[8 * p + 6], ow[8 * p + 7]))
+                        m = amax2(u2("prmt.b32", ma, mb, txl.uint32(0x5410)), u2("prmt.b32", ma, mb, txl.uint32(0x7632)))
+                        for x in (1, 2, 4, 8):
+                            m = amax2(m, shfl(m, x))
+                        e = e8_pair(abs2(m))
+                        ea = txl.bitwise_and(e, txl.uint32(0xFF))
+                        eb = txl.shift_right(e, txl.uint32(8))
+                        for half, ee in ((0, ea), (1, eb)):
+                            i = 2 * p + half
+                            with txl.If(cg == 0), txl.Then():
+                                txl.ptx.st.global_.f32(x_scale.ptr_to([sbase_row + 16 * i]), scale_of(ee))
+                            rb16 = rcp_bf16(ee)
+                            r2 = txl.bitwise_or(rb16, txl.shift_left(rb16, txl.uint32(16)))
+                            store(x_fp8, i, fp8x4(ow[4 * i], ow[4 * i + 1], r2, r2), fp8x4(ow[4 * i + 2], ow[4 * i + 3], r2, r2))
+                    if SPLIT:
+                        with txl.If(actA if p < RPT // 4 else actB), txl.Then():
+                            row_quant()
+                    else:
+                        row_quant()
+
             if write_col:
                 txl.ptx.bar.sync(txl.Cast("uint32", gbar + 2), txl.uint32(GW * 32))
                 rc = txl.alloc_local([4], "uint32")
-                txl.ptx.ld.shared.v4.b32(rc[0], rc[1], rc[2], rc[3], rcpw_all.ptr_to([gid * 64 + cg * 4]))
+                txl.ptx.ld.shared.v4.b32(rc[0], rc[1], rc[2], rc[3], rcpw_all.ptr_to([gp * 64 + cg * 4]))
                 for i in range(RPT):
                     store(x_ch, i, fp8x4(ow[4 * i], ow[4 * i + 1], rc[0], rc[1]), fp8x4(ow[4 * i + 2], ow[4 * i + 3], rc[2], rc[3]))
-
-            # the next tile's column reductions reuse redw / red
-            if write_col or bwd:
-                txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
 
     return compile_kernel(kern)
 
@@ -977,8 +1055,8 @@ def run(kind, gate_up, bias, offs, alpha, limit, dh=None):
         tensors = tensors[:5] + (x_scale.t().reshape(-1),) + tensors[6:]
     with tvm_ffi.use_torch_stream():
         if pipe:
-            ker = pipe_kernel(N, bwd, write_row, write_col, bf16_clamp, 4 if bwd else 3)
-            ker(*tensors, float(alpha), float(limit), G, num_tiles, min(num_tiles, num_sms()), M)
+            ker = pipe_kernel(N, bwd, write_row, write_col, bf16_clamp, 2 if bwd else 3)
+            ker(*tensors, float(alpha), float(limit), G, num_tiles, min(num_tiles, (2 if bwd else 1) * num_sms()), M)
         else:
             ker = quant_kernel(N, bwd, write_row, write_col, bf16_clamp)
             ker(*tensors, float(alpha), float(limit), G, num_tiles)
