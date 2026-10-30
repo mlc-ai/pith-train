@@ -1,7 +1,7 @@
 """
 Picker of the pinned dense chunked gated delta rule (chunk size 64, no initial or final state) at
-Qwen3.5's geometry: FLA's kernels launched with the configs FLA's autotuner picks on H200 on SM90
-(bit-identical to FLA), TIRx kernels on SM100. The callers' custom ops keep both opaque to
+Qwen3.5's geometry: on SM90 a CuTe-DSL forward and FLA's backward kernels launched with the configs
+FLA's autotuner picks on H200, TIRx kernels on SM100. The callers' custom ops keep both opaque to
 torch.compile.
 """
 
@@ -53,9 +53,10 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
 
     o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV) and A: bf16 (B, T, HV, 64) are what the backward
     reads, inputs of chunk_gdr_bwd_pinned only: their shapes and dtypes are fixed, their contents the
-    implementation's (on SM90 FLA's chunk-local cumulative gate and solved WY matrix). On SM90
-    bit-identical to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads.
-    Deterministic. Only where gated_delta_rule_pinned_supported is True.
+    implementation's (on SM90 FLA's chunk-local cumulative gate and solved WY matrix). On SM90 equal
+    to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads up to bf16
+    rounding (bit-identical when T is not a multiple of 64). Deterministic. Only where
+    gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
         case 9:

@@ -18,10 +18,10 @@ Checked:
   token-by-token fp32 recurrence and its autograd. The kernels keep some chunk intermediates in
   bf16, so the check is calc_diff below 1e-4 (output) and 1e-3 (gradients), plus a max absolute
   error within 2e-2 of the reference's largest magnitude;
-- where the pinned path runs FLA's kernels (its saved g_cum and A are FLA's bit for bit; their
-  contents are otherwise the implementation's), bit-exactness against FLA's chunked gated delta
-  rule on q / k repeated to the value heads, with FLA's autotuners restricted to the recorded
-  launch configs.
+- where the pinned backward runs FLA's kernels, bit-exactness of the backward against FLA's
+  chunked gated delta rule on q / k repeated to the value heads, given FLA's own g_cum and A, with
+  FLA's autotuners restricted to the recorded launch configs; the forward against FLA's within
+  bf16 rounding (bit for bit where it runs FLA's kernels, T not a multiple of 64).
 """
 
 import pytest
@@ -144,11 +144,16 @@ def test_not_supported_off_the_geometry() -> None:
 
 CASES = [
     (64, 16, "model", ()),
+    (64, 32, "mild", (0, 31)),
+    (128, 32, "model", (0,)),
+    (192, 16, "model", (0, 100)),
     (100, 16, "mild", ()),
     (256, 32, "model", ()),
     (300, 16, "mild", (0, 77, 128, 250)),
     (512, 16, "model", (0, 200)),
     (512, 32, "mild", ()),
+    (2048, 16, "model", (0, 700, 1024)),
+    (4096, 16, "mild", ()),
 ]
 
 
@@ -259,39 +264,43 @@ def fla_reference(q, k, v, g, beta, do):
     return o, g_cum, A, dq, dk, dv, dg, dbeta
 
 
-def pinned_path(q, k, v, g, beta, do):
-    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
-    dq, dk, dv, dg, dbeta = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
-    return o, g_cum, A, dq, dk, dv, dg, dbeta
-
-
 NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
 
 
 def skip_unless_fla_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Skip unless the pinned path runs FLA's kernels, told by its saved intermediates: g_cum and A
-    are FLA's bit for bit only there (the contract leaves their contents to the implementation).
+    Skip unless the pinned backward runs FLA's kernels, told by its gradients being FLA's bit for
+    bit given FLA's own g_cum and A.
     """
     pin_fla(monkeypatch, RECORDED)
     q, k, v, g, beta, do = make_inputs(256, H=16, gate="mild")
-    got, ref = chunk_gdr_fwd_pinned(q, k, v, g, beta), fla_reference(q, k, v, g, beta, do)
-    if not (torch.equal(got[1], ref[1]) and torch.equal(got[2], ref[2])):
-        pytest.skip("the pinned path does not run FLA's kernels")
+    ref = fla_reference(q, k, v, g, beta, do)
+    got = chunk_gdr_bwd_pinned(q, k, v, ref[1], beta, ref[2], do)
+    if not all(torch.equal(got_part, ref_part) for got_part, ref_part in zip(got, ref[3:])):
+        pytest.skip("the pinned backward does not run FLA's kernels")
 
 
 @pytest.mark.parametrize("H", [32, 16])
 @pytest.mark.parametrize(
     "S,resets", [(4096, ()), (1000, ()), (4096, (0, 300, 1777, 2048, 4091)), (8192, ())]
 )
-def test_bit_exact_against_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int) -> None:
+def test_fla_backward_pinned_given_fla_saved_tensors(monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int) -> None:
     """
-    H = 16 runs grouped value heads on unrepeated q / k; FLA gets them repeated.
+    The backward bit-exact given FLA's g_cum and A; the forward within bf16 rounding of FLA's (its
+    A in TF32 block merges, like FLA's). H = 16 runs grouped value heads on unrepeated q / k; FLA
+    gets them repeated.
     """
     skip_unless_fla_kernels(monkeypatch)
     q, k, v, g, beta, do = make_inputs(S, H=H, gate="mild", seed=S, resets=resets)
-    got, ref = pinned_path(q, k, v, g, beta, do), fla_reference(q, k, v, g, beta, do)
-    for name, got_part, ref_part in zip(NAMES, got, ref):
+    ref = fla_reference(q, k, v, g, beta, do)
+    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+    for name, got_part, ref_part in zip(NAMES[:3], (o, g_cum, A), ref[:3]):
+        assert got_part.dtype == ref_part.dtype and got_part.shape == ref_part.shape, name
+        assert calc_diff(got_part, ref_part) < 1e-6, (
+            f"{name}: calc_diff {calc_diff(got_part, ref_part):.2e}"
+        )
+    grads = chunk_gdr_bwd_pinned(q, k, v, ref[1], beta, ref[2], do)
+    for name, got_part, ref_part in zip(NAMES[3:], grads, ref[3:]):
         assert got_part.dtype == ref_part.dtype and got_part.shape == ref_part.shape, name
         assert torch.equal(got_part, ref_part), name
 
@@ -305,5 +314,6 @@ def test_fla_config_drift_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     configs = dict(RECORDED, dqkwg=dict(RECORDED["dqkwg"], num_warps=2))
     pin_fla(monkeypatch, configs)
     q, k, v, g, beta, do = make_inputs(4096, H=32, gate="mild")
-    got, ref = pinned_path(q, k, v, g, beta, do), fla_reference(q, k, v, g, beta, do)
-    assert not torch.equal(got[6], ref[6])
+    ref = fla_reference(q, k, v, g, beta, do)
+    grads = chunk_gdr_bwd_pinned(q, k, v, ref[1], beta, ref[2], do)
+    assert not torch.equal(grads[3], ref[6])
