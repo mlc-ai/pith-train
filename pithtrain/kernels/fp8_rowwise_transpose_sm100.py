@@ -1,20 +1,16 @@
 """
 SM100 fp8_quant_grad in TIRx-lite: rowwise 1x128 FP8 of x and of x.T from one read of x.
 
-Fast path (bf16, unit column stride, 16B-aligned rows, N % 8 == 0, M % 16 == 0) dispatches on the
-128x128 tile count T relative to the SM count S:
-  T < 4S   rr16: persistent, 2 CTAs/SM x 16 warps; warps 0-7 run the row phase while warps 8-15
-           run the column phase of the same staged tile (shorter per-tile latency chain).
-  T < 10S  rr8:  persistent, 3 CTAs/SM x 8 warps, row phase then column phase.
-  else     clc:  one CTA per tile with cluster-launch-control work stealing, TMA (3-D map,
-           128B swizzle) loads into a 2-stage mbarrier ring (dynamic load balance).
-rr8/rr16 cp.async 16 B (zero-filled edges) into a 2-stage XOR-swizzled ring. Row phase: 8 lanes
-per row (128 B coalesced stores); column phase: 8 lanes per column pair over 16-row groups, column
-abs-max reduced in-warp. Scales use an exact integer E8M0 formula; quantization is an exact
-power-of-two bf16x2 multiply plus cvt.rn.satfinite.e4m3x2.bf16x2.
+Fast path (bf16, unit column stride, 16B-aligned rows, N % 8 == 0, M % 16 == 0): one CTA per 128x128
+tile (non-persistent; the hardware CTA scheduler balances the tail), 8 warps, 4 CTAs/SM. Every thread
+issues its eight 16-byte loads up front (8 lanes per row: chunks k and k+8), copies them into an
+XOR-swizzled shared tile, quantizes its rows straight from registers (128 B coalesced xq stores per row),
+then one barrier and the column phase from shared memory (8 lanes per column pair over 16-row groups,
+column abs-max reduced in-warp, 128 B coalesced stores per xtq row). Scales use an exact integer E8M0
+formula; quantization is an exact power-of-two bf16x2 multiply plus cvt.rn.satfinite.e4m3x2.bf16x2.
 Everything else (fp32/fp16, odd shapes, arbitrary strides) takes a scalar generic kernel.
 
-Evolved with TIRx-harness: run grad, frontier member tilecount-dispatch-hybrid (commit 9c7c73d, 1.532x over the
+Evolved with TIRx-harness: run grad, frontier member oneshot-regload-tile (commit f103d83, 217.9 us vs 379.1 us, 1.74x over the
 previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
 tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
@@ -27,7 +23,6 @@ import tvm_ffi
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["fp8_quant_grad_sm100"]
-
 BLOCK = 128
 NTHREADS = 256
 
@@ -93,22 +88,9 @@ def pack16(lo, hi):
     return out
 
 
-# ---------------------------------------------------------------- fast bf16 tile kernel
-
-
-def phys_chunk(r, c):
-    """
-    Swizzled 16-byte chunk of logical (row r, chunk c) in a 256-byte staged row.
-
-    Row phase (8 lanes of a row read chunks k and k+8) and column phase (8 lanes = 8 row groups
-    of 16 rows read one 4-word chunk) are both bank-conflict-free.
-    """
-    return c ^ ((c >> 3) & 1) ^ ((r >> 4) & 7)
-
-
 def iket_range(name):
     """
-    Lane-0 IKET range (stripped by the plain tirx pipeline).
+    One IKET range per warp; stripped by the ordinary TIRx pipeline.
     """
     token = txl.alloc_local([1], "uint32")
     txl.assign(token[0], txl.cuda.iket.sentinel_token(name))
@@ -121,54 +103,21 @@ def iket_end(token):
     txl.cuda.iket.range_end(token[0])
 
 
+# ---------------------------------------------------------------- fast bf16 tile kernel
+
+
 TILE_WORDS = BLOCK * 64
 
 
-class TileWalk:
+def build_one():
     """
-    (tm, tn) of tile index L = cta + i * num_ctas, advanced incrementally (no per-tile division).
+    Non-persistent: one CTA per 128x128 tile (hardware scheduling balances the tail). Every
+    thread issues its eight 16-byte loads up front (registers), writes them to the swizzled smem
+    tile, runs the row phase from registers, then one barrier and the column phase from smem.
     """
 
-    def __init__(self, L, nbn, dm, dn):
-        self.tm = txl.local_scalar("int32", init=txl.truncdiv(L, nbn))
-        self.tn = txl.local_scalar("int32", init=txl.truncmod(L, nbn))
-        self.nbn, self.dm, self.dn = nbn, dm, dn
-
-    def advance(self):
-        txl.assign(self.tn, self.tn + self.dn)
-        txl.assign(self.tm, self.tm + self.dm)
-        with txl.If(self.tn >= self.nbn), txl.Then():
-            txl.assign(self.tn, self.tn - self.nbn)
-            txl.assign(self.tm, self.tm + 1)
-
-
-TMA_3D = "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
-HALF_WORDS = BLOCK * 32  # one 64-column half of a staged tile (16 KB)
-
-
-def x_tensor_map(params):
-    """
-    3-D view of x: (cols, row group g = r // 16, row in group e = r % 16) with box (64, 8, 16),
-    so the staged row order is s = e * 8 + g and the 128B swizzle (chunk ^ s % 8) separates both
-    the 8 lanes of a row (row phase) and the 8 row groups of a column (column phase).
-    """
-    x = params["x"]
-    M, N, ld = params["M"], params["N"], params["ld"]
-    tmap = txl.stack_alloca("tensormap", 1)
-    txl.cu_tensor_map_encode_tiled(
-        tmap, "bfloat16", 3, x.data,
-        N, M // 16, 16,
-        ld * 32, ld * 2,
-        64, 8, 16,
-        1, 1, 1,
-        0, 3, 2, 0,
-    )  # fmt: skip
-    return tmap
-
-
-def build_rr8():
-    @txl.kernel(warps=NTHREADS // 32, arch="sm_100a", grid="num_ctas", min_blocks_per_sm=3)
-    def fp8_quant_grad_persistent(
+    @txl.kernel(warps=NTHREADS // 32, arch="sm_100a", grid=lambda p: ((p["N"] + 127) // 128) * ((p["M"] + 127) // 128), min_blocks_per_sm=4)
+    def fp8_quant_grad_one(
         x: txl.gptr[txl.bf16],
         xq: txl.gptr[txl.u8],
         xs: txl.gptr[txl.i32],
@@ -178,502 +127,273 @@ def build_rr8():
         N: txl.i32,
         ld: txl.i64,
         off: txl.i64,
-        num_ctas: txl.i32,
+        pf: txl.i32,
     ):
-        cta = txl.cta_id()
+        cid = txl.cta_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
         pool = txl.smem_pool()
-        tiles = pool.alloc([2 * TILE_WORDS], "uint32", align=128)
-        nbn = txl.local_scalar("int32", init=(N + 127) >> 7)
-        nbm = txl.local_scalar("int32", init=(M + 127) >> 7)
-        count = txl.local_scalar("int32", init=txl.truncdiv(nbn * nbm - cta + num_ctas - 1, num_ctas))
-        dm = txl.local_scalar("int32", init=txl.truncdiv(num_ctas, nbn))
-        dn = txl.local_scalar("int32", init=txl.truncmod(num_ctas, nbn))
-        k = lane & 7
-        r0 = warp * 4 + (lane >> 3)  # row of this thread in iteration it: r0 + 32 * it
-        rg = lane & 7
-        pl = lane >> 3
+        tile = pool.alloc([TILE_WORDS], "uint32", align=128)
+        rsc = pool.alloc([BLOCK], "uint32", align=16)
+        nbn = (N + 127) >> 7
+        tm = txl.local_scalar("int32", init=txl.truncdiv(cid, nbn))
+        tn = txl.local_scalar("int32", init=cid - tm * nbn)
+        R0 = tm * 128
+        C0 = tn * 128
         M64 = i642(M)
         N64 = i642(N)
-
-        # per-thread constant offsets (tile independent)
-        xro = [txl.local_scalar("int64", init=i642(r0 + 32 * it) * ld + i642(k * 8)) for it in range(4)]
-        # smem word offsets for row-phase / copy chunks: row r, chunk k (+8)
-        soff = []
-        for it in range(4):
-            r = r0 + 32 * it
-            g = (r >> 4) & 7
-            soff.append([txl.local_scalar("int32", init=r * 64 + (((k + 8 * h) ^ h ^ g) << 2)) for h in range(2)])
-        # column phase: pair p = warp*4 + pl + 32*it2, rows rg*16 + e
-        coff = []
-        for it2 in range(2):
-            p = warp * 4 + pl + 32 * it2
-            c = p >> 2
-            coff.append(txl.local_scalar("int32", init=rg * 16 * 64 + ((c ^ ((c >> 3) & 1) ^ rg) << 2) + (p & 3)))
-
-        def issue(tm_, tn_, stage):
-            sb = stage * TILE_WORDS
-            R0 = tm_ * 128
-            C0 = tn_ * 128
-            tbase = txl.local_scalar("int64", init=off + i642(R0) * ld + i642(C0))
-            interior = (R0 + 128 <= M) & (C0 + 128 <= N)
-            with txl.If(interior):
-                with txl.Then():
-                    for it in range(4):
-                        for h in range(2):
-                            txl.ptx["cp.async.cg.shared.global"](
-                                tiles.ptr_to([sb + soff[it][h]]),
-                                txl.address_of(x[tbase + xro[it] + 64 * h]),
-                                16,
-                                u322(16),
-                            )
-                with txl.Else():
-                    for it in range(4):
-                        for h in range(2):
-                            ok = (R0 + r0 + 32 * it < M) & (C0 + k * 8 + 64 * h < N)
-                            txl.ptx["cp.async.cg.shared.global"](
-                                tiles.ptr_to([sb + soff[it][h]]),
-                                txl.address_of(x[off + txl.Select(ok, tbase - off + xro[it] + 64 * h, i642(0))]),
-                                16,
-                                txl.Select(ok, u322(16), u322(0)),
-                            )
-
-        ahead = TileWalk(cta, nbn, dm, dn)
-        for j in range(2 - 1):
-            with txl.If(j < count), txl.Then():
-                issue(ahead.tm, ahead.tn, j)
-                ahead.advance()
-            txl.ptx["cp.async.commit_group"]()
-
-        cur = TileWalk(cta, nbn, dm, dn)
-        stage = txl.local_scalar("int32", init=0)
-        istage = txl.local_scalar("int32", init=2 - 1)
-        w = txl.alloc_local([8], "uint32")
-        v = txl.alloc_local([16], "uint32")
-        with txl.serial(count) as i:
-            txl.ptx["cp.async.wait_group"](2 - 2)
-            txl.ptx.bar.sync(u322(0), u322(NTHREADS))
-            with txl.If(i + 2 - 1 < count), txl.Then():
-                issue(ahead.tm, ahead.tn, istage)
-                ahead.advance()
-            txl.ptx["cp.async.commit_group"]()
-            tm = cur.tm
-            tn = cur.tn
-            sb = stage * TILE_WORDS
-            R0 = tm * 128
-            C0 = tn * 128
-
-            # ---- row phase: 8 lanes per row; lane k holds elements 8k.. and 64+8k..
-            qtile = txl.local_scalar("int64", init=i642(R0) * N64 + i642(C0))
-            for it in range(4):
-                grow = R0 + r0 + 32 * it
-                for h in range(2):
-                    txl.ptx.ld.shared.v4.b32(w[4 * h], w[4 * h + 1], w[4 * h + 2], w[4 * h + 3], tiles.ptr_to([sb + soff[it][h]]))
-                m = txl.local_scalar("uint32", init=w[0])
-                for e in range(1, 8):
-                    txl.ptx.max.xorsign.abs.bf16x2(m, m, w[e])
-                a = txl.local_scalar("uint32", init=txl.bitwise_and(m, u322(0x7FFF7FFF)))
-                txl.ptx.max.u32(a, txl.bitwise_and(a, u322(0xFFFF)), txl.shift_right(a, u322(16)))
-                peer = txl.local_scalar("uint32")
-                for d in (1, 2, 4):
-                    txl.ptx.shfl_sync.bfly.b32(peer, a, u322(d), u322(31), u322(0xFFFFFFFF))
-                    txl.ptx.max.u32(a, a, peer)
-                sbits, rbits = scale_bits(rc(txl.shift_left(a, u322(16)), "float32"))
-                rcp2 = bf16x2_rcp(rbits)
-                o = []
-                for h in range(2):
-                    o.append(pack16(q_bf16x2(w[4 * h], rcp2), q_bf16x2(w[4 * h + 1], rcp2)))
-                    o.append(pack16(q_bf16x2(w[4 * h + 2], rcp2), q_bf16x2(w[4 * h + 3], rcp2)))
-                with txl.If(grow < M), txl.Then():
-                    qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
-                    with txl.If(C0 + 128 <= N):
-                        with txl.Then():
-                            txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
-                            txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
-                        with txl.Else():
-                            for h in range(2):
-                                with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
-                                    txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
-                    with txl.If(k == 0), txl.Then():
-                        txl.ptx.st.global_.b32(txl.address_of(xs[i642(grow) * i642(nbn) + i642(tn)]), sbits)
-
-            # ---- column phase: lane = pl * 8 + rg; pair p = warp*4 + pl (+32), rows rg*16..+15
-            for it2 in range(2):
-                p = warp * 4 + pl + 32 * it2
-                for e in range(16):
-                    txl.ptx.ld.shared.b32(v[e], tiles.ptr_to([sb + coff[it2] + e * 64]))
-                cm = txl.local_scalar("uint32", init=v[0])
-                for e in range(1, 16):
-                    txl.ptx.max.xorsign.abs.bf16x2(cm, cm, v[e])
-                txl.assign(cm, txl.bitwise_and(cm, u322(0x7FFF7FFF)))
-                pm = txl.local_scalar("uint32")
-                for d in (1, 2, 4):
-                    txl.ptx.shfl_sync.bfly.b32(pm, cm, u322(d), u322(31), u322(0xFFFFFFFF))
-                    txl.ptx.max.bf16x2(cm, cm, pm)
-                s_lo, r_lo = scale_bits(rc(txl.shift_left(cm, u322(16)), "float32"))
-                s_hi, r_hi = scale_bits(rc(txl.bitwise_and(cm, u322(0xFFFF0000)), "float32"))
-                rl2 = bf16x2_rcp(r_lo)
-                rh2 = bf16x2_rcp(r_hi)
-                lo = []
-                hi = []
-                for e in range(0, 16, 2):
-                    plo = txl.local_scalar("uint32")
-                    phi = txl.local_scalar("uint32")
-                    txl.ptx.prmt.b32(plo, v[e], v[e + 1], u322(0x5410))
-                    txl.ptx.prmt.b32(phi, v[e], v[e + 1], u322(0x7632))
-                    lo.append(q_bf16x2(plo, rl2))
-                    hi.append(q_bf16x2(phi, rh2))
-                lw = [pack16(lo[2 * j], lo[2 * j + 1]) for j in range(4)]
-                hw = [pack16(hi[2 * j], hi[2 * j + 1]) for j in range(4)]
-                col = C0 + 2 * p
-                with txl.If((col < N) & (R0 + rg * 16 < M)), txl.Then():
-                    ta = txl.local_scalar("int64", init=i642(col) * M64 + i642(R0 + rg * 16))
-                    txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta]), lw[0], lw[1], lw[2], lw[3])
-                    txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta + M64]), hw[0], hw[1], hw[2], hw[3])
-                    with txl.If(rg == 0), txl.Then():
-                        sa = txl.local_scalar("int64", init=i642(col) * i642(nbm) + i642(tm))
-                        txl.ptx.st.global_.b32(txl.address_of(xts[sa]), s_lo)
-                        txl.ptx.st.global_.b32(txl.address_of(xts[sa + i642(nbm)]), s_hi)
-            cur.advance()
-            txl.assign(stage, txl.Select(stage == 2 - 1, 0, stage + 1))
-            txl.assign(istage, txl.Select(istage == 2 - 1, 0, istage + 1))
-        txl.ptx["cp.async.wait_group"](0)
-
-    return fp8_quant_grad_persistent
-
-
-def build_rr16():
-    @txl.kernel(warps=512 // 32, arch="sm_100a", grid="num_ctas", min_blocks_per_sm=2)
-    def fp8_quant_grad_persistent(
-        x: txl.gptr[txl.bf16],
-        xq: txl.gptr[txl.u8],
-        xs: txl.gptr[txl.i32],
-        xtq: txl.gptr[txl.u8],
-        xts: txl.gptr[txl.i32],
-        M: txl.i32,
-        N: txl.i32,
-        ld: txl.i64,
-        off: txl.i64,
-        num_ctas: txl.i32,
-    ):
-        cta = txl.cta_id()
-        warp = txl.warp_id()
-        lane = txl.lane_id()
-        pool = txl.smem_pool()
-        tiles = pool.alloc([2 * TILE_WORDS], "uint32", align=128)
-        nbn = txl.local_scalar("int32", init=(N + 127) >> 7)
-        nbm = txl.local_scalar("int32", init=(M + 127) >> 7)
-        count = txl.local_scalar("int32", init=txl.truncdiv(nbn * nbm - cta + num_ctas - 1, num_ctas))
-        dm = txl.local_scalar("int32", init=txl.truncdiv(num_ctas, nbn))
-        dn = txl.local_scalar("int32", init=txl.truncmod(num_ctas, nbn))
-        k = lane & 7
-        role = warp >> 3  # 0: row phase, 1: column phase (both read the same staged tile)
-        wr = warp & 7
-        cr0 = warp * 4 + (lane >> 3)  # copy row of this thread: cr0 + 64 * it
-        r0 = wr * 4 + (lane >> 3)  # row-phase row: r0 + 32 * it
-        rg = lane & 7
-        pl = lane >> 3
-        M64 = i642(M)
-        N64 = i642(N)
-
-        # per-thread constant offsets (tile independent)
-        xro = [txl.local_scalar("int64", init=i642(cr0 + 64 * it) * ld + i642(k * 8)) for it in range(2)]
-        cso = []
-        for it in range(2):
-            r = cr0 + 64 * it
-            g = (r >> 4) & 7
-            cso.append([txl.local_scalar("int32", init=r * 64 + (((k + 8 * h) ^ h ^ g) << 2)) for h in range(2)])
-        # smem word offsets for row-phase / copy chunks: row r, chunk k (+8)
-        soff = []
-        for it in range(4):
-            r = r0 + 32 * it
-            g = (r >> 4) & 7
-            soff.append([txl.local_scalar("int32", init=r * 64 + (((k + 8 * h) ^ h ^ g) << 2)) for h in range(2)])
-        # column phase: pair p = warp*4 + pl + 32*it2, rows rg*16 + e
-        coff = []
-        for it2 in range(2):
-            p = wr * 4 + pl + 32 * it2
-            c = p >> 2
-            coff.append(txl.local_scalar("int32", init=rg * 16 * 64 + ((c ^ ((c >> 3) & 1) ^ rg) << 2) + (p & 3)))
-
-        def issue(tm_, tn_, stage):
-            sb = stage * TILE_WORDS
-            R0 = tm_ * 128
-            C0 = tn_ * 128
-            tbase = txl.local_scalar("int64", init=off + i642(R0) * ld + i642(C0))
-            interior = (R0 + 128 <= M) & (C0 + 128 <= N)
-            with txl.If(interior):
-                with txl.Then():
-                    for it in range(2):
-                        for h in range(2):
-                            txl.ptx["cp.async.cg.shared.global"](
-                                tiles.ptr_to([sb + cso[it][h]]),
-                                txl.address_of(x[tbase + xro[it] + 64 * h]),
-                                16,
-                                u322(16),
-                            )
-                with txl.Else():
-                    for it in range(2):
-                        for h in range(2):
-                            ok = (R0 + cr0 + 64 * it < M) & (C0 + k * 8 + 64 * h < N)
-                            txl.ptx["cp.async.cg.shared.global"](
-                                tiles.ptr_to([sb + cso[it][h]]),
-                                txl.address_of(x[off + txl.Select(ok, tbase - off + xro[it] + 64 * h, i642(0))]),
-                                16,
-                                txl.Select(ok, u322(16), u322(0)),
-                            )
-
-        ahead = TileWalk(cta, nbn, dm, dn)
-        for j in range(2 - 1):
-            with txl.If(j < count), txl.Then():
-                issue(ahead.tm, ahead.tn, j)
-                ahead.advance()
-            txl.ptx["cp.async.commit_group"]()
-
-        cur = TileWalk(cta, nbn, dm, dn)
-        stage = txl.local_scalar("int32", init=0)
-        istage = txl.local_scalar("int32", init=2 - 1)
-        w = txl.alloc_local([8], "uint32")
-        v = txl.alloc_local([16], "uint32")
-        with txl.serial(count) as i:
-            txl.ptx["cp.async.wait_group"](2 - 2)
-            txl.ptx.bar.sync(u322(0), u322(512))
-            with txl.If(i + 2 - 1 < count), txl.Then():
-                issue(ahead.tm, ahead.tn, istage)
-                ahead.advance()
-            txl.ptx["cp.async.commit_group"]()
-            tm = cur.tm
-            tn = cur.tn
-            sb = stage * TILE_WORDS
-            R0 = tm * 128
-            C0 = tn * 128
-
-            with txl.If(role == 0):
-                with txl.Then():
-                    # ---- row phase: 8 lanes per row; lane k holds elements 8k.. and 64+8k..
-                    qtile = txl.local_scalar("int64", init=i642(R0) * N64 + i642(C0))
-                    for it in range(4):
-                        grow = R0 + r0 + 32 * it
-                        for h in range(2):
-                            txl.ptx.ld.shared.v4.b32(w[4 * h], w[4 * h + 1], w[4 * h + 2], w[4 * h + 3], tiles.ptr_to([sb + soff[it][h]]))
-                        m = txl.local_scalar("uint32", init=w[0])
-                        for e in range(1, 8):
-                            txl.ptx.max.xorsign.abs.bf16x2(m, m, w[e])
-                        a = txl.local_scalar("uint32", init=txl.bitwise_and(m, u322(0x7FFF7FFF)))
-                        txl.ptx.max.u32(a, txl.bitwise_and(a, u322(0xFFFF)), txl.shift_right(a, u322(16)))
-                        peer = txl.local_scalar("uint32")
-                        for d in (1, 2, 4):
-                            txl.ptx.shfl_sync.bfly.b32(peer, a, u322(d), u322(31), u322(0xFFFFFFFF))
-                            txl.ptx.max.u32(a, a, peer)
-                        sbits, rbits = scale_bits(rc(txl.shift_left(a, u322(16)), "float32"))
-                        rcp2 = bf16x2_rcp(rbits)
-                        o = []
-                        for h in range(2):
-                            o.append(pack16(q_bf16x2(w[4 * h], rcp2), q_bf16x2(w[4 * h + 1], rcp2)))
-                            o.append(pack16(q_bf16x2(w[4 * h + 2], rcp2), q_bf16x2(w[4 * h + 3], rcp2)))
-                        with txl.If(grow < M), txl.Then():
-                            qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
-                            with txl.If(C0 + 128 <= N):
-                                with txl.Then():
-                                    txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
-                                    txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
-                                with txl.Else():
-                                    for h in range(2):
-                                        with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
-                                            txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
-                            with txl.If(k == 0), txl.Then():
-                                txl.ptx.st.global_.b32(txl.address_of(xs[i642(grow) * i642(nbn) + i642(tn)]), sbits)
-                with txl.Else():
-                    # ---- column phase: lane = pl * 8 + rg; pair p = warp*4 + pl (+32), rows rg*16..+15
-                    for it2 in range(2):
-                        p = wr * 4 + pl + 32 * it2
-                        for e in range(16):
-                            txl.ptx.ld.shared.b32(v[e], tiles.ptr_to([sb + coff[it2] + e * 64]))
-                        cm = txl.local_scalar("uint32", init=v[0])
-                        for e in range(1, 16):
-                            txl.ptx.max.xorsign.abs.bf16x2(cm, cm, v[e])
-                        txl.assign(cm, txl.bitwise_and(cm, u322(0x7FFF7FFF)))
-                        pm = txl.local_scalar("uint32")
-                        for d in (1, 2, 4):
-                            txl.ptx.shfl_sync.bfly.b32(pm, cm, u322(d), u322(31), u322(0xFFFFFFFF))
-                            txl.ptx.max.bf16x2(cm, cm, pm)
-                        s_lo, r_lo = scale_bits(rc(txl.shift_left(cm, u322(16)), "float32"))
-                        s_hi, r_hi = scale_bits(rc(txl.bitwise_and(cm, u322(0xFFFF0000)), "float32"))
-                        rl2 = bf16x2_rcp(r_lo)
-                        rh2 = bf16x2_rcp(r_hi)
-                        lo = []
-                        hi = []
-                        for e in range(0, 16, 2):
-                            plo = txl.local_scalar("uint32")
-                            phi = txl.local_scalar("uint32")
-                            txl.ptx.prmt.b32(plo, v[e], v[e + 1], u322(0x5410))
-                            txl.ptx.prmt.b32(phi, v[e], v[e + 1], u322(0x7632))
-                            lo.append(q_bf16x2(plo, rl2))
-                            hi.append(q_bf16x2(phi, rh2))
-                        lw = [pack16(lo[2 * j], lo[2 * j + 1]) for j in range(4)]
-                        hw = [pack16(hi[2 * j], hi[2 * j + 1]) for j in range(4)]
-                        col = C0 + 2 * p
-                        with txl.If((col < N) & (R0 + rg * 16 < M)), txl.Then():
-                            ta = txl.local_scalar("int64", init=i642(col) * M64 + i642(R0 + rg * 16))
-                            txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta]), lw[0], lw[1], lw[2], lw[3])
-                            txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta + M64]), hw[0], hw[1], hw[2], hw[3])
-                            with txl.If(rg == 0), txl.Then():
-                                sa = txl.local_scalar("int64", init=i642(col) * i642(nbm) + i642(tm))
-                                txl.ptx.st.global_.b32(txl.address_of(xts[sa]), s_lo)
-                                txl.ptx.st.global_.b32(txl.address_of(xts[sa + i642(nbm)]), s_hi)
-            cur.advance()
-            txl.assign(stage, txl.Select(stage == 2 - 1, 0, stage + 1))
-            txl.assign(istage, txl.Select(istage == 2 - 1, 0, istage + 1))
-        txl.ptx["cp.async.wait_group"](0)
-
-    return fp8_quant_grad_persistent
-
-
-def build_clc():
-    @txl.kernel(
-        warps=NTHREADS // 32,
-        arch="sm_100a",
-        grid=lambda p: ((p["N"] + 127) // 128) * ((p["M"] + 127) // 128),
-        min_blocks_per_sm=2,
-        host_prelude=x_tensor_map,
-    )
-    def fp8_quant_grad_clc(
-        x: txl.gptr[txl.bf16],
-        xq: txl.gptr[txl.u8],
-        xs: txl.gptr[txl.i32],
-        xtq: txl.gptr[txl.u8],
-        xts: txl.gptr[txl.i32],
-        M: txl.i32,
-        N: txl.i32,
-        ld: txl.i64,
-        *,
-        host,
-    ):
-        tmap = host
-        cta = txl.cta_id()
-        t = txl.thread_id()
-        warp = txl.warp_id()
-        lane = txl.lane_id()
-        pool = txl.smem_pool()
-        tiles = pool.alloc([2 * TILE_WORDS], "uint32", align=1024)
-        full = pool.alloc([2], "uint64", align=8)
-        clc_bar = pool.alloc([1], "uint64", align=8)
-        clc_resp = pool.alloc([4], "uint32", align=16)
-        slot = pool.alloc([2], "int32", align=8)
-        nbn = txl.local_scalar("int32", init=(N + 127) >> 7)
-        nbm = txl.local_scalar("int32", init=(M + 127) >> 7)
         k = lane & 7
         r0 = warp * 4 + (lane >> 3)
-        rg = lane & 7
-        pl = lane >> 3
-        M64 = i642(M)
-        N64 = i642(N)
-
-        # staged word offsets: half h, staged row s, swizzled chunk
-        soff = []
+        w = txl.alloc_local([32], "uint32")
+        tbase = txl.local_scalar("int64", init=off + i642(R0) * ld + i642(C0))
+        interior = (R0 + 128 <= M) & (C0 + 128 <= N)
+        tok_load = iket_range("global-load")
+        with txl.If(interior):
+            with txl.Then():
+                for it in range(4):
+                    for h in range(2):
+                        b = 8 * it + 4 * h
+                        txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
+            with txl.Else():
+                for it in range(4):
+                    for h in range(2):
+                        b = 8 * it + 4 * h
+                        for e in range(4):
+                            txl.assign(w[b + e], u322(0))
+                        with txl.If((R0 + r0 + 32 * it < M) & (C0 + (k + 8 * h) * 8 < N)), txl.Then():
+                            txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
+        iket_end(tok_load)
+        tok_stage = iket_range("shared-stage")
         for it in range(4):
             r = r0 + 32 * it
-            srow = (r & 15) * 8 + (r >> 4)
-            soff.append([txl.local_scalar("int32", init=h * HALF_WORDS + srow * 32 + ((k ^ (srow & 7)) << 2)) for h in range(2)])
-        coff = []
+            g = (r >> 4) & 7
+            for h in range(2):
+                b = 8 * it + 4 * h
+                txl.ptx.st.shared.v4.b32(tile.ptr_to([r * 64 + (((k + 8 * h) ^ h ^ g) << 2)]), w[b], w[b + 1], w[b + 2], w[b + 3])
+        iket_end(tok_stage)
+        # L2 prefetch of the tile one resident wave ahead (interior tiles only), one 256 B row per thread
+        tok_prefetch = iket_range("l2-prefetch")
+        fid = cid + pf
+        fm = txl.local_scalar("int32", init=txl.truncdiv(fid, nbn))
+        fn = fid - fm * nbn
+        tq = txl.thread_id()
+        with txl.If((tq < 128) & (fm * 128 + 128 <= M) & (fn * 128 + 128 <= N)), txl.Then():
+            txl.ptx.cp.async_.bulk.prefetch.L2.global_(txl.address_of(x[off + i642(fm * 128 + tq) * ld + i642(fn * 128)]), u322(256))
+        iket_end(tok_prefetch)
+        tok_row = iket_range("row-quant")
+        qtile = txl.local_scalar("int64", init=i642(R0) * N64 + i642(C0))
+        for it in range(4):
+            grow = R0 + r0 + 32 * it
+            m = txl.local_scalar("uint32", init=w[8 * it])
+            for e in range(1, 8):
+                txl.ptx.max.xorsign.abs.bf16x2(m, m, w[8 * it + e])
+            a = txl.local_scalar("uint32", init=txl.bitwise_and(m, u322(0x7FFF7FFF)))
+            txl.ptx.max.u32(a, txl.bitwise_and(a, u322(0xFFFF)), txl.shift_right(a, u322(16)))
+            peer = txl.local_scalar("uint32")
+            for d in (1, 2, 4):
+                txl.ptx.shfl_sync.bfly.b32(peer, a, u322(d), u322(31), u322(0xFFFFFFFF))
+                txl.ptx.max.u32(a, a, peer)
+            sbits, rbits = scale_bits(rc(txl.shift_left(a, u322(16)), "float32"))
+            rcp2 = bf16x2_rcp(rbits)
+            o = []
+            for h in range(2):
+                b = 8 * it + 4 * h
+                o.append(pack16(q_bf16x2(w[b], rcp2), q_bf16x2(w[b + 1], rcp2)))
+                o.append(pack16(q_bf16x2(w[b + 2], rcp2), q_bf16x2(w[b + 3], rcp2)))
+            with txl.If(grow < M), txl.Then():
+                qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
+                with txl.If(C0 + 128 <= N):
+                    with txl.Then():
+                        txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
+                        txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
+                    with txl.Else():
+                        for h in range(2):
+                            with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
+                                txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
+            with txl.If(k == 0), txl.Then():
+                txl.ptx.st.shared.b32(rsc.ptr_to([r0 + 32 * it]), sbits)
+        iket_end(tok_row)
+        tok_barrier = iket_range("cta-barrier")
+        txl.ptx.bar.sync(u322(0), u322(NTHREADS))
+        iket_end(tok_barrier)
+        tok_row_scale = iket_range("row-scale-store")
+        t = txl.thread_id()
+        with txl.If((t < 128) & (R0 + t < M)), txl.Then():
+            rs = txl.local_scalar("uint32")
+            txl.ptx.ld.shared.b32(rs, rsc.ptr_to([t]))
+            txl.ptx.st.global_.b32(txl.address_of(xs[i642(tn) * M64 + i642(R0 + t)]), rs)
+        iket_end(tok_row_scale)
+        tok_column = iket_range("column-quant")
+        rg = lane & 7
+        pl = lane >> 3
+        v = txl.alloc_local([16], "uint32")
         for it2 in range(2):
             p = warp * 4 + pl + 32 * it2
-            coff.append(txl.local_scalar("int32", init=(p >> 5) * HALF_WORDS + rg * 32 + ((((p >> 2) & 7) ^ rg) << 2) + (p & 3)))
+            c = p >> 2
+            co = rg * 16 * 64 + ((c ^ ((c >> 3) & 1) ^ rg) << 2) + (p & 3)
+            for e in range(16):
+                txl.ptx.ld.shared.b32(v[e], tile.ptr_to([co + e * 64]))
+            cm = txl.local_scalar("uint32", init=v[0])
+            for e in range(1, 16):
+                txl.ptx.max.xorsign.abs.bf16x2(cm, cm, v[e])
+            txl.assign(cm, txl.bitwise_and(cm, u322(0x7FFF7FFF)))
+            pm = txl.local_scalar("uint32")
+            for d in (1, 2, 4):
+                txl.ptx.shfl_sync.bfly.b32(pm, cm, u322(d), u322(31), u322(0xFFFFFFFF))
+                txl.ptx.max.bf16x2(cm, cm, pm)
+            s_lo, r_lo = scale_bits(rc(txl.shift_left(cm, u322(16)), "float32"))
+            s_hi, r_hi = scale_bits(rc(txl.bitwise_and(cm, u322(0xFFFF0000)), "float32"))
+            rl2 = bf16x2_rcp(r_lo)
+            rh2 = bf16x2_rcp(r_hi)
+            lo = []
+            hi = []
+            for e in range(0, 16, 2):
+                plo = txl.local_scalar("uint32")
+                phi = txl.local_scalar("uint32")
+                txl.ptx.prmt.b32(plo, v[e], v[e + 1], u322(0x5410))
+                txl.ptx.prmt.b32(phi, v[e], v[e + 1], u322(0x7632))
+                lo.append(q_bf16x2(plo, rl2))
+                hi.append(q_bf16x2(phi, rh2))
+            lw = [pack16(lo[2 * j], lo[2 * j + 1]) for j in range(4)]
+            hw = [pack16(hi[2 * j], hi[2 * j + 1]) for j in range(4)]
+            col = C0 + 2 * p
+            with txl.If((col < N) & (R0 + rg * 16 < M)), txl.Then():
+                ta = txl.local_scalar("int64", init=i642(col) * M64 + i642(R0 + rg * 16))
+                txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta]), lw[0], lw[1], lw[2], lw[3])
+                txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta + M64]), hw[0], hw[1], hw[2], hw[3])
+                with txl.If(rg == 0), txl.Then():
+                    sa = txl.local_scalar("int64", init=i642(tm) * N64 + i642(col))
+                    txl.ptx.st.global_.v2.b32(txl.address_of(xts[sa]), s_lo, s_hi)
+        iket_end(tok_column)
 
-        with txl.If(t == 0), txl.Then():
-            txl.ptx.prefetch.tensormap(txl.address_of(tmap))
-            for j in range(2):
-                txl.ptx.mbarrier.init.shared.b64(full.ptr_to([j]), u322(1))
-            txl.ptx.mbarrier.init.shared.b64(clc_bar.ptr_to([0]), u322(1))
-            txl.ptx.fence.mbarrier_init.release.cluster()
-        txl.ptx.bar.sync(u322(0), u322(NTHREADS))
+    return fp8_quant_grad_one
 
-        def issue(L, stg):
-            tm_ = txl.truncdiv(L, nbn)
-            tn_ = L - tm_ * nbn
-            txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([stg]), u322(BLOCK * BLOCK * 2))
-            for h in range(2):
-                txl.ptx[TMA_3D](
-                    tiles.ptr_to([stg * TILE_WORDS + h * HALF_WORDS]),
-                    txl.address_of(tmap),
-                    txl.Cast("int32", tn_ * 128 + 64 * h),
-                    txl.Cast("int32", tm_ * 8),
-                    txl.int32(0),
-                    full.ptr_to([stg]),
-                )
 
-        def request():
-            txl.ptx.mbarrier.arrive.expect_tx.shared.b64(clc_bar.ptr_to([0]), u322(16))
-            txl.ptx["clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128"](
-                clc_resp.ptr_to([0]), clc_bar.ptr_to([0])
-            )
+@functools.cache
+def one_kernel():
+    return build_one().compile()
 
-        cur = txl.local_scalar("int32", init=cta)
-        with txl.If(t == 0), txl.Then():
-            issue(cur, 0)
-            request()
 
-        i = txl.local_scalar("int32", init=0)
-        nxt = txl.local_scalar("uint32")
-        w = txl.alloc_local([8], "uint32")
-        v = txl.alloc_local([16], "uint32")
-        with txl.While(cur >= 0):
-            stage = i & 1
-            with txl.If(t == 0), txl.Then():
-                txl.cuda.mbarrier_wait(clc_bar.ptr_to([0]), i & 1)
-                txl.query_cancel_first_ctaid_x(nxt, clc_resp.ptr_to([0]))
-                with txl.If(nxt != u322(0xFFFFFFFF)):
+@functools.cache
+def num_sms(dev):
+    return torch.cuda.get_device_properties(dev).multi_processor_count
+
+
+
+def build_split4(MINB=6):
+    """
+    Small grids: four CTAs per 128x128 tile. Roles 0/1 quantize rows 0-63 / 64-127 (all 128 columns)
+    straight from registers; roles 2/3 quantize columns 0-63 / 64-127 (all 128 rows) through a 16 KB
+    XOR-swizzled shared tile. Each tile is read twice (the second read hits L2).
+    """
+
+    @txl.kernel(warps=NTHREADS // 32, arch="sm_100a", grid=lambda p: ((p["N"] + 127) // 128) * ((p["M"] + 127) // 128) * 4, min_blocks_per_sm=MINB)
+    def fp8_quant_grad_split4(
+        x: txl.gptr[txl.bf16],
+        xq: txl.gptr[txl.u8],
+        xs: txl.gptr[txl.i32],
+        xtq: txl.gptr[txl.u8],
+        xts: txl.gptr[txl.i32],
+        M: txl.i32,
+        N: txl.i32,
+        ld: txl.i64,
+        off: txl.i64,
+    ):
+        cid = txl.cta_id()
+        warp = txl.warp_id()
+        lane = txl.lane_id()
+        pool = txl.smem_pool()
+        tile = pool.alloc([BLOCK * 32], "uint32", align=128)
+        nbn = (N + 127) >> 7
+        role = cid & 3
+        tid = cid >> 2
+        tm = txl.local_scalar("int32", init=txl.truncdiv(tid, nbn))
+        tn = txl.local_scalar("int32", init=tid - tm * nbn)
+        R0 = tm * 128
+        C0 = tn * 128
+        M64 = i642(M)
+        N64 = i642(N)
+        k = lane & 7
+        r0 = warp * 4 + (lane >> 3)
+        w = txl.alloc_local([16], "uint32")
+        with txl.If(role < 2):
+            with txl.Then():
+                # rows R1 .. R1+63, chunks k and k+8 of each row
+                R1 = R0 + 64 * role
+                tbase = txl.local_scalar("int64", init=off + i642(R1) * ld + i642(C0))
+                with txl.If((R1 + 64 <= M) & (C0 + 128 <= N)):
                     with txl.Then():
-                        txl.ptx.st.shared.b32(slot.ptr_to([stage ^ 1]), txl.Cast("int32", nxt))
-                        issue(txl.Cast("int32", nxt), stage ^ 1)
-                        request()
-                    with txl.Else():
-                        txl.ptx.st.shared.b32(slot.ptr_to([stage ^ 1]), txl.int32(-1))
-            txl.cuda.mbarrier_wait(full.ptr_to([stage]), (i >> 1) & 1)
-            tm = txl.local_scalar("int32", init=txl.truncdiv(cur, nbn))
-            tn = txl.local_scalar("int32", init=cur - tm * nbn)
-            sb = stage * TILE_WORDS
-            R0 = tm * 128
-            C0 = tn * 128
-
-            qtile = txl.local_scalar("int64", init=i642(R0) * N64 + i642(C0))
-            for it in range(4):
-                grow = R0 + r0 + 32 * it
-                for h in range(2):
-                    txl.ptx.ld.shared.v4.b32(w[4 * h], w[4 * h + 1], w[4 * h + 2], w[4 * h + 3], tiles.ptr_to([sb + soff[it][h]]))
-                m = txl.local_scalar("uint32", init=w[0])
-                for e in range(1, 8):
-                    txl.ptx.max.xorsign.abs.bf16x2(m, m, w[e])
-                a = txl.local_scalar("uint32", init=txl.bitwise_and(m, u322(0x7FFF7FFF)))
-                txl.ptx.max.u32(a, txl.bitwise_and(a, u322(0xFFFF)), txl.shift_right(a, u322(16)))
-                peer = txl.local_scalar("uint32")
-                for d in (1, 2, 4):
-                    txl.ptx.shfl_sync.bfly.b32(peer, a, u322(d), u322(31), u322(0xFFFFFFFF))
-                    txl.ptx.max.u32(a, a, peer)
-                sbits, rbits = scale_bits(rc(txl.shift_left(a, u322(16)), "float32"))
-                rcp2 = bf16x2_rcp(rbits)
-                o = []
-                for h in range(2):
-                    o.append(pack16(q_bf16x2(w[4 * h], rcp2), q_bf16x2(w[4 * h + 1], rcp2)))
-                    o.append(pack16(q_bf16x2(w[4 * h + 2], rcp2), q_bf16x2(w[4 * h + 3], rcp2)))
-                with txl.If(grow < M), txl.Then():
-                    qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
-                    with txl.If(C0 + 128 <= N):
-                        with txl.Then():
-                            txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
-                            txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
-                        with txl.Else():
+                        for it in range(2):
                             for h in range(2):
-                                with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
-                                    txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
-                    with txl.If(k == 0), txl.Then():
-                        txl.ptx.st.global_.b32(txl.address_of(xs[i642(grow) * i642(nbn) + i642(tn)]), sbits)
-
-            for it2 in range(2):
-                p = warp * 4 + pl + 32 * it2
+                                b = 8 * it + 4 * h
+                                txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
+                    with txl.Else():
+                        for it in range(2):
+                            for h in range(2):
+                                b = 8 * it + 4 * h
+                                for e in range(4):
+                                    txl.assign(w[b + e], u322(0))
+                                with txl.If((R1 + r0 + 32 * it < M) & (C0 + (k + 8 * h) * 8 < N)), txl.Then():
+                                    txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
+                qtile = txl.local_scalar("int64", init=i642(R1) * N64 + i642(C0))
+                for it in range(2):
+                    grow = R1 + r0 + 32 * it
+                    m = txl.local_scalar("uint32", init=w[8 * it])
+                    for e in range(1, 8):
+                        txl.ptx.max.xorsign.abs.bf16x2(m, m, w[8 * it + e])
+                    a = txl.local_scalar("uint32", init=txl.bitwise_and(m, u322(0x7FFF7FFF)))
+                    txl.ptx.max.u32(a, txl.bitwise_and(a, u322(0xFFFF)), txl.shift_right(a, u322(16)))
+                    peer = txl.local_scalar("uint32")
+                    for d in (1, 2, 4):
+                        txl.ptx.shfl_sync.bfly.b32(peer, a, u322(d), u322(31), u322(0xFFFFFFFF))
+                        txl.ptx.max.u32(a, a, peer)
+                    sbits, rbits = scale_bits(rc(txl.shift_left(a, u322(16)), "float32"))
+                    rcp2 = bf16x2_rcp(rbits)
+                    o = []
+                    for h in range(2):
+                        b = 8 * it + 4 * h
+                        o.append(pack16(q_bf16x2(w[b], rcp2), q_bf16x2(w[b + 1], rcp2)))
+                        o.append(pack16(q_bf16x2(w[b + 2], rcp2), q_bf16x2(w[b + 3], rcp2)))
+                    with txl.If(grow < M), txl.Then():
+                        qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
+                        with txl.If(C0 + 128 <= N):
+                            with txl.Then():
+                                txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
+                                txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
+                            with txl.Else():
+                                for h in range(2):
+                                    with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
+                                        txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
+                        with txl.If(k == 0), txl.Then():
+                            txl.ptx.st.global_.b32(txl.address_of(xs[i642(tn) * M64 + i642(grow)]), sbits)
+            with txl.Else():
+                # columns C1 .. C1+63 of all 128 rows: lane k loads chunk k (8 columns) of rows r0 + 32 * it
+                C1 = C0 + 64 * (role - 2)
+                tbase = txl.local_scalar("int64", init=off + i642(R0) * ld + i642(C1))
+                with txl.If((R0 + 128 <= M) & (C1 + 64 <= N)):
+                    with txl.Then():
+                        for it in range(4):
+                            b = 4 * it
+                            txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642(k * 8)]))
+                    with txl.Else():
+                        for it in range(4):
+                            b = 4 * it
+                            for e in range(4):
+                                txl.assign(w[b + e], u322(0))
+                            with txl.If((R0 + r0 + 32 * it < M) & (C1 + k * 8 < N)), txl.Then():
+                                txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642(k * 8)]))
+                for it in range(4):
+                    r = r0 + 32 * it
+                    b = 4 * it
+                    txl.ptx.st.shared.v4.b32(tile.ptr_to([r * 32 + ((k ^ ((r >> 4) & 7)) << 2)]), w[b], w[b + 1], w[b + 2], w[b + 3])
+                txl.ptx.bar.sync(u322(0), u322(NTHREADS))
+                rg = lane & 7
+                p = warp * 4 + (lane >> 3)
+                c = p >> 2
+                co = rg * 16 * 32 + ((c ^ rg) << 2) + (p & 3)
+                v = txl.alloc_local([16], "uint32")
                 for e in range(16):
-                    txl.ptx.ld.shared.b32(v[e], tiles.ptr_to([sb + coff[it2] + e * 256]))
+                    txl.ptx.ld.shared.b32(v[e], tile.ptr_to([co + e * 32]))
                 cm = txl.local_scalar("uint32", init=v[0])
                 for e in range(1, 16):
                     txl.ptx.max.xorsign.abs.bf16x2(cm, cm, v[e])
@@ -697,52 +417,21 @@ def build_clc():
                     hi.append(q_bf16x2(phi, rh2))
                 lw = [pack16(lo[2 * j], lo[2 * j + 1]) for j in range(4)]
                 hw = [pack16(hi[2 * j], hi[2 * j + 1]) for j in range(4)]
-                col = C0 + 2 * p
+                col = C1 + 2 * p
                 with txl.If((col < N) & (R0 + rg * 16 < M)), txl.Then():
                     ta = txl.local_scalar("int64", init=i642(col) * M64 + i642(R0 + rg * 16))
                     txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta]), lw[0], lw[1], lw[2], lw[3])
                     txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta + M64]), hw[0], hw[1], hw[2], hw[3])
                     with txl.If(rg == 0), txl.Then():
-                        sa = txl.local_scalar("int64", init=i642(col) * i642(nbm) + i642(tm))
-                        txl.ptx.st.global_.b32(txl.address_of(xts[sa]), s_lo)
-                        txl.ptx.st.global_.b32(txl.address_of(xts[sa + i642(nbm)]), s_hi)
-            txl.ptx.bar.sync(u322(0), u322(NTHREADS))
-            txl.ptx.ld.shared.b32(cur, slot.ptr_to([stage ^ 1]))
-            txl.assign(i, i + 1)
+                        sa = txl.local_scalar("int64", init=i642(tm) * N64 + i642(col))
+                        txl.ptx.st.global_.v2.b32(txl.address_of(xts[sa]), s_lo, s_hi)
 
-    return fp8_quant_grad_clc
-
-
-RR8_CTAS_PER_SM = 3
-RR16_CTAS_PER_SM = 2
+    return fp8_quant_grad_split4
 
 
 @functools.cache
-def rr8_kernel():
-    return build_rr8().compile()
-
-
-@functools.cache
-def rr16_kernel():
-    return build_rr16().compile()
-
-
-@functools.cache
-def clc_kernel():
-    return build_clc().compile()
-
-
-NUM_SMS = {}
-
-
-def num_sms(dev):
-    n = NUM_SMS.get(dev)
-    if n is None:
-        n = NUM_SMS[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
-    return n
-
-
-# ---------------------------------------------------------------- generic scalar kernel
+def split4_kernel(MINB=6):
+    return build_split4(MINB).compile()
 
 
 def load_f32(x, dtype, idx):
@@ -794,8 +483,6 @@ def generic_kernel(dtype):
         pool = txl.smem_pool()
         tile = pool.alloc([BLOCK * PITCH], "float32", align=16)
         red = pool.alloc([2 * BLOCK], "float32", align=16)
-        nbn = (N + 127) // 128
-        nbm = (M + 127) // 128
         R0 = tm * 128
         C0 = tn * 128
 
@@ -831,7 +518,7 @@ def generic_kernel(dtype):
                     b = q_f32(tmp, rcp)
                     txl.ptx.st.global_.b8(txl.address_of(xq[i642(R0 + r) * i642(N) + i642(cc)]), txl.Cast("uint8", b))
             with txl.If(h == 0), txl.Then():
-                txl.ptx.st.global_.b32(txl.address_of(xs[i642(R0 + r) * i642(nbn) + i642(tn)]), sbits)
+                txl.ptx.st.global_.b32(txl.address_of(xs[i642(tn) * i642(M) + i642(R0 + r)]), sbits)
 
         # columnwise: thread (column c, half g) covers 64 rows
         c = t & 127
@@ -854,12 +541,12 @@ def generic_kernel(dtype):
                     b = q_f32(tmp, crcp)
                     txl.ptx.st.global_.b8(txl.address_of(xtq[i642(C0 + c) * i642(M) + i642(rr)]), txl.Cast("uint8", b))
             with txl.If(g == 0), txl.Then():
-                txl.ptx.st.global_.b32(txl.address_of(xts[i642(C0 + c) * i642(nbm) + i642(tm)]), csb)
+                txl.ptx.st.global_.b32(txl.address_of(xts[i642(tm) * i642(N) + i642(C0 + c)]), csb)
 
     return fp8_quant_grad_generic.compile()
 
 
-GENERIC_DTYPES = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
+GENERIC_DTYPES = {torch.bfloat16: txl.bf16, torch.float16: txl.f16, torch.float32: "float32"}
 
 
 def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -868,9 +555,9 @@ def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
     nbn, nbm = cdiv(N, BLOCK), cdiv(M, BLOCK)
     dev = x.device
     out_tok = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=dev)
-    scale_tok = torch.empty((M, nbn), dtype=torch.float32, device=dev)
+    scale_tok = torch.empty((nbn, M), dtype=torch.float32, device=dev).T
     out_t = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=dev)
-    scale_t = torch.empty((N, nbm), dtype=torch.float32, device=dev)
+    scale_t = torch.empty((nbm, N), dtype=torch.float32, device=dev).T
     if M == 0 or N == 0:
         return out_tok, scale_tok, out_t, scale_t
 
@@ -888,21 +575,19 @@ def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
     )
     with tvm_ffi.use_torch_stream():
         if fast:
-            outs = (out_tok.view(torch.uint8).view(-1), scale_tok.view(-1).view(torch.int32), out_t.view(torch.uint8).view(-1), scale_t.view(-1).view(torch.int32))
-            tiles, sms = nbn * nbm, num_sms(dev)
-            if tiles < 4 * sms:
-                rr16_kernel()(flat, *outs, M, N, s0, off, min(tiles, sms * RR16_CTAS_PER_SM))
-            elif tiles < 10 * sms:
-                rr8_kernel()(flat, *outs, M, N, s0, off, min(tiles, sms * RR8_CTAS_PER_SM))
+            outs = (out_tok.view(torch.uint8).view(-1), scale_tok.T.view(-1).view(torch.int32), out_t.view(torch.uint8).view(-1), scale_t.T.view(-1).view(torch.int32))
+            sms = num_sms(dev)
+            if 2 * nbn * nbm < 3 * sms:
+                split4_kernel()(flat, *outs, M, N, s0, off)
             else:
-                clc_kernel()(x.as_strided(((M - 1) * s0 + N,), (1,)), *outs, M, N, s0)
+                one_kernel()(flat, *outs, M, N, s0, off, 3 * sms)
         else:
             generic_kernel(GENERIC_DTYPES[x.dtype])(
                 flat,
                 out_tok.view(torch.uint8).view(-1),
-                scale_tok.view(-1).view(torch.int32),
+                scale_tok.T.view(-1).view(torch.int32),
                 out_t.view(torch.uint8).view(-1),
-                scale_t.view(-1).view(torch.int32),
+                scale_t.T.view(-1).view(torch.int32),
                 M,
                 N,
                 s0,
