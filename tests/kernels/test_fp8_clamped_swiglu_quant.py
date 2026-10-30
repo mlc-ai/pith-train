@@ -433,3 +433,209 @@ def test_inf_nan_blocks(N: int) -> None:
     out, _ = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
     assert_quant_equal(out[:2], ref[:2], ROW)
     assert_kmajor(out[2:], ref[2:], offs, 2 * N)
+
+
+def kmajor_channels_of(pair: tuple) -> int | None:
+    """
+    The channel count a K-major per-channel pair is laid out for (its scale's row count), or None
+    where the pair is (M, C) (no K-major layout, so no unfused fallback to tell apart).
+    """
+    return pair[1].shape[0] if pair[0].ndim == 1 else None
+
+
+def check_fwd_activation_fp32(x: torch.Tensor, h: torch.Tensor) -> None:
+    alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
+    gate, up = x[:, 0::2].double(), x[:, 1::2].double()
+    gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
+    want = (uc + 1) * gc * torch.sigmoid(alpha * gc)
+    torch.testing.assert_close(h.double(), want, rtol=1e-5, atol=1e-6 * want.abs().max().item())
+
+
+def ref64_fwd(x: torch.Tensor) -> torch.Tensor:
+    """
+    float64 clamped SwiGLU of the interleaved x (gate even, up odd), alpha / limit as fp32 values.
+    """
+    alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
+    gate, up = x[:, 0::2].double(), x[:, 1::2].double()
+    gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
+    return (uc + 1) * gc * torch.sigmoid(alpha * gc)
+
+
+def ref64_bwd(dh: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    float64 gradient of ref64_fwd with respect to x, interleaved like x; zero where the clamp saturates.
+    """
+    alpha, limit = to_f32(ALPHA), to_f32(LIMIT)
+    dh64, gate, up = dh.double(), x[:, 0::2].double(), x[:, 1::2].double()
+    gc, uc = gate.clamp(max=limit), up.clamp(-limit, limit)
+    sig = torch.sigmoid(alpha * gc)
+    out = torch.empty(x.shape, dtype=torch.float64, device=x.device)
+    out[:, 0::2] = torch.where(
+        gate <= limit, dh64 * (uc + 1) * sig * (1 + alpha * gc * (1 - sig)), 0.0
+    )
+    out[:, 1::2] = torch.where((up >= -limit) & (up <= limit), dh64 * gc * sig, 0.0)
+    return out
+
+
+STABLE_DELTA = (
+    2.0**-14
+)  # relative; far above the kernels' fp32 error (~1e-6), far below bf16's 2^-8 spacing
+
+
+def round_as(v64: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """
+    v64 rounded as the fallback stores the activation: to fp32, then to bf16 when the path is bf16.
+    """
+    v32 = v64.float()
+    return v32.to(dtype) if dtype == torch.bfloat16 else v32
+
+
+def unstable(v64: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Elements of the float64 activation whose stored value or FP8 encoding could depend on the kernels'
+    fp32 error: those whose rounding to bf16 (when dtype is bf16), e4m3 byte (rowwise or per-channel) or
+    block scale changes
+    under a relative perturbation of STABLE_DELTA (for a changed scale, the element setting the block's
+    amax), and nonzero values small enough for the kernels' flush-to-zero sigmoid to matter.
+    """
+    M, K = v64.shape
+    mid = round_as(v64, dtype)
+    ref = quantize_ref(mid, False)
+    bad = (v64 != 0) & (v64.abs() < 2.0**-60)
+    for factor in (1 - STABLE_DELTA, 1 + STABLE_DELTA):
+        alt = round_as(v64 * factor, dtype)
+        q = quantize_ref(alt, False)
+        if (
+            dtype == torch.bfloat16
+        ):  # an fp32 activation is compared to tolerance, only its FP8 must be stable
+            bad |= alt != mid
+        bad |= (q[0] != ref[0]) | (q[2] != ref[2])
+        pad = -(-K // BLOCK) * BLOCK - K
+        mag = torch.nn.functional.pad(mid.float().abs(), (0, pad)).view(M, -1, BLOCK)
+        rows, blocks = (q[1] != ref[1]).nonzero(as_tuple=True)
+        cols = blocks * BLOCK + mag[rows, blocks].argmax(-1)
+        bad[rows, cols.clamp(max=K - 1)] = True
+        mag_ch = mid.float().abs().view(M // BLOCK, BLOCK, K)
+        row_blocks, chans = (q[3] != ref[3]).nonzero(as_tuple=True)
+        bad[row_blocks * BLOCK + mag_ch[row_blocks, :, chans].argmax(-1), chans] = True
+    return bad
+
+
+def promoted_input(gu: torch.Tensor, bias: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    """
+    gate_up + bias[group] in the promoted dtype, as the fallback adds it: one fp32 add, rounded to bf16
+    when both are bf16.
+    """
+    x = gu.float() + bias.float()[group_ids(offs, gu.shape[0])]
+    return x.to(torch.bfloat16) if bias.dtype == torch.bfloat16 else x
+
+
+def stable_inputs(gu, bias, dh, offs, gen: torch.Generator, max_rounds: int = 30):
+    """
+    gu and dh with every (gate, up, dh) triple resampled (randn * 4, randn) until no element of the
+    forward activation or the backward gradient is unstable, so the exact expectations built from
+    float64 PyTorch below cannot depend on the kernels' approximate sigmoid.
+    """
+    gu, dh = gu.clone(), dh.clone()
+    for _ in range(max_rounds):
+        x = promoted_input(gu, bias, offs)
+        bad = unstable(ref64_fwd(x), x.dtype)
+        bad_bwd = unstable(ref64_bwd(dh.to(x.dtype), x), x.dtype)
+        bad |= bad_bwd[:, 0::2] | bad_bwd[:, 1::2]
+        rows, cols = bad.nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            return gu, dh
+        n = rows.numel()
+        fresh = (torch.randn(n, 2, generator=gen) * 4).to(gu.dtype).to(gu.device)
+        gu[rows, 2 * cols], gu[rows, 2 * cols + 1] = fresh[:, 0], fresh[:, 1]
+        dh[rows, cols] = torch.randn(n, generator=gen).to(dh.dtype).to(dh.device)
+    raise AssertionError("could not make the inputs stable")
+
+
+def bias_grad_ref(
+    dgu: torch.Tensor, offs: torch.Tensor, G: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    The bias gradient recipe: fp32 sums of each 128-row block of the stored gradient, added from zero
+    in block order per group, rounded once to dtype.
+    """
+    M, C = dgu.shape
+    blocks = dgu.float().view(M // BLOCK, BLOCK, C).sum(1)
+    out, start = torch.zeros(G, C, dtype=torch.float32, device=dgu.device), 0
+    for group_idx, end in enumerate((offs // BLOCK).tolist()):
+        for block_idx in range(start, end):
+            out[group_idx] = out[group_idx] + blocks[block_idx]
+        start = end
+    return out.to(dtype)
+
+
+NONFUSABLE = ["n_not_multiple_of_8", "fp32_bias", "int64_offsets", "strided_dh", "fp32_dh"]
+
+
+@pytest.mark.parametrize("case", NONFUSABLE)
+def test_nonfusable_fallback(case: str) -> None:
+    """
+    Inputs the fused SM90 kernels do not cover take the unfused sequence (bias add in the promoted
+    dtype, the clamped_swiglu kernels, fp8_quant_grouped). With padded=True its K-major pair keeps
+    C channels where the fused kernel would pad to padded_channels(C), which shows the fallback ran.
+
+    Expected values come from PyTorch only: the float64 activation and gradient of the promoted input
+    (bias add, clamp masks, dh cast as autograd does), rounded to the stored dtype, then the exact FP8
+    recipe (quantize_grouped_ref) and the bias gradient recipe. The inputs are made stable first
+    (stable_inputs), so the kernels' approximate sigmoid cannot move any stored value, e4m3 byte or
+    scale: the bytes and scales must match exactly, and the bias gradient exactly where it is bf16
+    (to fp32 tolerance for the fp32 bias, whose stored gradient is fp32).
+    """
+    M, G = 384, 3
+    N = 100 if case == "n_not_multiple_of_8" else 200
+    gu, bias, dh, offs = make_inputs(M, N, G, seed=41)
+    case_bias = bias.float() if case == "fp32_bias" else bias
+    case_offs = offs.long() if case == "int64_offsets" else offs
+    gu, dh = stable_inputs(gu, case_bias, dh, offs, torch.Generator().manual_seed(43))
+    probe = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=True)
+    if kmajor_channels_of(probe) is None:
+        pytest.skip("only the K-major layout has an unfused fallback to tell apart")
+    if case != "n_not_multiple_of_8":
+        assert kmajor_channels_of(probe) == padded_channels(N)  # these inputs alone run fused
+    bias, offs = case_bias, case_offs
+    dh_arg = dh
+    if case == "strided_dh":
+        dh_arg = torch.cat([dh, dh[:, :8]], dim=1)[:, :N]
+        assert not dh_arg.is_contiguous()
+    if case == "fp32_dh":
+        dh_arg = dh.float()
+    x = promoted_input(gu, bias, offs)
+    dh_x = dh_arg.to(x.dtype)  # as autograd casts it
+    h_ref, dgu_ref = round_as(ref64_fwd(x), x.dtype), round_as(ref64_bwd(dh_x, x), x.dtype)
+    if case in ("n_not_multiple_of_8", "fp32_bias", "int64_offsets"):
+        ref = quantize_grouped_ref(h_ref, offs)
+        assert_quant_equal(fp8_clamped_swiglu_rowwise(gu, bias, offs, ALPHA, LIMIT), ref[:2], ROW)
+        got = fp8_clamped_swiglu_kmajor(gu, bias, offs, ALPHA, LIMIT, padded=True)
+        assert kmajor_channels_of(got) == N
+        assert_kmajor(got, ref[2:], offs, N, padded=True)
+        # Diagnostic: the plain kernel's activation against the float64 formula.
+        h = clamped_swiglu_fwd(x, ALPHA, LIMIT)
+        if x.dtype == torch.bfloat16:
+            check_fwd_activation(x, h)
+        else:
+            check_fwd_activation_fp32(x, h)
+    got, d_bias = fp8_clamped_swiglu_bwd(dh_arg, gu, bias, offs, ALPHA, LIMIT, padded=True)
+    assert kmajor_channels_of(got[2:]) == 2 * N
+    ref = quantize_grouped_ref(dgu_ref, offs)
+    assert_quant_equal(got[:2], ref[:2], ROW)
+    assert_kmajor(got[2:], ref[2:], offs, 2 * N, padded=True)
+    want_bias = bias_grad_ref(dgu_ref, offs, G, bias.dtype)
+    assert d_bias.dtype == bias.dtype and d_bias.shape == bias.shape
+    if bias.dtype == torch.bfloat16:
+        assert torch.equal(d_bias, want_bias), "bias gradient differs from the recipe"
+    else:
+        scale = dgu_ref.abs().float().view(M // BLOCK, BLOCK, -1).sum(1).max().item()
+        torch.testing.assert_close(d_bias, want_bias, rtol=1e-5, atol=1e-6 * scale)
+    # Diagnostic: the plain kernel's gradient against the float64 formula.
+    dgu = clamped_swiglu_bwd(dh_x.contiguous(), x, ALPHA, LIMIT)
+    if x.dtype == torch.bfloat16:
+        check_bwd_activation(dh_x, x, dgu)
+    else:
+        torch.testing.assert_close(
+            dgu.double(), ref64_bwd(dh_x, x), rtol=1e-5, atol=1e-6 * dgu.abs().max().item()
+        )

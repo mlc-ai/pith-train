@@ -57,6 +57,7 @@ SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90"}
 SM90_CROSS_EDGES = {
     ("fp8_silu_mul_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_clamped_swiglu_quant_sm90", "fp8_rowwise_kmajor_sm90"),
+    ("fp8_clamped_swiglu_quant_sm90", "clamped_swiglu_sm90"),
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
 }
 # What models/ may import from modules/ (from kernels/ only the package, like everyone else).
