@@ -84,6 +84,10 @@ def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight
 
 
 def m_grouped_fp8_gemm_nt(a, b, out, grouped_mm_offs, M, group_indices=None):
+    """
+    SM90 branch of fp8_grouped_gemm: DeepGEMM's m-grouped contiguous FP8 GEMM into out. SM100 never
+    calls it; fp8_grouped_gemm runs fp8_grouped_gemm_sm100 there (the m-grouped forward and dgrad).
+    """
     if group_indices is None:
         group_indices = fp8_group_indices(grouped_mm_offs, M)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, out, group_indices)
