@@ -4,9 +4,10 @@ and the FP8 parameter all-gather kernels.
 
 The blockwise transposes are also called inside torch.compile regions. SM90 runs the Triton kernel
 there (fp8_blockwise_transpose), which torch.compile traces; SM100 runs the TIRx kernel through a
-torch.library custom op with a fake implementation, so a compiled region calls it as an opaque
-op. The all-gather kernels run the CuTe-DSL port on SM90 and the TIRx kernels on SM100. Every scale
-is row-major: the E8M0 2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
+torch.library custom op with a fake implementation, so a compiled region calls it as an opaque op
+(eager calls run it directly, without the op's dispatch). The all-gather kernels run the CuTe-DSL
+port on SM90 and the TIRx kernels on SM100. Every scale is row-major: the E8M0 2^ceil(log2(max(amax,
+1e-4) / 448)) of its 128x128 tile's amax.
 """
 
 from typing import Any, Optional, Sequence
@@ -64,8 +65,12 @@ def fp8_quant_weight(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
         case 9:
             return fp8cast_blockwise_transpose(x)
         case 10:
-            # detached: the custom op has no autograd formula, and the outputs carry no gradient
-            return fp8_quant_weight_op(x.detach())
+            # detached: the custom op has no autograd formula, and the outputs carry no gradient.
+            # Only a torch.compile trace needs the opaque op; eager calls skip its dispatch.
+            if torch.compiler.is_compiling():
+                return fp8_quant_weight_op(x.detach())
+            from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_quant_weight_sm100
+            return fp8_quant_weight_sm100(x.detach())
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
@@ -81,7 +86,10 @@ def fp8_quant_weight_grouped(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
         case 9:
             return fp8cast_blockwise_transpose_grouped(x)
         case 10:
-            return fp8_quant_weight_grouped_op(x.detach())
+            if torch.compiler.is_compiling():
+                return fp8_quant_weight_grouped_op(x.detach())
+            from pithtrain.kernels.fp8_weight_quant_sm100 import fp8_quant_weight_grouped_sm100
+            return fp8_quant_weight_grouped_sm100(x.detach())
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 

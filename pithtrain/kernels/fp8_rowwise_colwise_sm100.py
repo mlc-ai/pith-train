@@ -15,11 +15,23 @@ import math
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["fp8_quant_grouped_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 BLOCK = 128
 THREADS = 256
@@ -73,7 +85,7 @@ def quant_word(word, rcp2):
 
 @functools.cache
 def build(K: int):
-    return make(K).compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}))
+    return entry_function(make(K).compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})))
 
 
 def make(K: int):
@@ -251,7 +263,7 @@ T8 = W8 * 32
 
 @functools.cache
 def build_v8(K: int):
-    return make_v8(K).compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}))
+    return entry_function(make_v8(K).compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})))
 
 
 def make_v8(K: int):
@@ -393,14 +405,13 @@ def fp8_quant_grouped_sm100(input, grouped_mm_offs):
         return x_fp8, x_scale, x_ch_fp8, x_ch_scale
     fn = build_v8(K) if K % 16 == 0 else build(K)
     extra = (PF_DIST,) if K % 16 == 0 else ()
-    with tvm_ffi.use_torch_stream():
-        fn(
-            input.view(-1),
-            x_fp8.view(torch.uint8).view(-1),
-            x_scale.view(-1),
-            x_ch_fp8.view(torch.uint8).view(-1),
-            x_ch_scale.view(-1),
-            M // BLOCK,
-            *extra,
-        )
+    fn(
+        input.view(-1),
+        x_fp8.view(torch.uint8).view(-1),
+        x_scale.view(-1),
+        x_ch_fp8.view(torch.uint8).view(-1),
+        x_ch_scale.view(-1),
+        M // BLOCK,
+        *extra,
+    )
     return x_fp8, x_scale, x_ch_fp8, x_ch_scale

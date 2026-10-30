@@ -15,11 +15,23 @@ tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 import functools
 
 import torch
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["fp8_quant_act_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 BLOCK = 128
 DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
@@ -144,7 +156,7 @@ def generic_kernel(dtype: str):
             with txl.If(rvalid & (col < K)), txl.Then():
                 txl.ptx.st.global_.b8(qt.ptr_to([txl.cast(col, "int64") * M + r]), fp8_byte(v * bb))
 
-    return fp8_quant_act_generic.compile()
+    return entry_function(fp8_quant_act_generic.compile())
 
 
 # ----------------------------------------------------------------------------- fast path
@@ -189,7 +201,7 @@ ONESHOT_CTAS_PER_SM = 3
 
 @functools.cache
 def oneshot_kernel(ctas_per_sm: int, persistent: bool, direct: bool = False):
-    return oneshot_func(ctas_per_sm, persistent, direct).compile()
+    return entry_function(oneshot_func(ctas_per_sm, persistent, direct).compile())
 
 
 class Zero:
@@ -514,17 +526,16 @@ def fp8_quant_act_sm100(x: torch.Tensor):
     span = (M - 1) * sr + (K - 1) * sc + 1
     flat = x.as_strided((span,), (1,))
     outs = (q.view(torch.uint8).view(-1), s_store.view(-1), qt.view(torch.uint8).view(-1), st.view(-1))
-    with tvm_ffi.use_torch_stream():
-        if fast:
-            ntiles = nmb * nkb
-            # one CTA per tile when the grid fits one resident wave, else persistent CTAs
-            grid_n = min(ntiles, ONESHOT_CTAS_PER_SM * num_sms())
-            persistent = grid_n < ntiles
-            # Direct register loads win consistently when every tile fits in one resident wave;
-            # the self-producing TMA path remains faster once CTAs iterate persistently.
-            oneshot_kernel(ONESHOT_CTAS_PER_SM, persistent, not persistent)(flat, *outs, M, K, nmb, nkb, sr, grid_n)
-        else:
-            generic_kernel(DT[x.dtype])(flat, *outs, M, K, nmb, nkb, sr, sc)
+    if fast:
+        ntiles = nmb * nkb
+        # one CTA per tile when the grid fits one resident wave, else persistent CTAs
+        grid_n = min(ntiles, ONESHOT_CTAS_PER_SM * num_sms())
+        persistent = grid_n < ntiles
+        # Direct register loads win consistently when every tile fits in one resident wave;
+        # the self-producing TMA path remains faster once CTAs iterate persistently.
+        oneshot_kernel(ONESHOT_CTAS_PER_SM, persistent, not persistent)(flat, *outs, M, K, nmb, nkb, sr, grid_n)
+    else:
+        generic_kernel(DT[x.dtype])(flat, *outs, M, K, nmb, nkb, sr, sc)
     if not fast:
         s.copy_(s_store)
     return q, s, qt, st

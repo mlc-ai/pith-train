@@ -23,11 +23,23 @@ import functools
 from typing import NamedTuple, Optional
 
 import torch
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["bf16_expert_group_slots_sm100", "bf16_expert_gather_sum_sm100", "bf16_expert_gather_rows_sm100", "bf16_expert_segment_sum_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 FULL = 0xFFFFFFFF
 
@@ -211,7 +223,7 @@ def group_slots_kernel(G: int, has_x: bool):
             else:
                 txl.ptx.st.global_.s32(a_idx.ptr_to([row]), j)
 
-    return group_slots.compile()
+    return entry_function(group_slots.compile())
 
 
 CCS = 16  # (non-portable cluster size, launches on B200) cluster group_slots: the whole call is one cluster of CCS CTAs, CTA r owns slots [r * SP, r * SP + SP)
@@ -392,7 +404,7 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
                     txl.ptx.st.global_.s32(a_idx.ptr_to([row]), j)
         txl.cuda.iket.range_end(tk5[0])
 
-    return group_slots_cluster.compile()
+    return entry_function(group_slots_cluster.compile())
 
 
 def bf16_expert_group_slots_sm100(expert_idxs, expand_idx, num_groups, num_tokens):
@@ -412,16 +424,14 @@ def bf16_expert_group_slots_sm100(expert_idxs, expand_idx, num_groups, num_token
     csp = next((c for c in CSP if S <= CCS * c), None)
     if csp is not None:
         k = group_slots_cluster_kernel(num_groups, has_x, csp)
-        with tvm_ffi.use_torch_stream():
-            k(expert_idxs.view(torch.int32), (expand_idx if has_x else expert_idxs).view(torch.int32), cu, a_idx, row_of,
-              slot_of, mask.view(torch.uint64), table, S, num_tokens if has_x else 0)
+        k(expert_idxs.view(torch.int32), (expand_idx if has_x else expert_idxs).view(torch.int32), cu, a_idx, row_of,
+          slot_of, mask.view(torch.uint64), table, S, num_tokens if has_x else 0)
         if not has_x:
             return GroupSlots(cu, a_idx, row_of, slot_of, None, None)
         return GroupSlots(cu, a_idx, row_of, slot_of, mask, table)
     k = group_slots_kernel(num_groups, has_x)
-    with tvm_ffi.use_torch_stream():
-        k(expert_idxs, expand_idx if has_x else expert_idxs, cu, a_idx, row_of, slot_of, mask.view(torch.uint64),
-          table, S, num_tokens if has_x else 0)
+    k(expert_idxs, expand_idx if has_x else expert_idxs, cu, a_idx, row_of, slot_of, mask.view(torch.uint64),
+      table, S, num_tokens if has_x else 0)
     if not has_x:
         return GroupSlots(cu, a_idx, row_of, slot_of, None, None)
     return GroupSlots(cu, a_idx, row_of, slot_of, mask, table)
@@ -532,7 +542,7 @@ def gather_sum_kernel(G: int, H: int):
             txl.assign(m_n, m_n2)
             txl.assign(t, t + grid)
 
-    return gather_sum.compile()
+    return entry_function(gather_sum.compile())
 
 
 GS_TMA = True
@@ -673,7 +683,7 @@ def gather_sum_tma_kernel(G: int, H: int):
                 produce(sl)
             txl.assign(i, i + 1)
 
-    return gather_sum_tma.compile()
+    return entry_function(gather_sum_tma.compile())
 
 
 GS_PRODUCER_WARP = True  # tma3: a dedicated producer warp and per-slot empty barriers (no CTA barrier per unit)
@@ -884,7 +894,7 @@ def gather_sum_tma3_kernel(G: int, H: int):
                     produce(sl)
             txl.assign(i, i + 1)
 
-    return gather_sum_tma3.compile()
+    return entry_function(gather_sum_tma3.compile())
 
 
 def bf16_expert_gather_sum_sm100(grad, maps, num_groups, max_slots):
@@ -892,8 +902,7 @@ def bf16_expert_gather_sum_sm100(grad, maps, num_groups, max_slots):
     out = torch.empty(T, H, dtype=torch.bfloat16, device=grad.device)
     if T:
         k = (gather_sum_tma3_kernel if GS3 else gather_sum_tma_kernel if GS_TMA else gather_sum_kernel)(num_groups, H)
-        with tvm_ffi.use_torch_stream():
-            k(grad.view(-1).view(torch.uint32), maps.mask.view(torch.uint64), maps.table, out.view(-1).view(torch.uint32), T)
+        k(grad.view(-1).view(torch.uint32), maps.mask.view(torch.uint64), maps.table, out.view(-1).view(torch.uint32), T)
     return out
 
 
@@ -939,7 +948,7 @@ def gather_rows_kernel(N: int):
                 txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", r) * (N // 2) + (f % V) * 4]),
                                           w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3])
 
-    return gather_rows.compile()
+    return entry_function(gather_rows.compile())
 
 
 def bf16_expert_gather_rows_sm100(x, idx):
@@ -947,8 +956,7 @@ def bf16_expert_gather_rows_sm100(x, idx):
     out = torch.empty(R, N, dtype=torch.bfloat16, device=x.device)
     if R:
         k = gather_rows_kernel(N)
-        with tvm_ffi.use_torch_stream():
-            k(x.view(-1).view(torch.uint32), idx, out.view(-1).view(torch.uint32), R)
+        k(x.view(-1).view(torch.uint32), idx, out.view(-1).view(torch.uint32), R)
     return out
 
 
@@ -1092,7 +1100,7 @@ def segment_sum_kernel(N: int, has_idx: bool):
         with txl.If(txl.And(tid < COLS, oc < N)), txl.Then():
             txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + oc]), tot)
 
-    return segment_sum.compile()
+    return entry_function(segment_sum.compile())
 
 
 # two-launch split for these has_idx values: (warps per CTA, bytes per lane per row, rows in flight)
@@ -1259,7 +1267,7 @@ def segment_chunks_kernel(N: int, has_idx: bool):
                 for i in range(VE):
                     txl.ptx.st.global_.f32(part.ptr_to([txl.Cast("int64", c) * N + col + i]), acc[i])
 
-    return segment_chunks.compile()
+    return entry_function(segment_chunks.compile())
 
 
 @functools.cache
@@ -1301,7 +1309,7 @@ def segment_combine_kernel(N: int):
                         txl.assign(tot, tot + pv[q])
             txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + col]), tot)
 
-    return segment_combine.compile()
+    return entry_function(segment_combine.compile())
 
 
 def bf16_expert_segment_sum_sm100(x, cu_host, cu, idx=None):
@@ -1311,13 +1319,11 @@ def bf16_expert_segment_sum_sm100(x, cu_host, cu, idx=None):
     if G and has_idx in SEG2_CFG and cu_host[-1] * N * 2 >= SEG2_MIN_BYTES[has_idx]:
         NC = sum((cu_host[g + 1] - cu_host[g] + 255) // 256 for g in range(G))
         part = torch.empty(max(NC, 1) * N, dtype=torch.float32, device=x.device)
-        with tvm_ffi.use_torch_stream():
-            if NC:
-                segment_chunks_kernel(N, has_idx)(x.view(-1).view(torch.uint32), idx if has_idx else cu, cu, part, G, NC)
-            segment_combine_kernel(N)(cu, part, out.view(-1), G)
+        if NC:
+            segment_chunks_kernel(N, has_idx)(x.view(-1).view(torch.uint32), idx if has_idx else cu, cu, part, G, NC)
+        segment_combine_kernel(N)(cu, part, out.view(-1), G)
         return out
     if G:
         k = segment_sum_kernel(N, idx is not None)
-        with tvm_ffi.use_torch_stream():
-            k(x.view(-1).view(torch.uint32), idx if idx is not None else cu, cu, out.view(-1), G)
+        k(x.view(-1).view(torch.uint32), idx if idx is not None else cu, cu, out.view(-1), G)
     return out

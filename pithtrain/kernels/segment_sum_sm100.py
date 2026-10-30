@@ -19,11 +19,23 @@ import math
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["segment_sum_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 TILE = 128
 DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
@@ -597,7 +609,7 @@ def compiled(which, *key):
         func = func.with_attr("tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_programtic_dependent_launch", "tirx.use_dyn_shared_memory"])
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
-        return tvm.compile(tvm.IRModule({"main": func}), target=target, tir_pipeline="tirx")
+        return entry_function(tvm.compile(tvm.IRModule({"main": func}), target=target, tir_pipeline="tirx"))
 
 
 def segment_sum_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -614,13 +626,12 @@ def segment_sum_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype:
     k_red = compiled("reduce" if M >= LONG_TILES * TILE * G else "reduce_wide", it, ot, H)
     ring = ring_layout(dt, H)
     xf = x.view(-1) if M > 0 else torch.empty(1, dtype=x.dtype, device=x.device)
-    with tvm_ffi.use_torch_stream():
-        if M > 0:
-            if ring is not None:
-                n_units = slots * ring[2]
-                compiled("ring", dt, it, H)(xf, grouped_mm_offs, part.view(-1), M, G, n_units, min(n_units, CPS * sm_count()))
-            else:
-                vec, _ = vec2(dt, H)
-                compiled("sum", dt, it, H)(xf, grouped_mm_offs, part.view(-1), M, G, slots * layout(H, vec)[1])
-        k_red(part.view(-1), grouped_mm_offs, out.view(-1), M, G)
+    if M > 0:
+        if ring is not None:
+            n_units = slots * ring[2]
+            compiled("ring", dt, it, H)(xf, grouped_mm_offs, part.view(-1), M, G, n_units, min(n_units, CPS * sm_count()))
+        else:
+            vec, _ = vec2(dt, H)
+            compiled("sum", dt, it, H)(xf, grouped_mm_offs, part.view(-1), M, G, slots * layout(H, vec)[1])
+    k_red(part.view(-1), grouped_mm_offs, out.view(-1), M, G)
     return out

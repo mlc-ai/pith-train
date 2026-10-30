@@ -9,7 +9,6 @@ import functools
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
@@ -21455,8 +21454,7 @@ def chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta):
         ex = fwd_executable(H, HV, K, V)
         maps = (headed_map(q, H, T), headed_map(k, H, T), headed_map(v, HV, T), headed_map(o, HV, T))
         c_map = ckpt_map(A, max(1, (T - 1) // SEG), HV)
-        with tvm_ffi.use_torch_stream():
-            ex(*list(maps), g.reshape(-1), beta.reshape(-1), g_cum.reshape(-1), float(K ** -0.5), T, c_map, A.reshape(-1))
+        ex(*list(maps), g.reshape(-1), beta.reshape(-1), g_cum.reshape(-1), float(K ** -0.5), T, c_map, A.reshape(-1))
         return o, g_cum, A
     if H == HV:  # the CP prefill handles grouped value heads only; keep the N / M recurrence split here
         ex = None
@@ -21472,12 +21470,11 @@ def chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta):
         gf, bf, af = g.reshape(-1), beta.reshape(-1), A.reshape(-1)
         enter, trans = af[: n_seg * slot], af[n_seg * slot : 2 * n_seg * slot]
         k_map, v_map = maps[1], maps[2]
-        with tvm_ffi.use_torch_stream():
-            nrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, exit0.reshape(-1))
-            mrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, trans)
-            fscan(trans.view(torch.uint32), exit0.view(torch.uint32).reshape(-1), enter.view(torch.uint32), n_seg)
-            fwd(*list(maps), gf, bf, g_cum.reshape(-1), float(K ** -0.5), T, c_map, af, enter, seg_len,
-                2 * n_seg * slot // 8)
+        nrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, exit0.reshape(-1))
+        mrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, trans)
+        fscan(trans.view(torch.uint32), exit0.view(torch.uint32).reshape(-1), enter.view(torch.uint32), n_seg)
+        fwd(*list(maps), gf, bf, g_cum.reshape(-1), float(K ** -0.5), T, c_map, af, enter, seg_len,
+            2 * n_seg * slot // 8)
         return o, g_cum, A
     # FlashInfer CP chain: T precompute, fused M/N, fixup, CP prefill; then A = [X | P | 0], g_cum = g
     tpre, mnpre, fixup, prefill, pack = cp_executables(H, HV, K, V)
@@ -21493,13 +21490,12 @@ def chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta):
     desc = torch.empty((HV * n_seg * 5 * 128,), dtype=torch.int8, device=dev)
     dummy = transfer.reshape(-1)
     qf, kf, vf, gf = q.reshape(-1), k.reshape(-1), v.reshape(-1), g.reshape(-1)
-    with tvm_ffi.use_torch_stream():
-        tpre(kf, beta.reshape(-1), t_ws.reshape(-1), cu, T)
-        mnpre(kf, vf, t_ws.reshape(-1), gf, transfer.reshape(-1), local.reshape(-1), cu, T, seg_len, n_seg)
-        # the last segment's exit state is never read: stop the fixup one segment early
-        fixup(transfer.reshape(-1), local.reshape(-1), dummy, dummy, fixed.reshape(-1), dummy, cu, cu_seqlens2((n_seg - 1) * seg_len, dev), seg_len, n_seg)
-        prefill(qf, kf, vf, gf, t_ws.reshape(-1), fixed.reshape(-1), dummy, o.reshape(-1), cu, float(K ** -0.5), desc, T, seg_len, n_seg)
-        pack(fixed.reshape(-1), transfer.reshape(-1), gf, g_cum.reshape(-1), A.reshape(-1), T, n_seg, write_elems)
+    tpre(kf, beta.reshape(-1), t_ws.reshape(-1), cu, T)
+    mnpre(kf, vf, t_ws.reshape(-1), gf, transfer.reshape(-1), local.reshape(-1), cu, T, seg_len, n_seg)
+    # the last segment's exit state is never read: stop the fixup one segment early
+    fixup(transfer.reshape(-1), local.reshape(-1), dummy, dummy, fixed.reshape(-1), dummy, cu, cu_seqlens2((n_seg - 1) * seg_len, dev), seg_len, n_seg)
+    prefill(qf, kf, vf, gf, t_ws.reshape(-1), fixed.reshape(-1), dummy, o.reshape(-1), cu, float(K ** -0.5), desc, T, seg_len, n_seg)
+    pack(fixed.reshape(-1), transfer.reshape(-1), gf, g_cum.reshape(-1), A.reshape(-1), T, n_seg, write_elems)
     return o, g_cum, A
 
 
@@ -21560,21 +21556,20 @@ def chunk_gdr_bwd_pinned_sm100(q, k, v, g_cum, beta, A, do):
     wy = torch.empty((n_ckpt, HV, 2, 8192), dtype=torch.uint8, device=dev).reshape(-1)
     dsr_args = (maps[0], k_map, maps[3], gf, wy, dstate_r.reshape(-1), float(K ** -0.5), T, seg_len)
     bp_args = list(maps) + [gf, bf, dg.reshape(-1), dbeta.reshape(-1), float(K ** -0.5), T, seg_len]
-    with tvm_ffi.use_torch_stream():
-        if fwd_split:
-            slot = HV * V * K
-            xrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, af, wy)
-            trans_w = af[n_seg * slot : 2 * n_seg * slot].view(torch.uint32)
-            dsr(*dsr_args)
-            scan(trans_w, dstate_r.reshape(-1), dstate_g.reshape(-1), n_seg)
-            fpass(*bp_args, dstate_r.reshape(-1), dstate_g.reshape(-1), wy)
-            return dq, dk, dv, dg, dbeta
-        rec(k_map, v_map, c_map, gf, bf, T, SEG, af, af, wy)
-        if n_seg == 1:
-            rpass(*bp_args, dstate_r.reshape(-1), dstate_g.reshape(-1), wy)
-            return dq, dk, dv, dg, dbeta
-        mrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, trans.reshape(-1))
+    if fwd_split:
+        slot = HV * V * K
+        xrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, af, wy)
+        trans_w = af[n_seg * slot : 2 * n_seg * slot].view(torch.uint32)
         dsr(*dsr_args)
-        scan(trans.view(torch.uint32).reshape(-1), dstate_r.reshape(-1), dstate_g.reshape(-1), n_seg)
+        scan(trans_w, dstate_r.reshape(-1), dstate_g.reshape(-1), n_seg)
         fpass(*bp_args, dstate_r.reshape(-1), dstate_g.reshape(-1), wy)
+        return dq, dk, dv, dg, dbeta
+    rec(k_map, v_map, c_map, gf, bf, T, SEG, af, af, wy)
+    if n_seg == 1:
+        rpass(*bp_args, dstate_r.reshape(-1), dstate_g.reshape(-1), wy)
+        return dq, dk, dv, dg, dbeta
+    mrec(k_map, v_map, c_map, gf, bf, T, seg_len, af, trans.reshape(-1))
+    dsr(*dsr_args)
+    scan(trans.view(torch.uint32).reshape(-1), dstate_r.reshape(-1), dstate_g.reshape(-1), n_seg)
+    fpass(*bp_args, dstate_r.reshape(-1), dstate_g.reshape(-1), wy)
     return dq, dk, dv, dg, dbeta

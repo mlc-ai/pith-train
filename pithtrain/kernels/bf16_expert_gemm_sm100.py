@@ -33,11 +33,23 @@ import inspect
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["bf16_expert_gate_up_fwd_sm100", "bf16_expert_down_fwd_sm100", "bf16_expert_down_dgrad_sm100", "bf16_expert_gate_up_dgrad_sm100", "bf16_expert_gate_up_wgrad_sm100", "bf16_expert_down_wgrad_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 BM = 128  # rows per CTA; a 2-CTA cluster covers BMC = 256
 BMC = 256
@@ -1325,7 +1337,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
         if IKET:
             from tvm.tirx.cuda.iket import IketProfiler
             return IketProfiler().compile(kern.mod, target=target, tir_pipeline="tirx")
-        return tvm.compile(kern.mod, target=target, tir_pipeline="tirx")
+        return entry_function(tvm.compile(kern.mod, target=target, tir_pipeline="tirx"))
 
 
 @functools.cache
@@ -1364,7 +1376,7 @@ def build_gather(H):
     kern = txl.kernel(warps=WPC, arch="sm_100a", grid="num_ctas")(gather_rows)
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
-        return tvm.compile(kern.mod, target=target, tir_pipeline="tirx")
+        return entry_function(tvm.compile(kern.mod, target=target, tir_pipeline="tirx"))
 
 
 def gather(src, idx):
@@ -1374,9 +1386,8 @@ def gather(src, idx):
     M, H = idx.shape[0], src.shape[1]
     out = src.new_empty(M, H)
     ctas = max(1, min(4 * num_sms(), -(-M // 8)))
-    with tvm_ffi.use_torch_stream():
-        build_gather(H)(src.reshape(-1).view(torch.uint32), idx, out.reshape(-1).view(torch.uint32),
-                         M, ctas)
+    build_gather(H)(src.reshape(-1).view(torch.uint32), idx, out.reshape(-1).view(torch.uint32),
+                     M, ctas)
     return out
 
 
@@ -1457,8 +1468,7 @@ def bf16_expert_gate_up_fwd_sm100(x, w_gate, w_up, cu, a_idx, bias=None, act=())
         args.append(u322(bias.contiguous()))
     if clamped:
         args += [float(act[0]), float(act[1])]
-    with tvm_ffi.use_torch_stream():
-        fn(*args)
+    fn(*args)
     return preact, h
 
 
@@ -1474,8 +1484,7 @@ def bf16_expert_down_fwd_sm100(h, w_down, cu, slot_of, bias=None):
             u322(out)]
     if bias is not None:
         args.append(u322(bias.contiguous()))
-    with tvm_ffi.use_torch_stream():
-        fn(*args)
+    fn(*args)
     return out
 
 
@@ -1495,8 +1504,7 @@ def bf16_expert_down_dgrad_sm100(dy, w_down, preact, cu, slot_of, w_gate, w_up, 
             w_down.reshape(-1), u322(preact), u322(dpre), u322(h), int(swapped)]
     if clamped:
         args += [float(act[0]), float(act[1])]
-    with tvm_ffi.use_torch_stream():
-        fn(*args)
+    fn(*args)
     return dpre, h, swapped
 
 
@@ -1515,8 +1523,7 @@ def bf16_expert_gate_up_dgrad_sm100(dpre, w_gate, w_up, cu, dpre_swapped):
     NT = -(-H // BN)
     args = [cu, G, M, grid2(M, G, False, 0, NT), dpre.reshape(-1), flat(lo), diff,
             lo.stride(0), lo.stride(1), u322(dx)]
-    with tvm_ffi.use_torch_stream():
-        fn(*args)
+    fn(*args)
     return dx
 
 
@@ -1534,8 +1541,7 @@ def bf16_expert_gate_up_wgrad_sm100(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a
     flip = int(bool(dpre_swapped)) ^ int(mg_swapped)
     args = [cu, G, M, grid2(M, G, True, MT * NT, NT), dpre.reshape(-1), x.reshape(-1), x.shape[0],
             a_idx, flat(lo)] + ([flat(hi)] if far else []) + [diff, lo.stride(0), lo.stride(1), flip]
-    with tvm_ffi.use_torch_stream():
-        fn(*args)
+    fn(*args)
     return None
 
 
@@ -1550,6 +1556,5 @@ def bf16_expert_down_wgrad_sm100(dy, h, mg_down, cu, slot_of):
     MT, NT = -(-H // BMC), -(-inter // BN)
     args = [cu, G, M, grid2(M, G, True, MT * NT, NT), dy.reshape(-1), dy.shape[0], slot_of,
             h.reshape(-1), mg_down.reshape(-1)]
-    with tvm_ffi.use_torch_stream():
-        fn(*args)
+    fn(*args)
     return None

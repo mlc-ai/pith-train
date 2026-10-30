@@ -17,11 +17,23 @@ import functools
 import math
 
 import torch
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["group_bias_add_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 BLOCK = 64
 UNROLL = 2
@@ -122,7 +134,7 @@ def kernel2(dtype: str, itype: str, H: int, W: int):
                 add_words(dtype, Slice(yw, u * W), Slice(yw, u * W), Slice(bw, u * W), W)
                 txl.ptx[st](y.ptr_to([v * epv]), *[yw[u * W + k] for k in range(W)])
 
-    return group_bias_add.compile()
+    return entry_function(group_bias_add.compile())
 
 
 @functools.cache
@@ -160,7 +172,7 @@ def kernel_h(dtype: str, itype: str, H: int):
             txl.ptx[cvt](o, s)
             txl.ptx["st.global.b16"](y.ptr_to([v]), o)
 
-    return group_bias_add_h.compile()
+    return entry_function(group_bias_add_h.compile())
 
 
 MAX_ELEMS = 1 << 30  # per launch: element offsets (and G * H) stay well inside int32
@@ -184,21 +196,20 @@ def group_bias_add_sm100(y: torch.Tensor, bias: torch.Tensor, group_indices: tor
     row_bytes = H * esize
     yv, bv = y.view(-1), bias.view(-1)
     rows_per = max(1, MAX_ELEMS // H)
-    with tvm_ffi.use_torch_stream():
-        if row_bytes % 4 == 0:
-            align = math.gcd(4 * MAXW, row_bytes, y.data_ptr() % 32 or 32, bias.data_ptr() % 32 or 32)
-            if align >= 4:
-                W = align // 4
-                fn = kernel2(dtype, itype, H, W)
-                vpr = row_bytes // (4 * W)
-                for r0 in range(0, M, rows_per):
-                    r1 = min(M, r0 + rows_per)
-                    nvec = (r1 - r0) * vpr
-                    nb = -(-nvec // (BLOCK * UNROLL))
-                    tail = min(nb, TAIL_BYTES // (BLOCK * UNROLL * W * 4))
-                    fn(yv[r0 * H:r1 * H], bv, group_indices[r0:r1], nvec, tail)
-                return
-        fn = kernel_h(dtype, itype, H)
-        for r0 in range(0, M, rows_per):
-            r1 = min(M, r0 + rows_per)
-            fn(yv[r0 * H:r1 * H], bv, group_indices[r0:r1], (r1 - r0) * H)
+    if row_bytes % 4 == 0:
+        align = math.gcd(4 * MAXW, row_bytes, y.data_ptr() % 32 or 32, bias.data_ptr() % 32 or 32)
+        if align >= 4:
+            W = align // 4
+            fn = kernel2(dtype, itype, H, W)
+            vpr = row_bytes // (4 * W)
+            for r0 in range(0, M, rows_per):
+                r1 = min(M, r0 + rows_per)
+                nvec = (r1 - r0) * vpr
+                nb = -(-nvec // (BLOCK * UNROLL))
+                tail = min(nb, TAIL_BYTES // (BLOCK * UNROLL * W * 4))
+                fn(yv[r0 * H:r1 * H], bv, group_indices[r0:r1], nvec, tail)
+            return
+    fn = kernel_h(dtype, itype, H)
+    for r0 in range(0, M, rows_per):
+        r1 = min(M, r0 + rows_per)
+        fn(yv[r0 * H:r1 * H], bv, group_indices[r0:r1], (r1 - r0) * H)

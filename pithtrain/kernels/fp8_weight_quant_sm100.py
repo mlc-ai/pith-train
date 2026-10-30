@@ -15,7 +15,6 @@ import functools
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
@@ -39,23 +38,21 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
 def compile_v(kern):
     """
-    Compile once; return a launcher of the module's entry function (calling the module itself
-    looks the entry up on every call, ~4 us of host time) that runs it on torch's current stream.
+    Compile once; return the module's entry function itself (calling the module looks the entry up
+    on every call, ~4 us of host time). tvm-ffi runs it on torch's current stream, which it takes
+    from the torch tensor arguments.
     """
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     func = kern.func.with_attr("tirx.kernel_launch_params", PDL_LAUNCH)
     with target:
         mod = tvm.compile(tvm.IRModule({"main": func}), target=target, tir_pipeline="tirx")
-    fn = mod[kern.name]
-
-    def launch(*args):
-        with tvm_ffi.use_torch_stream():
-            fn(*args)
-
-    launch.keep_module = mod  # keep the module alive with its function
-    return launch
+    EXECUTABLES.append(mod)
+    return mod[kern.name]
 
 
 # ---------------------------------------------------------------- traced helpers

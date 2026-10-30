@@ -18,11 +18,24 @@ tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 import functools
 
 import torch
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["fp8_quant_grad_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
+
 BLOCK = 128
 NTHREADS = 256
 
@@ -271,7 +284,7 @@ def build_one():
 
 @functools.cache
 def one_kernel():
-    return build_one().compile()
+    return entry_function(build_one().compile())
 
 
 @functools.cache
@@ -431,7 +444,7 @@ def build_split4(MINB=6):
 
 @functools.cache
 def split4_kernel(MINB=6):
-    return build_split4(MINB).compile()
+    return entry_function(build_split4(MINB).compile())
 
 
 def load_f32(x, dtype, idx):
@@ -543,7 +556,7 @@ def generic_kernel(dtype):
             with txl.If(g == 0), txl.Then():
                 txl.ptx.st.global_.b32(txl.address_of(xts[i642(tm) * i642(N) + i642(C0 + c)]), csb)
 
-    return fp8_quant_grad_generic.compile()
+    return entry_function(fp8_quant_grad_generic.compile())
 
 
 GENERIC_DTYPES = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
@@ -573,25 +586,24 @@ def fp8_quant_grad_sm100(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
         and M % 16 == 0
         and flat.data_ptr() % 16 == 0
     )
-    with tvm_ffi.use_torch_stream():
-        if fast:
-            outs = (out_tok.view(torch.uint8).view(-1), scale_tok.T.view(-1).view(torch.int32), out_t.view(torch.uint8).view(-1), scale_t.T.view(-1).view(torch.int32))
-            sms = num_sms(dev)
-            if 2 * nbn * nbm < 3 * sms:
-                split4_kernel()(flat, *outs, M, N, s0, off)
-            else:
-                one_kernel()(flat, *outs, M, N, s0, off, 3 * sms)
+    if fast:
+        outs = (out_tok.view(torch.uint8).view(-1), scale_tok.T.view(-1).view(torch.int32), out_t.view(torch.uint8).view(-1), scale_t.T.view(-1).view(torch.int32))
+        sms = num_sms(dev)
+        if 2 * nbn * nbm < 3 * sms:
+            split4_kernel()(flat, *outs, M, N, s0, off)
         else:
-            generic_kernel(GENERIC_DTYPES[x.dtype])(
-                flat,
-                out_tok.view(torch.uint8).view(-1),
-                scale_tok.T.view(-1).view(torch.int32),
-                out_t.view(torch.uint8).view(-1),
-                scale_t.T.view(-1).view(torch.int32),
-                M,
-                N,
-                s0,
-                s1,
-                off,
-            )
+            one_kernel()(flat, *outs, M, N, s0, off, 3 * sms)
+    else:
+        generic_kernel(GENERIC_DTYPES[x.dtype])(
+            flat,
+            out_tok.view(torch.uint8).view(-1),
+            scale_tok.T.view(-1).view(torch.int32),
+            out_t.view(torch.uint8).view(-1),
+            scale_t.T.view(-1).view(torch.int32),
+            M,
+            N,
+            s0,
+            s1,
+            off,
+        )
     return out_tok, scale_tok, out_t, scale_t

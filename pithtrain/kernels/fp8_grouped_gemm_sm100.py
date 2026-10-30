@@ -18,7 +18,6 @@ import functools
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 from tvm.backend.cuda.cpp.descriptors import (
@@ -27,6 +26,19 @@ from tvm.backend.cuda.cpp.descriptors import (
 )
 
 __all__ = ["fp8_grouped_gemm_sm100", "k_grouped_fp8_gemm_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 NUM_SMS = 148
 BM = 128
@@ -1343,7 +1355,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False):
 
 def compile_v(kernel):
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
-    return tvm.compile(kernel.mod, target=target, tir_pipeline="tirx")
+    return entry_function(tvm.compile(kernel.mod, target=target, tir_pipeline="tirx"))
 
 
 @functools.cache
@@ -1386,8 +1398,7 @@ def fp8_grouped_gemm_sm100(a, b, n, grouped_mm_offs):
         ex = mgrouped_swap_exec(6)
     else:
         ex = mgrouped_exec(*mcfg(K, n))
-    with tvm_ffi.use_torch_stream():
-        ex(x, sx, w, sw, out, grouped_mm_offs, M, n, K, G)
+    ex(x, sx, w, sw, out, grouped_mm_offs, M, n, K, G)
     return out
 
 
@@ -1413,8 +1424,7 @@ def tile_counter(device):
     ctr = COUNTERS.get(key)
     if ctr is None:
         ctr = torch.empty(2, dtype=torch.int32, device=device)
-        with tvm_ffi.use_torch_stream():
-            zero_exec()(ctr)
+        zero_exec()(ctr)
         COUNTERS[key] = ctr
     return ctr
 
@@ -1437,5 +1447,4 @@ def k_grouped_fp8_gemm_sm100(a, b, d, ks, ks_tensor):
     # d prefetch into L2 by average group size: small groups (short tiles) from the TMA warp, well ahead;
     # medium groups from the epilogue at tile start (about one MMA tile of lead); none for large groups.
     ex = kgrouped_exec(5, 1, True, 256, M < 512 * G, 512 * G <= M < 1024 * G)
-    with tvm_ffi.use_torch_stream():
-        ex(xa, sa, xb, sb, d, ks_tensor, tile_counter(d.device), M, N, K, G)
+    ex(xa, sa, xb, sb, d, ks_tensor, tile_counter(d.device), M, N, K, G)

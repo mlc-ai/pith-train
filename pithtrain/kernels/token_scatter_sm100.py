@@ -31,11 +31,23 @@ import os
 from typing import Optional
 
 import torch
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["scatter_by_expert_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 GEMM_ALLOC_ALIGNMENT = 1024
 WARPS = int(os.environ.get("TS_WARPS", 8))
@@ -140,7 +152,7 @@ def init_kernel():
 
     from tirx_kernels.runner import compile_kernel
 
-    return compile_kernel(token_scatter_state_init.func, arch="sm_100a")
+    return entry_function(compile_kernel(token_scatter_state_init.func, arch="sm_100a"))
 
 
 def get_state(device):
@@ -149,8 +161,7 @@ def get_state(device):
     st = state2.get(key)
     if st is None:
         st = torch.empty((STATE_WORDS,), device=device, dtype=torch.int32)
-        with tvm_ffi.use_torch_stream():
-            init_kernel()(st)
+        init_kernel()(st)
         state2[key] = st
     return st
 
@@ -620,7 +631,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
     )
     from tirx_kernels.runner import compile_kernel
 
-    return compile_kernel(func, arch="sm_100a")
+    return entry_function(compile_kernel(func, arch="sm_100a"))
 
 
 @functools.cache
@@ -689,23 +700,22 @@ def scatter_by_expert_sm100(
     span = (num_tokens - 1) * input_tokens.stride(0) + hidden
     x_bytes = torch.as_strided(input_tokens, (span,), (1,)).view(torch.uint8)
     kern = build(row_bytes, vec, bulk_cfg(row_bytes, vec, src_stride == row_bytes), INSTR)
-    with tvm_ffi.use_torch_stream():
-        kern(
-            x_bytes,
-            expert_idxs,
-            out.view(-1).view(torch.uint8),
-            rev,
-            offs,
-            ks_tensor,
-            state,
-            dbg,
-            num_tokens,
-            num_groups,
-            padding_alignment,
-            src_stride,
-            tpc,
-            num_ctas,
-        )
+    kern(
+        x_bytes,
+        expert_idxs,
+        out.view(-1).view(torch.uint8),
+        rev,
+        offs,
+        ks_tensor,
+        state,
+        dbg,
+        num_tokens,
+        num_groups,
+        padding_alignment,
+        src_stride,
+        tpc,
+        num_ctas,
+    )
     if ks is None:
         ks_host = pinned_buffer(num_groups)
         ks_host.copy_(ks_tensor, non_blocking=True)

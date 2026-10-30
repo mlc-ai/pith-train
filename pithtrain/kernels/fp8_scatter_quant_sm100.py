@@ -23,11 +23,23 @@ import inspect
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["scatter_quant_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 BLOCK = 128
 FULL = 0xFFFFFFFF
@@ -122,7 +134,7 @@ def count_kernel(gb):
                     txl.ptx.st.global_.s32(ks_t.ptr_to([g]), pad(c))
                 txl.assign(acc, acc + pad(c))
 
-    return count.compile()
+    return entry_function(count.compile())
 
 
 @functools.cache
@@ -130,7 +142,7 @@ def fused_kernel(n, gb):
     func = fused_traced(n, gb).func.with_attr(
         "tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_cooperative_launch", "tirx.use_dyn_shared_memory"]
     )
-    return tvm.compile(tvm.IRModule({"main": func}), target=tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}), tir_pipeline="tirx")
+    return entry_function(tvm.compile(tvm.IRModule({"main": func}), target=tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}), tir_pipeline="tirx"))
 
 
 def smem_bytes(n, gb):
@@ -811,8 +823,7 @@ def scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx=None, padd
     if group_counts is None:
         # sizes needed on the host to allocate: one counting kernel + the one allowed device-to-host copy
         counts_dev = torch.empty((g,), dtype=torch.int32, device=dev)
-        with tvm_ffi.use_torch_stream():
-            count_kernel(gb)(experts, counts_dev, offs, ks_t, m, g)
+        count_kernel(gb)(experts, counts_dev, offs, ks_t, m, g)
         group_counts = counts_dev.tolist()
     ks = [(c + BLOCK - 1) // BLOCK * BLOCK for c in group_counts]
     rows = sum(ks)
@@ -835,7 +846,6 @@ def scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx=None, padd
         x_fp8.view(-1).view(torch.int32), x_scale.view(-1), x_ch.view(-1).view(torch.int32), x_ch_scale.view(-1),
         ws, src_of_row, m, g, ntiles, int(expand_idx is None), num_ctas, min(gathered.numel() * 2, PF_CAP) // 16,
     ]
-    with tvm_ffi.use_torch_stream():
-        fused_kernel(n, gb)(*args)
+    fused_kernel(n, gb)(*args)
     return (x_fp8, x_scale, x_ch, x_ch_scale), reverse, offs, ks, ks_t
 

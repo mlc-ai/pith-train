@@ -21,11 +21,23 @@ import struct
 
 import torch
 import tvm
-import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 
 __all__ = ["clamped_swiglu_quant_fwd_sm100", "fp8_clamped_swiglu_rowwise_sm100", "fp8_clamped_swiglu_kmajor_sm100", "fp8_clamped_swiglu_bwd_sm100"]
+
+
+EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
+
+
+def entry_function(ex):
+    """
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
+    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    """
+    EXECUTABLES.append(ex)
+    return ex["main"]
+
 
 BLOCK = 128
 WARPS = 8
@@ -1079,7 +1091,7 @@ def guard(cond, go):
 def compile_kernel(kernel):
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
-        return tvm.compile(kernel.mod, target=target, tir_pipeline="tirx")
+        return entry_function(tvm.compile(kernel.mod, target=target, tir_pipeline="tirx"))
 
 
 SCHED = {}
@@ -1139,15 +1151,14 @@ def run(kind, gate_up, bias, offs, alpha, limit, dh=None):
         x_scale = torch.empty((n_ct, M), dtype=torch.float32, device=dev).t()
         tensors = tensors[:5] + (x_scale.t().reshape(-1),) + tensors[6:]
         tensors = tensors + (sched_counter(dev),)
-    with tvm_ffi.use_torch_stream():
-        if pipe:
-            ker = pipe_kernel(N, bwd, write_row, write_col, bf16_clamp, 2 if bwd else 3)
-            ker(*tensors, float(alpha), float(limit), G, num_tiles, min(num_tiles, (2 if bwd else 1) * num_sms()), M)
-        else:
-            ker = quant_kernel(N, bwd, write_row, write_col, bf16_clamp)
-            ker(*tensors, float(alpha), float(limit), G, num_tiles)
-        if bwd:
-            segsum_kernel(C)(partial.view(-1), offs, d_bias.view(-1), G, G * ((C + 127) // 128))
+    if pipe:
+        ker = pipe_kernel(N, bwd, write_row, write_col, bf16_clamp, 2 if bwd else 3)
+        ker(*tensors, float(alpha), float(limit), G, num_tiles, min(num_tiles, (2 if bwd else 1) * num_sms()), M)
+    else:
+        ker = quant_kernel(N, bwd, write_row, write_col, bf16_clamp)
+        ker(*tensors, float(alpha), float(limit), G, num_tiles)
+    if bwd:
+        segsum_kernel(C)(partial.view(-1), offs, d_bias.view(-1), G, G * ((C + 127) // 128))
     return (x_fp8, x_scale, x_ch, x_ch_scale), d_bias
 
 
