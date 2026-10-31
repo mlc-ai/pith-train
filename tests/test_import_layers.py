@@ -52,7 +52,7 @@ SM90_ONLY = {
     "group_indices_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
-SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90"}
+SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90", "row_slice_sm90"}
 # Cross-feature edges from an _sm90 file into another feature's _smXX file.
 SM90_CROSS_EDGES = {
     ("fp8_silu_mul_quant_sm90", "fp8_rowwise_kmajor_sm90"),

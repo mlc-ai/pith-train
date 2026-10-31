@@ -221,6 +221,7 @@ Code that appears in more than one file lives once, in the shared module for its
 | Inline-PTX `dsl_user_op`s used by two or more files: loads, stores, shuffles, conversions (`ld_v4`, `st_v4`, `prmt`, `max_u32`, ...) | `cute_ptx_sm90.py` |
 | E8M0 scale math and FP8 quantization steps (`e8m0_scale`, `quant4_e4m3`, the 4-way amax) | `fp8_e8m0_scale_sm90.py` |
 | Fake tensors and streams for `cute.compile` (`fake`, `fake_stream`, `TORCH2CUTE`) | `cute_compile_sm90.py` |
+| Row machinery of the cluster row kernels: a CTA's slice of a row, its bulk copy into shared memory, 16-byte unit unpack / pack, head and tail elements (`RowSlice`, `RowAccess`, `unpack_unit`) | `row_slice_sm90.py` |
 | Layout of FP8 scales | `fp8_scale_layout.py` |
 | The Triton E8M0 scale | `fp8_scale.py` |
 

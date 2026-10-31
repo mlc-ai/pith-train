@@ -10,11 +10,11 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint32, const_expr
-from cutlass._mlir import ir
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import asm, bf16_hi, bf16_lo, f32_as_u32, ld_v4, lds_b32, lds_v4, pack_bf16, st_v4, sts_b32, to_ir, u32_as_f32, unpack
+from pithtrain.kernels.cute_ptx_sm90 import asm, barrier_expect_tx, barrier_wait, f32_as_u32, ld_v4, lds_b32, lds_v4, st_v4, sts_b32, to_ir
+from pithtrain.kernels.row_slice_sm90 import RowAccess, RowSlice, lds_f32, pack_unit, sts_f32, unit_extremes, unpack_unit
 
 __all__ = ["cross_entropy_fwd_bwd_sm90"]
 
@@ -32,70 +32,6 @@ def exp_shifted(x: Float32, shift: Float32, use_ftz: bool, *, loc=None, ip=None)
     """
     ex2_op = "ex2.approx.ftz.f32" if use_ftz else "ex2.approx.f32"
     return Float32(asm(T.f32(), [to_ir(x, Float32, loc, ip), to_ir(shift, Float32, loc, ip)], "{\n.reg .f32 t;\nsub.rn.f32 t, $1, $2;\nmul.rn.f32 t, t, 0f3FB8AA3B;\n" + ex2_op + " $0, t;\n}", "=f,f,f"))
-
-
-@dsl_user_op
-def packed_op(op: str, first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
-    return Uint32(asm(T.i32(), [to_ir(first, Uint32, loc, ip), to_ir(second, Uint32, loc, ip)], op + " $0, $1, $2;", "=r,r,r"))
-
-
-@dsl_user_op
-def barrier_expect_tx(barrier: Int32, num_bytes: Int32, *, loc=None, ip=None) -> None:
-    asm(None, [to_ir(barrier, Int32, loc, ip), to_ir(num_bytes, Int32, loc, ip)], "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;", "r,r", side_effects=True)
-
-
-@dsl_user_op
-def barrier_wait(barrier: Int32, parity: Int32, *, loc=None, ip=None) -> None:
-    asm(None, [to_ir(barrier, Int32, loc, ip), to_ir(parity, Int32, loc, ip)], "{\n.reg .pred p;\nWAIT:\nmbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n@!p bra WAIT;\n}", "r,r", side_effects=True)
-
-
-def lds_f32(addr: Int32) -> Float32:
-    return u32_as_f32(lds_b32(addr))
-
-
-def sts_f32(addr: Int32, value: Float32) -> None:
-    sts_b32(addr, f32_as_u32(value), Int32(1))
-
-
-def unpack_unit(words: tuple, dtype) -> list:
-    """
-    The elements of 16 bytes (or of fewer words) as fp32, in address order.
-    """
-    if const_expr(dtype is cutlass.BFloat16):
-        return [half for word in words for half in (bf16_lo(word), bf16_hi(word))]
-    if const_expr(dtype is cutlass.Float16):
-        f32_pair = ir.Type.parse("!llvm.struct<(f32, f32)>")
-        return [half for word in words for half in unpack(asm(f32_pair, [to_ir(word, Uint32)], "{\n.reg .b16 l, h;\nmov.b32 {l, h}, $2;\ncvt.f32.f16 $0, l;\ncvt.f32.f16 $1, h;\n}", "=f,=f,r"), 2, Float32)]
-    return [u32_as_f32(word) for word in words]
-
-
-def unit_extremes(words: tuple, dtype) -> tuple:
-    """
-    (max, min) of a unit; for 16-bit types the packed max / min select an input value exactly before
-    it is widened.
-    """
-    if const_expr(dtype is not cutlass.Float32):
-        suffix = ".bf16x2" if const_expr(dtype is cutlass.BFloat16) else ".f16x2"
-        packed_max = packed_op("max" + suffix, packed_op("max" + suffix, words[0], words[1]), packed_op("max" + suffix, words[2], words[3]))
-        packed_min = packed_op("min" + suffix, packed_op("min" + suffix, words[0], words[1]), packed_op("min" + suffix, words[2], words[3]))
-        (max_lo, max_hi), (min_lo, min_hi) = unpack_unit((packed_max,), dtype), unpack_unit((packed_min,), dtype)
-        return cute.arch.fmax(max_lo, max_hi), cute.arch.fmin(min_lo, min_hi)
-    values = unpack_unit(words, dtype)
-    unit_max, unit_min = values[0], values[0]
-    for value in values[1:]:
-        unit_max, unit_min = cute.arch.fmax(unit_max, value), cute.arch.fmin(unit_min, value)
-    return unit_max, unit_min
-
-
-def pack_unit(values: list, dtype) -> tuple:
-    """
-    Round the fp32 values once to dtype and pack them into four words.
-    """
-    if const_expr(dtype is cutlass.BFloat16):
-        return tuple(pack_bf16(values[2 * i], values[2 * i + 1]) for i in range(4))
-    if const_expr(dtype is cutlass.Float16):
-        return tuple(Uint32(asm(T.i32(), [to_ir(values[2 * i + 1], Float32), to_ir(values[2 * i], Float32)], "cvt.rn.f16x2.f32 $0, $1, $2;", "=r,f,f")) for i in range(4))
-    return tuple(f32_as_u32(value) for value in values)
 
 
 def combine_stats(max_a: Float32, sum_a: Float32, max_b: Float32, sum_b: Float32) -> tuple:
@@ -128,33 +64,6 @@ def block_sum(value, s_partial: Int32, lane: Int32, warp: Int32, num_warps: cutl
     return total
 
 
-class RowSlice:
-    """
-    Where a CTA's part of one row sits. The row splits into a 16-byte aligned interior, cut into
-    slices of slice_units 16-byte units, one per CTA of the cluster, and a head and a tail of fewer
-    than 16 bytes each, which rank 0 handles element by element. target_unit is the CTA-local unit
-    holding x[target], -1 when another CTA or the head / tail holds it.
-    """
-
-    def __init__(self, x_base: Int64, row_idx: Int32, cta_rank: Int32, target_idx: Int64, num_cols: int, element_bytes: int, slice_units: int) -> None:
-        row_bytes = Int64(num_cols * element_bytes)
-        self.row_start = x_base + Int64(row_idx) * row_bytes
-        self.row_end = self.row_start + row_bytes
-        self.interior_start = cutlass.min((self.row_start + Int64(15)) & Int64(-16), self.row_end)
-        self.interior_end = cutlass.max(self.row_end & Int64(-16), self.interior_start)
-        num_units = Int32((self.interior_end - self.interior_start) >> Int64(4))
-        unit_start = cta_rank * slice_units
-        self.cta_units = cutlass.max(cutlass.min(num_units - unit_start, Int32(slice_units)), Int32(0))
-        self.slice_start = self.interior_start + Int64(unit_start) * Int64(16)
-        self.target_addr = self.row_start + target_idx * Int64(element_bytes)
-        is_interior_target = (self.target_addr >= self.interior_start) & (self.target_addr < self.interior_end)
-        target_unit_in_row = Int32((self.target_addr - self.interior_start) >> Int64(4))
-        owner_rank = cutlass.select_(is_interior_target, target_unit_in_row // max(slice_units, 1), Int32(0))
-        self.owns_target = owner_rank == cta_rank
-        self.target_unit = cutlass.select_(is_interior_target & self.owns_target, target_unit_in_row - unit_start, Int32(-1))
-        self.target_element = Int32((self.target_addr - self.interior_start) & Int64(15)) // element_bytes
-
-
 class RowStats:
     """
     The row's max and sum of exp(x - max), the same bits in every CTA of the cluster, and the
@@ -180,6 +89,7 @@ class CrossEntropy:
         self.unit_elements = 16 // self.element_bytes
         self.slice_units = (num_cols * self.element_bytes // 16 + cluster_size - 1) // cluster_size
         self.chunk_units = (self.slice_units + chunks - 1) // chunks
+        self.access = RowAccess(dtype, chunks, self.chunk_units)
 
     @cute.jit
     def __call__(self, mX: cute.Tensor, mTarget: cute.Tensor, mLoss: cute.Tensor, mCount: cute.Tensor, mMeanLoss: cute.Tensor, ignore_index: Int64, stream) -> None:
@@ -196,7 +106,7 @@ class CrossEntropy:
         row_idx, cta_rank = bx // self.cluster_size, bx % self.cluster_size
         lane, warp = tidx % 32, tidx // 32
         s_slice, s_stats, s_warp, s_target, s_barriers = self.allocate_buffers()
-        self.init_barriers(s_barriers, tidx)
+        self.access.init_barriers(s_barriers, tidx, self.chunks + 1, self.cluster_size > 1)
 
         target_idx = Int64(mTarget[row_idx])
         row = RowSlice(mX.iterator.toint(), row_idx, cta_rank, target_idx, self.num_cols, self.element_bytes, self.slice_units)
@@ -204,7 +114,8 @@ class CrossEntropy:
             self.store_zero_row(row, mLoss, row_idx, tidx, cta_rank)
             self.sync_cluster_exit()
         else:
-            self.issue_slice_loads(row, s_slice, s_barriers, tidx)
+            if const_expr(self.is_resident):
+                self.access.issue_slice_loads(row, s_slice, s_barriers, tidx)
             acc_max, acc_sum, acc_min, edge_value = self.reduce_slice(row, s_slice, s_barriers, s_target, tidx, cta_rank)
             cta_max, cta_sum, cta_min = self.reduce_block(acc_max, acc_sum, acc_min, s_warp, lane, warp)
             row_max, row_sum = self.exchange_row_stats(cta_max, cta_sum, s_stats, s_barriers, tidx, lane, warp, cta_rank)
@@ -224,33 +135,6 @@ class CrossEntropy:
         s_target = smem.allocate(16, byte_alignment=16).toint()
         s_barriers = smem.allocate((self.chunks + 1) * 8, byte_alignment=8).toint()
         return s_slice, s_stats, s_warp, s_target, s_barriers
-
-    @cute.jit
-    def init_barriers(self, s_barriers: Int32, tidx: Int32) -> None:
-        """
-        One barrier per chunk of the slice and one for the exchange. Peers signal the exchange
-        barrier only after the cluster wait that follows this arrive.
-        """
-        if tidx == 0:
-            for k in cutlass.range_constexpr(self.chunks + 1):
-                asm(None, [to_ir(s_barriers + k * 8, Int32)], "mbarrier.init.shared::cta.b64 [$0], 1;", "r", side_effects=True)
-            asm(None, [], "fence.mbarrier_init.release.cluster;", "", side_effects=True)
-        cute.arch.sync_threads()
-        if const_expr(self.cluster_size > 1):
-            cute.arch.cluster_arrive_relaxed()
-
-    @cute.jit
-    def issue_slice_loads(self, row: RowSlice, s_slice: Int32, s_barriers: Int32, tidx: Int32) -> None:
-        """
-        One thread starts a bulk copy of each chunk of the slice into shared memory.
-        """
-        if const_expr(self.is_resident):
-            if tidx == 0:
-                for k in cutlass.range_constexpr(self.chunks):
-                    chunk_units = cutlass.max(cutlass.min(row.cta_units - k * self.chunk_units, Int32(self.chunk_units)), Int32(0))
-                    barrier_expect_tx(s_barriers + k * 8, chunk_units * 16)
-                    if chunk_units > 0:
-                        asm(None, [to_ir(s_slice + k * self.chunk_units * 16, Int32), to_ir(row.slice_start + Int64(k * self.chunk_units * 16), Int64), to_ir(chunk_units * 16, Int32), to_ir(s_barriers + k * 8, Int32)], "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r", side_effects=True)
 
     @cute.jit
     def load_unit(self, row: RowSlice, s_slice: Int32, unit_idx: Int32) -> tuple:
@@ -281,8 +165,8 @@ class CrossEntropy:
                     sts_f32(s_target, target_value)
         edge_value = -Float32.inf
         if cta_rank == 0:
-            edge_addr, edge_ok = self.edge_element(row, tidx)
-            edge_value = self.load_element(edge_addr, edge_ok)
+            edge_addr, edge_ok = self.access.edge_element(row, tidx)
+            edge_value = self.access.load_element(edge_addr, edge_ok)
             acc_max, acc_sum = combine_stats(acc_max, acc_sum, edge_value, cutlass.select_(edge_ok, Float32(1.0), Float32(0.0)))
             acc_min = cutlass.select_(edge_ok, cute.arch.fmin(acc_min, edge_value), acc_min)
             if edge_ok & (edge_addr == row.target_addr):
@@ -302,36 +186,6 @@ class CrossEntropy:
         for value in values:
             acc_sum = acc_sum + exp_shifted(value, shift, True)
         return new_max, acc_sum, cute.arch.fmin(acc_min, unit_min)
-
-    @cute.jit
-    def edge_element(self, row: RowSlice, tidx: Int32) -> tuple:
-        """
-        Thread i < unit_elements owns head element i, thread unit_elements + i owns tail element i.
-        """
-        is_head = tidx < self.unit_elements
-        edge_addr = cutlass.select_(is_head, row.row_start + Int64(tidx * self.element_bytes), row.interior_end + Int64((tidx - self.unit_elements) * self.element_bytes))
-        edge_ok = cutlass.select_(is_head, edge_addr < row.interior_start, (tidx < 2 * self.unit_elements) & (edge_addr < row.row_end))
-        return edge_addr, edge_ok
-
-    @cute.jit
-    def load_element(self, addr: Int64, ok) -> Float32:
-        value = -Float32.inf
-        if ok:
-            if const_expr(self.element_bytes == 4):
-                value = Float32(asm(T.f32(), [to_ir(addr, Int64)], "ld.global.f32 $0, [$1];", "=f,l", side_effects=True))
-            else:
-                bits = Uint32(asm(T.i32(), [to_ir(addr, Int64)], "{\n.reg .b16 h;\nld.global.b16 h, [$1];\ncvt.u32.u16 $0, h;\n}", "=r,l", side_effects=True))
-                value = unpack_unit((bits,), self.dtype)[0]
-        return value
-
-    @cute.jit
-    def store_element(self, addr: Int64, value: Float32, ok) -> None:
-        if ok:
-            if const_expr(self.element_bytes == 4):
-                asm(None, [to_ir(addr, Int64), to_ir(value, Float32)], "st.global.f32 [$0], $1;", "l,f", side_effects=True)
-            else:
-                convert = "cvt.rn.bf16.f32" if const_expr(self.dtype is cutlass.BFloat16) else "cvt.rn.f16.f32"
-                asm(None, [to_ir(addr, Int64), to_ir(value, Float32)], "{\n.reg .b16 h;\n" + convert + " h, $1;\nst.global.b16 [$0], h;\n}", "l,f", side_effects=True)
 
     @cute.jit
     def reduce_block(self, acc_max: Float32, acc_sum: Float32, acc_min: Float32, s_warp: Int32, lane: Int32, warp: Int32) -> tuple:
@@ -395,9 +249,9 @@ class CrossEntropy:
         else:
             self.store_slice_grad(row, s_slice, s_target, stats.row_max, rcp_sum, rcp_counted, tidx, False)
         if cta_rank == 0:
-            edge_addr, edge_ok = self.edge_element(row, tidx)
+            edge_addr, edge_ok = self.access.edge_element(row, tidx)
             edge_grad = self.grad_of(edge_value, stats.row_max, rcp_sum, rcp_counted, False)
-            self.store_element(edge_addr, cutlass.select_(edge_addr == row.target_addr, edge_grad - rcp_counted, edge_grad), edge_ok)
+            self.access.store_element(edge_addr, cutlass.select_(edge_addr == row.target_addr, edge_grad - rcp_counted, edge_grad), edge_ok)
 
     @cute.jit
     def store_slice_grad(self, row: RowSlice, s_slice: Int32, s_target: Int32, row_max: Float32, rcp_sum: Float32, rcp_counted: Float32, tidx: Int32, use_ftz: cutlass.Constexpr[bool]) -> None:
@@ -409,7 +263,7 @@ class CrossEntropy:
             grads = [self.grad_of(value, row_max, rcp_sum, rcp_counted, use_ftz) for value in unpack_unit(self.load_unit(row, s_slice, unit_idx), self.dtype)]
             st_v4(row.slice_start + Int64(unit_idx) * Int64(16), pack_unit(grads, self.dtype), Int32(1))
             if unit_idx == row.target_unit:
-                self.store_element(row.target_addr, self.grad_of(lds_f32(s_target), row_max, rcp_sum, rcp_counted, False) - rcp_counted, True)
+                self.access.store_element(row.target_addr, self.grad_of(lds_f32(s_target), row_max, rcp_sum, rcp_counted, False) - rcp_counted, True)
 
     @cute.jit
     def store_row_loss(self, row: RowSlice, s_target: Int32, stats: RowStats, mLoss: cute.Tensor, row_idx: Int32, tidx: Int32) -> None:
@@ -426,8 +280,8 @@ class CrossEntropy:
         for unit_idx in cutlass.range(tidx, row.cta_units, self.threads, unroll=1):
             st_v4(row.slice_start + Int64(unit_idx) * Int64(16), zeros, Int32(1))
         if cta_rank == 0:
-            edge_addr, edge_ok = self.edge_element(row, tidx)
-            self.store_element(edge_addr, Float32(0.0), edge_ok)
+            edge_addr, edge_ok = self.access.edge_element(row, tidx)
+            self.access.store_element(edge_addr, Float32(0.0), edge_ok)
             if tidx == 0:
                 mLoss[row_idx] = Float32(0.0)
 

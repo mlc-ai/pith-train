@@ -15,7 +15,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
+__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "barrier_expect_tx", "barrier_wait", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "packed_op", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
 
 
 def f32_hex(value: float) -> str:
@@ -294,6 +294,21 @@ def max2(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
 @dsl_user_op
 def prmt_args_last(word_lo: Uint32, word_hi: Uint32, selector: int, *, loc=None, ip=None) -> Uint32:
     return Uint32(asm_args_last(T.i32(), f"prmt.b32 $0, $1, $2, {selector:#x};", "=r,r,r", [to_ir(word_lo, Uint32, loc, ip), to_ir(word_hi, Uint32, loc, ip)]))
+
+
+@dsl_user_op
+def packed_op(op: str, first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(asm(T.i32(), [to_ir(first, Uint32, loc, ip), to_ir(second, Uint32, loc, ip)], op + " $0, $1, $2;", "=r,r,r"))
+
+
+@dsl_user_op
+def barrier_expect_tx(barrier: Int32, num_bytes: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [to_ir(barrier, Int32, loc, ip), to_ir(num_bytes, Int32, loc, ip)], "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;", "r,r", side_effects=True)
+
+
+@dsl_user_op
+def barrier_wait(barrier: Int32, parity: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [to_ir(barrier, Int32, loc, ip), to_ir(parity, Int32, loc, ip)], "{\n.reg .pred p;\nWAIT:\nmbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n@!p bra WAIT;\n}", "r,r", side_effects=True)
 
 
 @dsl_user_op
