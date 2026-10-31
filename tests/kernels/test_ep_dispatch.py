@@ -5,15 +5,19 @@ PyTorch. Names: m tokens, k experts per token, ne experts, ep EP ranks, epr expe
 Sender side, where a token routed to several experts of one EP rank is sent to it once:
 
 - tokens_per_ep_rank, dedup_tokens_per_gpu and send_meta carry no order and are compared exactly.
-- idxs, expand_idx and dispatch_token_idxs carry an order. On the inputs the H200 path covers they
-  are compared exactly with a stable reference (argsort(stable=True), nonzero), since the CuTe
-  kernel places tokens in order within each bucket. Other inputs, and every input on SM100, take
-  atomic placement, where they are compared as per-bucket sets plus the invariant
-  dispatch_token_idxs[rank_start + expand_idx] == idxs // k.
+- idxs, expand_idx and dispatch_token_idxs carry an order. On the H200 every input takes the CuTe
+  kernel, which places tokens in order within each bucket, and they are compared exactly with a
+  stable reference (argsort(stable=True), nonzero). SM100 (Triton) places atomically, where they
+  are compared as per-bucket sets plus the invariant dispatch_token_idxs[rank_start + expand_idx]
+  == idxs // k.
 
 Receiver side, ep_dispatch_recv_idx carries no order and is compared exactly. End-to-end tests
 emulate the operator's all-to-alls in one process and check that every received slot resolves to
 its token and expert.
+
+Inputs only the H200 path takes (any integer dtype and stride, more than 1024 bins or 2048
+segments with Triton compiles of minutes, its limits and their ValueErrors) skip elsewhere on
+cute_kernels(). The ValueError tests use zero-stride views, so they allocate nothing.
 
 The routing contract: a token's top-k experts are distinct, as torch.topk returns them.
 """
@@ -76,6 +80,17 @@ def routing(m: int, k: int, ne: int, epr: int, kind: str = "random", seed: int =
         assert int((weights > 0).sum()) >= k
         ids = torch.multinomial(weights.expand(m, ne), k, replacement=False, generator=gen)
     return ids.cuda()
+
+
+def wide_routing(m: int, k: int, ne: int, seed: int) -> torch.Tensor:
+    """
+    (m, k) int64 distinct expert ids without routing's (m, ne) sort, for many experts: token t
+    picks base_t + j * step_t mod ne, with step_t <= ne // k.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    base = torch.randint(0, ne, (m, 1), generator=gen, device="cuda")
+    step = torch.randint(1, ne // k + 1, (m, 1), generator=gen, device="cuda")
+    return (base + torch.arange(k, device="cuda") * step) % ne
 
 
 def check_shapes(outs, m: int, k: int, ep: int, epr: int) -> None:
@@ -203,6 +218,18 @@ def test_dispatch_m_zero() -> None:
         assert all(out.numel() == 0 for out in outs[2:5])
 
 
+def test_dispatch_k_zero() -> None:
+    """
+    k == 0 (no slots) gives zero counts and launches nothing, also for many tokens.
+    """
+    requires_cute()
+    for m in (5, 2**20):
+        topk_ids = torch.empty((m, 0), dtype=torch.int64, device="cuda")
+        outs = run_dispatch(topk_ids, 4, 8)
+        assert int(outs[0].abs().sum()) == int(outs[1].abs().sum()) == int(outs[5].abs().sum()) == 0
+        assert outs[3].numel() == outs[4].numel() == 0
+
+
 def test_dispatch_meta_out() -> None:
     """
     With meta_out, tokens_per_ep_rank and dedup_tokens_per_gpu are its first 2 * ep_size entries,
@@ -265,6 +292,51 @@ def test_dispatch_grid_barrier_stress() -> None:
         check_stable(run_dispatch(topk_ids, ep, epr), refs[id(topk_ids)], topk_ids, ep, epr)
 
 
+def test_dispatch_two_streams() -> None:
+    """
+    Two calls on two streams back to back, no sync between them, 50 times: each stays exact, so
+    concurrent launches share no scratch (histograms, grid-barrier counter).
+    """
+    ep, epr, k = 8, 16, 8
+    first, second = routing(300_000, k, ep * epr, epr, seed=31), routing(200_003, k, ep * epr, epr, kind="ragged", seed=32)  # fmt: skip
+    refs = [stable_reference(topk_ids, ep, epr) for topk_ids in (first, second)]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    for _ in range(50):
+        outs = []
+        for stream, topk_ids in zip(streams, (first, second)):
+            with torch.cuda.stream(stream):
+                outs.append(run_dispatch(topk_ids, ep, epr))
+        torch.cuda.synchronize()
+        for case_outs, ref, topk_ids in zip(outs, refs, (first, second)):
+            check_stable(case_outs, ref, topk_ids, ep, epr)
+
+
+def test_dispatch_side_stream() -> None:
+    """
+    Called under a side stream whose queued work (a sleep, then the write of topk_ids) is still
+    pending: the kernel must run on that stream, after the write, so the outputs are exact after
+    synchronizing that stream only. A first call on the stream warms the key: compiling, loading
+    the module and allocating the stream's scratch synchronize, which would hide the order.
+    """
+    ep, epr, k = 4, 32, 8
+    final, stale = routing(70_000, k, ep * epr, epr, seed=41), routing(70_000, k, ep * epr, epr, seed=42)  # fmt: skip
+    ref = stable_reference(final, ep, epr)
+    topk_ids = stale.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        run_dispatch(stale, ep, epr)
+    side.synchronize()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(200_000_000)
+        topk_ids.copy_(final)
+        outs = run_dispatch(topk_ids, ep, epr)
+    side.synchronize()
+    check_stable(outs, ref, final, ep, epr)
+
+
 def test_dispatch_stability_is_enforced() -> None:
     """
     A placement atomics could produce (two rows of one bucket swapped) passes the per-bucket
@@ -282,23 +354,168 @@ def test_dispatch_stability_is_enforced() -> None:
     assert buckets(swapped, counts) == buckets(ref["idxs"], counts)
 
 
-def test_dispatch_fallback_int32_ids() -> None:
-    for ep, epr, k in ((4, 32, 8), (8, 8, 6), (1, 64, 6)):
-        topk_ids = routing(4133, k, ep * epr, epr, seed=2).int()
-        outs = run_dispatch(topk_ids, ep, epr)
-        check_any_order(outs, stable_reference(topk_ids, ep, epr), topk_ids, ep, epr)
+def requires_cute() -> None:
+    if not cute_kernels():
+        pytest.skip("an input only the H200 (CuTe) path takes")
 
 
-def test_dispatch_fallback_many_bins() -> None:
+# dtypes the Triton path reads too; the unsigned 16/32/64-bit ones only the H200 path
+DTYPES = [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8]
+WIDE_UNSIGNED = [torch.uint16, torch.uint32, torch.uint64]
+
+
+@pytest.mark.parametrize("ep", [1, 2, 4, 8])
+@pytest.mark.parametrize("ne,k", MODELS)
+@pytest.mark.parametrize("dtype", DTYPES[1:] + WIDE_UNSIGNED)
+def test_dispatch_dtypes(dtype: torch.dtype, ne: int, k: int, ep: int) -> None:
     """
-    More than 1024 bins, ep_size * (experts_per_rank + 1), with as few experts as reach that, since
-    the fallback unrolls a loop per expert and compiles slowly for more.
+    topk_ids of every integer dtype whose range holds the expert ids.
     """
-    ep, epr, k = 32, 32, 8
-    for m in (513,):
-        topk_ids = routing(m, k, ep * epr, epr, seed=m)
+    if dtype in WIDE_UNSIGNED:
+        requires_cute()
+    if dtype == torch.int8 and ne > 128:
+        pytest.skip("expert ids beyond int8")
+    epr = ne // ep
+    for m in (1, 511, 513, 4133):
+        topk_ids = routing(m, k, ne, epr, seed=m + ep).to(dtype)
+        check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids.long(), ep, epr), topk_ids, ep, epr)  # fmt: skip
+
+
+def column_major(topk_ids: torch.Tensor) -> torch.Tensor:
+    view = topk_ids.t().contiguous().t()
+    assert (view.stride(0) == 1 or topk_ids.shape[0] == 1) and torch.equal(view, topk_ids)
+    return view
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("kind", ["random", "ragged"])
+@pytest.mark.parametrize("ep,epr,k", [(4, 32, 8), (8, 8, 6), (1, 64, 6), (8, 32, 8), (4, 8, 4)])
+def test_dispatch_column_major(ep: int, epr: int, k: int, kind: str, dtype: torch.dtype) -> None:
+    """
+    A transposed view (inner stride m), which the Triton path reads as row-major (wrong ids).
+    """
+    requires_cute()
+    for m in (1, 511, 4133):
+        topk_ids = routing(m, k, ep * epr, epr, kind, seed=m + k).to(dtype)
+        ref = stable_reference(topk_ids.long(), ep, epr)
+        check_stable(run_dispatch(column_major(topk_ids), ep, epr), ref, topk_ids, ep, epr)
+
+
+def test_dispatch_inner_stride() -> None:
+    """
+    A non-unit inner stride (every other column), also with a wider row stride and int16 ids.
+    """
+    requires_cute()
+    ep, epr, k = 4, 32, 8
+    for dtype in (torch.int64, torch.int16):
+        wide = routing(4133, 2 * k + 1, ep * epr, epr, seed=6).to(dtype)
+        topk_ids = wide[:, ::2][:, :k]
+        assert topk_ids.stride() == (2 * k + 1, 2)
+        check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids.long(), ep, epr), topk_ids, ep, epr)  # fmt: skip
+
+
+def test_dispatch_zero_row_stride() -> None:
+    """
+    k == 1 with every token on one expert, as a zero-stride (expanded) view.
+    """
+    ep, epr = 4, 8
+    for m in (1, 513, 4133):
+        topk_ids = torch.full((1, 1), 13, dtype=torch.int64, device="cuda").expand(m, 1)
+        assert topk_ids.stride() == (0, 1) or m == 1
+        check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids.contiguous(), ep, epr), topk_ids, ep, epr)  # fmt: skip
+
+
+def test_dispatch_stability_is_enforced_strided() -> None:
+    """
+    test_dispatch_stability_is_enforced on int32 and column-major inputs: the outputs equal the
+    stable reference, and a swap within a bucket would not.
+    """
+    requires_cute()
+    ep, epr, k = 4, 8, 4
+    ids = routing(1024, k, ep * epr, epr, seed=11)
+    ref = stable_reference(ids, ep, epr)
+    for topk_ids in (ids.int(), column_major(ids)):
         outs = run_dispatch(topk_ids, ep, epr)
-        check_any_order(outs, stable_reference(topk_ids, ep, epr), topk_ids, ep, epr)
+        assert torch.equal(outs[3], ref["idxs"])
+        swapped = outs[3].clone()
+        swapped[[0, 1]] = swapped[[1, 0]]
+        assert not torch.equal(swapped, ref["idxs"])
+
+
+@pytest.mark.parametrize("epr", [32, 64, 128, 162])
+def test_dispatch_many_bins(epr: int) -> None:
+    """
+    More than 1024 bins, ep_size * (experts_per_rank + 1), at EP 32 up to the largest experts per
+    rank the H200's shared memory holds (162: 5216 bins). The Triton path compiles for minutes past
+    epr 32, so only that one runs elsewhere.
+    """
+    if epr > 32:
+        requires_cute()
+    ep, k = 32, 8
+    for m in (513, 4133) if cute_kernels() else (513,):
+        topk_ids = routing(m, k, ep * epr, epr, seed=m) if epr <= 64 else wide_routing(m, k, ep * epr, seed=m)  # fmt: skip
+        check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids, ep, epr), topk_ids, ep, epr)  # fmt: skip
+
+
+@pytest.mark.parametrize("ep,epr,k", [(1, 5235, 8), (4, 1308, 8), (32, 162, 8)])
+def test_dispatch_bin_limit(ep: int, epr: int, k: int) -> None:
+    """
+    At the limit (5236 bins at ep 1 and 4, 5216 at ep 32), with enough tokens that every SM holds
+    one CTA of the cooperative grid (each ~227 KB of shared memory) and several chunks.
+    """
+    requires_cute()
+    m = 2 * 512 * torch.cuda.get_device_properties(0).multi_processor_count + 77
+    topk_ids = wide_routing(m, k, ep * epr, seed=ep)
+    check_stable(run_dispatch(topk_ids, ep, epr), stable_reference(topk_ids, ep, epr), topk_ids, ep, epr)  # fmt: skip
+
+
+def test_dispatch_rejects() -> None:
+    """
+    The H200 limits raise ValueError before anything is allocated: zero-stride views of 2^30 and
+    2^31 tokens cost no memory, and nothing launches.
+    """
+    requires_cute()
+    ids = torch.zeros(1, 1, dtype=torch.uint8, device="cuda")
+    for topk_ids, ep, epr, match in (
+        (ids.expand(4, 1), 32, 163, "5236"),  # 5248 bins
+        (ids.expand(4, 1), 1, 5236, "5236"),  # 5237 bins
+        (ids.expand(4, 1), 33, 1, "ep_size"),
+        (ids.expand(2**31, 1), 1, 8, "2\\^31"),  # m * k == 2^31
+        (ids.expand(2**30, 1), 1, 8, "2\\^31"),  # m * (k + min(k, ep)) == 2^31
+        (ids.expand(2**28, 4), 4, 8, "2\\^31"),  # m * k == 2^30, m * (k + min(k, ep)) == 2^31
+        (ids.float().expand(4, 1), 1, 8, "integer dtype"),
+        (ids.bool().expand(4, 1), 1, 8, "integer dtype"),
+        (ids.expand(4, 1)[None], 1, 8, "2-D"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            ep_dispatch_send_idx(topk_ids, ep * epr, ep, epr)
+
+
+def test_dispatch_no_triton(monkeypatch) -> None:
+    """
+    The H200 path runs no Triton kernel on any input class, formerly-uncovered ones included.
+    """
+    requires_cute()
+    import triton
+
+    def no_triton(*args, **kwargs):
+        raise AssertionError("a Triton kernel ran on the H200 path")
+
+    monkeypatch.setattr(triton.runtime.jit.JITFunction, "run", no_triton)
+    ep, epr, k = 4, 32, 8
+    ids = routing(4133, k, ep * epr, epr, seed=1)
+    for topk_ids in (ids, ids.int(), column_major(ids), ids.to(torch.uint8)):
+        run_dispatch(topk_ids, ep, epr)
+    run_dispatch(routing(513, 8, 32 * 32, 32, seed=2), 32, 32)
+    meta, received = recv_case(4, 32, 3000, 0)
+    for received_expand_idx in (
+        received,
+        received.int(),
+        torch.stack([received, received], 1)[:, 0],
+    ):
+        ep_dispatch_recv_idx(meta, received_expand_idx, 4, 32)
+    ep_dispatch_recv_idx(*recv_case(32, 128, 3000, 1), 32, 128)
+    ep_dispatch_recv_idx(*recv_case(64, 2, 3000, 2), 64, 2)
 
 
 def expand_reference(meta: torch.Tensor, received_expand_idx: torch.Tensor, ep: int, epr: int):
@@ -332,21 +549,50 @@ def check_expand(meta, received_expand_idx, ep, epr, ref_expand_idx=None) -> Non
     assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
 
 
-# (ep_size, experts_per_rank) up to 2048 segments: a larger count leaves the H200's CuTe kernel
-# for a Triton kernel that unrolls every segment (minutes to compile), which no model reaches.
+# (ep_size, experts_per_rank): up to 2048 segments and 32 senders everywhere; past that only on
+# the H200 (the Triton kernel unrolls every segment and compiles for minutes), up to its
+# shared-memory limit, ceil4(segments) + ceil4(ep_size) <= 57600.
 EXPAND_GEOMETRIES = [
     (ep, epr)
     for ep in (1, 2, 4, 8, 16, 32)
     for epr in (1, 3, 5, 8, 32, 64, 128, 256)
     if ep * epr <= 2048
 ]
+EXPAND_GEOMETRIES_CUTE = [(16, 256), (32, 128), (32, 256), (8, 1000), (32, 1799), (1, 57596), (64, 1), (128, 8), (256, 4), (257, 3), (512, 2), (4096, 1), (28799, 1)]  # fmt: skip
 
 
-@pytest.mark.parametrize("ep,epr", EXPAND_GEOMETRIES)
+@pytest.mark.parametrize("ep,epr", EXPAND_GEOMETRIES + EXPAND_GEOMETRIES_CUTE)
 def test_ep_dispatch_recv_idx(ep: int, epr: int) -> None:
+    if (ep, epr) in EXPAND_GEOMETRIES_CUTE:
+        requires_cute()
     for seed, total in ((0, 3000), (1, 70000), (2, 1), (3, 1023), (4, 1025)):
         meta, received_expand_idx = recv_case(ep, epr, total, seed)
         check_expand(meta, received_expand_idx, ep, epr)
+
+
+def test_ep_dispatch_recv_idx_side_stream() -> None:
+    """
+    As test_dispatch_side_stream for the receiver: recv_meta and received_expand_idx are written on
+    the side stream behind a sleep, and the outputs are exact after synchronizing that stream only
+    (after a warm call, as there).
+    """
+    for ep, epr in ((4, 32), (32, 256)):
+        meta, received_expand_idx = recv_case(ep, epr, 70_000, 5, zero_frac=0.0)
+        stale_meta = meta.flip(0).contiguous()
+        meta_dst, received_dst = stale_meta.clone(), torch.zeros_like(received_expand_idx)
+        ref = expand_reference(meta, received_expand_idx, ep, epr)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            ep_dispatch_recv_idx(meta, received_expand_idx, ep, epr)
+        side.synchronize()
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(200_000_000)
+            meta_dst.copy_(meta)
+            received_dst.copy_(received_expand_idx)
+            got = ep_dispatch_recv_idx(meta_dst, received_dst, ep, epr)
+        side.synchronize()
+        assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
 
 
 def test_ep_dispatch_recv_idx_empty() -> None:
@@ -369,9 +615,9 @@ def test_ep_dispatch_recv_idx_sensitive() -> None:
     assert not torch.equal(got[0], expand_reference(meta, received_expand_idx, 4, 32)[0])
 
 
-def test_ep_dispatch_recv_idx_fallback_strided() -> None:
+def test_ep_dispatch_recv_idx_strided() -> None:
     """
-    A non-contiguous received expand_idx, which the CuTe kernel does not cover.
+    A non-contiguous received expand_idx (every other element), and a zero-stride one (one value).
     """
     for ep, epr, total in ((4, 8, 300), (8, 32, 70000)):
         meta, received_expand_idx = recv_case(ep, epr, total, 0)
@@ -379,6 +625,105 @@ def test_ep_dispatch_recv_idx_fallback_strided() -> None:
         strided.copy_(received_expand_idx)
         assert not strided.is_contiguous()
         check_expand(meta, strided, ep, epr, ref_expand_idx=received_expand_idx)
+        repeated = torch.full((1,), 17, dtype=torch.int64, device="cuda").expand(received_expand_idx.numel())  # fmt: skip
+        check_expand(meta, repeated, ep, epr, ref_expand_idx=repeated.contiguous())
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int16, torch.int8, torch.uint8, torch.uint16, torch.uint32, torch.uint64])  # fmt: skip
+def test_ep_dispatch_recv_idx_dtypes(dtype: torch.dtype) -> None:
+    """
+    received_expand_idx of every integer dtype (values in its range), contiguous and strided: the
+    outputs stay int64.
+    """
+    requires_cute()
+    for ep, epr, total in ((4, 8, 300), (8, 32, 70000), (32, 128, 5000)):
+        meta, received_expand_idx = recv_case(ep, epr, total, 1)
+        narrow = (
+            received_expand_idx % 100 if dtype in (torch.int8, torch.uint8) else received_expand_idx
+        )
+        check_expand(meta, narrow.to(dtype), ep, epr, ref_expand_idx=narrow)
+        strided = torch.stack([narrow, narrow], 1).to(dtype)[:, 1]
+        check_expand(meta, strided, ep, epr, ref_expand_idx=narrow)
+
+
+def test_ep_dispatch_recv_idx_meta_layout() -> None:
+    """
+    A strided recv_meta is read exactly; on the H200 an int32 one too (copied to int64).
+    """
+    meta, received_expand_idx = recv_case(8, 32, 5000, 2)
+    strided = torch.stack([meta, -meta], 1)[:, 0]
+    assert strided.stride() == (2,)
+    check_expand(strided, received_expand_idx, 8, 32, ref_expand_idx=received_expand_idx)
+    if cute_kernels():
+        got = ep_dispatch_recv_idx(meta.int(), received_expand_idx, 8, 32)
+        ref = expand_reference(meta, received_expand_idx, 8, 32)
+        assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+
+
+def test_ep_dispatch_recv_idx_short_large_counts() -> None:
+    """
+    A received_expand_idx shorter than slot counts that add up past 2^31 (or exceed 2^32 alone):
+    the first total slots still get exact indices on the H200, whose scans clamp each count to
+    total. Nothing large is allocated.
+    """
+    requires_cute()
+    for ep, epr in ((1, 2), (4, 8), (32, 128), (64, 2)):
+        gen = torch.Generator(device="cpu").manual_seed(ep)
+        counts = torch.randint(0, 3, (ep, epr), generator=gen)
+        counts.view(-1)[1::5] = 2**31  # past Int32 alone
+        counts.view(-1)[3::7] = 2**32 + 1  # its low word is 1
+        dedup = torch.randint(1, 50, (ep,), generator=gen)
+        meta = torch.cat([counts, dedup[:, None]], 1).reshape(-1).cuda()
+        for total in (1, 2, 3, 1000):
+            received_expand_idx = torch.randint(0, 50, (total,), device="cuda")
+            clamped = torch.cat([counts.clamp_max(total), dedup[:, None]], 1).reshape(-1).cuda()
+            ref_expert, ref_expand = expand_reference(clamped, torch.zeros(int(counts.clamp_max(total).sum()), dtype=torch.int64, device="cuda"), ep, epr)  # fmt: skip
+            got = ep_dispatch_recv_idx(meta, received_expand_idx, ep, epr)
+            assert torch.equal(got[0], ref_expert[:total])
+            assert torch.equal(got[1], ref_expand[:total] + received_expand_idx)
+
+
+@pytest.mark.parametrize("ep,epr,total", [(8, 256, 2**22), (32, 128, 2**21)])
+def test_ep_dispatch_recv_idx_saturating_scan(ep: int, epr: int, total: int) -> None:
+    """
+    Every segment count is huge (2^31, 2^32 + 1), so even clamped to total the starts pass 2^31:
+    total * segments > 2^31 selects the scan saturating at total (unrolled at 2048 segments, tiled
+    at 4096), which keeps them exact, where a plain Int32 scan would wrap them negative, already at
+    the binary search's first probe (the middle segment), and misplace slots. Three slots on sender
+    0's expert 0, then every later slot on its expert 1. At most 32 MiB of received indices.
+    """
+    requires_cute()
+    counts = torch.full((ep, epr), 2**31, dtype=torch.int64)
+    counts[:, 2::3] = 2**32 + 1
+    counts[0, 0] = 3
+    dedup = torch.arange(1, ep + 1) * 100
+    meta = torch.cat([counts, dedup[:, None]], 1).reshape(-1).cuda()
+    received_expand_idx = torch.randint(0, 50, (total,), device="cuda")
+    expert_idxs, expand_idx = ep_dispatch_recv_idx(meta, received_expand_idx, ep, epr)
+    assert expert_idxs.dtype == expand_idx.dtype == torch.int64
+    expected_experts = torch.ones(total, dtype=torch.int64, device="cuda")
+    expected_experts[:3] = 0
+    assert torch.equal(expert_idxs, expected_experts)
+    assert torch.equal(expand_idx, received_expand_idx)  # every slot from sender 0, dedup start 0
+
+
+def test_ep_dispatch_recv_idx_rejects() -> None:
+    """
+    The H200 limits raise ValueError before anything is allocated (zero-stride views).
+    """
+    requires_cute()
+    one = torch.zeros(1, dtype=torch.int64, device="cuda")
+    for ep, epr, received_expand_idx, meta_numel, match in (
+        (1, 1, one.expand(2**31), 2, "2\\^31"),
+        (32, 1800, one.expand(4), 32 * 1801, "57600"),
+        (1, 57597, one.expand(4), 57598, "57600"),
+        (28801, 1, one.expand(4), 2 * 28801, "57600"),
+        (4, 8, one.float().expand(4), 36, "integer"),
+        (4, 8, one.expand(4), 35, "recv_meta"),
+        (4, 8, one.expand(4)[None], 36, "1-D"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            ep_dispatch_recv_idx(one.expand(meta_numel), received_expand_idx, ep, epr)
 
 
 @pytest.mark.parametrize("ne,k", MODELS)
