@@ -28,6 +28,7 @@ from pithtrain.kernels.group_bias_add import group_bias_add
 from pithtrain.kernels.log_prob import log_prob_bwd, log_prob_fwd
 from pithtrain.kernels.segment_sum import segment_sum
 from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
+from pithtrain.kernels.compile_options import stage_compile_options
 from pithtrain.kernels.token_scatter import scatter_by_expert
 from pithtrain.kernels.tuning import tune_kernels
 
@@ -115,3 +116,6 @@ __all__.append("gated_delta_rule_pinned_supported")
 
 # Launch-config tuning
 __all__.append("tune_kernels")
+
+# Inductor options of the models' compiled stages
+__all__.append("stage_compile_options")

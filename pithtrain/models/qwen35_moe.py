@@ -13,7 +13,11 @@ from torch.utils.checkpoint import (
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
+from pithtrain.kernels import (
+    bf16_experts_supported,
+    fp8_fused_experts_supported,
+    stage_compile_options,
+)
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
@@ -448,7 +452,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         self.to_contiguous = sharded and self.is_linear and not linear_at(layer_idx - 1)
         self.to_zigzag = sharded and self.is_linear and not linear_at(layer_idx + 1)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=stage_compile_options() or None)
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -524,7 +528,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
 
     # Not fused with the next layer's forward_stage1 into one compiled region as qwen3_moe does:
     # for this model the fused region changes the forward bits at its layer boundaries.
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options=stage_compile_options() or None)
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,
