@@ -35,6 +35,7 @@ from pithtrain.kernels import (
     fp8_clamped_swiglu_bwd,
     fp8_clamped_swiglu_kmajor,
     fp8_clamped_swiglu_rowwise,
+    fp8_group_indices,
     fp8_quant_grouped,
     k_grouped_fp8_gemm,
 )
@@ -639,3 +640,116 @@ def test_nonfusable_fallback(case: str) -> None:
         torch.testing.assert_close(
             dgu.double(), ref64_bwd(dh_x, x), rtol=1e-5, atol=1e-6 * dgu.abs().max().item()
         )
+
+
+# Bias gradient (block_segment_sum's fold of the 128-row block partials). The fold order is fixed:
+# each group's blocks are added in row order from zero, so check_bias_grad needs no fold term. On
+# the SM90 unfused fallback the partials are the plain PyTorch block sums of the bf16 gradient, so
+# there the gradient is checked bit for bit; fp8_group_indices' documented SM90-only hint (None on
+# SM100) marks that device, independently of the kernel under test.
+SM90 = fp8_group_indices(torch.tensor([BLOCK], dtype=torch.int32, device="cuda"), BLOCK) is not None
+
+
+def block_fold(dgu: torch.Tensor, offs: torch.Tensor, dtype, reverse: bool = False) -> torch.Tensor:
+    """
+    Each group's fp32 block sums of dgu added one at a time from zero, in increasing block order
+    (or decreasing with reverse), rounded once to dtype.
+    """
+    M, C = dgu.shape
+    blocks = dgu.float().view(M // BLOCK, BLOCK, C).sum(1)
+    out, start = [], 0
+    for end in (offs // BLOCK).tolist():
+        acc = torch.zeros(C, device=dgu.device)
+        for block_idx in range(end - 1, start - 1, -1) if reverse else range(start, end):
+            acc = acc + blocks[block_idx]
+        out.append(acc)
+        start = end
+    return torch.stack(out).to(dtype)
+
+
+def inputs_for_blocks(block_counts: list, N: int, seed: int):
+    gen = torch.Generator().manual_seed(seed)
+    M = BLOCK * sum(block_counts)
+    gu = torch.randn(M, 2 * N, generator=gen) * 4
+    bias = torch.randn(len(block_counts), 2 * N, generator=gen)
+    dh = torch.randn(M, N, generator=gen)
+    offs = (torch.tensor(block_counts).cumsum(0) * BLOCK).to(torch.int32).cuda()
+    bf = dict(dtype=torch.bfloat16, device="cuda")
+    return gu.to(**bf), bias.to(**bf), dh.to(**bf), offs
+
+
+def skewed_blocks(G: int, num_blocks: int, seed: int) -> list:
+    gen = torch.Generator().manual_seed(seed)
+    weights = torch.exp(0.3 * torch.randn(G, generator=gen))
+    counts = torch.floor(weights / weights.sum() * num_blocks).long()
+    counts[: num_blocks - int(counts.sum())] += 1
+    return counts.tolist()
+
+
+# (block counts per group, N): gpt-oss contract M / G (balanced and lognormal(0.3) skew; N = 2880 runs
+# fused, N = 100 the unfused fallback), ragged with empty groups, N not a multiple of 128 or 8, and one
+# group of 545 blocks (a 70000-row group padded to 128).
+BIAS_CASES = [
+    ([16] * 8, 2880),
+    (skewed_blocks(4, 259, 1), 2880),
+    (skewed_blocks(16, 138, 2), 2880),
+    ([0, 3, 0, 1, 40, 0, 2], 2880),
+    ([0, 3, 0, 1, 40, 0, 2], 100),
+    ([5, 0, 7], 136),
+    ([1], 2880),
+    ([2, 545, 0, 1], 2880),
+    ([2, 545, 0, 1], 100),
+    (skewed_blocks(64, 300, 3), 100),
+]
+
+
+@pytest.mark.parametrize("block_counts,N", BIAS_CASES)
+def test_bias_grad(block_counts: list, N: int) -> None:
+    gu, bias, dh, offs = inputs_for_blocks(block_counts, N, seed=sum(block_counts) + N)
+    dgu = clamped_swiglu_bwd(dh, biased_ref(gu, bias, offs), ALPHA, LIMIT)
+    _, d_bias = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
+    check_bias_grad(d_bias, dgu, offs, bias)
+    if SM90 and N % 8 != 0:
+        # the fallback's partials are dgu's PyTorch block sums: the fold is exact, and its order shows
+        assert torch.equal(d_bias, block_fold(dgu, offs, bias.dtype))
+
+
+@pytest.mark.parametrize("N", [2880, 100])
+def test_bias_grad_block_order(N: int) -> None:
+    """
+    Group 1's blocks are B0, B1 = -B0 exactly (the same rows with dh negated, scaled by 2^16) and a
+    small B2: the fold in row order from zero gives B2's sum, any other order loses it in the
+    rounding of the large terms. Fused (N = 2880) and fallback (N = 100) paths alike.
+    """
+    gu, bias, dh, offs = inputs_for_blocks([2, 3, 1], N, seed=N + 5)
+    rows = slice(2 * BLOCK, 3 * BLOCK)
+    gu[3 * BLOCK : 4 * BLOCK] = gu[rows]
+    dh[rows] = dh[rows] * 2.0**16
+    dh[3 * BLOCK : 4 * BLOCK] = -dh[rows]
+    dgu = clamped_swiglu_bwd(dh, biased_ref(gu, bias, offs), ALPHA, LIMIT)
+    _, d_bias = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
+    small = dgu[4 * BLOCK : 5 * BLOCK].float()
+    want = small.sum(0)
+    tol = 2.0**-8 * want.abs() + 2.0**-16 * small.abs().sum(0)
+    assert bool(((d_bias[1].float() - want).abs() <= tol).all())
+    big = dgu[rows].float().abs().sum(0)
+    assert bool((big > 2.0**12 * small.abs().sum(0)).any()), "the large blocks must dominate"
+
+
+@pytest.mark.parametrize("N", [2880, 100])
+def test_bias_grad_side_stream(N: int) -> None:
+    """
+    The backward runs on the caller's current stream: inputs written on a side stream behind a sleep
+    give the right bias gradient when the call is made on that stream.
+    """
+    gu_src, bias_src, dh_src, offs = inputs_for_blocks([3, 0, 9, 4], N, seed=N)
+    gu, bias, dh = torch.zeros_like(gu_src), torch.zeros_like(bias_src), torch.zeros_like(dh_src)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(50_000_000)
+        gu.copy_(gu_src), bias.copy_(bias_src), dh.copy_(dh_src)
+        _, d_bias = fp8_clamped_swiglu_bwd(dh, gu, bias, offs, ALPHA, LIMIT)
+    stream.synchronize()
+    dgu = clamped_swiglu_bwd(dh_src, biased_ref(gu_src, bias_src, offs), ALPHA, LIMIT)
+    check_bias_grad(d_bias, dgu, offs, bias_src)
