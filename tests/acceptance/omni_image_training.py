@@ -394,6 +394,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_reference_attention_argument(parser)
     parser.add_argument("--mode", choices=("cpu", "reference", "staged"), required=True)
+    from tests.acceptance.omni_hopper_hardware import add_hardware_argument
+
+    add_hardware_argument(parser)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pp", type=int, default=1)
@@ -410,7 +413,9 @@ def main():
     assert os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", (
         "Explicit GPU authorization required"
     )
-    assert torch.cuda.is_available() and "H100" in torch.cuda.get_device_name(), "Use Flame H100"
+    from tests.acceptance.omni_hopper_hardware import require_hardware
+
+    require_hardware(getattr(args, "hardware_family", "H100"))
     if args.mode == "reference":
         gpu_reference(args)
     else:

@@ -121,3 +121,5 @@ Thinker conversion.
 A completed CPU prepare, a parsed CLI, or the presence of a driver does not
 establish GPU correctness. Retain per-rank JSON, stdout, input hashes, exact
 commit and actual hardware/dependency versions with the final acceptance result.
+
+Explicit H200 execution uses `--hardware-family H200` on each prepare/producer/restore command. The default remains H100; CUDA, the selected family and compute capability9.0 are required. This test admission option changes no model precision, numerical threshold, topology or restore assertion. A parsed flag or CPU unit test is not GPU acceptance evidence.

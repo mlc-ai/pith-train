@@ -235,6 +235,7 @@ def input_identity(root, modalities):
 
 def identity(args, spec):
     return dict(
+        expected_hardware_family=getattr(args, "hardware_family", "H100"),
         protocol="strict_multimodal_save_then_runtime_state_v1",
         commit=subprocess.check_output(
             ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True
@@ -337,7 +338,9 @@ def run_gpu(args, spec):
     assert int(os.environ.get("WORLD_SIZE", "1")) == args.world_size
     assert torch.cuda.is_available(), "Requires CUDA"
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    assert "H100" in torch.cuda.get_device_name(), "Requires H100"
+    from tests.acceptance.omni_hopper_hardware import require_hardware
+
+    require_hardware(getattr(args, "hardware_family", "H100"))
     prepared = json.loads((args.output / "prepare.json").read_text())
     assert {
         key: value
@@ -534,6 +537,9 @@ def parse_args(argv=None):
         "--mode", choices=("prepare", "produce", "restore", "negative"), required=True
     )
     parser.add_argument("--component", choices=("audio", "video", "multimodal"), default="audio")
+    from tests.acceptance.omni_hopper_hardware import add_hardware_argument
+
+    add_hardware_argument(parser)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--restore-root", type=Path)

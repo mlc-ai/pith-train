@@ -348,7 +348,9 @@ def staged(args):
     from pithtrain.tasks import pretrain_lm
     from tests.acceptance.omni_distributed_resume import snapshot
 
-    assert torch.cuda.is_available() and "H100" in torch.cuda.get_device_name()
+    from tests.acceptance.omni_hopper_hardware import require_hardware
+
+    require_hardware(getattr(args, "hardware_family", "H100"))
     assert not args.output.exists(), "Use a fresh evidence directory"
     _, _, batches, config = source_inputs(args.dataset)
     world, rank = int(os.environ["WORLD_SIZE"]), int(os.environ["RANK"])
@@ -508,6 +510,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_reference_attention_argument(parser)
     parser.add_argument("mode", choices=("prepare", "staged"))
+    from tests.acceptance.omni_hopper_hardware import add_hardware_argument
+
+    add_hardware_argument(parser)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pp", type=int, default=1)

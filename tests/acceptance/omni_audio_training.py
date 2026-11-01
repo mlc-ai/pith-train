@@ -108,6 +108,9 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_reference_attention_argument(parser)
     parser.add_argument("--mode", choices=("preflight", "staged"), required=True)
+    from tests.acceptance.omni_hopper_hardware import add_hardware_argument
+
+    add_hardware_argument(parser)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pp", type=int, choices=(1, 2), default=1)
@@ -131,7 +134,9 @@ def main():
     assert os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", "GPU execution is opt-in"
     assert torch.cuda.is_available(), "Requires CUDA"
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    assert "H100" in torch.cuda.get_device_name(), "Requires H100"
+    from tests.acceptance.omni_hopper_hardware import require_hardware
+
+    require_hardware(getattr(args, "hardware_family", "H100"))
     assert int(os.environ["WORLD_SIZE"]) == args.pp * args.dp, "Use the requested CP1 topology"
     from tests.acceptance.omni_image_staged import run
 
