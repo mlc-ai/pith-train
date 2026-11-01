@@ -263,7 +263,9 @@ def native_constructor_namespace(package, case, rank):
         "torch": torch,
         "nn": torch.nn,
         "F": torch.nn.functional,
-        "training": SimpleNamespace(Linear=torch.nn.Linear, fp8=False),
+        "training": SimpleNamespace(
+            Linear=torch.nn.Linear, fp8=False, deterministic_token_layout=False
+        ),
         "BF16Linear": torch.nn.Linear,
         "distributed": SimpleNamespace(
             pp_size=case.pp, pp_rank=rank // (case.world // case.pp), ep_size=case.ep
@@ -321,6 +323,7 @@ def test_original_fixture_shapes_packing_and_ragged_shift(package, case):
         torch=fake_torch,
         ragged=case.ragged,
         packed=case.packed,
+        cp_size=case.cp,
         sequence_length=128,
         num_global_chunks=20,
         micro_batch_size=1 if case.packed else 3,

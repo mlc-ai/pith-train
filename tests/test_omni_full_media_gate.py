@@ -2,6 +2,7 @@
 
 import ast
 import json
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +59,7 @@ def native_full_constructor(modality):
     namespace = native_constructor_namespace(ROOT, BY_NAME["dense-single"], 0)
     namespace["distributed"].cp_size = 1
     namespace.update(
+        partial=partial,
         Qwen3OmniMoeVisionEncoder=Qwen3OmniMoeVisionEncoder,
         Qwen3OmniMoeVideoEncoder=Qwen3OmniMoeVideoEncoder,
         Qwen3OmniMoeAudioEncoder=Qwen3OmniMoeAudioEncoder,
