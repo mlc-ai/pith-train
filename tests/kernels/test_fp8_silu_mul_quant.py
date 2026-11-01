@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from pithtrain.kernels import (
+    fp8_quant_grouped,
     fp8_silu_mul_bwd,
     fp8_silu_mul_fwd,
     fp8_silu_mul_gu_bwd,
@@ -155,6 +156,15 @@ def check_bwd_activation(dh, g, u, dg, du) -> None:
     assert_bf16_close(dg, dh64 * u64 * sig * (1.0 + g64 - silu), front * (1 + g64.abs()), floor)
 
 
+def same_output(got: torch.Tensor, want: torch.Tensor) -> bool:
+    """
+    Equal FP8 bytes, or equal scale values (strides unspecified).
+    """
+    if got.dtype == torch.float32:
+        return torch.equal(got, want)
+    return torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
 def make_offs(sizes: list[int]) -> torch.Tensor:
     return torch.tensor(sizes, device="cuda", dtype=torch.int32).cumsum(0).to(torch.int32)
 
@@ -210,6 +220,8 @@ CASES = [
     ("experts128", 768, "normal"),
     ("over_cap", 768, "normal"),
     ("all_empty_but_one", 512, "negative"),
+    ("over_cap", 100, "outliers"),  # N % 8 != 0 and > 1024 groups
+    ("imbalanced", 1003, "wide"),  # odd N
 ]
 
 
@@ -378,3 +390,25 @@ def test_inf_nan_blocks(N: int) -> None:
     assert_quant_equal(got_g, dg, offs)
     assert_quant_equal(got_u, du, offs)
     assert_quant_equal(fp8_silu_mul_gu_bwd(dh, gu, offs), torch.cat([dg, du], 1), offs)
+
+
+@pytest.mark.parametrize("groups,N", [("imbalanced", 100), ("over_cap", 768), ("imbalanced", 1003), ("imbalanced", 768)])  # fmt: skip
+def test_fused_equals_plain(groups: str, N: int) -> None:
+    """
+    Every entry point gives fp8_quant_grouped's bytes and scales of the plain activation, fused or
+    on its unfused path (N % 8 != 0, more than 1024 groups).
+    """
+    offs, dh, g, u = make_case(groups, N, "outliers", seed=4)
+    gu = torch.cat([g, u], 1).contiguous()
+    dg, du = silu_mul_bwd(dh, g, u)
+    pairs = [
+        (fp8_silu_mul_fwd(g, u, offs), silu_mul_fwd(g, u)),
+        (fp8_silu_mul_gu_fwd(gu, offs), silu_mul_fwd(g, u)),
+    ]
+    pairs += list(zip(fp8_silu_mul_bwd(dh, g, u, offs), (dg, du)))
+    pairs.append((fp8_silu_mul_gu_bwd(dh, gu, offs), torch.cat([dg, du], 1)))
+    for got, x in pairs:
+        want = fp8_quant_grouped(x, offs)
+        for got_part, want_part in zip(got, want):
+            assert got_part.shape == want_part.shape
+            assert same_output(got_part, want_part)

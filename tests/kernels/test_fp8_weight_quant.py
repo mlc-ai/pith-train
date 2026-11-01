@@ -443,7 +443,8 @@ def test_blockwise_transpose_side_stream(compiled: bool) -> None:
         entry3 = torch.compile(
             lambda w: fp8_quant_weight_grouped(w), fullgraph=True, options=options
         )
-        entry2(torch.zeros_like(src2)), entry3(torch.zeros_like(src3))
+    # warm both entries (first-call builds and compiles) so the sleep below outlasts the calls
+    entry2(torch.zeros_like(src2)), entry3(torch.zeros_like(src3))
     side = torch.cuda.Stream()
     torch.cuda.synchronize()
     with torch.cuda.stream(side):

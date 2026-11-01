@@ -77,9 +77,19 @@ def nan_free_abs(x: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isnan(x_abs), torch.zeros_like(x_abs), x_abs)
 
 
-def ref_rowwise(x: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def nan_scale(scale: torch.Tensor, has_nan: torch.Tensor) -> torch.Tensor:
     """
-    1x128 along each row: fp8 (M, K), scale (M, ceil(K / 128)).
+    The scale SM90's fp8_quant_grouped gives a block holding NaN (its amax is an unsigned max of the
+    |x| bit patterns, so the NaN wins): bits 0x80000000, whose exact reciprocal in cast is
+    0xFF000000.
+    """
+    return torch.where(has_nan, torch.tensor(-0.0, device=scale.device), scale)
+
+
+def ref_rowwise(x: torch.Tensor, native: bool = False, nan_wins: bool = False) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+    """
+    1x128 along each row: fp8 (M, K), scale (M, ceil(K / 128)). nan_wins: blocks holding NaN take
+    nan_scale instead of ignoring the NaN.
     """
     M, K = x.shape
     num_kblocks = -(-K // BLOCK)
@@ -87,17 +97,21 @@ def ref_rowwise(x: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, to
     x_padded[:, :K] = x.float()
     x_blocks = x_padded.view(M, num_kblocks, BLOCK)
     scale = e8m0_scale(nan_free_abs(x_blocks).amax(-1), native)
+    if nan_wins:
+        scale = nan_scale(scale, torch.isnan(x_blocks).any(-1))
     q = cast(x_blocks, scale[..., None]).view(M, num_kblocks * BLOCK)[:, :K].contiguous()
     return q, scale
 
 
-def ref_channelwise(x: torch.Tensor, native: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def ref_channelwise(x: torch.Tensor, native: bool = False, nan_wins: bool = False) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
     """
     128x1 along the rows (M a multiple of 128): fp8 (M, K), scale (K, M / 128).
     """
     M, K = x.shape
-    x_blocks = x.float().view(M // BLOCK, BLOCK, K)
+    x_blocks = x.float().reshape(M // BLOCK, BLOCK, K)
     scale = e8m0_scale(nan_free_abs(x_blocks).amax(1), native)
+    if nan_wins:
+        scale = nan_scale(scale, torch.isnan(x_blocks).any(1))
     q = cast(x_blocks, scale[:, None, :]).view(M, K)
     return q, scale.T
 
@@ -169,7 +183,7 @@ def offsets(ks: list[int]) -> torch.Tensor:
     return torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).to(DEV)
 
 
-def make_input(M: int, K: int, kind: str = "randn", seed: int = 0) -> torch.Tensor:
+def make_input(M: int, K: int, kind: str = "randn", seed: int = 0, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:  # fmt: skip
     gen = torch.Generator(device=DEV).manual_seed(seed)
     x = torch.randn(M, K, device=DEV, generator=gen)
     if kind == "scaled":  # per-row and per-column dynamic range over many binades
@@ -190,7 +204,16 @@ def make_input(M: int, K: int, kind: str = "randn", seed: int = 0) -> torch.Tens
         x = -x.abs()
     elif kind == "zeros":
         x = torch.zeros_like(x)
-    return x.to(torch.bfloat16)
+    return x.to(dtype)
+
+
+def same_output(got: torch.Tensor, want: torch.Tensor) -> bool:
+    """
+    Equal FP8 bytes, or equal scale values (strides unspecified).
+    """
+    if got.dtype == torch.float32:
+        return torch.equal(got.view(torch.int32), want.view(torch.int32))
+    return torch.equal(got.view(torch.uint8), want.view(torch.uint8))
 
 
 def assert_fp8_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
@@ -259,21 +282,22 @@ def assert_fp8_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor, n
 
 def assert_scale_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor, name: str) -> None:
     assert got.dtype == torch.float32 and got.shape == ref.shape, (name, got.shape, ref.shape)
-    ok = (got == ref) | (got == alt)
+    bits = got.view(torch.int32)  # bit patterns: -0.0 (a NaN block's scale) is not +0.0
+    ok = (bits == ref.view(torch.int32)) | (bits == alt.view(torch.int32))
     assert bool(ok.all()), f"{name}: {(~ok).sum().item()} scales differ"
 
 
-def check_grouped_input(x: torch.Tensor, ks: list[int]) -> None:
+def check_grouped_input(x: torch.Tensor, ks: list[int], offs: torch.Tensor | None = None, nan_wins: bool = False) -> None:  # fmt: skip
     """
     fp8_quant_grouped against the reference in the output's per-channel layout, the SM100-native
     E8M0 accepted element by element (it differs only in blocks whose amax is infinite).
     """
     M, K = x.shape
-    x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(x, offsets(ks))
-    (row_q, row_scale), (row_q_alt, row_scale_alt) = ref_rowwise(x), ref_rowwise(x, native=True)
+    x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(x, offsets(ks) if offs is None else offs)
+    (row_q, row_scale), (row_q_alt, row_scale_alt) = ref_rowwise(x, nan_wins=nan_wins), ref_rowwise(x, native=True, nan_wins=nan_wins)  # fmt: skip
     assert_fp8_either(x_fp8, row_q, row_q_alt, "x_fp8")
     assert_scale_either(x_scale, row_scale, row_scale_alt, "x_scale")
-    (ch_q, ch_s), (ch_q_alt, ch_s_alt) = ref_channelwise(x), ref_channelwise(x, native=True)
+    (ch_q, ch_s), (ch_q_alt, ch_s_alt) = ref_channelwise(x, nan_wins=nan_wins), ref_channelwise(x, native=True, nan_wins=nan_wins)  # fmt: skip
     if ch_fp8.ndim == 1:  # K-major per group
         assert ch_fp8.shape == (M * K,)
         ch_q, ch_q_alt = to_kmajor(ch_q, ks), to_kmajor(ch_q_alt, ks)
@@ -349,6 +373,279 @@ def test_fp8_quant_grouped_inf_nan(ks: list[int], K: int) -> None:
     x[3, 5], x[130, 7], x[131, K - 1], x[200, 129 % K] = inf, -inf, inf, -inf
     x[9, 1], x[140, 2], x[sum(ks) - 1, K - 2] = nan, nan, nan
     check_grouped_input(x, ks)
+
+
+# SM90's fp8_quant_grouped also takes bf16, fp16 or fp32 input with any strides and base alignment
+# and any N, and int32 or int64 offsets of any stride; SM100's takes bf16 contiguous with int32
+# offsets. These cases run where the per-channel output is K-major (SM90).
+FALLBACK_KS = [256, 0, 384, 128]
+FALLBACK_NS = [2048, 200, 100, 1004, 2047, 1]
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+
+def needs_sm90_inputs() -> None:
+    if not kmajor_layout():
+        pytest.skip(
+            "fp8_quant_grouped takes bf16 contiguous input with int32 offsets on this device"
+        )
+
+
+def make_view(M: int, N: int, view: str, dtype: torch.dtype, kind: str = "randn", seed: int = 0) -> torch.Tensor:  # fmt: skip
+    """
+    The values of make_input(M, N, kind) in a view of the given layout: contiguous, transposed
+    (unit stride along M), rowstrided (row pitch N + 64), colstrided (column stride 2), everyother
+    (every other row of a 2M-row tensor), broadcast (row 0 repeated, row stride 0) or misaligned<k>
+    (contiguous at a base k bytes past 16-byte alignment).
+    """
+    x = make_input(M, N, kind, seed, dtype)
+    if view == "contiguous":
+        return x
+    if view == "transposed":
+        return x.T.contiguous().T
+    if view == "broadcast":
+        return x[:1].expand(M, N)
+    if view == "rowstrided":
+        out = torch.full((M, N + 64), float("nan"), dtype=dtype, device=DEV)[:, :N]
+    elif view == "colstrided":
+        out = torch.full((M, 2 * N), float("nan"), dtype=dtype, device=DEV)[:, ::2]
+    elif view == "everyother":
+        out = torch.full((2 * M, N), float("nan"), dtype=dtype, device=DEV)[::2]
+    else:
+        offset = int(view.removeprefix("misaligned")) // x.element_size()
+        out = torch.full((M * N + 16,), float("nan"), dtype=dtype, device=DEV)[offset : offset + M * N].view(M, N)  # fmt: skip
+        assert out.data_ptr() % 16 != 0
+    out.copy_(x)
+    return out
+
+
+@pytest.mark.parametrize("kind", ["randn", "scaled", "outliers", "large", "negative", "zeros"])
+@pytest.mark.parametrize("dtype", ["fp32", "fp16"])
+@pytest.mark.parametrize("ks,K", [(IMBALANCED, 2048), ([256, 0, 512, 256], 200), ([128, 256], 100), ([128, 128], 2047)])  # fmt: skip
+def test_fp8_quant_grouped_dtypes(ks: list[int], K: int, dtype: str, kind: str) -> None:
+    """
+    fp32 is quantized from its own values (no bf16 rounding) and fp16 from its exact fp32 widening;
+    values past the fp16 range become inf, whose blocks follow the recipe too.
+    """
+    needs_sm90_inputs()
+    check_grouped_input(make_input(sum(ks), K, kind, 3, DTYPES[dtype]), ks)
+
+
+VIEWS = [
+    "transposed",
+    "rowstrided",
+    "colstrided",
+    "everyother",
+    "broadcast",
+    "misaligned2",
+    "misaligned4",
+    "misaligned8",
+]
+
+
+@pytest.mark.parametrize("N", FALLBACK_NS)
+@pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
+@pytest.mark.parametrize("view", VIEWS)
+def test_fp8_quant_grouped_views(view: str, dtype: str, N: int) -> None:
+    needs_sm90_inputs()
+    if view == "misaligned2" and dtype == "fp32":
+        pytest.skip("an fp32 tensor is 4-byte aligned")
+    x = make_view(sum(FALLBACK_KS), N, view, DTYPES[dtype], "scaled", N)
+    check_grouped_input(x, FALLBACK_KS)
+
+
+@pytest.mark.parametrize("N", [2048, 7])
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+@pytest.mark.parametrize(
+    "ks", [[0, 0, 256, 0, 128], [128, 0, 0, 256, 0, 0], [384], [128, 0, 128, 0, 0, 128]]
+)
+@pytest.mark.parametrize("form", ["int32", "int64", "int32_strided", "int64_strided"])
+def test_fp8_quant_grouped_offsets(form: str, ks: list[int], dtype: str, N: int) -> None:
+    """
+    Offsets as int32 or int64, contiguous or every other element of a (G, 2) tensor, with leading,
+    middle and trailing empty groups (repeated offsets).
+    """
+    needs_sm90_inputs()
+    offs = offsets(ks).to(torch.int64 if form.startswith("int64") else torch.int32)
+    if form.endswith("strided"):
+        offs = torch.stack([offs, torch.full_like(offs, -1)], 1)[:, 0]
+        assert offs.stride(0) == 2
+    check_grouped_input(make_input(sum(ks), N, "scaled", 5, DTYPES[dtype]), ks, offs)
+
+
+@pytest.mark.parametrize("G", [1025, 1500])
+@pytest.mark.parametrize("dtype,N", [("fp32", 256), ("bf16", 100), ("fp16", 2048)])
+def test_fp8_quant_grouped_many_groups_inputs(G: int, dtype: str, N: int) -> None:
+    needs_sm90_inputs()
+    gen = torch.Generator().manual_seed(G)
+    ks = (torch.randint(0, 2, (G,), generator=gen) * 128).tolist()
+    ks[-1] = 128
+    check_grouped_input(make_input(sum(ks), N, "scaled", G, DTYPES[dtype]), ks, offsets(ks).long())
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
+@pytest.mark.parametrize("view", ["contiguous", "transposed", "misaligned4"])
+def test_fp8_quant_grouped_nan_blocks(view: str, dtype: str) -> None:
+    """
+    NaN on SM90: a block holding NaN takes nan_scale on every path and dtype (the bf16 contiguous
+    path's behaviour); blocks with inf or only finite values follow the recipe. Covers +NaN and
+    -NaN among finite values, NaN with +inf / -inf, all-NaN, all-zero blocks and a scale boundary,
+    in rowwise and K-major blocks, negative zeros, and checks every layout against the contiguous
+    bf16 bytes; scales are compared as bit patterns.
+    """
+    needs_sm90_inputs()
+    ks, N = [256, 0, 384], 300
+    x = make_input(sum(ks), N, "randn", 9, torch.float32)
+    inf, nan = float("inf"), float("nan")
+    x[3, 5], x[4, 6], x[130, 7], x[131, N - 1] = nan, -nan, inf, -inf
+    x[130, 8], x[200, 129], x[200, 130] = nan, inf, nan
+    x[256:384, 128:256] = nan  # all-NaN blocks both ways
+    x[384:512, 0:128] = 0.0  # all-zero blocks
+    x[512:640, 0:128] = -0.0  # all negative-zero blocks
+    x[520, 130:140], x[5, 140:150] = -0.0, -0.0
+    x[600, :] = 448.0 * 2.0**-3  # amax exactly at a scale boundary
+    x[601, 256:] = -nan
+    x = x.to(DTYPES[dtype])
+    xv = make_view(sum(ks), N, view, DTYPES[dtype]).copy_(x) if view != "contiguous" else x
+    if view == "transposed":
+        xv = x.T.contiguous().T
+    check_grouped_input(xv, ks, nan_wins=True)
+    if dtype == "bf16":
+        got, want = fp8_quant_grouped(xv, offsets(ks)), fp8_quant_grouped(x, offsets(ks))
+        for g, w in zip(got, want):
+            assert same_output(g, w)
+
+
+# e4m3 midpoints at scale 1 and the value each rounds to under round-to-nearest-even (the even
+# mantissa), both signs: [1, 2) has step 1/8, [2, 4) step 1/4, [0.5, 1) step 1/16.
+E4M3_TIES = [
+    (1.0625, 1.0),
+    (1.1875, 1.25),
+    (2.125, 2.0),
+    (2.375, 2.5),
+    (0.53125, 0.5),
+    (0.59375, 0.625),
+]
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
+@pytest.mark.parametrize("view", ["contiguous", "transposed", "misaligned4"])
+def test_fp8_quant_grouped_ties_to_even(view: str, dtype: str) -> None:
+    """
+    Exact e4m3 midpoints in blocks whose scale is forced to 1 (amax 300: 300 / 448 rounds up to
+    2^0), in rowwise and K-major blocks: each rounds to the even neighbour, for both signs.
+    """
+    needs_sm90_inputs()
+    ks, N = [128, 128], 256
+    x = torch.zeros(sum(ks), N)
+    x[:, 0], x[:, 128], x[0, :], x[128, :] = 300.0, 300.0, 300.0, 300.0  # every block's amax is 300
+    mids = torch.tensor([m for m, _ in E4M3_TIES] + [-m for m, _ in E4M3_TIES])
+    want = torch.tensor([r for _, r in E4M3_TIES] + [-r for _, r in E4M3_TIES])
+    x[1:128, 1:128] = mids.repeat(127 * 127 // len(mids) + 1)[: 127 * 127].view(127, 127)
+    x = x.to(DTYPES[dtype]).to(DEV)
+    assert torch.equal(x[1, 1 : 1 + len(mids)].float().cpu(), mids)  # exact in dtype
+    xv = make_view(sum(ks), N, view, DTYPES[dtype]).copy_(x) if view != "contiguous" else x
+    if view == "transposed":
+        xv = x.T.contiguous().T
+    check_grouped_input(xv, ks)
+    x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(xv, offsets(ks))
+    assert bool((x_scale == 1.0).all()) and bool((ch_scale == 1.0).all())
+    got_row = x_fp8[1, 1 : 1 + len(mids)].float().cpu()
+    assert torch.equal(got_row, want), (got_row, want)
+    ch_rows = ch_fp8[: N * ks[0]].view(N, ks[0])  # group 0's K-major block: column c, rows 0..127
+    got_col = ch_rows[1, 1 : 1 + len(mids)].float().cpu()
+    want_col = x[1 : 1 + len(mids), 1].float().cpu()
+    want_col = torch.tensor(
+        [dict((m, r) for m, r in zip(mids.tolist(), want.tolist()))[v] for v in want_col.tolist()]
+    )
+    assert torch.equal(got_col, want_col), (got_col, want_col)
+
+
+def test_fp8_quant_grouped_edges() -> None:
+    """
+    M == 0 or N == 0 returns empty outputs for any G (empty groups included); M > 0 with no groups,
+    or M past the int32 offsets, raises ValueError; an unsupported dtype raises TypeError.
+    """
+    needs_sm90_inputs()
+    for M, N, G, dtype in ((0, 2048, 0, torch.float32), (0, 100, 3, torch.float16), (256, 0, 2, torch.bfloat16), (256, 0, 0, torch.float32)):  # fmt: skip
+        x = torch.empty(M, N, dtype=dtype, device=DEV)
+        x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(
+            x, torch.full((G,), M, dtype=torch.int32, device=DEV)
+        )
+        assert x_fp8.shape == (M, N) and x_fp8.dtype == torch.float8_e4m3fn
+        assert x_scale.shape == (M, blocks(N)) and x_scale.dtype == torch.float32
+        assert ch_fp8.shape == (M * N,) and ch_fp8.dtype == torch.float8_e4m3fn
+        assert ch_scale.shape == (N, M // BLOCK) and ch_scale.dtype == torch.float32
+    for dtype in (torch.bfloat16, torch.float32):
+        with pytest.raises(ValueError):
+            fp8_quant_grouped(
+                torch.zeros(128, 256, dtype=dtype, device=DEV),
+                torch.empty(0, dtype=torch.int32, device=DEV),
+            )
+    huge = torch.zeros(1, 8, dtype=torch.bfloat16, device=DEV).expand(2**31, 8)
+    with pytest.raises(ValueError):
+        fp8_quant_grouped(huge, torch.tensor([2**31], dtype=torch.int64, device=DEV))
+    with pytest.raises(TypeError):
+        fp8_quant_grouped(torch.zeros(128, 256, dtype=torch.float64, device=DEV), offsets([128]))
+
+
+def test_fp8_quant_grouped_side_stream() -> None:
+    """
+    x and int64 strided offsets made on a side stream, quantized there while the default stream is
+    busy: the offset conversion and the kernel run on the current stream.
+    """
+    needs_sm90_inputs()
+    ks, N = [2048, 0, 1024, 1024], 1004
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(int(5e7))
+        x = make_input(sum(ks), N, "scaled", 4, torch.float32)
+        offs = torch.stack([offsets(ks).long(), offsets(ks).long()], 1)[:, 1]
+        out = fp8_quant_grouped(x, offs)
+    side.synchronize()
+    want = fp8_quant_grouped(x, offsets(ks))
+    check_grouped_input(x, ks)
+    for g, w in zip(out, want):
+        assert same_output(g, w)
+
+
+def test_fp8_quant_grouped_no_triton() -> None:
+    """
+    No input class launches a Triton kernel or a scale-layout copy on SM90: inside the profiler
+    every CUDA kernel is a CuTe (Staged)RowwiseKmajor launch, except exactly one copy per call whose
+    offsets are converted to contiguous int32.
+    """
+    needs_sm90_inputs()
+    ks, M = [256, 0, 128], 384
+    gen = torch.Generator().manual_seed(1025)
+    many_ks = (torch.randint(0, 2, (1025,), generator=gen) * 128).tolist()
+    many_ks[-1] = 128
+    calls = [(make_view(M, 256, view, DTYPES[dtype]), offsets(ks)) for view in ("transposed", "rowstrided", "colstrided", "misaligned4") for dtype in ("bf16", "fp32")]  # fmt: skip
+    calls += [
+        (make_input(M, 100), offsets(ks)),
+        (make_input(M, 2047, dtype=torch.float16), offsets(ks)),
+    ]
+    calls += [(make_input(M, 256, dtype=torch.float32), offsets(ks))]
+    converted = [
+        (make_input(M, 256), offsets(ks).long()),
+        (make_input(M, 256), torch.stack([offsets(ks)] * 2, 1)[:, 0]),
+    ]
+    converted += [
+        (make_input(sum(many_ks), 100, dtype=torch.float32), offsets(many_ks).long())
+    ]  # G > 1024
+    for x, offs in calls + converted:  # compile outside the profiled region
+        fp8_quant_grouped(x, offs)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for x, offs in calls + converted:
+            fp8_quant_grouped(x, offs)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    cute = [n for n in names if "RowwiseKmajor" in n]
+    others = [n for n in names if "RowwiseKmajor" not in n]
+    assert len(cute) == len(calls) + len(converted), names
+    assert not [n for n in names if "fp8cast_rowwise_colwise" in n or "triton" in n.lower()], names
+    assert len(others) == len(converted) and all("copy" in n.lower() for n in others), others
 
 
 def ref_group_indices(offs: torch.Tensor, M: int) -> torch.Tensor:

@@ -10,7 +10,10 @@ def fp8cast_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
     Rowwise and K-major colwise FP8 quantization of x from one read.
 
     x is bf16 or fp32 (M, N) with M % 128 == 0. grouped_mm_offs is int32 (num_groups,), the
-    cumulative group ends (no leading zero, last entry M), each a multiple of 128.
+    cumulative group ends (no leading zero, last entry M), each a multiple of 128. SM90 also takes
+    fp16, any strides and base alignment of x, and int64 or non-contiguous offsets; there M == 0 or
+    N == 0 gives empty outputs for any num_groups, and otherwise num_groups == 0 or M > 2^31 - 1
+    raises ValueError. Inputs are not modified.
 
     Returns (tok_fp8, tok_scale, kmajor_fp8, kmajor_scale):
     - tok_fp8 float8_e4m3fn (M, N) and tok_scale float32 (M, ceil(N / 128)): 1x128
@@ -19,9 +22,11 @@ def fp8cast_rowwise_kmajor(x: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tu
       each column within a group; group g, with K_g rows, is stored as its (N, K_g) row-major block
       starting at grouped_mm_offs[g - 1] * N (0 for g = 0).
 
-    FP8 bytes and scale values are the same on both architectures, the scale strides are not: SM90
-    returns both scales MN-major (see fp8_scale_layout), the layout DeepGEMM's SM90 GEMMs read
-    without a transpose; SM100 returns them row-major.
+    On SM90 a block holding NaN gets the scale bits 0x80000000 (its amax compares |x| bit patterns,
+    where NaN is largest), and a block whose amax is infinite gets scale inf where SM100 saturates
+    it to 2^127. Otherwise FP8 bytes and scale values are the same on both architectures, the scale
+    strides are not: SM90 returns both scales MN-major (see fp8_scale_layout), the layout
+    DeepGEMM's SM90 GEMMs read without a transpose; SM100 returns them row-major.
     """
     match ARCH_MAJOR:
         case 9:

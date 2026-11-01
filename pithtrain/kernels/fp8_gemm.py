@@ -268,7 +268,8 @@ def fp8_quant_grouped(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tup
     FP8 operands of a grouped-GEMM input from one read: (x_fp8, x_scale, x_ch_fp8, x_ch_scale).
 
     - input: bf16 (M, K) contiguous, rows grouped by expert, each group padded to a multiple of 128
-      rows; grouped_mm_offs: int32 cumulative group ends (last = M).
+      rows; grouped_mm_offs: int32 cumulative group ends (last = M). SM90 also takes fp16 or fp32
+      input with any strides and base alignment, and int64 or non-contiguous offsets.
     - x_fp8 e4m3 (M, K), x_scale fp32 (M, ceil(K / 128)): rowwise 1x128, the a
       operand of fp8_grouped_gemm.
     - x_ch_fp8, x_ch_scale: per-channel (128 rows x 1 within each group), the operand of
@@ -276,7 +277,10 @@ def fp8_quant_grouped(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tup
       offs[g-1] * K), scale (K, M / 128). SM100: (M, K), scale (M / 128, K).
 
     Per 128-element block, scale = the power of two at or above max(amax, 1e-4) / 448 (at least
-    2^-126) and fp8 = e4m3_satfinite(x / scale).
+    2^-126) and fp8 = e4m3_satfinite(x / scale), for blocks without NaN and with a finite amax. An
+    infinite amax gives scale inf on SM90 and 2^127 on SM100. On SM90 a block holding NaN gets the
+    scale bits 0x80000000 and fp8 = e4m3_satfinite(x * r) with r the bits 0xFF000000 (its amax
+    compares |x| bit patterns, where NaN is largest).
     """
     match ARCH_MAJOR:
         case 9:
