@@ -1,8 +1,8 @@
 """
 Picker of the pinned dense chunked gated delta rule (chunk size 64, no initial or final state) at
-Qwen3.5's geometry: on SM90 a CuTe-DSL forward and FLA's backward kernels launched with the configs
-FLA's autotuner picks on H200, TIRx kernels on SM100. The callers' custom ops keep both opaque to
-torch.compile.
+Qwen3.5's geometry: on SM90 CuTe-DSL kernels in both directions when T is a multiple of 64, and
+FLA's kernels launched with the configs FLA's autotuner picks on H200 otherwise; TIRx kernels on
+SM100. The callers' custom ops keep both opaque to torch.compile.
 """
 
 import torch
@@ -12,12 +12,28 @@ from pithtrain.kernels.arch import ARCH_MAJOR
 __all__ = ["chunk_gdr_bwd_pinned", "chunk_gdr_fwd_pinned", "gated_delta_rule_pinned_supported"]
 
 
+def consistent_geometry(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
+    """
+    Whether the five tensors are what the kernels index without checking: ranks 4 / 4 / 4 / 3 / 3,
+    all contiguous on one CUDA device, v, g and beta sharing q / k's batch and length with g and
+    beta (B, T, HV), and T > 0. Never raises on a malformed call.
+    """
+    tensors = (q, k, v, g, beta)
+    if tuple(t.dim() for t in tensors) != (4, 4, 4, 3, 3):
+        return False
+    B, T = k.shape[:2]
+    HV = v.shape[2]
+    return T > 0 and tuple(v.shape[:2]) == (B, T) and tuple(g.shape) == (B, T, HV) and tuple(beta.shape) == (B, T, HV) and len({t.device for t in tensors}) == 1 and k.device.type == "cuda" and all(t.is_contiguous() for t in tensors)
+
+
 def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether a call has the geometry the kernels take: B == 1, HV == 32, HV a multiple of H, K == V
-    == 128, bf16 q / k / v / beta and an fp32 gate. On SM90 FLA's autotune keys hold B (cumsum), H,
-    HV, K and V, and the backward's single K block needs K <= 128.
+    == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry. On SM90 FLA's autotune
+    keys hold B (cumsum), H, HV, K and V, and the backward's single K block needs K <= 128.
     """
+    if not consistent_geometry(q, k, v, g, beta):
+        return False
     B, _, H, K = k.shape
     HV, V = v.shape[2:]
     return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
@@ -28,13 +44,13 @@ def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the geometry of
     pinned_shapes, on SM100, or on SM90 with the recorded FLA and Triton versions. Otherwise the
     caller uses FLA's autotuned entry points. Constant per geometry: torch.compile guards on the
-    shape and dtype checks and treats the version check as a constant.
+    shape, device and dtype checks and treats the version check as a constant.
     """
     if not pinned_shapes(q, k, v, g, beta):
         return False
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.gated_delta_rule_pinned_sm90 import pinned_launch_supported
+            from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import pinned_launch_supported
             return pinned_launch_supported()
         case 10:
             return True
@@ -52,15 +68,16 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     j // (HV / H). Inputs are not modified.
 
     o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV) and A: bf16 (B, T, HV, 64) are what the backward
-    reads, inputs of chunk_gdr_bwd_pinned only: their shapes and dtypes are fixed, their contents the
-    implementation's (on SM90 FLA's chunk-local cumulative gate and solved WY matrix). On SM90 equal
-    to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads up to bf16
-    rounding (bit-identical when T is not a multiple of 64). Deterministic. Only where
+    reads, inputs of chunk_gdr_bwd_pinned only: their shapes and dtypes are fixed, their contents
+    the implementation's (on SM90 FLA's chunk-local cumulative gate and solved WY matrix). On SM90
+    equal to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads up to
+    bf16 rounding (when T is not a multiple of 64, FLA's kernels on the configs its autotuner picks
+    on H200, bit-identical to it while it picks those). Deterministic. Only where
     gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.gated_delta_rule_pinned_sm90 import chunk_gdr_fwd_pinned_sm90
+            from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import chunk_gdr_fwd_pinned_sm90
             return chunk_gdr_fwd_pinned_sm90(q, k, v, g, beta)
         case 10:
             from pithtrain.kernels.gated_delta_rule_pinned_sm100 import chunk_gdr_fwd_pinned_sm100
@@ -78,13 +95,17 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
 
     dq, dk: (B, T, HV, K) in q's / k's dtype, per value head (the caller sums each group of HV / H
     heads, in repeat_interleave order, for the key-head gradients). dv like v; dg: fp32 (B, T, HV),
-    with respect to the raw gate g; dbeta like beta. On SM90 bit-identical to FLA 0.5.2's
-    chunk_gated_delta_rule_bwd on repeat-interleaved q / k. Deterministic. Only where
-    gated_delta_rule_pinned_supported is True.
+    with respect to the raw gate g; dbeta like beta. On SM90, with T a multiple of 64, CuTe kernels
+    on FLA 0.5.2's chunk algorithm and rounding points. Against the fp32 recurrence, measured
+    against FLA's chunk_gdr_bwd on repeat-interleaved q / k: calc_diff within 1.001x of FLA's and
+    the largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 / 8192, 3
+    seeds), and within the verifier's 1.10x bounds in its cases. Otherwise FLA's kernels on the
+    configs its autotuner picks on H200, bit-identical to it while it picks those. Deterministic.
+    Only where gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
         case 9:
-            from pithtrain.kernels.gated_delta_rule_pinned_sm90 import chunk_gdr_bwd_pinned_sm90
+            from pithtrain.kernels.gated_delta_rule_pinned_bwd_sm90 import chunk_gdr_bwd_pinned_sm90
             return chunk_gdr_bwd_pinned_sm90(q, k, v, g_cum, beta, A, do)
         case 10:
             from pithtrain.kernels.gated_delta_rule_pinned_sm100 import chunk_gdr_bwd_pinned_sm100

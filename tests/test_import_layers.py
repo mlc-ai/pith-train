@@ -26,7 +26,8 @@ library's interface, over pithtrain/, tests/, benchmarks/, tools/ and examples/:
   import pipeline/ for layer_partition and model_forward, a package-level 2-cycle that is acyclic
   per module because pipeline/ imports only models/interface.py);
 - _sm90 / _sm100 files exist only in kernels/, and every _sm90 file has its _sm100 sibling unless
-  it is SM90-only or a shared SM90 helper;
+  it is SM90-only or a shared SM90 helper (the halves <feature>_fwd_sm90 / <feature>_bwd_sm90 of a
+  rule-8 split pair with <feature>_sm100 and may import each other);
 - no _sm100 file imports an _sm90 file or a picker, an _sm90 file imports another feature's _smXX
   file only along the named cross-feature edges, and no picker imports another picker;
 - get_device_capability appears in pithtrain/ only in kernels/arch.py;
@@ -291,11 +292,28 @@ def is_smxx(mod: str) -> bool:
     return stem_of(mod).endswith(("_sm90", "_sm100"))
 
 
+SPLIT_HALVES = ("_fwd_sm90", "_bwd_sm90")
+"""
+Rule 8: a feature's SM90 code may be split into <feature>_fwd_sm90 / <feature>_bwd_sm90, the two halves
+of its one SM90 implementation.
+"""
+
+
+def sm90_feature(stem: str) -> str:
+    """
+    The feature an _sm90 stem implements: <feature>_sm90, <feature>_fwd_sm90 and <feature>_bwd_sm90
+    all implement <feature>.
+    """
+    for suffix in (*SPLIT_HALVES, "_sm90"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
 def find_pickers() -> set[str]:
     stems = {stem_of(m) for m in MODULES if layer_of(m) == "kernels"}
-    return {
-        f"pithtrain.kernels.{s}" for s in stems if f"{s}_sm90" in stems and f"{s}_sm100" in stems
-    }
+    has_sm90 = lambda s: any(f"{s}{suffix}" in stems for suffix in ("_sm90", *SPLIT_HALVES))
+    return {f"pithtrain.kernels.{s}" for s in stems if has_sm90(s) and f"{s}_sm100" in stems}
 
 
 PICKERS = find_pickers()
@@ -382,7 +400,7 @@ def find_violations() -> set[tuple[str, str, str]]:
         if is_smxx(mod) and layer != "kernels":
             found.add(("smxx-outside-kernels", mod, ""))
         if layer == "kernels" and stem.endswith("_sm90"):
-            sibling = stem[: -len("_sm90")] + "_sm100"
+            sibling = sm90_feature(stem) + "_sm100"
             if (
                 stem not in SM90_ONLY | SM90_HELPERS
                 and f"pithtrain.kernels.{sibling}" not in MODULES
@@ -429,10 +447,13 @@ def find_violations() -> set[tuple[str, str, str]]:
                 if stem.endswith("_sm100") and stem_of(t).endswith("_sm90"):
                     found.add(("sm100-imports-sm90", mod, t))
                 if stem.endswith("_sm90") and stem not in SM90_HELPERS:
-                    own = stem[: -len("_sm90")]
+                    own = sm90_feature(stem)
                     ts = stem_of(t)
                     ok = (
-                        ts == own + "_sm100" or ts in SM90_HELPERS or (stem, ts) in SM90_CROSS_EDGES
+                        ts == own + "_sm100"
+                        or ts in SM90_HELPERS
+                        or (stem, ts) in SM90_CROSS_EDGES
+                        or (ts.endswith("_sm90") and sm90_feature(ts) == own)
                     )
                     if not ok:
                         found.add(("sm90-cross-feature", mod, t))

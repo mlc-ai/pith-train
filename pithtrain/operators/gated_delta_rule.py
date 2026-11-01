@@ -159,8 +159,16 @@ dense_fwd.register_autograd(dense_backward, setup_context=dense_setup_context)
 
 def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:  # fmt: skip
     """
-    gated_delta_rule without context parallelism, through the pinned FLA launches; callers
-    check gated_delta_rule_pinned_supported first.
+    gated_delta_rule without context parallelism, through the pinned kernels; callers check
+    gated_delta_rule_pinned_supported first.
+
+    On SM90, with the length a multiple of 64, the forward and backward run CuTe kernels on FLA
+    0.5.2's chunk algorithm and rounding points; the forward's saved g_cum and A are bit-identical
+    to FLA's. Against the fp32 recurrence, measured against FLA: calc_diff within 1.001x of FLA's
+    and the largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 /
+    8192, 3 seeds), and within the verifier's 1.10x bounds in its cases. Otherwise (a ragged length)
+    FLA's kernels on the recorded H200 launch configs, bit-identical to FLA while those are its
+    autotuner's picks.
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape
@@ -186,8 +194,12 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
     of heads, and each key head serves a group of consecutive value heads. With a cp_group the
     recurrence is sharded over it: s is the rank-local length, in the contiguous layout.
     """
-    if cp_group is None and gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        return dense_gated_delta_rule(q, k, v, g, beta)
+    if cp_group is None:
+        # Contiguous before the check: the pinned kernels take contiguous tensors, and both paths copy
+        # anyway (dense_gated_delta_rule and gdr_fwd).
+        q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+        if gated_delta_rule_pinned_supported(q, k, v, g, beta):
+            return dense_gated_delta_rule(q, k, v, g, beta)
     repeats = v.shape[2] // q.shape[2]
     if repeats > 1:
         q = q.repeat_interleave(repeats, dim=2)
