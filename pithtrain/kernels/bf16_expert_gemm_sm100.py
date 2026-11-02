@@ -9,10 +9,11 @@ One persistent, warp-specialized tcgen05 grouped-GEMM template covers the six en
 
 Persistent 2-CTA clusters (tcgen05.mma.cta_group::2, 256 x 256 x 64 tiles, two TMEM
 accumulators). Warpgroup 0: TMA producer, MMA issuer (CTA0) / gather relay (CTA1), tile-prefix
-warp; then 4 or 8 epilogue warps; then 4 cp.async row-gather warps for a_idx / slot_of operands.
+warp; then 4 or 8 epilogue warps; then 4, 8 or 16 cp.async row-gather warps for a_idx / slot_of
+operands.
 Small expert groups (mean rows <= SWAP_ROWS) run the M-grouped GEMMs swap-AB: weights on the MMA
 M side, the group's tokens on a runtime N (<= 256, steps of 32), so a group tail wastes < 32 rows.
-The wgrads read pre-gathered rows and accumulate the fp32 main grads by TMA reduce-add.
+The wgrads gather their rows in-kernel and accumulate the fp32 main grads by TMA reduce-add.
 
 The two gate / up weights are read through one rank-4 tensor map (H, 2, I, G) whose second mode
 strides between the two weights in address order, so the MMA sees the interleaved
@@ -23,9 +24,16 @@ training) take the far-pair variants instead: the gate_up fwd / dgrad weight row
 the cp.async gather warps with 64-bit addresses (same interleaved smem rows, same epilogues), and
 the gate_up wgrad reduces each main grad through its own tensor map.
 
-Evolved with TIRx-harness: run bf16gemm, frontier member cluster2-cpasync-tmareduce (commit c2b333c, 16183 us vs 268442 us, 16.588x over the
-previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+Kernel overlap: every launch uses programmatic dependent launch. The wgrads, when the host finds
+them independent of every launch that may still run on the stream (byte extents), take an
+overlap variant: cluster-launch-control dynamic tile scheduling and no griddepcontrol.wait before
+the main loop, so their clusters fill the SMs the previous kernel frees in its tail; they wait for
+the previous grid at exit, so completion order is unchanged.
+
+Evolved with TIRx-harness: run bf16gemm, frontier member cluster2-cpasync-tmareduce (commit
+59570dc, 15702 us vs 267991 us, 17.068x over the previous SM100 path in the task's benchmark).
+Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on
+torch's current stream.
 """
 
 import functools
@@ -63,11 +71,13 @@ GMAX = 1024
 EPI_WARP0 = 4
 PREFIX_WARP = 2
 IKET = False
+SLOTS = 2  # tile-id ring depth
 
 MMA = "tcgen05.mma.cta_group::2.kind::f16"
 TMEM_LD32 = "tcgen05.ld.sync.aligned.32x32b.x32.b32"
 TMA = "cp.async.bulk.tensor.{}d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2"
 CP16 = "cp.async.cg.shared.global.L2::128B"
+TMA_ST2 = "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
 LOG2E = 1.4426950408889634
 
 # kind -> (k_grouped, a_major, b_major, a_gather)
@@ -198,19 +208,34 @@ def swap_ok(kind, inter):
     return kind in ("gu_fwd", "gu_dgrad") or (kind == "down_fwd" and inter >= 2048)
 
 
-def use_swap(M, G):
-    return M <= SWAP_ROWS * G
+def bnt(kind, N, swap, far):
+    """
+    Cluster tile N: 240 where N is a multiple of 240 but not of 256 (gpt-oss 2880). down_fwd
+    only (K-major B): the MN-major-B kinds (gu_dgrad, down_dgrad) measured 6-11% slower with
+    120-column B halves per CTA.
+    """
+    if kind == "down_fwd" and not swap and not far and N % 256 and N % 240 == 0:
+        return 240
+    return BN
+
+
+# gate_up fwd: non-swap measured faster at 512 rows/expert (q35 EP4/4k 134 -> 129 us)
+SWAP_ROWS_GU_FWD = 448
+
+
+def use_swap(M, G, rows=SWAP_ROWS):
+    return M <= rows * G
 
 
 def use_materialized_gu_fwd(M, G, H, inter):
     """
     The pure-TMA frontier wins only for GPT-OSS forward rows at >=4096 rows/expert.
     """
-    return H == 2880 and inter == 2880 and M >= 4096 * G
+    return H == 2880 and inter == 2880 and M >= 1024 * G
 
 
 @functools.cache
-def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far=False):
+def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far=False, dyn=False):
     k_grouped, a_major, b_major, a_gather = KINDS[kind]
     # Problem geometry per kind: (K, N) for M-grouped; (Mo, No) for K-grouped.
     if kind == "gu_fwd":
@@ -225,11 +250,15 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
         MO, N = 2 * inter, H
     else:
         MO, N = H, inter
-    NT = -(-N // BN)
+    # gpt-oss N = 2880 = 11.25 x 256: uniform 240-column tiles (12 x 240) instead of 11 full
+    # tiles and a quarter tile that costs a full one (non-swap, fast-path plain epilogues only)
+    BNT = bnt(kind, N, swap and swap_ok(kind, inter), far)
+    HNT = BNT // 2
+    NT = -(-N // BNT)
     KT = None if k_grouped else -(-K // BK)
     MT = -(-MO // BMC) if k_grouped else None
     A_BYTES = BM * BK * 2
-    B_BYTES = HN * BK * 2
+    B_BYTES = (HNT if b_major == "k" else HN) * BK * 2
     # For large GPT-OSS forward rows, a separate coalesced gather followed by a pure-TMA
     # gate/up GEMM is faster than issuing the indexed cp.async gather inside every K stage.
     # Keep the frontier path for every other kind and shape.
@@ -253,7 +282,15 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
     PREGATHERED = False  # wgrads gather x[a_idx] / dy[slot_of] rows in-kernel (no gather pass)
     CH = (BN // 32) // (NEPI // 4)  # 32-column chunks per epilogue warp
     GW0 = EPI_WARP0 + NEPI
-    NWARPS = GW0 + (4 if GATHER else 0)
+    # gather warps: more warps keep more cp.async row segments in flight. gu_fwd: 8; wgrads: 16
+    # for small I (qwen-like, measured -8..-13 us per wgrad vs 8), 8 for I = 2880 (16 measured
+    # +5..15 us there); down_dgrad and the far-pair weight gathers keep 4 (register budget)
+    NGW = 4
+    if GATHER and not WFAR and kind in ("gu_fwd", "gu_wgrad", "down_wgrad"):
+        NGW = 16 if (k_grouped and inter <= 1024) else 8
+    RPW = BM // NGW  # K-major A: tile rows per gather warp
+    KPW = BK // NGW  # MN-major: K rows per gather warp
+    NWARPS = GW0 + (NGW if GATHER else 0)
     REGS = (56, 80, 184) if kind == "down_dgrad" else None
     # wgrads keep 32 KB of smem for the fp32 TMA-reduce staging of the epilogue
     # wgrads keep 32 KB for the fp32 reduce staging, down_dgrad 32 KB for its coalescing
@@ -269,11 +306,26 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
     NST = STAGES - 1 if k_grouped else ((STAGES - 1 if SPLIT_DPRE else STAGES - 2) if (kind == "down_dgrad" and not SWAP) else STAGES)
     # down_dgrad prefetches the next preact chunk by cp.async into a per-warp smem tile
     PF = kind == "down_dgrad" and not SWAP
+    # M-grouped bf16 outputs (down_dgrad dpre / h, gu_fwd preact / h, gu_dgrad dx): full 32-row
+    # chunks leave by TMA store from the swizzled staging tile (the epilogue warps skip the
+    # ld.shared + st.global copy-out); group-tail chunks keep the masked stores
+    TMA_ST = kind in ("down_dgrad", "gu_fwd", "gu_dgrad") and not SWAP
     STG = kind == "down_fwd" and SWAP  # swap-AB scatter: stage token rows across the 4 lane-quadrant warps
     a_shape = (NST, BM, BK) if a_major == "k" else (NST, BK, BM)
-    b_shape = (NST, HN, BK) if b_major == "k" else (NST, BK, HN)
+    b_shape = (NST, HNT, BK) if b_major == "k" else (NST, BK, HN)
     a_idesc_trans = a_major == "mn"
     b_idesc_trans = b_major == "mn"
+    # overlap variant (dyn): dynamic tile scheduling by cluster launch control (the grid holds one
+    # cluster per tile, upper bound; resident clusters cancel pending ones and take their tile
+    # ids) and no griddepcontrol.wait before the main loop: clusters land on the SMs the previous
+    # (independent, host-checked) kernel frees in its tail and take more tiles than late ones.
+    # Every CTA waits for the previous grid before it exits, so this grid's completion still
+    # implies its predecessor's.
+    DYN = dyn
+    # ring consumers per entry (arrivals on CTA0's slot-empty barrier): the TMA producer(s),
+    # the MMA issuer, CTA1's gather relay, every epilogue warp and every gather warp
+    NCONS = ((1 if TMA_BYTES == 0 else 2) + 1 + (1 if GATHER else 0) + 2 * NEPI
+             + (2 * NGW if GATHER else 0))
     params = params2(kind, has_bias, clamped, MG2)
     names = [n for n, _ in params]
 
@@ -292,11 +344,17 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 maps["b"] = txl.stack_alloca("tensormap", 1)
                 enc(maps["b"], 4, p["w"].data, H, 2, inter, p["G"], p["wdiff"] * 2, p["ws1"] * 2,
                     p["ws0"] * 2, 64, 2, HN // 2, 1, 1, 1, 1, 1, 0, 3, 2, 0)
+            if TMA_ST:
+                # preact (M, 2I): 32 x 32 boxes (64B swizzle); h (M, I): 32 rows x 16 (32B)
+                maps["d"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["d"], 2, p["preact"].data, 2 * inter, p["M"], 4 * inter, 32, 32, 1, 1, 0, 2, 2, 0)
+                maps["e"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["e"], 2, p["h"].data, inter, p["M"], 2 * inter, 16, 32, 1, 1, 0, 1, 2, 0)
         elif kind == "down_fwd":
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["hin"].data, inter, p["M"], inter * 2, 64, BM, 1, 1, 0, 3, 2, 0)
             maps["b"] = txl.stack_alloca("tensormap", 1)
-            enc(maps["b"], 3, p["wd"].data, inter, H, p["G"], inter * 2, H * inter * 2, 64, HN, 1,
+            enc(maps["b"], 3, p["wd"].data, inter, H, p["G"], inter * 2, H * inter * 2, 64, HNT, 1,
                 1, 1, 1, 0, 3, 2, 0)
         elif kind == "down_dgrad":
             maps["a"] = txl.stack_alloca("tensormap", 1)
@@ -304,6 +362,15 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
             maps["b"] = txl.stack_alloca("tensormap", 1)
             enc(maps["b"], 3, p["wd"].data, inter, H, p["G"], inter * 2, H * inter * 2, 64, BK, 1,
                 1, 1, 1, 0, 3, 2, 0)
+            if TMA_ST:
+                # epilogue TMA stores of the swizzled staging tiles: dpre (M, 2I) in 32-row boxes
+                # of 64 columns (128B swizzle) or 32 (split staging, 64B swizzle), h (M, I) in
+                # 32 x 32 (64B swizzle)
+                maps["d"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["d"], 2, p["dpre"].data, 2 * inter, p["M"], 4 * inter, 32 if SPLIT_DPRE else 64, 32,
+                    1, 1, 0, 2 if SPLIT_DPRE else 3, 2, 0)
+                maps["e"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["e"], 2, p["h"].data, inter, p["M"], 2 * inter, 32, 32, 1, 1, 0, 2, 2, 0)
         elif kind == "gu_dgrad":
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["dpre"].data, 2 * inter, p["M"], 4 * inter, 64, BM, 1, 1, 0, 3, 2, 0)
@@ -313,6 +380,10 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 maps["b"] = txl.stack_alloca("tensormap", 1)
                 enc(maps["b"], 4, p["w"].data, H, 2, inter, p["G"], p["wdiff"] * 2, p["ws1"] * 2,
                     p["ws0"] * 2, 64, 2, BK // 2, 1, 1, 1, 1, 1, 0, 3, 2, 0)
+            if TMA_ST:
+                # dx (M, H): 32 x 32 boxes (64B swizzle)
+                maps["d"] = txl.stack_alloca("tensormap", 1)
+                enc(maps["d"], 2, p["dx"].data, H, p["M"], 2 * H, 32, 32, 1, 1, 0, 2, 2, 0)
         elif kind == "gu_wgrad":
             maps["a"] = txl.stack_alloca("tensormap", 1)
             enc(maps["a"], 2, p["dpre"].data, 2 * inter, p["M"], 4 * inter, 64, BK, 1, 1, 0, 3, 2, 0)
@@ -365,8 +436,20 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                                init_full=1 + (1 if GATHER else 0))
         acc_pipe = txl.Pipeline(smem, 2, full="tcgen05", empty="mbar", init_empty=2 * NEPI)
         gfull = txl.MBarrier(smem, NST)
-        gfull.init(128)
+        gfull.init(32 * NGW)
         order = smem.alloc((GMAX,), "int32", align=16)
+        if DYN:
+            # tile-id ring: per CTA a full barrier (the local scheduler's expect_tx arrive + the
+            # multicast CLC response bytes) and the 16-byte responses; CTA0's empty barrier
+            # collects every consumer warp of the pair. dfull / dresp: CTA0's private drain slot.
+            sfull = txl.MBarrier(smem, SLOTS)
+            sfull.init(1)
+            sempty = txl.MBarrier(smem, SLOTS)
+            sempty.init(NCONS)
+            dfull = txl.MBarrier(smem, 1)
+            dfull.init(1)
+            resp = smem.alloc((SLOTS * 4,), "uint32", align=16)
+            dresp = smem.alloc((4,), "uint32", align=16)
         smem.pool.move_base_to(8192 + 4 * (GMAX + 1))
         a_tile = smem.alloc(a_shape, "bfloat16", swizzle=txl.SW128B)
         b_tile = smem.alloc(b_shape, "bfloat16", swizzle=txl.SW128B)
@@ -381,6 +464,13 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
         if STG:
             # per epilogue half, two 32-token x 128-feature bf16 tiles (64 u32 per token row)
             sbuf = smem.alloc(((NEPI // 4) * 2 * 32 * 64,), "uint32", align=1024)
+
+        # programmatic dependent launch: the smem-only prologue above overlaps the previous
+        # kernel's tail; every global access of this grid follows its completion, and the next
+        # kernel may start its own prologue once all of this grid's CTAs are resident
+        if not DYN:
+            txl.ptx.griddepcontrol.wait()
+        txl.ptx.griddepcontrol.launch_dependents()
 
         # ---- tile prefix over the groups (warp 2), then TMEM allocation (warp 1).
         with txl.If(warp == PREFIX_WARP), txl.Then():
@@ -497,8 +587,17 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 self.lo = txl.local_scalar("int32", init=0)
                 self.hi = txl.local_scalar("int32", init=0)
                 self.nn = txl.local_scalar("int32", init=BN)
+                if DYN:
+                    self.tn = txl.local_scalar("int32", init=0)
+                    self.ss = txl.PipelineState(SLOTS, 0)
 
             def locate(self):
+                if DYN:
+                    # CLC ids normally grow per cluster; restart the group search otherwise
+                    first = txl.local_scalar("int32")
+                    txl.ptx.ld.shared.s32(first, prefix.ptr_to([self.k]))
+                    with txl.If(self.t < first), txl.Then():
+                        txl.assign(self.k, 0)
                 nxt = txl.local_scalar("int32")
                 txl.ptx.ld.shared.s32(nxt, prefix.ptr_to([self.k + 1]))
                 with txl.While(self.t >= nxt):
@@ -521,11 +620,67 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                     rem = self.hi - self.lo - self.mt * BMC
                     txl.assign(self.nn, txl.Select(rem >= BN, txl.int32(BN), (rem + 31) // 32 * 32))
 
+            def fetch_next(self):
+                """
+                Warp-collective: take the next ring entry (this cluster's next tile, or past
+                total when the scheduler stopped) into self.tn and release the slot.
+                """
+                if DYN:
+                    sfull.wait(self.ss.stage, self.ss.phase)
+                    cid = txl.local_scalar("uint32")
+                    txl.query_cancel_first_ctaid_x(cid, resp.ptr_to([self.ss.stage * 4]))
+                    txl.assign(self.tn, txl.Select(cid == txl.uint32(0xFFFFFFFF),
+                                                   txl.int32(0x7FFFFFFF),
+                                                   txl.Cast("int32", cid >> txl.uint32(1))))
+                    txl.cuda.warp_sync()
+                    with txl.If(txl.lane_id() == 0), txl.Then():
+                        sempty.arrive(self.ss.stage, remote=0)
+                    self.ss.advance()
+
             def advance(self):
-                txl.assign(self.t, self.t + p["num_ctas"] // 2)
+                if DYN:
+                    txl.assign(self.t, self.tn)
+                else:
+                    txl.assign(self.t, self.t + p["num_ctas"] // 2)
 
         def full_bar(stage):
             return txl.cuda.cvta_generic_to_shared(full_cta0.ptr_to([stage]))
+
+        # ------------------------------------------------------------ CLC scheduler (warp 3)
+        if DYN:
+            with txl.If((warp == 3) & (lane == 0)), txl.Then():
+                ph_f = txl.PipelineState(SLOTS, 0)
+                ph_e = txl.PipelineState(SLOTS, 1)
+                cid = txl.local_scalar("uint32", init=txl.uint32(0))
+                stop = txl.local_scalar("int32", init=txl.Select(cluster >= total, 1, 0))
+                with txl.While(stop == 0):
+                    s = ph_f.stage
+                    with txl.If(cbx == 0), txl.Then():
+                        sempty.wait(ph_e.stage, ph_e.phase)
+                        txl.ptx[
+                            "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                            ".mbarrier::complete_tx::bytes.multicast::cluster::all.b128"
+                        ](resp.ptr_to([s * 4]), sfull.ptr_to([s]))
+                    txl.ptx.mbarrier.arrive.expect_tx.shared.b64(sfull.ptr_to([s]), txl.uint32(16))
+                    sfull.wait(s, ph_f.phase)
+                    txl.query_cancel_first_ctaid_x(cid, resp.ptr_to([s * 4]))
+                    with txl.If((cid == txl.uint32(0xFFFFFFFF))
+                                | (txl.Cast("int32", cid >> txl.uint32(1)) >= total)), txl.Then():
+                        txl.assign(stop, 1)
+                    ph_f.advance()
+                    ph_e.advance()
+                # drain: cancel the remaining (tile-less) pending clusters so they never launch
+                with txl.If((cbx == 0) & (cid != txl.uint32(0xFFFFFFFF))), txl.Then():
+                    dph = txl.local_scalar("int32", init=0)
+                    with txl.While(cid != txl.uint32(0xFFFFFFFF)):
+                        txl.ptx[
+                            "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                            ".mbarrier::complete_tx::bytes.b128"
+                        ](dresp.ptr_to([0]), dfull.ptr_to([0]))
+                        txl.ptx.mbarrier.arrive.expect_tx.shared.b64(dfull.ptr_to([0]), txl.uint32(16))
+                        dfull.wait(0, dph)
+                        txl.query_cancel_first_ctaid_x(cid, dresp.ptr_to([0]))
+                        txl.assign(dph, dph ^ 1)
 
         # ------------------------------------------------------------ TMA producer
         # (the non-gathered operand(s); the gathered one is the cp.async role below). With both
@@ -537,6 +692,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
             st = txl.PipelineState(NST, 1)
             with txl.While(walk.t < total):
                 walk.locate()
+                walk.fetch_next()
                 nkt = txl.local_scalar("int32")
                 if k_grouped:
                     txl.assign(nkt, (walk.hi - walk.lo + (BK - 1)) // BK)
@@ -562,7 +718,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                                 txl.ptx[TMA.format(2)](
                                     a_base, txl.address_of(a_map), i32(k), i32(mrow), full_bar(s)
                                 )
-                            n0 = walk.nt * BN + cbx * HN
+                            n0 = walk.nt * BNT + cbx * HNT
                             if B_GATH:
                                 pass
                             elif kind == "gu_fwd":
@@ -655,6 +811,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
 
                 with txl.While(walk.t < total):
                     walk.locate()
+                    walk.fetch_next()
                     if kind == "gu_dgrad":
                         # far-pair MN-major weights: warp gw owns K rows 16 gw .. + 15 of the stage
                         nseg = HN // 64
@@ -678,7 +835,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                         # K-major A: warp gw owns tile rows 32 gw .. + 31; 8 lanes per row
                         # (far pair: likewise B's weight rows)
                         if A_GATH:
-                            load_index(walk.lo + walk.mt * BMC + cbx * (walk.nn // 2) + gw * 32 + lane, walk.hi)
+                            load_index(walk.lo + walk.mt * BMC + cbx * (walk.nn // 2) + gw * RPW + lane % RPW, walk.hi)
                         wn0 = walk.nt * BN + cbx * HN
                         with txl.serial(KT) as kt:
                             tk = range_v("g-wait-empty")
@@ -687,9 +844,9 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                             txl.ptx.fence.proxy.async_.shared__cta()
                             s = st.stage
                             if A_GATH:
-                                for i in range(8):
+                                for i in range(RPW // 4):
                                     txl.ptx.shfl_sync.idx.b32(row, my, txl.uint32(i * 4) + txl.Cast("uint32", sub), txl.uint32(31), FULLM)
-                                    trow = gw * 32 + i * 4 + sub
+                                    trow = gw * RPW + i * 4 + sub
                                     copy(a_tile[s].ptr_to(trow, chunk * 8), kt * BK + chunk * 8, True)
                             if WFAR:
                                 for i in range(8):
@@ -708,24 +865,24 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                         nkt = txl.local_scalar("int32", init=(walk.hi - walk.lo + (BK - 1)) // BK)
                         # the row index of stage kt + 1 is loaded one stage ahead (off the
                         # cp.async critical path)
-                        load_index(walk.lo + gw * 16 + lane % 16, walk.hi)
+                        load_index(walk.lo + gw * KPW + lane % KPW, walk.hi)
                         with txl.serial(nkt) as kt:
                             txl.assign(cur_row, my)
-                            rn = walk.lo + (kt + 1) * BK + gw * 16 + lane % 16
+                            rn = walk.lo + (kt + 1) * BK + gw * KPW + lane % KPW
                             load_index(rn, walk.hi)
                             tk = range_v("g-wait-empty")
                             ab_pipe.empty.wait(st.stage, st.phase)
                             end(tk)
                             txl.ptx.fence.proxy.async_.shared__cta()
                             s = st.stage
-                            for i in range(4 * nseg):
+                            for i in range(KPW * nseg // 4):
                                 # 4 (row, segment) pairs per instruction, 8 lanes each
                                 pair = i * 4 + sub
                                 rr = pair // nseg
                                 seg = pair % nseg
                                 txl.ptx.shfl_sync.idx.b32(row, cur_row, txl.Cast("uint32", rr), txl.uint32(31), FULLM)
                                 col = seg * 64 + chunk * 8
-                                copy(tile[s].ptr_to(gw * 16 + rr, col), col0 + col, col0 + col < H)
+                                copy(tile[s].ptr_to(gw * KPW + rr, col), col0 + col, col0 + col < H)
                             txl.ptx["cp.async.mbarrier.arrive.noinc.shared.b64"](gfull.ptr_to([s]))
                             st.advance()
                     walk.advance()
@@ -738,6 +895,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 st = txl.PipelineState(NST, 0)
                 with txl.While(walk.t < total):
                     walk.locate()
+                    walk.fetch_next()
                     nkt = txl.local_scalar("int32")
                     if k_grouped:
                         txl.assign(nkt, (walk.hi - walk.lo + (BK - 1)) // BK)
@@ -769,11 +927,16 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 trans_a=b_idesc_trans if SWAP else a_idesc_trans,
                 trans_b=a_idesc_trans if SWAP else b_idesc_trans, n_cta_groups=2,
             )
+            if BNT != BN:
+                # PTX allows N in steps of 16 for cta_group::2 kind::f16 (the encoder helper
+                # checks steps of 32): patch the N field (bits 17-22 = N >> 3)
+                txl.assign(idesc[0], (idesc[0] & txl.uint32(0xFF81FFFF)) | txl.uint32((BNT >> 3) << 17))
             a_desc, a_off = a_tile[0].encode(major=a_major, mma_k=16)
             b_desc, b_off = b_tile[0].encode(major=b_major, mma_k=16)
             leader = txl.local_scalar("uint32", init=txl.cuda.elect_sync())
             with txl.While(walk.t < total):
                 walk.locate()
+                walk.fetch_next()
                 nkt = txl.local_scalar("int32")
                 if k_grouped:
                     txl.assign(nkt, (walk.hi - walk.lo + (BK - 1)) // BK)
@@ -843,6 +1006,12 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
             xb = (warp - EPI_WARP0) * XWORDS
 
             def xaddr(row, ch, nch):
+                if TMA_ST and nch == 4:
+                    # 64-byte rows in the TMA 64B-swizzle pattern (16-byte chunk ^= (row / 2) % 4)
+                    return xbuf.ptr_to([xb + row * 16 + ((ch ^ ((row // 2) % 4)) * 4)])
+                if TMA_ST and nch == 2:
+                    # 32-byte rows in the TMA 32B-swizzle pattern (16-byte chunk ^= (row / 4) % 2)
+                    return xbuf.ptr_to([xb + row * 8 + ((ch ^ ((row // 4) % 2)) * 4)])
                 # rows of nch 16-byte chunks packed into 128-byte lines, 128B-swizzled
                 rpl = 8 // nch
                 line = row // rpl
@@ -860,7 +1029,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 cp.async this warp's 32 rows x 32 (gate, up) words of preact for tile w,
                 chunk c into pbuf (rows past the group zero-filled; chunks past N skipped).
                 """
-                n0 = w.nt * BN + half * (CH * 32) + c * 32
+                n0 = w.nt * BNT + half * (CH * 32) + c * 32
                 rb = w.lo + w.mt * BMC + cbx * BM + ew * 32
                 with txl.If(n0 < N), txl.Then():
                     for it in range(8):
@@ -894,9 +1063,10 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                                              dst[4 * c2 + 3], xaddr(lane, c2, nch))
                 txl.cuda.warp_sync()
 
-            def stage_store(src, nch, gaddr, ok):
+            def stage_store(src, nch, gaddr, ok, cmask=None, tma=None, full=None):
                 """
-                This lane's row src[4 nch] -> smem -> coalesced global rows.
+                This lane's row src[4 nch] -> smem -> coalesced global rows (or, with tma and a
+                full 32-row chunk, one TMA store of the staging tile).
                 """
                 tmp = txl.alloc_local((4,), "uint32")
                 for c2 in range(nch):
@@ -905,12 +1075,28 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 txl.cuda.warp_sync()
                 rpi = 32 // nch
                 ch = lane % nch
-                for it in range(nch):
-                    row = it * rpi + lane // nch
-                    txl.ptx.ld.shared.v4.b32(tmp[0], tmp[1], tmp[2], tmp[3], xaddr(row, ch, nch))
-                    dst_ptr = gaddr(row, ch)  # warp-convergent (may shuffle)
-                    with txl.If(ok(row)), txl.Then():
-                        txl.ptx.st.global_.v4.b32(dst_ptr, tmp[0], tmp[1], tmp[2], tmp[3])
+
+                def copy_out():
+                    for it in range(nch):
+                        row = it * rpi + lane // nch
+                        txl.ptx.ld.shared.v4.b32(tmp[0], tmp[1], tmp[2], tmp[3], xaddr(row, ch, nch))
+                        dst_ptr = gaddr(row, ch)  # warp-convergent (may shuffle)
+                        with txl.If(ok(row) if cmask is None else (ok(row) & cmask(ch))), txl.Then():
+                            txl.ptx.st.global_.v4.b32(dst_ptr, tmp[0], tmp[1], tmp[2], tmp[3])
+                if tma is None:
+                    copy_out()
+                else:
+                    txl.ptx.fence.proxy.async_.shared__cta()
+                    txl.cuda.warp_sync()
+                    with txl.If(full):
+                        with txl.Then():
+                            with txl.If(lane == 0), txl.Then():
+                                tma(xbuf.ptr_to([xb]))
+                                txl.ptx.cp.async_.bulk.commit_group()
+                                # the staging tile is rewritten next: its source read must be done
+                                txl.ptx.cp.async_.bulk.wait_group.read(0)
+                        with txl.Else():
+                            copy_out()
                 txl.cuda.warp_sync()
 
             dw = txl.alloc_local((32,), "uint32") if XSTAGE else None
@@ -1098,6 +1284,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                     prefetch(pw, 0)
             with txl.While(walk.t < total):
                 walk.locate()
+                walk.fetch_next()
                 tk = range_v("e-wait-acc")
                 acc_pipe.full.wait(acc.stage, acc.phase)
                 end(tk)
@@ -1126,7 +1313,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                     # runtime chunk loop: one copy of the chunk body keeps the epilogue in the I-cache
                     with txl.serial(CH) as c:
                         col = half * (CH * 32) + c * 32
-                        n0 = walk.nt * BN + col
+                        n0 = walk.nt * BNT + col
                         if PF:
                             # this chunk's preact landed in pbuf: registers, then
                             # prefetch the next chunk (or the next tile's first)
@@ -1142,15 +1329,29 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                                 with txl.Then():
                                     prefetch(walk, c + 1)
                                 with txl.Else():
-                                    pw.advance()
+                                    if DYN:
+                                        txl.assign(pw.t, walk.tn)
+                                    else:
+                                        pw.advance()
                                     with txl.If(pw.t < total), txl.Then():
                                         pw.locate()
                                         prefetch(pw, 0)
-                        with txl.If(n0 < N), txl.Then():
+                        with txl.If((n0 < N) if BNT == BN else ((n0 < N) & (col < BNT))), txl.Then():
                             taddr = tmem_base + txl.Cast("uint32", (ew * 32) << 16) + txl.Cast(
                                 "uint32", acc.stage * BN + col
                             )
-                            txl.ptx[TMEM_LD32](*[v[i] for i in range(32)], taddr)
+                            if BNT % 32 == 0:
+                                txl.ptx[TMEM_LD32](*[v[i] for i in range(32)], taddr)
+                            else:
+                                # a 240-column tile's last chunk: only 16 accumulator columns
+                                with txl.If(col + 32 <= BNT):
+                                    with txl.Then():
+                                        txl.ptx[TMEM_LD32](*[v[i] for i in range(32)], taddr)
+                                    with txl.Else():
+                                        txl.ptx["tcgen05.ld.sync.aligned.32x32b.x16.b32"](
+                                            *[v[i] for i in range(16)], taddr)
+                                        for i in range(16, 32):
+                                            txl.assign(v[i], txl.float32(0.0))
                             txl.ptx.tcgen05.wait__ld.sync.aligned()
                             if k_grouped:
                                 # fp32 main grads: stage the 32x32 block, TMA-reduce-add it (OOB
@@ -1192,28 +1393,48 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                                 if XSTAGE:
                                     rb = walk.lo + walk.mt * BMC + cbx * BM + ew * 32
                                     ok = lambda row: rb + row < walk.hi  # noqa: E731
+                                    full = (rb + 32 <= walk.hi) if TMA_ST else None
+                                    i32c = lambda e: txl.Cast("int32", e)  # noqa: E731
+
+                                    def tma_st(m, c0):
+                                        if not TMA_ST:
+                                            return None
+                                        return lambda sp: txl.ptx[TMA_ST2](txl.address_of(maps[m]), i32c(c0), i32c(rb), sp)
                                     if kind == "down_dgrad":
                                         dgrad_math(p, ld, v, dw, w16, clamped, alpha, limit)
+                                        # 240-column tiles: the last chunk holds 16 columns (i)
+                                        part = BNT % 32 != 0
                                         if SPLIT_DPRE:
                                             for hh in range(2):
-                                                stage_store(Off(dw, 16 * hh), 4, lambda row, ch, hh=hh: p["dpre"].ptr_to([(rb + row) * inter + n0 + 16 * hh + ch * 4]), ok)
+                                                stage_store(Off(dw, 16 * hh), 4, lambda row, ch, hh=hh: p["dpre"].ptr_to([(rb + row) * inter + n0 + 16 * hh + ch * 4]), ok,
+                                                            (lambda ch, hh=hh: col + 16 * hh + ch * 4 < BNT) if part else None,
+                                                            tma_st("d", 2 * (n0 + 16 * hh)), full)
                                         else:
-                                            stage_store(dw, 8, lambda row, ch: p["dpre"].ptr_to([(rb + row) * inter + n0 + ch * 4]), ok)
-                                        stage_store(w16, 4, lambda row, ch: p["h"].ptr_to([(rb + row) * (inter // 2) + n0 // 2 + ch * 4]), ok)
+                                            stage_store(dw, 8, lambda row, ch: p["dpre"].ptr_to([(rb + row) * inter + n0 + ch * 4]), ok,
+                                                        (lambda ch: col + ch * 4 < BNT) if part else None,
+                                                        tma_st("d", 2 * n0), full)
+                                        stage_store(w16, 4, lambda row, ch: p["h"].ptr_to([(rb + row) * (inter // 2) + n0 // 2 + ch * 4]), ok,
+                                                    (lambda ch: col + ch * 8 < BNT) if part else None,
+                                                    tma_st("e", n0), full)
                                     elif kind == "gu_fwd":
                                         fwd_math(p, walk, n0, v, w16, w8, ld, has_bias, clamped, alpha, limit)
-                                        stage_store(w16, 4, lambda row, ch: p["preact"].ptr_to([(rb + row) * inter + n0 // 2 + ch * 4]), ok)
-                                        stage_store(w8, 2, lambda row, ch: p["h"].ptr_to([(rb + row) * (inter // 2) + n0 // 4 + ch * 4]), ok)
+                                        stage_store(w16, 4, lambda row, ch: p["preact"].ptr_to([(rb + row) * inter + n0 // 2 + ch * 4]), ok,
+                                                    None, tma_st("d", n0), full)
+                                        stage_store(w8, 2, lambda row, ch: p["h"].ptr_to([(rb + row) * (inter // 2) + n0 // 4 + ch * 4]), ok,
+                                                    None, tma_st("e", n0 // 2), full)
                                     else:
                                         plain_math(p, walk, n0, v, w16, ld, has_bias)
+                                        # 240-column tiles: the last chunk holds 16 columns
+                                        cm = None if BNT % 32 == 0 else (lambda ch: col + ch * 8 < BNT)
                                         if kind == "gu_dgrad":
-                                            stage_store(w16, 4, lambda row, ch: p["dx"].ptr_to([(rb + row) * (N // 2) + n0 // 2 + ch * 4]), ok)
+                                            stage_store(w16, 4, lambda row, ch: p["dx"].ptr_to([(rb + row) * (N // 2) + n0 // 2 + ch * 4]), ok, cm,
+                                                        tma_st("d", n0), full)
                                         else:
                                             def out_addr(row, ch):
                                                 d = txl.local_scalar("int32")
                                                 txl.ptx.shfl_sync.idx.b32(d, dst, txl.Cast("uint32", row), txl.uint32(31), txl.uint32(0xFFFFFFFF))
                                                 return p["out"].ptr_to([d * (N // 2) + n0 // 2 + ch * 4])
-                                            stage_store(w16, 4, out_addr, ok)
+                                            stage_store(w16, 4, out_addr, ok, cm)
 
                 txl.ptx.tcgen05.fence__before_thread_sync()
                 txl.cuda.warp_sync()
@@ -1222,7 +1443,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
                 end(tk2)
                 acc.advance()
                 walk.advance()
-            if k_grouped:
+            if k_grouped or TMA_ST:
                 with txl.If(lane == 0), txl.Then():
                     txl.ptx.cp.async_.bulk.wait_group(0)
                 txl.cuda.warp_sync()
@@ -1234,6 +1455,9 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
             dealloc = txl.local_scalar("uint32")
             txl.ptx.ld.shared.u32(dealloc, tmem_addr.ptr_to([0]))
             txl.ptx["tcgen05.dealloc.cta_group::2.sync.aligned.b32"](dealloc, txl.uint32(512))
+        if DYN:
+            # completion order: this grid ends only after the previous one
+            txl.ptx.griddepcontrol.wait()
 
     def fwd_math(p, walk, n0, v, w16, w8, ld, has_bias, clamped, alpha, limit):
         """
@@ -1269,9 +1493,11 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
         """
         if has_bias:
             for q in range(4):
+                # 8 columns per load; a 240-column tile's last chunk may end past N
+                ok = n0 + 8 * q < N
                 txl.ptx.ld.global_.v4.b32(
                     ld[4 * q], ld[4 * q + 1], ld[4 * q + 2], ld[4 * q + 3],
-                    p["bias"].ptr_to([(walk.g * N + n0) // 2 + 4 * q]),
+                    p["bias"].ptr_to([txl.Select(ok, (walk.g * N + n0) // 2 + 4 * q, 0)]),
                 )
         for q in range(16):
             a0 = txl.local_scalar("float32")
@@ -1332,12 +1558,23 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
     )
     kern = txl.kernel(warps=NWARPS, arch="sm_100a", min_blocks_per_sm=1, grid="num_ctas",
                       host_prelude=host_prelude)(entry)
+    mod = pdl(kern.mod)
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         if IKET:
             from tvm.tirx.cuda.iket import IketProfiler
-            return IketProfiler().compile(kern.mod, target=target, tir_pipeline="tirx")
-        return entry_function(tvm.compile(kern.mod, target=target, tir_pipeline="tirx"))
+            return IketProfiler().compile(mod, target=target, tir_pipeline="tirx")
+        return entry_function(tvm.compile(mod, target=target, tir_pipeline="tirx"))
+
+
+def pdl(mod):
+    """
+    Launch the kernel with programmatic stream serialization (PDL); the remaining launch
+    tags (grid, cluster, block, dynamic smem) are still derived by the compiler.
+    """
+    (gv,) = list(mod.functions.keys())
+    return tvm.IRModule({gv: mod[gv].with_attr("tirx.kernel_launch_params",
+                                               ["tirx.use_programtic_dependent_launch"])})
 
 
 @functools.cache
@@ -1355,6 +1592,8 @@ def build_gather(H):
         r = txl.local_scalar("int32", init=txl.cta_id() * WPC + warp)
         row = txl.local_scalar("int32")
         buf = txl.alloc_local((4 * (-(-CH // 32)),), "uint32")
+        txl.ptx.griddepcontrol.wait()
+        txl.ptx.griddepcontrol.launch_dependents()
         with txl.While(r < M):
             txl.ptx.ld.global_.s32(row, idx.ptr_to([r]))
             for i in range(-(-CH // 32)):
@@ -1376,7 +1615,7 @@ def build_gather(H):
     kern = txl.kernel(warps=WPC, arch="sm_100a", grid="num_ctas")(gather_rows)
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
-        return entry_function(tvm.compile(kern.mod, target=target, tir_pipeline="tirx"))
+        return entry_function(tvm.compile(pdl(kern.mod), target=target, tir_pipeline="tirx"))
 
 
 def gather(src, idx):
@@ -1424,7 +1663,7 @@ def pair2(a, b):
     return lo, hi, nbytes // hi.element_size(), swapped, nbytes >= TMA_STRIDE_LIMIT
 
 
-def grid2(M, G, k_grouped, per_group_tiles, NT):
+def grid2(M, G, k_grouped, per_group_tiles, NT, dyn=False):
     """
     CTA count: two per cluster, at most one cluster per SM pair or per tile.
     """
@@ -1434,7 +1673,60 @@ def grid2(M, G, k_grouped, per_group_tiles, NT):
         ub = G * per_group_tiles
     else:
         ub = (-(-M // BMC) + G) * NT
+    if dyn:
+        return 2 * max(1, ub)
     return 2 * max(1, min(num_sms() // 2, ub))
+
+
+# Kernel overlap (the wgrads): every launch here uses programmatic dependent launch and triggers
+# its dependents right after its prologue, and every launch that waits (griddepcontrol.wait) does
+# so before its first global access. The overlap variants skip that wait and wait at exit
+# instead, so they may run alongside every launch since (and including) the last waiting one on
+# the stream: WINDOW holds those launches' byte extents (reads, writes), and an overlap variant
+# is chosen only if it neither reads what they write nor writes what they touch. Ordinary
+# (non-PDL) stream work in between only adds ordering. Assumes no foreign kernel that triggers
+# its dependents early sits right before an overlap launch.
+WINDOW = {}
+
+
+def ext(*ts):
+    """
+    Byte extents [lo, hi) of tensors' storage spans (empty tensors skipped).
+    """
+    out = []
+    for t in ts:
+        if t is None or t.numel() == 0:
+            continue
+        span = 1 + sum((s - 1) * st for s, st in zip(t.shape, t.stride()))
+        out.append((t.data_ptr(), t.data_ptr() + span * t.element_size()))
+    return out
+
+
+def hit(xs, ys):
+    return any(a < d and c < b for a, b in xs for c, d in ys)
+
+
+def stream_key():
+    stream = torch.cuda.current_stream()
+    return stream.device_index, stream.cuda_stream  # per (device, stream): stream handles may repeat across devices
+
+
+def may_overlap(reads, writes):
+    """
+    An overlap launch with these extents is independent of every launch that may still run.
+    """
+    win = WINDOW.get(stream_key())
+    if not win or len(win) >= 4:
+        return False
+    return not any(hit(writes, r) or hit(writes, w) or hit(reads, w) for r, w in win)
+
+
+def track(reads, writes, overlapped):
+    key = stream_key()
+    if overlapped:
+        WINDOW[key].append((reads, writes))
+    else:
+        WINDOW[key] = [(reads, writes)]
 
 
 def u322(t):
@@ -1455,11 +1747,11 @@ def bf16_expert_gate_up_fwd_sm100(x, w_gate, w_up, cu, a_idx, bias=None, act=())
     if M == 0:
         return preact, h
     check_shapes(H, inter)
-    lo, hi2, diff, swapped, far = pair2(w_gate, w_up)
+    lo, hi, diff, swapped, far = pair2(w_gate, w_up)
     clamped = bool(act)
     materialized = use_materialized_gu_fwd(M, G, H, inter)
     fn = build("gu_fwd", H, inter, bias is not None, clamped,
-                use_swap(M, G) and swap_ok("gu_fwd", inter), materialized, far)
+                use_swap(M, G, SWAP_ROWS_GU_FWD) and swap_ok("gu_fwd", inter), materialized, far)
     NT = -(-2 * inter // BN)
     xsrc = gather(x, a_idx) if materialized else x
     args = [cu, G, M, grid2(M, G, False, 0, NT), xsrc.reshape(-1), xsrc.shape[0], a_idx, flat(lo),
@@ -1469,6 +1761,7 @@ def bf16_expert_gate_up_fwd_sm100(x, w_gate, w_up, cu, a_idx, bias=None, act=())
     if clamped:
         args += [float(act[0]), float(act[1])]
     fn(*args)
+    track(ext(x, xsrc, lo, hi, cu, a_idx, bias), ext(preact, h), False)
     return preact, h
 
 
@@ -1478,13 +1771,15 @@ def bf16_expert_down_fwd_sm100(h, w_down, cu, slot_of, bias=None):
     if M == 0:
         return out
     check_shapes(H, inter)
-    fn = build("down_fwd", H, inter, bias is not None, False, use_swap(M, G) and swap_ok("down_fwd", inter))
-    NT = -(-H // BN)
+    sw = use_swap(M, G) and swap_ok("down_fwd", inter)
+    fn = build("down_fwd", H, inter, bias is not None, False, sw)
+    NT = -(-H // bnt("down_fwd", H, sw, False))
     args = [cu, G, M, grid2(M, G, False, 0, NT), h.reshape(-1), w_down.reshape(-1), slot_of,
             u322(out)]
     if bias is not None:
         args.append(u322(bias.contiguous()))
     fn(*args)
+    track(ext(h, w_down, cu, slot_of, bias), ext(out), False)
     return out
 
 
@@ -1499,12 +1794,13 @@ def bf16_expert_down_dgrad_sm100(dy, w_down, preact, cu, slot_of, w_gate, w_up, 
     check_shapes(H, inter)
     clamped = bool(act)
     fn = build("down_dgrad", H, inter, False, clamped)
-    NT = -(-inter // BN)
+    NT = -(-inter // bnt("down_dgrad", inter, False, False))
     args = [cu, G, M, grid2(M, G, False, 0, NT), dy.reshape(-1), dy.shape[0], slot_of,
             w_down.reshape(-1), u322(preact), u322(dpre), u322(h), int(swapped)]
     if clamped:
         args += [float(act[0]), float(act[1])]
     fn(*args)
+    track(ext(dy, w_down, preact, cu, slot_of), ext(dpre, h), False)
     return dpre, h, swapped
 
 
@@ -1515,15 +1811,16 @@ def bf16_expert_gate_up_dgrad_sm100(dpre, w_gate, w_up, cu, dpre_swapped):
     if M == 0:
         return dx
     check_shapes(H, inter)
-    lo, hi2, diff, swapped, far = pair2(w_gate, w_up)
+    lo, hi, diff, swapped, far = pair2(w_gate, w_up)
     if bool(swapped) != bool(dpre_swapped):
         raise NotImplementedError("dpre pair order must follow the weights' address order")
-    fn = build("gu_dgrad", H, inter, False, False, use_swap(M, G) and swap_ok("gu_dgrad", inter),
-                False, far)
-    NT = -(-H // BN)
+    sw = use_swap(M, G) and swap_ok("gu_dgrad", inter)
+    fn = build("gu_dgrad", H, inter, False, False, sw, False, far)
+    NT = -(-H // bnt("gu_dgrad", H, sw, far))
     args = [cu, G, M, grid2(M, G, False, 0, NT), dpre.reshape(-1), flat(lo), diff,
             lo.stride(0), lo.stride(1), u322(dx)]
     fn(*args)
+    track(ext(dpre, lo, hi, cu), ext(dx), False)
     return dx
 
 
@@ -1534,14 +1831,18 @@ def bf16_expert_gate_up_wgrad_sm100(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a
     G, inter, H = mg_gate.shape
     check_shapes(H, inter)
     lo, hi, diff, mg_swapped, far = pair2(mg_gate, mg_up)
-    fn = build("gu_wgrad", H, inter, False, False, False, False, far)
+    reads, writes = ext(x, dpre, cu, a_idx), ext(lo, hi)
+    ovl = may_overlap(reads, writes)
+    fn = build("gu_wgrad", H, inter, False, False, False, False, far, ovl)
     MT, NT = -(-2 * inter // BMC), -(-H // BN)
     # dpre lane l is the gate iff l == dpre_swapped; main-grad address lane a is the gate iff
     # a == mg_swapped, so a = l ^ flip
     flip = int(bool(dpre_swapped)) ^ int(mg_swapped)
-    args = [cu, G, M, grid2(M, G, True, MT * NT, NT), dpre.reshape(-1), x.reshape(-1), x.shape[0],
-            a_idx, flat(lo)] + ([flat(hi)] if far else []) + [diff, lo.stride(0), lo.stride(1), flip]
+    args = [cu, G, M, grid2(M, G, True, MT * NT, NT, ovl), dpre.reshape(-1), x.reshape(-1),
+            x.shape[0], a_idx, flat(lo)] + ([flat(hi)] if far else []) + [diff, lo.stride(0),
+                                                                             lo.stride(1), flip]
     fn(*args)
+    track(reads, writes, ovl)
     return None
 
 
@@ -1552,9 +1853,12 @@ def bf16_expert_down_wgrad_sm100(dy, h, mg_down, cu, slot_of):
     G, H, inter = mg_down.shape
     assert mg_down.is_contiguous()
     check_shapes(H, inter)
-    fn = build("down_wgrad", H, inter, False, False)
+    reads, writes = ext(dy, h, cu, slot_of), ext(mg_down)
+    ovl = may_overlap(reads, writes)
+    fn = build("down_wgrad", H, inter, False, False, False, False, False, ovl)
     MT, NT = -(-H // BMC), -(-inter // BN)
-    args = [cu, G, M, grid2(M, G, True, MT * NT, NT), dy.reshape(-1), dy.shape[0], slot_of,
+    args = [cu, G, M, grid2(M, G, True, MT * NT, NT, ovl), dy.reshape(-1), dy.shape[0], slot_of,
             h.reshape(-1), mg_down.reshape(-1)]
     fn(*args)
+    track(reads, writes, ovl)
     return None
