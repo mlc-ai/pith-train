@@ -28,9 +28,9 @@ def ep_dispatch_send_idx(topk_ids: torch.Tensor, num_experts: int, ep_size: int,
       all-to-all). Valid until the next call on the same stream (it may be reused scratch).
 
     Order within a bucket (a rank's chunk of dispatch_token_idxs, an expert's run of idxs) is token
-    order on SM90 (deterministic) and atomic order on the Triton path, which SM90 also takes for
-    inputs the CuTe kernel does not cover (e.g. more than 1024 experts + ranks). Counts and
-    per-bucket sets are identical on both. m == 0 gives zero counts and empty index outputs.
+    order on SM90 (deterministic) and atomic order on SM100 (TIRx kernel) and on the Triton path SM90
+    takes for inputs the CuTe kernel does not cover (e.g. more than 1024 experts + ranks). Counts and
+    per-bucket sets are identical on all paths. m == 0 gives zero counts and empty index outputs.
     """
     match ARCH_MAJOR:
         case 9:
