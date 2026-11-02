@@ -100,7 +100,9 @@ def test_masked_logits(dtype):
     logits[:, ::2] = float("-inf")
     logits[0, :-1] = float("-inf")
     target[0] = 151935
-    target[1::2] = 2 * torch.arange(1, 5, device="cuda") + 1  # unmasked odd columns
+    target[1:] = (
+        2 * torch.arange(1, 9, device="cuda") + 1
+    )  # every other row's target on an unmasked odd column
     grad = check(logits, target, 0.6, grad_logp, grad_entropy)
     assert not grad[:, ::2].any()
 
