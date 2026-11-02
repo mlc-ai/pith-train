@@ -18,8 +18,12 @@ widened to int64 first, and other logit dtypes take a PyTorch path with the same
 
 Evolved with TIRx-harness: run cross_entropy, frontier member cluster-resident-tma (commit fce2df20,
 10880 us vs 19448 us, 1.788x over the previous SM100 path, the Triton kernel adapted from
-TransformerEngine, in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+TransformerEngine, in the task's benchmark). Changed since: for 16-bit logits the cluster path keeps
+the logits in shared memory and recomputes exp(x - max) in fp32 in the gradient pass, where the
+member stored an f16 exp(x - chunk max) that zeroed terms more than ~16.6 below it; through KCoral
+on the same task that costs 11471 us vs 10883 us for the member in the same session (1.696x over
+the Triton kernel). Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched
+through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -454,8 +458,11 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                             txl.ptx["cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"](buf.ptr_to([k * chunk_el]), inp.ptr_to([base + txl.Cast("int64", k * chunk_el)]), sz, bar.ptr_to([k]))
 
                 # Per-thread, per-chunk: chunk max -> running max mref[k]; e = exp(x - mref[k]) is summed
-                # into s and written back in place (f16 for 16-bit logits, f32 for fp32), so the grad pass
-                # needs no second exponential: grad = e * exp(mref[k] - M) * inv_n / S.
+                # into s. fp32 logits get e written back in place, so their grad pass needs no second
+                # exponential: grad = e * exp(mref[k] - M) * inv_n / S. 16-bit logits stay in shared
+                # memory as loaded and the grad pass recomputes exp(x - M) in fp32: an f16 copy of e
+                # would flush terms more than ~16.6 below the chunk max to zero (and lose precision
+                # from ~9.7 below, in f16 denormals), where the contract is fp32 until the final round.
                 m, s, xt = txl.local_scalar("float32", init=txl.float32(NEG_BIG)), txl.local_scalar("float32", init=txl.float32(0.0)), txl.local_scalar("float32", init=txl.float32(0.0))
                 owner = txl.And(tl >= 0, tl < cnt)
                 with txl.If(txl.And(tid == 0, owner)), txl.Then():
@@ -491,11 +498,10 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                                 if ldt == txl.f32:
                                     txl.assign(ow[2 * q], txl.reinterpret("uint32", ex))
                                     txl.assign(ow[2 * q + 1], txl.reinterpret("uint32", ey))
-                                else:
-                                    txl.ptx["cvt.rn.f16x2.f32"](ow[q], ey, ex)
-                            v = k * chunk_vec + j * nt + tid
-                            with txl.If(v < nvec), txl.Then():
-                                txl.ptx["st.shared.v4.b32"](buf.ptr_to([v * epv]), ow[0], ow[1], ow[2], ow[3])
+                            if ldt == txl.f32:
+                                v = k * chunk_vec + j * nt + tid
+                                with txl.If(v < nvec), txl.Then():
+                                    txl.ptx["st.shared.v4.b32"](buf.ptr_to([v * epv]), ow[0], ow[1], ow[2], ow[3])
                         txl.assign(s, s + txl.cuda.float2_x(acc) + txl.cuda.float2_y(acc))
                 block_merge(m, s, red, warps, lane, warp)
 
@@ -527,18 +533,28 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                     txl.ptx.st.shared.s32(last.ptr_to([0]), txl.Select(old == N - 1, txl.int32(1), txl.int32(0)))
                 vt = txl.local_scalar("int32", init=txl.Select(owner, tl // epv, txl.int32(-1)))
                 g = txl.alloc_local([epv], "float32")
+                mm, ss = txl.cuda.make_float2(m, m), txl.cuda.make_float2(scale, scale)
                 for k in range(nchunk):
                     with txl.If(k * chunk_el < cnt), txl.Then():
-                        f = txl.local_scalar("float32", init=exp2((mref[k] - m) * LOG2E) * scale)
-                        ff = txl.cuda.make_float2(f, f)
+                        if ldt == txl.f32:
+                            f = txl.local_scalar("float32", init=exp2((mref[k] - m) * LOG2E) * scale)
+                            ff = txl.cuda.make_float2(f, f)
                         for j in range(VPT):
                             v = k * chunk_vec + j * nt + tid
                             with txl.If(v < nvec), txl.Then():
                                 txl.ptx["ld.shared.v4.b32"](words[0], words[1], words[2], words[3], buf.ptr_to([v * epv]))
-                                for q, pr in enumerate(pairs(words, txl.f32 if ldt == txl.f32 else txl.f16)):
-                                    r2 = f2("mul", pr, ff)
-                                    txl.assign(g[2 * q], txl.cuda.float2_x(r2))
-                                    txl.assign(g[2 * q + 1], txl.cuda.float2_y(r2))
+                                for q, pr in enumerate(pairs(words, ldt)):
+                                    if ldt == txl.f32:
+                                        r2 = f2("mul", pr, ff)
+                                        txl.assign(g[2 * q], txl.cuda.float2_x(r2))
+                                        txl.assign(g[2 * q + 1], txl.cuda.float2_y(r2))
+                                    else:
+                                        # exp(x - M) * inv_n / S in fp32, as ce_stream computes it
+                                        d = f2("mul", f2("sub", pr, mm), L2)
+                                        ex, ey = txl.local_scalar("float32", init=exp2(txl.cuda.float2_x(d))), txl.local_scalar("float32", init=exp2(txl.cuda.float2_y(d)))
+                                        r2 = f2("mul", txl.cuda.make_float2(ex, ey), ss)
+                                        txl.assign(g[2 * q], txl.cuda.float2_x(r2))
+                                        txl.assign(g[2 * q + 1], txl.cuda.float2_y(r2))
                                 with txl.If(v == vt), txl.Then():
                                     rel = tl - v * epv
                                     for q in range(epv):
