@@ -1,6 +1,8 @@
 """
-Picker of clamped_swiglu_fwd / clamped_swiglu_bwd: the Triton kernels in clamped_swiglu_sm90, the
-TIRx kernels in clamped_swiglu_sm100 on SM100 (the same bits).
+Picker of gpt-oss's clamped SwiGLU over an interleaved gate_up and its gradient.
+
+SM90 runs the CuTe-DSL kernels, SM100 the Triton kernels; both return the same values (bf16
+bit-identical).
 """
 
 import torch
@@ -16,7 +18,7 @@ def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> tor
     (up_clamped + 1) * gate_clamped * sigmoid(alpha * gate_clamped) with gate = gate_up[:, 0::2], up
     = gate_up[:, 1::2], gate_clamped = min(gate, limit), up_clamped = clamp(up, -limit, limit).
 
-    gate_up is contiguous (M, 2N), bf16 (any float dtype). alpha and limit are Python floats
+    gate_up is contiguous (M, 2N), bf16, fp16, fp32 or fp64. alpha and limit are Python floats
     (gpt-oss: 1.702, 7.0). Computed in fp32 and rounded once to the input dtype. Deterministic.
     """
     match ARCH_MAJOR:

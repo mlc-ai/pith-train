@@ -13,77 +13,20 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass._mlir import ir
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
+from pithtrain.kernels.cute_ptx_sm90 import abs2, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, u32_as_f32
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
-from pithtrain.kernels.silu_mul_sm90 import silu_mul_bwd_sm90, silu_mul_fwd_sm90
+from pithtrain.kernels.silu_mul_sm90 import silu_mul_bwd_sm90, silu_mul_fwd_sm90, swiglu_bwd, swiglu_fwd
 
 __all__ = ["SiluMulQuant", "SiluMulQuantGU", "fp8_silu_mul_gu_bwd_sm90", "fp8_silu_mul_bwd_sm90", "silu_mul_quant_fusable", "fp8_silu_mul_fwd_sm90", "silu_mul_quant_gu_fusable", "fp8_silu_mul_gu_fwd_sm90"]
 
 BLOCK = 128  # rows per quantization group and columns per CTA tile
 THREADS = 512
 VEC = 8  # BF16 columns per thread (one 16-byte load)
-
-
-# sigmoid(x) = 1 / (1 + exp(-x)). Triton 3.7 emits, for fp32:
-#     sub.f32 t, 0, x;  mul.f32 t, t, log2e;  ex2.approx.f32 e, t;  add.f32 d, e, 1;
-#     div.full.f32 s, 1, d
-# This 5-instruction sequence gives the same bits for every bf16 gate value (checked exhaustively):
-# - x * -log2e == (0 - x) * log2e: negation is exact; ex2(+-0) = 1; NaN is canonical.
-# - ex2 non-ftz differs from ftz only when e is subnormal, and then 1 + e == 1 either way.
-# - div.full(1, d) == 0.25 * rcp(0.25 * d) for every fp32 d >= 1 (also checked exhaustively),
-#   and 0.25 * (1 + e) == fma(e, 0.25, 0.25) because scaling by 0.25 is exact here.
-# .rn pins every mul/add so ptxas cannot contract differently from the Triton kernels.
-SIGMOID_PTX = (
-    "mul.rn.f32 t, $G, 0fBFB8AA3B;\n"
-    "ex2.approx.ftz.f32 t, t;\n"
-    "fma.rn.f32 t, t, 0f3E800000, 0f3E800000;\n"
-    "rcp.approx.ftz.f32 s, t;\n"
-    "mul.rn.f32 s, s, 0f3E800000;\n"
-)
-
-
-@dsl_user_op
-def swiglu_fwd(gate: Float32, up: Float32, *, loc=None, ip=None) -> Float32:
-    """
-    silu(gate) * up in fp32 as (sigmoid(gate) * gate) * up, the Triton forward's exact op order.
-    """
-    return Float32(asm_args_last(T.f32(), "{\n.reg .f32 t, s;\n" + SIGMOID_PTX.replace("$G", "$1") + "mul.rn.f32 s, s, $1;\nmul.rn.f32 $0, s, $2;\n}", "=f,f,f", [to_ir(gate, Float32, loc, ip), to_ir(up, Float32, loc, ip)]))
-
-
-@dsl_user_op
-def swiglu_bwd(grad_h: Float32, gate: Float32, up: Float32, *, loc=None, ip=None) -> tuple:
-    """
-    (grad_gate, grad_up) in fp32, the Triton backward's ops after LLVM contraction:
-
-    grad_up   = grad_h * (s * gate)
-    grad_gate = ((grad_h * up) * s) * fma(-s, gate, 1 + gate)      with s = sigmoid(gate)
-    """
-    result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
-    packed = asm_args_last(
-        result_type,
-        "{\n.reg .f32 t, s, a, b;\n"
-        + SIGMOID_PTX.replace("$G", "$3")
-        + "mul.rn.f32 a, s, $3;\n"  # silu
-        "mul.rn.f32 $1, a, $2;\n"  # grad_up
-        "mul.rn.f32 b, $2, $4;\n"  # grad_h * up
-        "mul.rn.f32 b, b, s;\n"  # * sigmoid
-        "add.rn.f32 a, $3, 0f3F800000;\n"  # 1 + gate
-        "neg.f32 t, s;\n"
-        "fma.rn.f32 a, t, $3, a;\n"  # 1 + gate - s * gate, unrounded product
-        "mul.rn.f32 $0, b, a;\n}",
-        "=f,=f,f,f,f",
-        [to_ir(value, Float32, loc, ip) for value in (grad_h, gate, up)],
-    )
-    return unpack(packed, 2, Float32, loc, ip)
-
-
 G_CAP = 1024  # expert groups the shared-memory offset table holds
 STAGES = 2  # cp.async tiles in flight per CTA (backward cannot fit 3 in shared memory)
 

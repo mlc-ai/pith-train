@@ -2,12 +2,11 @@
 Picker of the weight-side 128x128 blockwise FP8 quantization: the blockwise transposes of a weight
 and the FP8 parameter all-gather kernels.
 
-The blockwise transposes are also called inside torch.compile regions. SM90 runs the Triton kernel
-there (fp8_blockwise_transpose), which torch.compile traces; SM100 runs the TIRx kernel through a
-torch.library custom op with a fake implementation, so a compiled region calls it as an opaque op
-(eager calls run it directly, without the op's dispatch). The all-gather kernels run the CuTe-DSL
-port on SM90 and the TIRx kernels on SM100. Every scale is row-major: the E8M0 2^ceil(log2(max(amax,
-1e-4) / 448)) of its 128x128 tile's amax.
+The blockwise transposes are also called inside torch.compile regions. SM90 runs the CuTe-DSL kernel
+there behind an opaque op defined in fp8_weight_quant_sm90; SM100 runs the TIRx kernel through a
+torch.library custom op with a fake implementation, so a compiled region calls it as an opaque
+op. The all-gather kernels run the CuTe-DSL port on SM90 and the TIRx kernels on SM100. Every scale
+is row-major: the E8M0 2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
 """
 
 from typing import Any, Optional, Sequence
@@ -15,7 +14,6 @@ from typing import Any, Optional, Sequence
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
-from pithtrain.kernels.fp8_blockwise_transpose import fp8cast_blockwise_transpose, fp8cast_blockwise_transpose_grouped
 
 __all__ = ["fp8_pack_transpose", "fp8_scales", "fp8_scales_multi", "fp8_shard_amax", "fp8_shard_amax_multi", "fp8_shard_cast", "fp8_quant_weight", "fp8_quant_weight_grouped"]
 
@@ -63,7 +61,9 @@ def fp8_quant_weight(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     """
     match ARCH_MAJOR:
         case 9:
-            return fp8cast_blockwise_transpose(x)
+            from pithtrain.kernels.fp8_weight_quant_sm90 import fp8_quant_weight_sm90
+            # detached: the op has no autograd formula, and the outputs carry no gradient
+            return fp8_quant_weight_sm90(x.detach())
         case 10:
             # detached: the custom op has no autograd formula, and the outputs carry no gradient.
             # Only a torch.compile trace needs the opaque op; eager calls skip its dispatch.
@@ -84,7 +84,8 @@ def fp8_quant_weight_grouped(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     """
     match ARCH_MAJOR:
         case 9:
-            return fp8cast_blockwise_transpose_grouped(x)
+            from pithtrain.kernels.fp8_weight_quant_sm90 import fp8_quant_weight_grouped_sm90
+            return fp8_quant_weight_grouped_sm90(x.detach())
         case 10:
             if torch.compiler.is_compiling():
                 return fp8_quant_weight_grouped_op(x.detach())

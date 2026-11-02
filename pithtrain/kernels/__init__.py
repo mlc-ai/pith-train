@@ -3,8 +3,9 @@ PithTrain's kernel library. __all__ is its whole interface: code outside this pa
 from pithtrain.kernels, never a submodule. Each name's docstring is its contract, verified against
 PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100 implementation
 itself; callers that need to know whether a fused path exists use the capability queries
-fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported and
-gated_delta_rule_cp_supported. Importing the package never loads cutlass, QuACK or tvm_tirx.
+fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported,
+gated_delta_rule_cp_supported and chunk_gdr_cp_supported. Importing the package never loads cutlass,
+QuACK or tvm_tirx.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad
@@ -23,12 +24,13 @@ from pithtrain.kernels.fp8_scale_layout import act_scale_like
 from pithtrain.kernels.fp8_scatter_quant import scatter_quant
 from pithtrain.kernels.fp8_silu_mul_quant import fp8_silu_mul_bwd, fp8_silu_mul_gu_bwd, fp8_silu_mul_fwd, fp8_silu_mul_gu_fwd
 from pithtrain.kernels.fp8_weight_quant import fp8_pack_transpose, fp8_scales, fp8_scales_multi, fp8_shard_amax, fp8_shard_amax_multi, fp8_shard_cast, fp8_quant_weight, fp8_quant_weight_grouped
-from pithtrain.kernels.gated_delta_rule_cp import chunk_gdr_cp_bwd_post, chunk_gdr_cp_bwd_pre, chunk_gdr_cp_fwd_post, chunk_gdr_cp_fwd_pre, gated_delta_rule_cp_plan, gated_delta_rule_cp_supported
+from pithtrain.kernels.gated_delta_rule_cp import chunk_gdr_cp_bwd_post, chunk_gdr_cp_bwd_pre, chunk_gdr_cp_fwd_post, chunk_gdr_cp_fwd_pre, chunk_gdr_cp_supported, gated_delta_rule_cp_plan, gated_delta_rule_cp_supported, gdr_cp_bwd_local, gdr_cp_bwd_output, gdr_cp_bwd_states, gdr_cp_fwd_local, gdr_cp_fwd_output, gdr_cp_merge
 from pithtrain.kernels.gated_delta_rule_pinned import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned, gated_delta_rule_pinned_supported
 from pithtrain.kernels.group_bias_add import group_bias_add
 from pithtrain.kernels.log_prob import log_prob_bwd, log_prob_fwd
 from pithtrain.kernels.segment_sum import segment_sum
 from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
+from pithtrain.kernels.compile_options import stage_compile_options
 from pithtrain.kernels.token_scatter import scatter_by_expert
 from pithtrain.kernels.tuning import tune_kernels
 
@@ -83,6 +85,10 @@ __all__.append("segment_sum")
 __all__.append("silu_mul_bwd")
 __all__.append("silu_mul_fwd")
 
+# log-probability
+__all__.append("log_prob_bwd")
+__all__.append("log_prob_fwd")
+
 # MoE routing and token movement
 __all__.append("ep_dispatch_recv_idx")
 __all__.append("ep_dispatch_send_idx")
@@ -104,23 +110,29 @@ __all__.append("bf16_expert_gate_up_wgrad")
 __all__.append("bf16_experts_supported")
 __all__.append("bf16_expert_segment_sum")
 
-# Gated DeltaNet pinned launches (FLA on SM90, TIRx on SM100)
+# Gated DeltaNet pinned launches (CuTe on SM90, TIRx on SM100)
 __all__.append("chunk_gdr_bwd_pinned")
 __all__.append("chunk_gdr_fwd_pinned")
 __all__.append("gated_delta_rule_pinned_supported")
 
-# Gated DeltaNet under context parallelism (TIRx on SM100; SM90 runs FLA in the operator)
+# Gated DeltaNet under context parallelism: CuTe-DSL pieces of FLA's structure on SM90, TIRx stages on SM100
 __all__.append("chunk_gdr_cp_bwd_post")
 __all__.append("chunk_gdr_cp_bwd_pre")
 __all__.append("chunk_gdr_cp_fwd_post")
 __all__.append("chunk_gdr_cp_fwd_pre")
+__all__.append("chunk_gdr_cp_supported")
 __all__.append("gated_delta_rule_cp_plan")
 __all__.append("gated_delta_rule_cp_supported")
-
-# Log-probability and entropy of a tempered softmax (RL objectives)
-__all__.append("log_prob_bwd")
-__all__.append("log_prob_fwd")
+__all__.append("gdr_cp_bwd_local")
+__all__.append("gdr_cp_bwd_output")
+__all__.append("gdr_cp_bwd_states")
+__all__.append("gdr_cp_fwd_local")
+__all__.append("gdr_cp_fwd_output")
+__all__.append("gdr_cp_merge")
 
 
 # Launch-config tuning
 __all__.append("tune_kernels")
+
+# Inductor options of the models' compiled stages
+__all__.append("stage_compile_options")

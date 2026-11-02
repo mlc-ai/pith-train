@@ -4,8 +4,8 @@ in CuTe-DSL for SM90.
 
 The forward reads the raw gate_up GEMM output and the bias and writes the four outputs of
 fp8cast_rowwise_kmajor of h; the backward reads dh, gate_up and the bias and writes the four outputs
-for d(gate_up) plus fp32 per-128-row-block column sums that block_segment_sum turns into the bias
-gradient. Neither materializes the bf16 biased gate_up, h or d(gate_up). The FP8 bytes and scales
+for d(gate_up) plus fp32 per-128-row-block column sums that block_segment_sum_sm90 turns into the
+bias gradient. Neither materializes the bf16 biased gate_up, h or d(gate_up). The FP8 bytes and scales
 are bit-identical to the unfused sequence: the bias add is one fp32 add rounded to bf16, and the
 activation replays the Triton clamped_swiglu kernels' PTX. Both scales come back MN-major.
 
@@ -15,8 +15,6 @@ sequence (biased_gate_up, the clamped_swiglu kernels and fp8cast_rowwise_kmajor_
 
 from __future__ import annotations
 
-import struct
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -25,13 +23,13 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.arch import SM_COUNT
-from pithtrain.kernels.clamped_swiglu_sm90 import clamped_swiglu_bwd_sm90, clamped_swiglu_fwd_sm90
+from pithtrain.kernels.clamped_swiglu_sm90 import clamped_swiglu_bwd_sm90, clamped_swiglu_fwd_sm90, f32, make_bwd_op, make_fwd_op
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, ld_v4, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
-from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, ptx_f32, quant4_e4m3
+from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
-from pithtrain.kernels.segment_sum_sm90 import block_segment_sum
+from pithtrain.kernels.segment_sum_sm90 import block_segment_sum_sm90
 
 __all__ = ["ClampedSwiGLUQuant", "fp8_clamped_swiglu_bwd_sm90", "clamped_swiglu_quant_fusable", "clamped_swiglu_quant_fwd_sm90", "fp8_clamped_swiglu_kmajor_sm90", "fp8_clamped_swiglu_rowwise_sm90"]
 
@@ -51,23 +49,17 @@ def biased_gate_up(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: t
 
 def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does.
+    bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does (and
+    made contiguous).
     """
     x = biased_gate_up(gate_up, bias, grouped_mm_offs)
-    return clamped_swiglu_bwd_sm90(dh.to(x.dtype), x, alpha, limit)
+    return clamped_swiglu_bwd_sm90(dh.to(x.dtype).contiguous(), x, alpha, limit)
 
 BLOCK = 128  # rows per quantization group and output columns per CTA tile
 THREADS = 512
 VEC = 8  # output columns per thread
 G_CAP = 1024  # expert groups the shared-memory offset table holds
 STAGES = {False: 3, True: 2}  # cp.async tiles in flight per CTA, keyed by backward
-
-
-def f32(x: float) -> float:
-    """
-    x rounded to float32, as Triton receives a Python float scalar argument.
-    """
-    return struct.unpack("<f", struct.pack("<f", x))[0]
 
 
 @dsl_user_op
@@ -94,96 +86,6 @@ def lds_v2(addr: Int32, *, loc=None, ip=None) -> tuple:
     struct_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
     words = asm_args_last(struct_type, "ld.shared.v2.b32 {$0, $1}, [$2];", "=r,=r,r", [to_ir(addr, Int32, loc, ip)], side_effects=True)  # side_effects keeps the load behind the barrier
     return unpack(words, 2, Uint32, loc, ip)
-
-
-# The clamped SwiGLU math replays the exact PTX the Triton clamped_swiglu kernels compile to (Triton
-# 3.7), with L = limit, a = alpha:
-#   gc = min.f32(g, L);  uc = min.f32(max.f32(u, 0 - L), L)
-#   sigmoid(a * gc):  t = fma(-a, gc, 0);  t = t * log2e;  e = ex2.approx.f32 t;  d = e + 1;
-#                     s = div.full.f32(1, d)
-# fma(-a, gc, 0) == -(a * gc) rounded, so t * log2e == (a * gc) * -log2e (negation is
-# exact). The remaining sigmoid steps are the 5-instruction sequence of silu_mul_quant's
-# SIGMOID_PTX, verified there for every fp32 d >= 1 (div.full) and every ex2 input.
-#   forward:  out = (uc + 1) * (gc * s)
-#   backward: grad_uc = (gc * s) * dh
-#             grad_gc = ((uc + 1) * dh * s) * fma(a * gc, 1 - s, 1)      (LLVM contraction)
-#             grad_g  = g <= L ? grad_gc : 0;   grad_u = -L <= u <= L ? grad_uc : 0
-def sigmoid_ptx(x: str) -> str:
-    """
-    PTX computing s = sigmoid(x) of the fp32 register x (uses t, s).
-    """
-    return (
-        f"mul.rn.f32 t, {x}, 0fBFB8AA3B;\n"
-        "ex2.approx.ftz.f32 t, t;\n"
-        "fma.rn.f32 t, t, 0f3E800000, 0f3E800000;\n"
-        "rcp.approx.ftz.f32 s, t;\n"
-        "mul.rn.f32 s, s, 0f3E800000;\n"
-    )
-
-
-def clamp_ptx(alpha: float, limit: float) -> str:
-    """
-    gc, uc, ag = alpha * gc and s = sigmoid(ag) from g = $G, u = $U.
-    """
-    L, neg_L, A = ptx_f32(limit), ptx_f32(-limit), ptx_f32(alpha)
-    return (
-        f"min.f32 gc, $G, {L};\n"
-        f"max.f32 uc, $U, {neg_L};\n"
-        f"min.f32 uc, uc, {L};\n"
-        f"mul.rn.f32 ag, gc, {A};\n" + sigmoid_ptx("ag")
-    )
-
-
-def make_fwd_op(alpha: float, limit: float):
-    clamp_text = clamp_ptx(alpha, limit).replace("$G", "$1").replace("$U", "$2")
-
-    @dsl_user_op
-    def fwd_op(gate: Float32, up: Float32, *, loc=None, ip=None) -> Float32:
-        return Float32(
-            asm_args_last(
-                T.f32(),
-                "{\n.reg .f32 gc, uc, ag, t, s;\n" + clamp_text + "mul.rn.f32 s, gc, s;\n"  # glu
-                "add.rn.f32 uc, uc, 0f3F800000;\n"
-                "mul.rn.f32 $0, uc, s;\n}",
-                "=f,f,f",
-                [to_ir(gate, Float32, loc, ip), to_ir(up, Float32, loc, ip)],
-            )
-        )
-
-    return fwd_op
-
-
-def make_bwd_op(alpha: float, limit: float):
-    clamp_text = clamp_ptx(alpha, limit).replace("$G", "$3").replace("$U", "$4")
-    L, neg_L = ptx_f32(limit), ptx_f32(-limit)
-
-    @dsl_user_op
-    def bwd_op(dh: Float32, gate: Float32, up: Float32, *, loc=None, ip=None) -> tuple:
-        result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
-        packed = asm_args_last(
-            result_type,
-            "{\n.reg .f32 gc, uc, ag, t, s, a, b;\n.reg .pred pg, pu, pl;\n"
-            + clamp_text
-            + "add.rn.f32 uc, uc, 0f3F800000;\n"
-            "mul.rn.f32 a, uc, $2;\n"  # (uc + 1) * dh
-            "mul.rn.f32 b, gc, s;\n"  # glu
-            "mul.rn.f32 b, b, $2;\n"  # grad_uc
-            "mul.rn.f32 a, a, s;\n"
-            "sub.rn.f32 t, 0f3F800000, s;\n"
-            "fma.rn.f32 t, ag, t, 0f3F800000;\n"
-            "mul.rn.f32 a, a, t;\n"  # grad_gc
-            f"setp.le.f32 pg, $3, {L};\n"
-            f"setp.le.f32 pu, $4, {L};\n"
-            f"setp.ge.f32 pl, $4, {neg_L};\n"
-            "and.pred pu, pu, pl;\n"
-            "selp.f32 $0, a, 0f00000000, pg;\n"
-            "selp.f32 $1, b, 0f00000000, pu;\n}",
-            "=f,=f,f,f,f",
-            [to_ir(value, Float32, loc, ip) for value in (dh, gate, up)],
-        )
-        return unpack(packed, 2, Float32, loc, ip)
-
-    return bwd_op
 
 
 class TileThread:
@@ -627,7 +529,7 @@ def fp8_clamped_swiglu_bwd_sm90(dh: torch.Tensor, gate_up: torch.Tensor, bias: t
     if not (clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs) and dh.dtype == torch.bfloat16 and dh.is_contiguous()):
         grad_gate_up = clamped_swiglu_bwd_biased(dh, gate_up, bias, grouped_mm_offs, alpha, limit)
         partials = grad_gate_up.float().view(M // BLOCK, BLOCK, 2 * N).sum(1)
-        return fp8cast_rowwise_kmajor_sm90(grad_gate_up, grouped_mm_offs), block_segment_sum(partials, grouped_mm_offs, bias.dtype)
+        return fp8cast_rowwise_kmajor_sm90(grad_gate_up, grouped_mm_offs), block_segment_sum_sm90(partials, grouped_mm_offs, bias.dtype)
     KP = 2 * N if kmajor_channels is None else kmajor_channels
     assert KP >= 2 * N
     out = allocate_outputs(M, 2 * N, gate_up.device, KP)
@@ -635,4 +537,4 @@ def fp8_clamped_swiglu_bwd_sm90(dh: torch.Tensor, gate_up: torch.Tensor, bias: t
     fn = get_kernel(N, True, f32(alpha), f32(limit), gate_up.device, KP)
     fn(dh, gate_up, bias, grouped_mm_offs, *out, partials)
     assert G > 0
-    return out, block_segment_sum(partials, grouped_mm_offs, bias.dtype)
+    return out, block_segment_sum_sm90(partials, grouped_mm_offs, bias.dtype)

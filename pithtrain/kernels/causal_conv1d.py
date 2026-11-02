@@ -1,19 +1,16 @@
 """
-Picker of causal_conv1d, the causal depthwise conv1d of the Qwen3.5 Gated DeltaNet on the
-channels-last (B, S, C) layout: the Triton kernels in causal_conv1d_sm90, the TIRx kernels in
-causal_conv1d_sm100 on SM100.
+Causal depthwise conv1d of the Qwen3.5 Gated DeltaNet on the channels-last (B, S, C) layout, forward
+writing the (B, C, S) storage a sliced nn.Conv1d output has, and backward (dx and dw).
 
 offset is the number of leading rows of x that are history (the K - 1 tokens of conv state prepended
 under context parallelism), not outputs.
 """
 
-from __future__ import annotations
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["causal_conv1d_bwd", "causal_conv1d_fwd", "causal_conv1d_empty"]
+__all__ = ["causal_conv1d_bwd", "causal_conv1d_empty", "causal_conv1d_fwd"]
 
 
 def causal_conv1d_empty(x: torch.Tensor, offset: int) -> torch.Tensor:
@@ -32,7 +29,8 @@ def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Te
     1) + k, c], taps at negative positions skipped.
 
     x: bf16 (B, offset + S, C) contiguous, its first offset rows history. w: (C, 1, K) or (C, K)
-    contiguous, any float dtype (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
+    contiguous with K <= 8 (SM90 raises ValueError beyond; SM100 does not check), any float dtype
+    (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
     in the layout of causal_conv1d_empty, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2),
     w, padding=K - 1, groups=C)[..., offset:offset + S].transpose(1, 2).
     """

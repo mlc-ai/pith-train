@@ -9,7 +9,9 @@ import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
 
-__all__ = ["scatter_by_expert"]
+__all__ = ["GEMM_ALLOC_ALIGNMENT", "scatter_by_expert"]
+
+GEMM_ALLOC_ALIGNMENT = 1024
 
 
 def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
@@ -19,8 +21,8 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
     grouped_mm_offs, ks_tensor, ks).
 
     - input_tokens: (num_tokens, hidden) with unit inner stride (any row stride, any dtype).
-      expert_idxs: int64 (num_tokens,) contiguous, values in [0, num_groups); a length other than
-      num_tokens raises ValueError. Inputs are not modified.
+      expert_idxs: int64 (num_tokens,) contiguous, values in [0, num_groups), length num_tokens.
+      Inputs are not modified.
     - group_counts: the true rows per group on the host, if known; ks then follows without the
       device-to-host copy (and host sync), and must match expert_idxs.
     - output_tokens: (sum(ks), hidden) row-major in input_tokens' dtype, a prefix view of an
@@ -32,7 +34,10 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
     - num_tokens == 0 returns empty tensors, grouped_mm_offs and ks_tensor of shape (0,), and
       ks == [].
 
-    Rows are copied exactly. Placement within a group is atomic_add order, not deterministic.
+    Rows are copied exactly. Placement within a group: token order on SM90 (so every output is
+    deterministic); unspecified on SM100 (atomic_add order, not deterministic). Consumers locate a
+    token only through reverse_shuffle_idxs. An expert_idxs length other than num_tokens raises
+    ValueError on SM90 (also for num_tokens == 0); SM100 does not check it.
     """
     match ARCH_MAJOR:
         case 9:

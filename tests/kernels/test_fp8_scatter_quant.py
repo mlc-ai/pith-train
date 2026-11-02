@@ -265,13 +265,14 @@ def test_scatter_quant_identity(host_counts: bool) -> None:
 
 def test_scatter_quant_n_not_multiple_of_8() -> None:
     """
-    N % 8 != 0 takes the unfused path, whose row placement is not stable, so
-    check_stable is skipped.
+    N % 8 != 0 takes the unfused path on SM90 (scatter_by_expert), whose placement is stable too.
     """
     sizes, G, N = RAGGED, len(RAGGED), 100
     expert_idxs, expand, m_src = make_routing(sizes, 2, True, 9)
     gathered = make_tokens(m_src, N, 9)
-    check(gathered, expert_idxs, G, expand, None, scatter_quant(gathered, expert_idxs, G, expand))
+    out = scatter_quant(gathered, expert_idxs, G, expand)
+    check(gathered, expert_idxs, G, expand, None, out)
+    check_stable(expert_idxs, G, out[1], out[2])
 
 
 def test_scatter_quant_determinism() -> None:

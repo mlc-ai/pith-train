@@ -1,201 +1,365 @@
 """
-Verifies log_prob_fwd and log_prob_bwd, the fused per-token log-probability and entropy of a
-tempered softmax and its in-place backward, against PyTorch.
-
-Contract: for logits x (N, V) and inv_temperature = 1 / T, p = softmax(x / T) per row; logp is
-log p[target] (0 for a target outside [0, V)), entropy is -sum p log p with 0 log 0 = 0, both fp32.
-The backward overwrites x with the gradient of g_logp * logp + g_entropy * entropy, computed in fp32
-and rounded once to x's dtype (an invalid target drops its g_logp). row_max and log_sum are opaque
-statistics passed from the forward to the backward; only their shape and dtype are checked.
+Contract: log_prob_fwd(inp, target, inv_temperature) returns the (N,) fp32 logp, entropy, row_max and
+log_sum of softmax(inp * inv_temperature) and leaves the logits alone; log_prob_bwd overwrites the
+logits in place with the gradient of grad_logp . logp + grad_entropy . entropy, computed in fp32 and
+rounded once, bumps their version counter once and returns None. Targets outside [0, V) give logp
+0 and drop grad_logp; -inf logits add 0 to the entropy and get gradient 0. Checked against an FP64
+PyTorch reference written here.
 """
+
+import math
 
 import pytest
 import torch
 
 from pithtrain.kernels import log_prob_bwd, log_prob_fwd
 
-# Gradient tolerances: both sides round an fp32 gradient once to the logits' dtype, so the result
-# may differ by one ulp.
-GRAD_TOL = {torch.float32: (1e-4, 1e-6), torch.bfloat16: (1e-2, 1e-6), torch.float16: (2e-3, 1e-6)}
+INT64_MAX, INT64_MIN = 2**63 - 1, -(2**63)
+# The four models' vocabularies: deepseek-v2-lite, qwen3-30b-a3b, gpt-oss-20b, qwen3.5-35b-a3b.
+MODEL_VOCABS = [102400, 151936, 201088, 248320]
 
 
-def reference(logits, target, temperature, grad_logp, grad_entropy):
+def reference(logits, target, temperature, grad_logp, grad_entropy, rows_per_chunk=512):
     """
-    logp, entropy and the logits' gradient, through log_softmax in fp32 (fp64 for fp64 logits).
+    FP64 logp, entropy, row_max and log_sum, and the FP64 gradient rounded once to the logits' dtype,
+    a few rows at a time.
     """
-    dtype = torch.promote_types(logits.dtype, torch.float32)
-    x = logits.detach().to(dtype).requires_grad_()
-    logp_all = torch.log_softmax(x / temperature, dim=-1)
-    entropy = -(logp_all.exp() * torch.where(logp_all > float("-inf"), logp_all, 0.0)).sum(dim=-1)
-    valid = (target >= 0) & (target < logits.shape[-1])
-    logp = logp_all.gather(-1, torch.where(valid, target, 0).long().unsqueeze(-1)).squeeze(-1)
-    logp = torch.where(valid, logp, 0.0)
-    torch.autograd.backward((logp, entropy), (grad_logp.to(dtype), grad_entropy.to(dtype)))
-    return logp.detach(), entropy.detach(), x.grad.to(logits.dtype)
+    vocab = logits.shape[1]
+    outputs = []
+    for start in range(0, max(logits.shape[0], 1), rows_per_chunk):
+        x = logits[start : start + rows_per_chunk].double() / temperature
+        y = target[start : start + rows_per_chunk].long()
+        g_logp = grad_logp[start : start + rows_per_chunk]
+        g_ent = grad_entropy[start : start + rows_per_chunk].double()
+        log_p = torch.log_softmax(x, dim=-1)
+        p = log_p.exp()
+        log_p_finite = torch.where(log_p > float("-inf"), log_p, 0.0)  # 0 log 0 = 0
+        entropy = -(p * log_p_finite).sum(dim=-1)
+        valid = (y >= 0) & (y < vocab)
+        safe = torch.where(valid, y, 0)
+        logp = torch.where(valid, log_p.gather(-1, safe.unsqueeze(-1)).squeeze(-1), 0.0)
+        row_max = x.max(dim=-1).values
+        log_sum = torch.logsumexp(x - row_max.unsqueeze(-1), dim=-1)
+        g_logp = torch.where(valid, g_logp.double(), 0.0)
+        grad = -p * (
+            g_logp.unsqueeze(-1) + g_ent.unsqueeze(-1) * (log_p_finite + entropy.unsqueeze(-1))
+        )
+        rows = torch.nonzero(valid).squeeze(-1)
+        grad[rows, safe[rows]] += g_logp[rows]
+        outputs.append((logp, entropy, row_max, log_sum, (grad / temperature).to(logits.dtype)))
+    return [torch.cat(parts) for parts in zip(*outputs)]
 
 
-def run(inp, target, temperature, grad_logp, grad_entropy):
-    """
-    log_prob_fwd then log_prob_bwd on inp (overwritten with the gradient); returns logp, entropy.
-    """
-    N = inp.shape[0]
-    before = inp.clone()
+def run_kernels(logits, target, temperature, grad_logp, grad_entropy):
+    inp = logits.clone()
     logp, entropy, row_max, log_sum = log_prob_fwd(inp, target, 1.0 / temperature)
-    assert torch.equal(inp, before)  # the forward leaves the logits intact
-    for t in (logp, entropy, row_max, log_sum):
-        assert t.shape == (N,) and t.dtype == torch.float32
-    log_prob_bwd(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, 1.0 / temperature)
-    return logp, entropy
+    assert torch.equal(inp, logits)  # the forward leaves the logits unchanged
+    for out in (logp, entropy, row_max, log_sum):
+        assert out.shape == (logits.shape[0],) and out.dtype == torch.float32
+    data_ptr, version = inp.data_ptr(), inp._version
+    assert log_prob_bwd(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, 1.0 / temperature) is None  # fmt: skip
+    assert inp.data_ptr() == data_ptr and inp._version == version + 1  # in place, bumped once
+    return logp, entropy, row_max, log_sum, inp
 
 
-def check(logits, target, temperature, grad_logp, grad_entropy, inp=None):
-    expected_logp, expected_entropy, expected_grad = reference(logits, target, temperature, grad_logp, grad_entropy)  # fmt: skip
-    inp = logits.clone() if inp is None else inp
-    logp, entropy = run(inp, target, temperature, grad_logp, grad_entropy)
-    torch.testing.assert_close(logp, expected_logp.float(), rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(entropy, expected_entropy.float(), rtol=1e-5, atol=1e-5)
-    rtol, atol = GRAD_TOL[logits.dtype]
-    torch.testing.assert_close(inp, expected_grad, rtol=rtol, atol=atol)
-    return inp
+def check(logits, target, temperature=1.0, grad_logp=None, grad_entropy=None, seed=0):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    num_rows = logits.shape[0]
+    if grad_logp is None:
+        grad_logp, grad_entropy = torch.randn((2, num_rows), generator=generator, device="cuda")
+    got = run_kernels(logits, target, temperature, grad_logp, grad_entropy)
+    want = reference(logits, target, temperature, grad_logp, grad_entropy)
+    logp, entropy, row_max, log_sum, grad = got
+    torch.testing.assert_close(logp.double(), want[0], rtol=1e-5, atol=1e-5, equal_nan=True)
+    torch.testing.assert_close(entropy.double(), want[1], rtol=1e-5, atol=1e-5, equal_nan=True)
+    # row_max and log_sum are internal to the pair but defined for rows with a finite logit, in
+    # natural-log units (SM90) or base 2 (SM100): whichever the row_max says, log_sum must match.
+    finite = torch.isfinite(want[2])
+    unit = 1.0
+    if not torch.allclose(row_max.double()[finite], want[2][finite], rtol=1e-6, atol=1e-6):
+        unit = 1.0 / math.log(2.0)
+    torch.testing.assert_close(
+        row_max.double()[finite], unit * want[2][finite], rtol=1e-6, atol=1e-6
+    )
+    torch.testing.assert_close(
+        log_sum.double()[finite], unit * want[3][finite], rtol=1e-5, atol=1e-5
+    )
+    # Both round an fp32 gradient once to the logits' dtype, so 16-bit types may differ by one ulp.
+    rtol, atol = (1e-4, 1e-6) if logits.dtype == torch.float32 else (1e-2, 1e-6)
+    torch.testing.assert_close(grad, want[4], rtol=rtol, atol=atol, equal_nan=True)
+    return got
 
 
-def make(N, V, dtype, seed=0, scale=3.0):
-    gen = torch.Generator(device="cuda").manual_seed(seed)
-    logits = (torch.randn((N, V), generator=gen, device="cuda") * scale).to(dtype)
-    target = torch.randint(V, (N,), generator=gen, device="cuda")
-    grad_logp, grad_entropy = torch.randn((2, N), generator=gen, device="cuda")
-    return logits, target, grad_logp, grad_entropy
+def random_problem(num_rows, vocab, dtype, invalid_every=7, seed=0):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    logits = (torch.randn((num_rows, vocab), generator=generator, device="cuda") * 3).to(dtype)
+    target = torch.randint(vocab, (num_rows,), generator=generator, device="cuda")
+    target[::invalid_every] = -100
+    return logits, target
 
 
-@pytest.mark.parametrize("temperature", [1.0, 0.6])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_rows", [1, 3, 4096, 8192])
+@pytest.mark.parametrize("vocab", MODEL_VOCABS)
+def test_model_vocabularies(num_rows, vocab):
+    logits, target = random_problem(num_rows, vocab, torch.bfloat16)
+    check(logits, target, temperature=1.0 if num_rows % 2 == 0 else 0.6)
+
+
+@pytest.mark.parametrize("temperature", [1.0, 0.6, 0.5])
 @pytest.mark.parametrize(
-    "N,V",
+    "dtype, vocab",
     [
-        (3, 151936),  # qwen3-30b-a3b
-        (3, 248320),  # qwen3.5-35b-a3b
-        (3, 102400),  # deepseek-v2-lite
-        (3, 201088),  # gpt-oss
-        (67, 8192),
-        (5, 1000),  # V not a multiple of 128
-        (4, 1),
-        (2, 7),  # V below one vector
+        (torch.bfloat16, 5003),
+        (torch.float16, 5003),
+        (torch.float32, 33),
+        (torch.float32, 151936),
+        (torch.float16, 151936),
+        (torch.bfloat16, 1),
+        (torch.float32, 1),
     ],
 )
-def test_matches_log_softmax(N, V, dtype, temperature):
-    logits, target, grad_logp, grad_entropy = make(N, V, dtype)
-    # the first and last column, and both sides of power-of-two tile boundaries
-    for row, index in enumerate((0, V - 1, 32767, 32768, 16384)):
-        if row < N and index < V:
-            target[row] = index
-    check(logits, target, temperature, grad_logp, grad_entropy)
+def test_dtypes_and_temperatures(dtype, vocab, temperature):
+    logits, target = random_problem(67, vocab, dtype)
+    check(logits, target, temperature)
+
+
+@pytest.mark.parametrize(
+    "inv_temperature", [-1.0, -0.0, 0.0, float("inf"), float("nan"), 1e-50, 1e100, 3.5e38]
+)
+def test_rejects_nonpositive_or_nonfinite_temperature(inv_temperature):
+    """
+    Both entry points raise ValueError before launching anything, also for values a Python float
+    holds but fp32 rounds to 0 or inf.
+    """
+    logits, target = random_problem(3, 5003, torch.bfloat16)
+    stats = torch.zeros((3, 3), device="cuda")
+    with pytest.raises(ValueError):
+        log_prob_fwd(logits, target, inv_temperature)
+    with pytest.raises(ValueError):
+        log_prob_bwd(logits.clone(), target, *stats, *stats[:2], inv_temperature)
+
+
+# The SM90 layout, restated so targets sit exactly on its CTA slice and chunk edges (elsewhere these
+# are ordinary columns). Forward: above 64 rows 1 CTA per row up to 80 KB, else a cluster of 2; up to
+# 64 rows the smallest of 1, 2, 4, 8 CTAs whose slices fit 40 KB; slices stream in chunks of about
+# 16 KB, except up to 8 rows, where a slice lands whole. Backward: ceil(row bytes / 12 KB) slices, or
+# 2 KB up to 16 rows. Slices and chunks are whole numbers of 128-byte lines.
+TINY_FWD_ROWS, SMALL_FWD_ROWS, TINY_BWD_ROWS = 8, 64, 16
+
+
+def line_units(num_units, num_parts):
+    return (-(-num_units // num_parts) + 7) // 8 * 8
+
+
+def fwd_layout(vocab, element_bytes, num_rows):
+    """
+    (cluster size, chunks per slice) of the forward.
+    """
+    row_bytes = vocab * element_bytes
+    if num_rows <= SMALL_FWD_ROWS:
+        ctas = next((ctas for ctas in (1, 2, 4, 8) if row_bytes <= ctas * 40 * 1024), 8)
+    else:
+        ctas = 1 if row_bytes <= 80 * 1024 else 2
+    chunks = 1 if num_rows <= TINY_FWD_ROWS else max(1, -(-row_bytes // (ctas * 16 * 1024)))
+    return ctas, chunks
+
+
+def slice_counts(vocab, element_bytes, num_rows):
+    bwd_bytes = 2 * 1024 if num_rows <= TINY_BWD_ROWS else 12 * 1024
+    return fwd_layout(vocab, element_bytes, num_rows)[0], max(
+        1, -(-vocab * element_bytes // bwd_bytes)
+    )
+
+
+def slice_boundaries(vocab, element_bytes, num_rows):
+    """
+    First column of every forward and backward CTA slice but the first, and of every forward chunk,
+    for rows that start on a 16-byte boundary (V * element_bytes a multiple of 16).
+    """
+    num_units, unit_elements = vocab * element_bytes // 16, 16 // element_bytes
+    fwd, bwd = slice_counts(vocab, element_bytes, num_rows)
+    starts = set()
+    for num_slices in (fwd, bwd):
+        slice_units = line_units(num_units, num_slices)
+        starts.update(k * slice_units for k in range(1, num_slices) if k * slice_units < num_units)
+    fwd_units = line_units(num_units, fwd)
+    chunk_units = line_units(fwd_units, fwd_layout(vocab, element_bytes, num_rows)[1])
+    for rank in range(fwd):
+        for k in range(1, -(-fwd_units // chunk_units)):
+            if rank * fwd_units + k * chunk_units < min((rank + 1) * fwd_units, num_units):
+                starts.add(rank * fwd_units + k * chunk_units)
+    return sorted(unit * unit_elements for unit in starts)
+
+
+def test_slice_boundaries_follow_the_layout():
+    assert slice_counts(151936, 2, 4096) == (2, 25) and slice_counts(102400, 2, 4096) == (2, 17)
+    assert slice_counts(151936, 4, 4096) == (2, 50) and slice_counts(30000, 2, 4096) == (1, 5)
+    assert slice_counts(151936, 2, 3) == (8, 149) and slice_counts(102400, 2, 16) == (8, 100)
+    assert fwd_layout(151936, 2, 8) == (8, 1) and fwd_layout(151936, 2, 64) == (8, 3)
+    # bf16 151936: 1 cluster edge, 24 backward slice edges, 2 x 9 forward chunk edges, one of which
+    # (unit 11400) is also a backward edge.
+    assert len(slice_boundaries(151936, 2, 4096)) == 1 + 24 + 18 - 1
+
+
+@pytest.mark.parametrize("dtype, vocab", [(torch.bfloat16, 5003), (torch.float32, 33)])
+def test_targets_on_every_column(dtype, vocab):
+    # One row per target column: every head, tail and slice edge of a ragged row, misaligned rows too.
+    logits, _ = random_problem(vocab, vocab, dtype)
+    check(logits, torch.arange(vocab, device="cuda"))
+
+
+@pytest.mark.parametrize(
+    "rows_per_call", [TINY_FWD_ROWS, TINY_BWD_ROWS, SMALL_FWD_ROWS, SMALL_FWD_ROWS + 1]
+)
+@pytest.mark.parametrize(
+    "dtype, vocab",
+    [(torch.bfloat16, v) for v in MODEL_VOCABS]
+    + [(torch.float32, 151936), (torch.float16, 151936)],
+)
+def test_targets_on_every_slice_boundary(dtype, vocab, rows_per_call):
+    # One row per target: both sides of every forward and backward slice edge (the last element of
+    # one CTA's last unit, the first of the next CTA's), plus the row's first and last columns, in
+    # calls of rows_per_call rows, so each row-count regime's layout is checked at its own edges.
+    element_bytes = torch.finfo(dtype).bits // 8
+    unit_elements = 16 // element_bytes
+    columns = {0, 1, vocab - 2, vocab - 1}
+    for start in slice_boundaries(vocab, element_bytes, rows_per_call):
+        columns.update((start - unit_elements, start - 1, start, start + unit_elements - 1))
+    columns = sorted(columns)
+    columns += [0] * (-len(columns) % rows_per_call)  # whole calls only
+    logits, _ = random_problem(len(columns), vocab, dtype)
+    for start in range(0, len(columns), rows_per_call):
+        rows = slice(start, start + rows_per_call)
+        check(logits[rows], torch.tensor(columns[rows], device="cuda"))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_invalid_targets(dtype):
+    vocab = 8192
+    element_bytes = torch.finfo(dtype).bits // 8
+    invalid = [-100, -1, vocab, 2**40, INT64_MAX, INT64_MIN, 2**62, -(2**62)]
+    # Targets whose unguarded byte offset target * element_bytes wraps into or near the row.
+    invalid += [2**63 // element_bytes + k for k in (0, 1, 5)]
+    invalid += [
+        2**64 // element_bytes + k for k in (0, 1, 5) if 2**64 // element_bytes + k <= INT64_MAX
+    ]
+    target = torch.tensor(invalid + [0, vocab - 1], device="cuda")
+    logits, _ = random_problem(len(target), vocab, dtype)
+    logp = check(logits, target, temperature=0.6)[0]
+    assert not logp[: len(invalid)].any()
+
+
+def test_all_targets_invalid():
+    logits, _ = random_problem(64, 151936, torch.bfloat16)
+    logp = check(logits, torch.full((64,), -100, device="cuda"))[0]
+    assert not logp.any()
+
+
+@pytest.mark.parametrize("target_dtype", [torch.int32, torch.int64, torch.int16])
+@pytest.mark.parametrize("is_strided", [False, True])
+def test_target_dtypes_and_strides(target_dtype, is_strided):
+    vocab = 30000 if target_dtype == torch.int16 else 151936
+    logits, target = random_problem(67, vocab, torch.bfloat16)
+    target = target.to(target_dtype)
+    if is_strided:
+        target = torch.stack((target, torch.zeros_like(target)), dim=1)[:, 0]
+        assert target.stride(0) == 2
+    check(logits, target)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_masked_logits(dtype):
-    """
-    -inf logits add nothing to the entropy and get no gradient; row 0 keeps only its last column.
-    """
-    logits, target, grad_logp, grad_entropy = make(9, 151936, dtype, seed=1)
-    logits[:, ::2] = float("-inf")
-    logits[0, :-1] = float("-inf")
-    target[0] = 151935
-    target[1:] = (
-        2 * torch.arange(1, 9, device="cuda") + 1
-    )  # every other row's target on an unmasked odd column
-    grad = check(logits, target, 0.6, grad_logp, grad_entropy)
-    assert not grad[:, ::2].any()
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_extreme_logits(dtype):
-    """
-    Spike, uniform and offset rows against an fp64 reference.
-    """
-    V = 152064
-    logits, target, grad_logp, grad_entropy = make(6, V, torch.float32, seed=2, scale=1.0)
-    logits[0] = 7.0  # uniform: entropy log(V)
-    logits[1, target[1]] = 80.0  # the target takes all the mass
-    logits[2, 0] = 80.0  # another token takes all the mass
-    logits[3] *= 1000.0  # a few tokens take all the mass
-    logits[4] = logits[4] * 30.0 - 1e4  # large offset
-    logits[5] *= 1e-3  # nearly uniform
-    logits = logits.to(dtype)
-    # T = 0.5 keeps x / T exact in fp32.
-    for temperature in (1.0, 0.5):
-        truth = reference(logits.double(), target, temperature, grad_logp.double(), grad_entropy.double())  # fmt: skip
-        inp = logits.clone()
-        logp, entropy = run(inp, target, temperature, grad_logp, grad_entropy)
-        torch.testing.assert_close(logp.double(), truth[0], rtol=1e-6, atol=1e-5)
-        torch.testing.assert_close(entropy.double(), truth[1], rtol=1e-6, atol=1e-5)
-        rtol, atol = GRAD_TOL[dtype]
-        torch.testing.assert_close(inp, truth[2].to(dtype), rtol=rtol, atol=atol)
-
-
-def test_out_of_range_targets():
-    """
-    Invalid targets give logp 0 and drop g_logp; int32 targets work as int64 ones do.
-    """
-    logits, _, grad_logp, grad_entropy = make(6, 8192, torch.bfloat16, seed=3)
-    target = torch.tensor([-100, 0, -1, 8191, 8192, 2**40], device="cuda")
-    check(logits, target, 0.6, grad_logp, grad_entropy)
-    target32 = torch.tensor([-100, 0, -1, 8191, 8192, 2**30], device="cuda", dtype=torch.int32)
-    check(logits, target32, 0.6, grad_logp, grad_entropy)
-
-
-def test_other_float_dtypes():
-    """
-    fp16 and fp64 logits are read as fp32; the gradient is rounded once to their dtype.
-    """
-    logits, target, grad_logp, grad_entropy = make(5, 4099, torch.float32, seed=4)
-    check(logits.half(), target, 1.0, grad_logp, grad_entropy)
-    logits64 = logits.double()
-    expected = reference(logits, target, 1.0, grad_logp, grad_entropy)  # fp32 arithmetic
-    inp = logits64.clone()
-    logp, entropy = run(inp, target, 1.0, grad_logp, grad_entropy)
-    torch.testing.assert_close(logp, expected[0], rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(entropy, expected[1], rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(inp, expected[2].double(), rtol=1e-4, atol=1e-6)
-
-
-@pytest.mark.parametrize("pad", [0, 8, 3])
-def test_row_stride_and_gradient_strides(pad):
-    """
-    Logits with a row stride above V (aligned or not) are read and overwritten in place, padding
-    untouched; stride-0 and strided upstream gradients.
-    """
-    N, V = 33, 8192
-    logits, target, _, _ = make(N, V, torch.bfloat16, seed=5)
-    storage = torch.full((N, V + pad), 7.0, device="cuda", dtype=torch.bfloat16)
-    inp = storage[:, :V]
-    inp.copy_(logits)
-    grad_logp = torch.full((1,), 1.0, device="cuda").expand(N)  # stride 0, as from logp.sum()
-    grad_entropy = torch.randn(2 * N, device="cuda")[::2]  # stride 2
-    check(logits, target, 0.6, grad_logp, grad_entropy, inp=inp)
-    assert (storage[:, V:] == 7.0).all()
-
-
-def test_masked_rows_get_zero_gradient():
-    logits, target, grad_logp, grad_entropy = make(12, 151936, torch.bfloat16, seed=6)
-    grad_logp[::3] = grad_entropy[::3] = 0.0
-    grad = check(logits, target, 1.0, grad_logp, grad_entropy)
-    assert not grad[::3].any()
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_backward_is_deterministic(dtype):
-    logits, target, grad_logp, grad_entropy = make(64, 152064, dtype, seed=7)
-    first = logits.clone()
-    run(first, target, 1.0, grad_logp, grad_entropy)
-    for _ in range(4):
-        again = logits.clone()
-        run(again, target, 1.0, grad_logp, grad_entropy)
-        assert torch.equal(again, first)
+def test_negative_infinity(dtype):
+    vocab, num_rows = 151936, 8
+    logits, target = random_problem(num_rows, vocab, dtype)
+    neg_inf = float("-inf")
+    logits[0, ::2] = neg_inf  # every other logit, from column 0
+    target[0] = 4  # a -inf target: logp -inf, gradient 0 there
+    logits[1, :-1] = neg_inf  # only the last logit is finite
+    logits[2, : vocab * 7 // 8] = neg_inf  # leading slices and cluster ranks entirely -inf
+    logits[3, vocab // 2 :] = neg_inf  # trailing ones
+    logits[4, 1::2] = neg_inf
+    logits[5] = neg_inf  # every logit -inf: NaN entropy and gradient, as log_softmax gives
+    target[5] = 7
+    logits[6] = neg_inf
+    target[6] = -100  # ... and logp 0 for an invalid target
+    logp, entropy, _, _, grad = check(logits, target)
+    assert torch.isfinite(entropy[:5]).all() and torch.isfinite(grad[:5]).all()
+    is_masked = logits[:5] == neg_inf
+    is_masked[torch.arange(5, device="cuda"), target[:5]] = (
+        False  # d logp / dx at the target is 1 / T
+    )
+    assert (grad[:5][is_masked] == 0).all()
+    assert entropy[5:7].isnan().all() and logp[5].isnan() and logp[6] == 0
 
 
 def test_empty():
-    inp = torch.empty((0, 1000), device="cuda", dtype=torch.bfloat16)
-    target = torch.empty((0,), device="cuda", dtype=torch.int64)
-    grads = torch.empty((2, 0), device="cuda")
-    logp, entropy = run(inp, target, 1.0, grads[0], grads[1])
-    assert logp.shape == entropy.shape == (0,)
+    logits = torch.empty((0, 151936), dtype=torch.bfloat16, device="cuda")
+    target = torch.empty((0,), dtype=torch.int64, device="cuda")
+    outputs = log_prob_fwd(logits, target, 1.0)
+    assert all(out.shape == (0,) and out.dtype == torch.float32 for out in outputs)
+    empty = torch.empty((0,), device="cuda")
+    assert log_prob_bwd(logits, target, *outputs[2:], outputs[1], empty, empty, 1.0) is None
+
+
+def test_stride_zero_upstream_gradients():
+    logits, target = random_problem(33, 151936, torch.bfloat16)
+    ones = torch.ones((), device="cuda")
+    check(logits, target, 0.6, ones.expand(33), (-0.01 * ones).expand(33))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_deterministic(dtype):
+    logits, target = random_problem(256, 151936, dtype)
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    grads = torch.randn((2, 256), generator=generator, device="cuda")
+    first = run_kernels(logits, target, 0.6, *grads)
+    for _ in range(10):
+        again = run_kernels(logits, target, 0.6, *grads)
+        assert all(torch.equal(a, b) for a, b in zip(again, first))
+
+
+def test_custom_ops():
+    """
+    Where the kernels launch through custom ops (needed for torch.compile), they pass opcheck.
+    """
+    logits, target = random_problem(5, 1000, torch.bfloat16)
+    log_prob_fwd(logits, target, 1.0)  # registers the ops where they exist
+    namespace = torch.ops.pithtrain
+    # The ops' names: log_prob_fwd / _bwd where the SM90 module defines them, _sm100 in the picker.
+    names = [n for n in ("log_prob_fwd", "log_prob_fwd_sm100") if hasattr(namespace, n)]
+    if not names:
+        pytest.skip("this device launches the kernels without custom ops")
+    fwd, bwd = getattr(namespace, names[0]), getattr(namespace, names[0].replace("fwd", "bwd"))
+    torch.library.opcheck(fwd, (logits, target, 1.25))
+    stats = fwd(logits, target, 1.25)
+    grads = torch.randn((2, 5), device="cuda")
+    bwd_args = (logits.clone(), target, stats[2], stats[3], stats[1], grads[0], grads[1], 1.25)
+    torch.library.opcheck(bwd, bwd_args)
+
+
+def test_under_torch_compile():
+    """
+    Compiled (fullgraph) forward + backward match eager bitwise and update the logits in place; the
+    version counter advances once in eager.
+    """
+
+    def forward_backward(inp, target, grad_logp, grad_entropy):
+        logp, entropy, row_max, log_sum = log_prob_fwd(inp, target, 1.25)
+        log_prob_bwd(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, 1.25)
+        return logp, entropy
+
+    logits, target = random_problem(16, 8192, torch.bfloat16)
+    grads = torch.randn((2, 16), device="cuda")
+    compiled = torch.compile(forward_backward, fullgraph=True)
+    results = []
+    for fn in (compiled, forward_backward):
+        inp = logits.clone()
+        data_ptr, version = inp.data_ptr(), inp._version
+        outputs = fn(inp, target, *grads)
+        # Eager: the backward's own single bump. Compiled: that bump, where the graph runs the kernel
+        # in place on inp, plus at most Inductor's input-mutation epilogue (a copy_ of inp onto
+        # itself), never a second bump from the kernel.
+        bumps = inp._version - version
+        assert inp.data_ptr() == data_ptr and bumps in ((1, 2) if fn is compiled else (1,))
+        results.append((*outputs, inp))
+    assert all(torch.equal(a, b) for a, b in zip(*results))

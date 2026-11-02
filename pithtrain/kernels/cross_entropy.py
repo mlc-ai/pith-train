@@ -1,8 +1,3 @@
-"""
-Picker of cross_entropy_fwd_bwd: the Triton kernel (adapted from TransformerEngine) in
-cross_entropy_sm90, the TIRx kernels in cross_entropy_sm100 on SM100.
-"""
-
 import torch
 
 from pithtrain.kernels.arch import ARCH_MAJOR
@@ -15,15 +10,16 @@ def cross_entropy_fwd_bwd(inp: torch.Tensor, target: torch.Tensor, ignore_index:
     Mean cross-entropy of the logits inp against target, overwriting the logits with the gradient of
     that mean. Returns (loss, grad).
 
-    inp: (N, V) bf16 or fp32 logits, overwritten in place when row-contiguous (otherwise a
-    contiguous copy is overwritten and inp is left alone). target: integer (N,), each in [0, V) or
-    ignore_index (any other value reads out of bounds); not modified.
+    inp: (N, V) bf16, fp16 or fp32 logits with V >= 1 (SM90 raises ValueError for V == 0; SM100 does
+    not check), overwritten in place when row-contiguous (otherwise a contiguous copy is overwritten
+    and inp is left alone). target: integer (N,), any
+    stride, each in [0, V) or ignore_index (any other value reads out of bounds); not modified.
 
     loss: fp32 scalar, the sum over non-ignored rows of logsumexp(x) - x[target] divided by n =
     max(non-ignored rows, 1). grad: inp itself (or the copy), (softmax(x) - onehot(target)) / n per
     non-ignored row computed in fp32 and rounded once, zero rows where target == ignore_index.
     Matches F.cross_entropy(inp.float(), target, ignore_index=ignore_index) and its gradient to
-    fp32 rounding; deterministic.
+    fp32 rounding; deterministic. No (N, V) temporary is allocated for row-contiguous inp.
     """
     match ARCH_MAJOR:
         case 9:

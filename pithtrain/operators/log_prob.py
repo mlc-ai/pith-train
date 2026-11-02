@@ -30,19 +30,10 @@ class LogProb(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_logp, grad_entropy):
         inp, target, row_max, log_sum, entropy = ctx.saved_tensors
+        # Overwrites the logits and bumps their version counter, invalidating other saved uses.
         log_prob_bwd(
-            inp,
-            target,
-            row_max,
-            log_sum,
-            entropy,
-            grad_logp,
-            grad_entropy,
-            ctx.inv_temperature,
+            inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, ctx.inv_temperature
         )
-
-        # Kernel writes bypass autograd; invalidate other saved references to the logits.
-        torch.autograd.graph.increment_version(inp)
         return inp, None, None
 
 
