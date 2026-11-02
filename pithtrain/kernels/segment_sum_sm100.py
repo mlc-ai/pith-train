@@ -18,10 +18,14 @@ Every TMA kernel sums a tile column by column with rows in classes (tile-relativ
 accumulated in row order and the classes folded 0, 1, 2, 3, so a group's bits do not depend on the
 kernel its call is dispatched to.
 
-The tagged scratch is uninitialized (torch.empty): a word counts as written only when its high half
-carries this call's tag, a 16-bit per-call counter spread into an inf/NaN pattern (next_tag), so
-consecutive calls always differ. The tag is a host argument fixed per launch, so this path must not
-be captured in a CUDA graph (replays would reuse one tag over the previous replay's words).
+The tagged scratch is a buffer this module owns per (device, stream), zero-filled when allocated: a
+word counts as written only when its high half carries this call's tag, a 16-bit per-call epoch of
+that buffer spread into an inf/NaN pattern (tag_of), so consecutive calls always differ. A zero word
+carries no tag, and only this module's earlier calls on the same stream ever wrote the buffer; when
+the epoch would wrap (every 65535 calls) the buffer is zeroed again, in stream order before the
+call, so a stale word can never carry the current tag. The tag is a host argument fixed per launch,
+so this path must not be captured in a CUDA graph (replays would reuse one tag over the previous
+replay's words).
 
 Evolved with TIRx-harness: run segment_sum, frontier member compact-swizzle-tagreduce (commit
 3bc9af80, 181.894 us vs 640.179 us, 3.52x over the previous SM100 path in the task's benchmark).
@@ -31,7 +35,6 @@ torch's current stream.
 
 import functools
 import math
-import os
 
 import torch
 import tvm
@@ -58,19 +61,34 @@ DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "floa
 IT = {torch.int32: "int32", torch.int64: "int64"}
 
 
-EPOCH = [int.from_bytes(os.urandom(2), "little")]
+TAGGED_SCRATCH = {}  # (device type, index, stream) -> [int64 buffer (uint64 words), epoch of its last call]
 
 
-def next_tag():
+def tag_of(e):
     """
-    This call's 32-bit word tag: 16 bits of a per-call counter spread under a mask that makes the
-    tag half an inf/NaN pattern as fp32, as both bf16 / fp16 halves and as FP8 bytes, so stale
-    scratch from real tensors never carries it, and consecutive calls (whose scratch is usually the
-    previous call's words) always differ.
+    The 32-bit word tag of epoch e (1 .. 0xFFFF): its 16 bits spread under a mask that makes the tag
+    half an inf/NaN pattern as fp32, as both bf16 / fp16 halves and as FP8 bytes, never zero.
     """
-    e = EPOCH[0] = (EPOCH[0] + 1) & 0xFFFF
     t = 0x7F807F80 | (e & 0x7F) | ((e & 0x80) << 8) | ((e & 0x7F00) << 8) | ((e & 0x8000) << 16)
     return t - (1 << 32) if t >= 1 << 31 else t
+
+
+def tagged_scratch(n, device):
+    """
+    (the first n words of this stream's tagged scratch, this call's tag). The buffer is zero-filled
+    when allocated or grown, and zeroed again (stream-ordered, before this call's kernels) when its
+    epoch would wrap, so no word in it can carry the returned tag before this call writes it. Kept
+    per (device, stream): launches on two streams never share words or epochs.
+    """
+    key = (device.type, device.index, torch.cuda.current_stream(device).cuda_stream)
+    ent = TAGGED_SCRATCH.get(key)
+    if ent is None or ent[0].numel() < n:
+        ent = TAGGED_SCRATCH[key] = [torch.zeros(max(n, 1 << 16), dtype=torch.int64, device=device), 0]
+    ent[1] += 1
+    if ent[1] > 0xFFFF:
+        ent[0].zero_()
+        ent[1] = 1
+    return ent[0][:n].view(torch.uint64), tag_of(ent[1])
 
 
 def cdiv(a, b):
@@ -1308,8 +1326,7 @@ def segment_sum_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype:
     slots = G + cdiv(M, TILE)
     if M > 0 and ring is not None and G <= GS:
         # compact ring publishes tagged tile words; the reduce (PDL, resident early) starts on each chain's last word
-        tag = next_tag()
-        part = torch.empty((slots * H + 1,), dtype=torch.uint64, device=x.device)  # + the pool counter
+        part, tag = tagged_scratch(slots * H + 1, x.device)  # + the pool counter
         cfg = TR_LONG if M >= LONG_TILES * TILE * G else TR_SHORT
         n_units = slots * ring[2]  # upper bound (the kernel schedules only real tiles)
         compiled("ring", dt, it, H, True)(xf, grouped_mm_offs, part.view(-1), M, G, n_units, min(n_units, CPS * sm_count()), tag)
