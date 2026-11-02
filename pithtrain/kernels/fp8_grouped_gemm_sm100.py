@@ -235,12 +235,12 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
 
     @txl.kernel()
     def mgrouped(
-        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
-        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
-        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
-        offs: txl.Tensor((txl.int64(),), txl.i32),
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         M: txl.int32,
         N: txl.int32,
         K: txl.int32,
@@ -717,12 +717,12 @@ def build_mgrouped_w320(STAGES, VSF=False):
 
     @txl.kernel()
     def mgrouped_w320(
-        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
-        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
-        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
-        offs: txl.Tensor((txl.int64(),), txl.i32),
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         M: txl.int32,
         N: txl.int32,
         K: txl.int32,
@@ -1190,12 +1190,12 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
 
     @txl.kernel()
     def mgrouped_w320r(
-        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
-        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
-        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
-        offs: txl.Tensor((txl.int64(),), txl.i32),
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         M: txl.int32,
         N: txl.int32,
         K: txl.int32,
@@ -1685,12 +1685,12 @@ def build_mgrouped_1cta(STAGES, VSF=False):
 
     @txl.kernel()
     def mgrouped_1cta(
-        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
-        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
-        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
-        offs: txl.Tensor((txl.int64(),), txl.i32),
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         M: txl.int32,
         N: txl.int32,
         K: txl.int32,
@@ -2014,12 +2014,12 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
 
     @txl.kernel()
     def mgrouped_swap(
-        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
-        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
-        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
-        offs: txl.Tensor((txl.int64(),), txl.i32),
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         M: txl.int32,
         N: txl.int32,
         K: txl.int32,
@@ -2444,13 +2444,13 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
 
     @txl.kernel()
     def kgrouped(
-        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        b: txl.Tensor((txl.int64(), txl.int64()), FP8),
-        sfb: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
-        d: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
-        ks: txl.Tensor((txl.int64(),), txl.i32),
-        ctr: txl.Tensor((txl.int64(),), txl.i32),
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        b: txl.Tensor((txl.int64(), txl.int64()), FP8, data_alignment=1),
+        sfb: txl.Tensor((txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        d: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32, data_alignment=1),
+        ks: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
+        ctr: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         M: txl.int32,
         N: txl.int32,
         K: txl.int32,
@@ -2910,7 +2910,7 @@ def kgrouped_exec(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32, 
 
 
 @txl.kernel()
-def zero2(ctr: txl.Tensor((txl.int64(),), txl.i32)):
+def zero2(ctr: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)):
     txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=32))
     with txl.if_(txl.thread_id() < 2), txl.then_():
         txl.ptx.st.global_.s32(ctr.ptr_to([txl.thread_id()]), txl.int32(0))

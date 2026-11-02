@@ -235,7 +235,7 @@ def fwd_kernel(dtype, threads, vec, unroll):
     tile = vec * threads
 
     @txl.kernel()
-    def clamped_swiglu_fwd(gate_up: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), dtype), n: txl.int64, alpha: txl.float32, limit: txl.float32):
+    def clamped_swiglu_fwd(gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64, alpha: txl.float32, limit: txl.float32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_of(threads, vec, unroll, n), block=(threads // 32) * 32))
         neg_limit = op("neg.f32", limit)
         base = txl.cast(txl.cta_id(), "int64") * (tile * unroll) + txl.cast(txl.thread_id(), "int64") * vec
@@ -269,7 +269,7 @@ def bwd_kernel(dtype, threads, vec, unroll):
     tile = vec * threads
 
     @txl.kernel()
-    def clamped_swiglu_bwd(grad_out: txl.Tensor((txl.int64(),), dtype), gate_up: txl.Tensor((txl.int64(),), dtype), grad_gate_up: txl.Tensor((txl.int64(),), dtype), n: txl.int64, alpha: txl.float32, limit: txl.float32):
+    def clamped_swiglu_bwd(grad_out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64, alpha: txl.float32, limit: txl.float32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_of(threads, vec, unroll, n), block=(threads // 32) * 32))
         neg_limit = op("neg.f32", limit)
         base = txl.cast(txl.cta_id(), "int64") * (tile * unroll) + txl.cast(txl.thread_id(), "int64") * vec

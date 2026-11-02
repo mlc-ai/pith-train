@@ -94,7 +94,7 @@ def make(K: int):
     ragged = K % BLOCK != 0
 
     @txl.kernel()
-    def quant(x: txl.Tensor((txl.int64(),), txl.bf16), q_row: txl.Tensor((txl.int64(),), txl.u8), s_row: txl.Tensor((txl.int64(),), txl.f32), q_col: txl.Tensor((txl.int64(),), txl.u8), s_col: txl.Tensor((txl.int64(),), txl.f32), num_rb: txl.int32):
+    def quant(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), q_row: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), s_row: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), q_col: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), s_col: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), num_rb: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_rb * nkb, block=(THREADS // 32) * 32))
         bid = txl.cta_id()
         tid = txl.thread_id()
@@ -265,7 +265,7 @@ def make_v8(K: int):
     ragged = K % BLOCK != 0
 
     @txl.kernel()
-    def quant(x: txl.Tensor((txl.int64(),), txl.bf16), q_row: txl.Tensor((txl.int64(),), txl.u8), s_row: txl.Tensor((txl.int64(),), txl.f32), q_col: txl.Tensor((txl.int64(),), txl.u8), s_col: txl.Tensor((txl.int64(),), txl.f32), num_rb: txl.int32, pf_dist: txl.int32):
+    def quant(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), q_row: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), s_row: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), q_col: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), s_col: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), num_rb: txl.int32, pf_dist: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_rb * nkb, block=(W8) * 32))
         bid = txl.cta_id()
         tid = txl.thread_id()

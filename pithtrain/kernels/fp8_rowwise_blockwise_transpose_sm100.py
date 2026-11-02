@@ -87,7 +87,7 @@ def hi(word, dtype):
 @functools.cache
 def generic_kernel(dtype: str):
     @txl.kernel()
-    def fp8_quant_act_generic(x: txl.Tensor((txl.int64(),), dtype), q: txl.Tensor((txl.int64(),), txl.u8), s: txl.Tensor((txl.int64(),), txl.f32), qt: txl.Tensor((txl.int64(),), txl.u8), st: txl.Tensor((txl.int64(),), txl.f32), M: txl.int32, K: txl.int32, nmb: txl.int32, nkb: txl.int32, sr: txl.int64, sc: txl.int64):
+    def fp8_quant_act_generic(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), q: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), s: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), qt: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), st: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), M: txl.int32, K: txl.int32, nmb: txl.int32, nkb: txl.int32, sr: txl.int64, sc: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=nmb * nkb, block=128))
         b = txl.cta_id()
         t = txl.thread_id()
@@ -226,11 +226,11 @@ def oneshot_func(ctas_per_sm: int, persistent: bool = True, direct: bool = False
 
     @txl.kernel()
     def fp8_quant_act_self(
-        x: txl.Tensor((txl.int64(),), txl.bf16),
-        q: txl.Tensor((txl.int64(),), txl.u8),
-        s: txl.Tensor((txl.int64(),), txl.f32),
-        qt: txl.Tensor((txl.int64(),), txl.u8),
-        st: txl.Tensor((txl.int64(),), txl.f32),
+        x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        q: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
+        s: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        qt: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
+        st: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
         M: txl.int32,
         K: txl.int32,
         nmb: txl.int32,

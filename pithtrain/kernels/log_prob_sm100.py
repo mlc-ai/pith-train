@@ -191,7 +191,7 @@ def sweep(x, dtype, vec, base, nvec, tid, f, body, j0=0, nt=NT):
 @functools.cache
 def fwd_kernel(dtype, vec):
     @txl.kernel()
-    def log_prob_fwd(x: txl.Tensor((txl.int64(),), dtype), tgt: txl.Tensor((txl.int64(),), txl.i64), logp: txl.Tensor((txl.int64(),), txl.f32), ent: txl.Tensor((txl.int64(),), txl.f32), rmax: txl.Tensor((txl.int64(),), txl.f32), lsum: txl.Tensor((txl.int64(),), txl.f32), n_rows: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, inv_t: txl.float32):
+    def log_prob_fwd(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), tgt: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), logp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), ent: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), rmax: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), lsum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), n_rows: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, inv_t: txl.float32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_rows, block=(WARPS) * 32))
         tid = txl.thread_id()
         lane = txl.lane_id()
@@ -330,7 +330,7 @@ BNT = BWARPS * 32
 @functools.cache
 def bwd_kernel(dtype, vec):
     @txl.kernel()
-    def log_prob_bwd(x: txl.Tensor((txl.int64(),), dtype), tgt: txl.Tensor((txl.int64(),), txl.i64), rmax: txl.Tensor((txl.int64(),), txl.f32), lsum: txl.Tensor((txl.int64(),), txl.f32), ent: txl.Tensor((txl.int64(),), txl.f32), glogp: txl.Tensor((txl.int64(),), txl.f32), gent: txl.Tensor((txl.int64(),), txl.f32), n_ctas: txl.int32, n_chunks: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, gl_stride: txl.int64, ge_stride: txl.int64, inv_t: txl.float32):
+    def log_prob_bwd(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), tgt: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), rmax: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), lsum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), ent: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), glogp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), gent: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), n_ctas: txl.int32, n_chunks: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, gl_stride: txl.int64, ge_stride: txl.int64, inv_t: txl.float32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_ctas, block=(BWARPS) * 32))
         tid = txl.thread_id()
         cta = txl.cta_id()

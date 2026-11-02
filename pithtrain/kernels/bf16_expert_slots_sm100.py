@@ -77,7 +77,7 @@ def group_slots_kernel(G: int, has_x: bool):
     NW = TILE // 32
 
     @txl.kernel()
-    def group_slots(e: txl.Tensor((txl.int64(),), txl.i64), x: txl.Tensor((txl.int64(),), txl.i64), cu: txl.Tensor((txl.int64(),), txl.i32), a_idx: txl.Tensor((txl.int64(),), txl.i32), row_of: txl.Tensor((txl.int64(),), txl.i32), slot_of: txl.Tensor((txl.int64(),), txl.i32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), S: txl.int32, T: txl.int32):
+    def group_slots(e: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), a_idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), row_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), slot_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), S: txl.int32, T: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.max(1, (S + TILE - 1) // TILE), block=(NW) * 32))
         b = txl.cta_id()
         tid = txl.thread_id()
@@ -232,8 +232,8 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
     U = csp // TILE  # 1024-slot tiles per CTA, held in registers
 
     @txl.kernel()
-    def group_slots_cluster(e: txl.Tensor((txl.int64(),), txl.i32), # int64 ids viewed as int32 pairs: the low word at 2 * j
-        x: txl.Tensor((txl.int64(),), txl.i32), cu: txl.Tensor((txl.int64(),), txl.i32), a_idx: txl.Tensor((txl.int64(),), txl.i32), row_of: txl.Tensor((txl.int64(),), txl.i32), slot_of: txl.Tensor((txl.int64(),), txl.i32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), S: txl.int32, T: txl.int32):
+    def group_slots_cluster(e: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), # int64 ids viewed as int32 pairs: the low word at 2 * j
+        x: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), a_idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), row_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), slot_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), S: txl.int32, T: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=CCS * NCL, block=(NW) * 32, cluster=CCS))
         r = txl.cuda.cluster_cta_id("x")
         # peers' shared memory may be written only once every CTA of the cluster has started: arrive now,
@@ -439,7 +439,7 @@ def gather_sum_kernel(G: int, H: int):
     GRID = NUM_SMS * GS_CTAS_PER_SM.get(H, 4)
 
     @txl.kernel()
-    def gather_sum(grad: txl.Tensor((txl.int64(),), txl.u32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), T: txl.int32):
+    def gather_sum(grad: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), T: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW) * 32))
         tid = txl.thread_id()
         grid = txl.min(T, GRID)
@@ -549,7 +549,7 @@ def gather_sum_tma_kernel(G: int, H: int):
     assert RB % 16 == 0 and KB <= 32
 
     @txl.kernel()
-    def gather_sum_tma(grad: txl.Tensor((txl.int64(),), txl.u32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), T: txl.int32):
+    def gather_sum_tma(grad: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), T: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW) * 32))
         tid = txl.thread_id()
         lane = tid & 31
@@ -690,7 +690,7 @@ def gather_sum_tma3_kernel(G: int, H: int):
     PW = NW if GS_PRODUCER_WARP else 0  # the producer warp (a dedicated extra warp, or consumer warp 0)
 
     @txl.kernel()
-    def gather_sum_tma3(grad: txl.Tensor((txl.int64(),), txl.u32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), T: txl.int32):
+    def gather_sum_tma3(grad: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), T: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW + (1 if GS_PRODUCER_WARP else 0)) * 32))
         tid = txl.thread_id()
         lane = tid & 31
@@ -889,7 +889,7 @@ def gather_rows_kernel(N: int):
     NW = 8
 
     @txl.kernel()
-    def gather_rows(x: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), R: txl.int32):
+    def gather_rows(x: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), R: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(R + ROWS_PER_CTA - 1) // ROWS_PER_CTA, block=(NW) * 32))
         b = txl.cta_id()
         tid = txl.thread_id()
@@ -951,7 +951,7 @@ def segment_sum_kernel(N: int, has_idx: bool):
     assert 256 % D == 0
 
     @txl.kernel()
-    def segment_sum(x: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), cu: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.f32), G: txl.int32):
+    def segment_sum(x: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), G: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(W) * 32))
         b = txl.cta_id()
         g = b // NCB
@@ -1131,7 +1131,7 @@ def segment_chunks_kernel(N: int, has_idx: bool):
     assert 256 % D == 0
 
     @txl.kernel()
-    def segment_chunks(x: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), cu: txl.Tensor((txl.int64(),), txl.i32), part: txl.Tensor((txl.int64(),), txl.f32), G: txl.int32, NC: txl.int32):
+    def segment_chunks(x: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), G: txl.int32, NC: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NC * NCB, block=(W) * 32))
         if SEG_PDL:
             txl.ptx.griddepcontrol.launch_dependents()  # the combine may launch now; it waits for our writes
@@ -1245,7 +1245,7 @@ def segment_combine_kernel(N: int, pdl: bool):
     NCB = (N + 255) // 256
 
     @txl.kernel()
-    def segment_combine(cu: txl.Tensor((txl.int64(),), txl.i32), part: txl.Tensor((txl.int64(),), txl.f32), out: txl.Tensor((txl.int64(),), txl.f32), G: txl.int32):
+    def segment_combine(cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), G: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=256, programmatic_stream_serialization=True if pdl else None))
         b = txl.cta_id()
         g = b // NCB

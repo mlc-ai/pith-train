@@ -733,17 +733,17 @@ def make_main(
 
     @txl.kernel()
     def main(
-        q_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        o_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
-        g_out: txl.Tensor((txl.int64(),), txl.f32),
+        q_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        o_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        g_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
         scale: txl.float32,
         seq_len: txl.int32,
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        a_out: txl.Tensor((txl.int64(),), txl.bf16),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        a_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
     ):
         host = host_maps({"q_map_t": q_map_t, "k_map_t": k_map_t, "v_map_t": v_map_t, "o_map_t": o_map_t, "gate": gate, "beta": beta, "g_out": g_out, "scale": scale, "seq_len": seq_len, "c_map_t": c_map_t, "a_out": a_out})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sms, block=12 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
@@ -3177,18 +3177,18 @@ def F_make_main(
 
     @txl.kernel()
     def main(
-        q_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        o_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
-        g_out: txl.Tensor((txl.int64(),), txl.f32),
+        q_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        o_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        g_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
         scale: txl.float32,
         seq_len: txl.int32,
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        a_out: txl.Tensor((txl.int64(),), txl.bf16),
-        initial_state: txl.Tensor((txl.int64(),), txl.bf16),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        a_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        initial_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seg_len: txl.int32,
         zero_vec0: txl.int32,
     ):
@@ -5676,16 +5676,16 @@ def R_make_main(
 
     @txl.kernel()
     def main(
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seq_len: txl.int32,
         seg_len: txl.int32,
-        initial_state: txl.Tensor((txl.int64(),), txl.bf16),
-        final_state: txl.Tensor((txl.int64(),), txl.bf16),
-        wy: txl.Tensor((txl.int64(),), txl.u8),
+        initial_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        final_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        wy: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
     ):
         host = host_maps({"k_map_t": k_map_t, "v_map_t": v_map_t, "c_map_t": c_map_t, "gate": gate, "beta": beta, "seq_len": seq_len, "seg_len": seg_len, "initial_state": initial_state, "final_state": final_state, "wy": wy})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sms, block=12 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
@@ -7703,16 +7703,16 @@ def X_make_main(
 
     @txl.kernel()
     def main(
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seq_len: txl.int32,
         seg_len: txl.int32,
-        initial_state: txl.Tensor((txl.int64(),), txl.bf16),
-        final_state: txl.Tensor((txl.int64(),), txl.bf16),
-        wy: txl.Tensor((txl.int64(),), txl.u8),
+        initial_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        final_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        wy: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
     ):
         host = host_maps({"k_map_t": k_map_t, "v_map_t": v_map_t, "c_map_t": c_map_t, "gate": gate, "beta": beta, "seq_len": seq_len, "seg_len": seg_len, "initial_state": initial_state, "final_state": final_state, "wy": wy})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sms, block=12 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
@@ -9752,15 +9752,15 @@ def M_make_main(
 
     @txl.kernel()
     def main(
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seq_len: txl.int32,
         seg_len: txl.int32,
-        initial_state: txl.Tensor((txl.int64(),), txl.bf16),
-        final_state: txl.Tensor((txl.int64(),), txl.bf16),
+        initial_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        final_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
     ):
         host = host_maps({"k_map_t": k_map_t, "v_map_t": v_map_t, "c_map_t": c_map_t, "gate": gate, "beta": beta, "seq_len": seq_len, "seg_len": seg_len, "initial_state": initial_state, "final_state": final_state})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sms, block=12 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
@@ -11765,15 +11765,15 @@ def N_make_main(
 
     @txl.kernel()
     def main(
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seq_len: txl.int32,
         seg_len: txl.int32,
-        initial_state: txl.Tensor((txl.int64(),), txl.bf16),
-        final_state: txl.Tensor((txl.int64(),), txl.bf16),
+        initial_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        final_state: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
     ):
         host = host_maps({"k_map_t": k_map_t, "v_map_t": v_map_t, "c_map_t": c_map_t, "gate": gate, "beta": beta, "seq_len": seq_len, "seg_len": seg_len, "initial_state": initial_state, "final_state": final_state})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sms, block=12 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
@@ -13952,24 +13952,24 @@ def B_make_main(
 
     @txl.kernel()
     def main(
-        q_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        v_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        do_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        c_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        dq_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        dk_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        dv_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
-        dgate: txl.Tensor((txl.int64(),), txl.f32),
-        dbeta: txl.Tensor((txl.int64(),), txl.bf16),
+        q_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        v_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        do_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        c_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        dq_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        dk_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        dv_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        dgate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        dbeta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         scale: txl.float32,
         seq_len: txl.int32,
         seg_len: txl.int32,
-        dstate0: txl.Tensor((txl.int64(),), txl.f32),
-        dstate_in: txl.Tensor((txl.int64(),), txl.f32),
-        wy: txl.Tensor((txl.int64(),), txl.u8),
+        dstate0: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        dstate_in: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        wy: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
     ):
         host = host_maps({"q_map_t": q_map_t, "k_map_t": k_map_t, "v_map_t": v_map_t, "do_map_t": do_map_t, "c_map_t": c_map_t, "dq_map_t": dq_map_t, "dk_map_t": dk_map_t, "dv_map_t": dv_map_t, "gate": gate, "beta": beta, "dgate": dgate, "dbeta": dbeta, "scale": scale, "seq_len": seq_len, "seg_len": seg_len, "dstate0": dstate0, "dstate_in": dstate_in, "wy": wy})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sms, block=12 * 32, cluster=(1, 1, 1)), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1, required_block_size=True))
@@ -16410,12 +16410,12 @@ def D_make_dsr(*, num_sms, q_ratio, k_ratio, n_heads_out, span=False):
 
     @txl.kernel()
     def dsr(
-        q_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        k_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        do_map_t: txl.Tensor((txl.int64(),), txl.bf16),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        wy: txl.Tensor((txl.int64(),), txl.u8),
-        dstate_r: txl.Tensor((txl.int64(),), txl.f32),
+        q_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        k_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        do_map_t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        wy: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
+        dstate_r: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
         scale: txl.float32,
         seq_len: txl.int32,
         seg_len: txl.int32,
@@ -18171,10 +18171,10 @@ def C__make_t_precompute(spec):
     # dependent triangular inverses remain independent below.
     @txl.kernel()
     def t_precompute(
-        k: txl.Tensor((txl.int64(),), io_dtype),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
-        t: txl.Tensor((txl.int64(),), io_dtype),
-        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype),
+        k: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        t: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype, data_alignment=1),
         seq_len: txl.int32,
     ):
         host = host_maps({"k": k, "beta": beta, "t": t, "cu_seqlens": cu_seqlens, "seq_len": seq_len})
@@ -18449,14 +18449,14 @@ def C__make_fixup_simt(spec):
 
     @txl.kernel()
     def fixup_simt(
-        transfer: txl.Tensor((txl.int64(),), txl.f32),
-        local_state: txl.Tensor((txl.int64(),), txl.f32),
-        initial_state: txl.Tensor((txl.int64(),), state_dtype),
-        initial_state_workspace: txl.Tensor((txl.int64(),), txl.f32),
-        fixed_state: txl.Tensor((txl.int64(),), txl.f32),
-        final_state: txl.Tensor((txl.int64(),), state_dtype),
-        state_indices: txl.Tensor((txl.int64(),), txl.i32),
-        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype),
+        transfer: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        local_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        initial_state: txl.Tensor((txl.int64(),), state_dtype, data_alignment=1),
+        initial_state_workspace: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        fixed_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        final_state: txl.Tensor((txl.int64(),), state_dtype, data_alignment=1),
+        state_indices: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype, data_alignment=1),
     ):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_sequences * state_heads * row_ctas, block=4 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=2))
         roles = txl.specialize()
@@ -18652,14 +18652,14 @@ def C__make_fixup_utcmma(spec, rows, m_stages, compute_regs):
 
     @txl.kernel()
     def fixup_utcmma(
-        transfer: txl.Tensor((txl.int64(),), txl.f32),
-        local_state: txl.Tensor((txl.int64(),), txl.f32),
-        initial_state: txl.Tensor((txl.int64(),), state_dtype),
-        initial_state_workspace: txl.Tensor((txl.int64(),), txl.f32),
-        fixed_state: txl.Tensor((txl.int64(),), txl.f32),
-        final_state: txl.Tensor((txl.int64(),), state_dtype),
-        state_indices: txl.Tensor((txl.int64(),), txl.i32),
-        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype),
+        transfer: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        local_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        initial_state: txl.Tensor((txl.int64(),), state_dtype, data_alignment=1),
+        initial_state_workspace: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        fixed_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        final_state: txl.Tensor((txl.int64(),), state_dtype, data_alignment=1),
+        state_indices: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype, data_alignment=1),
         cp_chunk_len: txl.int32,
         n_cp: txl.int32,
     ):
@@ -18964,17 +18964,17 @@ def C__make_mn_precompute(spec):
 
     @txl.kernel()
     def mn_precompute(
-        k: txl.Tensor((txl.int64(),), io_dtype),
-        v: txl.Tensor((txl.int64(),), io_dtype),
-        t: txl.Tensor((txl.int64(),), io_dtype),
-        alpha: txl.Tensor((txl.int64(),), txl.f32),
-        transfer: txl.Tensor((txl.int64(),), txl.f32),
-        local_state: txl.Tensor((txl.int64(),), txl.f32),
-        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype),
+        k: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        v: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        t: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        alpha: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        transfer: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        local_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype, data_alignment=1),
         seq_len: txl.int32,
         cp_chunk_len: txl.int32,
         n_cp: txl.int32,
-        a_tail: txl.Tensor((txl.int64(),), txl.bf16),
+        a_tail: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
     ):
         host = host_maps({"k": k, "v": v, "t": t, "alpha": alpha, "transfer": transfer, "local_state": local_state, "cu_seqlens": cu_seqlens, "seq_len": seq_len, "cp_chunk_len": cp_chunk_len, "n_cp": n_cp, "a_tail": a_tail})
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(NS, 1), block=12 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
@@ -19542,23 +19542,23 @@ def C__make_prefill(spec):
 
     @txl.kernel()
     def prefill(
-        q: txl.Tensor((txl.int64(),), io_dtype),
-        k: txl.Tensor((txl.int64(),), io_dtype),
-        v: txl.Tensor((txl.int64(),), io_dtype),
-        alpha: txl.Tensor((txl.int64(),), txl.f32),
-        t: txl.Tensor((txl.int64(),), io_dtype),
-        fixed_state: txl.Tensor((txl.int64(),), txl.f32),
-        initial_state_workspace: txl.Tensor((txl.int64(),), txl.f32),
-        o: txl.Tensor((txl.int64(),), io_dtype),
-        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype),
+        q: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        k: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        v: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        alpha: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        t: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        fixed_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        initial_state_workspace: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        o: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), cu_dtype, data_alignment=1),
         scale: txl.float32,
-        descriptor_workspace: txl.Tensor((txl.int64(),), txl.i8),
+        descriptor_workspace: txl.Tensor((txl.int64(),), txl.i8, data_alignment=1),
         seq_len: txl.int32,
         cp_chunk_len: txl.int32,
         n_cp: txl.int32,
-        transfer_in: txl.Tensor((txl.int64(),), txl.f32),
-        g_out: txl.Tensor((txl.int64(),), txl.f32),
-        a_tail: txl.Tensor((txl.int64(),), io_dtype),
+        transfer_in: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        g_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        a_tail: txl.Tensor((txl.int64(),), io_dtype, data_alignment=1),
         n_extra: txl.int32,
     ):
         host = host_maps({"q": q, "k": k, "v": v, "alpha": alpha, "t": t, "fixed_state": fixed_state, "initial_state_workspace": initial_state_workspace, "o": o, "cu_seqlens": cu_seqlens, "scale": scale, "descriptor_workspace": descriptor_workspace, "seq_len": seq_len, "cp_chunk_len": cp_chunk_len, "n_cp": n_cp, "transfer_in": transfer_in, "g_out": g_out, "a_tail": a_tail, "n_extra": n_extra})
@@ -20443,11 +20443,11 @@ def make_cp_pack(n_heads):
 
     @txl.kernel()
     def cp_pack(
-        fixed_state: txl.Tensor((txl.int64(),), txl.f32),
-        transfer: txl.Tensor((txl.int64(),), txl.f32),
-        gate: txl.Tensor((txl.int64(),), txl.f32),
-        g_out: txl.Tensor((txl.int64(),), txl.f32),
-        a_out: txl.Tensor((txl.int64(),), txl.bf16),
+        fixed_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        transfer: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        gate: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        g_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        a_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seq_len: txl.int32,
         n_seg: txl.int32,
         write_elems: txl.int64,
@@ -20510,9 +20510,9 @@ SCAN_PAD = 68  # u32 words per shared row (64 + 4 pad)
 def make_scan(n_heads):
     @txl.kernel()
     def scan(
-        p_words: txl.Tensor((txl.int64(),), txl.u32),
-        r: txl.Tensor((txl.int64(),), txl.f32),
-        g_out: txl.Tensor((txl.int64(),), txl.f32),
+        p_words: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
+        r: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        g_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
         n_seg: txl.int32,
     ):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_heads * 4, block=4 * 32))
@@ -20588,9 +20588,9 @@ def make_scan(n_heads):
 def make_fscan(n_heads):
     @txl.kernel()
     def fscan(
-        p_words: txl.Tensor((txl.int64(),), txl.u32),
-        n_words: txl.Tensor((txl.int64(),), txl.u32),
-        x_words: txl.Tensor((txl.int64(),), txl.u32),
+        p_words: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
+        n_words: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
+        x_words: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
         n_seg: txl.int32,
     ):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_heads * 4, block=4 * 32))
@@ -20741,10 +20741,10 @@ def make_tpre2(k_heads, n_sms):
 
     @txl.kernel()
     def t_precompute2(
-        k: txl.Tensor((txl.int64(),), txl.bf16),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
-        t: txl.Tensor((txl.int64(),), txl.bf16),
-        cu_seqlens: txl.Tensor((txl.int64(),), txl.i32),
+        k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         seq_len: txl.int32,
     ):
         host = host_maps({"k": k, "beta": beta, "t": t, "cu_seqlens": cu_seqlens, "seq_len": seq_len})
@@ -21020,10 +21020,10 @@ def make_tpre3(k_heads, n_sms, ctas_per_sm=3, head_bars=False):
 
     @txl.kernel()
     def t_precompute3(
-        k: txl.Tensor((txl.int64(),), txl.bf16),
-        beta: txl.Tensor((txl.int64(),), txl.bf16),
-        t: txl.Tensor((txl.int64(),), txl.bf16),
-        cu_seqlens: txl.Tensor((txl.int64(),), txl.i32),
+        k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        t: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        cu_seqlens: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
         seq_len: txl.int32,
     ):
         host = host_maps({"k": k, "beta": beta, "t": t, "cu_seqlens": cu_seqlens, "seq_len": seq_len})
@@ -21475,10 +21475,10 @@ def make_sfix(n_heads, num_sms):
 
     @txl.kernel()
     def sfix(
-        transfer: txl.Tensor((txl.int64(),), txl.f32),
-        local_state: txl.Tensor((txl.int64(),), txl.f32),
-        fixed: txl.Tensor((txl.int64(),), txl.f32),
-        a_tail: txl.Tensor((txl.int64(),), txl.bf16),
+        transfer: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        local_state: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        fixed: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        a_tail: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         seq_len: txl.int32,
         maxseg: txl.int32,
         lp: txl.int32,
@@ -21634,9 +21634,9 @@ def make_sscan(n_heads, num_sms):
 
     @txl.kernel()
     def sscan(
-        p_words: txl.Tensor((txl.int64(),), txl.u32),
-        r: txl.Tensor((txl.int64(),), txl.f32),
-        g_out: txl.Tensor((txl.int64(),), txl.f32),
+        p_words: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
+        r: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        g_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
         seq_len: txl.int32,
         lp: txl.int32,
     ):

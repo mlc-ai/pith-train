@@ -200,7 +200,7 @@ def KERN_COMMON_make_zero(HV):
     """
 
     @txl.kernel()
-    def zero_payload(p: txl.Tensor((txl.int64(),), txl.f32)):
+    def zero_payload(p: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[HV, 1], block=128))
         head = txl.cta_id()[0]
         tid = txl.thread_id()
@@ -278,7 +278,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
         return tuple(maps)
 
     @txl.kernel()
-    def intra2(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), v: txl.Tensor((txl.int64(),), txl.bf16), g: txl.Tensor((txl.int64(),), txl.f32), beta: txl.Tensor((txl.int64(),), txl.bf16), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, n_chunks: txl.int32, g_cum: txl.Tensor((txl.int64(),), txl.f32), a_out: txl.Tensor((txl.int64(),), txl.bf16), w_out: txl.Tensor((txl.int64(),), txl.bf16), u_out: txl.Tensor((txl.int64(),), txl.bf16), aqk_out: txl.Tensor((txl.int64(),), txl.bf16), payload: txl.Tensor((txl.int64(),), txl.f32), zero_payload: txl.int32, num_ctas: txl.int32, S: txl.int32):
+    def intra2(q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), v: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), nseg: txl.int32, n_chunks: txl.int32, g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), a_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), u_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), aqk_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), payload: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), zero_payload: txl.int32, num_ctas: txl.int32, S: txl.int32):
         host = prepare_host(dict(q=q, k=k, v=v, S=S))
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[num_ctas] if persistent else [n_chunks, HV], block=4 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=3) if diet else None)
         q_map, k_map, v_map = host
@@ -914,7 +914,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
     NCONS = 3 if with_o else NSG + 1
 
     @txl.kernel()
-    def rec7(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), u: txl.Tensor((txl.int64(),), txl.bf16), aqk: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, c_lo0: txl.int32, c_hi0: txl.int32, h0: txl.Tensor((txl.int64(),), txl.f32), use_h0: txl.int32, scale: txl.float32, o: txl.Tensor((txl.int64(),), txl.bf16), h_out: txl.Tensor((txl.int64(),), txl.bf16), vn_out: txl.Tensor((txl.int64(),), txl.bf16), summ: txl.Tensor((txl.int64(),), txl.f32), ag: txl.Tensor((txl.int64(),), txl.f32), m_first: txl.int32, m_step: txl.int32, m_n: txl.int32, nzr: txl.int32, ck1: txl.int32, ck2: txl.int32, ck3: txl.int32, kt1: txl.int32, kt2: txl.int32, kt3: txl.int32, ckm: txl.int32):
+    def rec7(q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), u: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), aqk: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), nseg: txl.int32, c_lo0: txl.int32, c_hi0: txl.int32, h0: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), use_h0: txl.int32, scale: txl.float32, o: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), h_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), vn_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), summ: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), ag: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), m_first: txl.int32, m_step: txl.int32, m_n: txl.int32, nzr: txl.int32, ck1: txl.int32, ck2: txl.int32, ck3: txl.int32, kt1: txl.int32, kt2: txl.int32, kt3: txl.int32, ckm: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[NVB * nzr, HV] if (nz > 1 and static_nz is None) else [NVB * (static_nz or 1), HV], block=NWARPS * 32, programmatic_stream_serialization=True if pdl else None))
         sm = txl.alloc_tensor((SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
@@ -1496,7 +1496,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
         return tuple(maps)
 
     @txl.kernel()
-    def fsum7(k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), u: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), bos: txl.int32, eos: txl.int32, payload: txl.Tensor((txl.int64(),), txl.f32), q: txl.Tensor((txl.int64(),), txl.bf16), aqk: txl.Tensor((txl.int64(),), txl.bf16), o: txl.Tensor((txl.int64(),), txl.bf16), scale: txl.float32, a_ck: txl.Tensor((txl.int64(),), txl.bf16), ck1: txl.int32, ck2: txl.int32, ck3: txl.int32, kt1: txl.int32, kt2: txl.int32, kt3: txl.int32, ckm: txl.int32, S: txl.int32):
+    def fsum7(k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), u: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), bos: txl.int32, eos: txl.int32, payload: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), aqk: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), o: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), scale: txl.float32, a_ck: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), ck1: txl.int32, ck2: txl.int32, ck3: txl.int32, kt1: txl.int32, kt2: txl.int32, kt3: txl.int32, ckm: txl.int32, S: txl.int32):
         host = prepare_host(dict(k=k, w=w, q=q, aqk=aqk, S=S))
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[4, HV], block=NW * 32))
         k_map, w_map, q_map, aqk_map = host
@@ -2065,7 +2065,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
         return tuple(maps)
 
     @txl.kernel()
-    def bsum7(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), dv_local: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), bos: txl.int32, eos: txl.int32, scale: txl.float32, payload: txl.Tensor((txl.int64(),), txl.f32), dh_out: txl.Tensor((txl.int64(),), txl.bf16), dv2_out: txl.Tensor((txl.int64(),), txl.bf16), S: txl.int32):
+    def bsum7(q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), do: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dv_local: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), bos: txl.int32, eos: txl.int32, scale: txl.float32, payload: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), dh_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dv2_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), S: txl.int32):
         host = prepare_host(dict(q=q, k=k, w=w, S=S))
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[4, HV], block=BSUM7_NWARPS * 32))
         q_map, k_map, w_map = host
@@ -2657,7 +2657,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
         return tuple(maps)
 
     @txl.kernel()
-    def brec7(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), dv_local: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, c_lo: txl.int32, c_hi: txl.int32, scale: txl.float32, dh_out: txl.Tensor((txl.int64(),), txl.bf16), dv2_out: txl.Tensor((txl.int64(),), txl.bf16), summ: txl.Tensor((txl.int64(),), txl.f32), ag: txl.Tensor((txl.int64(),), txl.f32), m_first: txl.int32, m_step: txl.int32, m_n: txl.int32, S: txl.int32):
+    def brec7(q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), do: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dv_local: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), nseg: txl.int32, c_lo: txl.int32, c_hi: txl.int32, scale: txl.float32, dh_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dv2_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), summ: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), ag: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), m_first: txl.int32, m_step: txl.int32, m_n: txl.int32, S: txl.int32):
         host = prepare_host(dict(q=q, k=k, w=w, S=S))
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[4, HV], block=NWARPS * 32))
         q_map, k_map, w_map = host
@@ -3084,7 +3084,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
     sT = BPREP2_su64 if ptg else KERN_COMMON_sw256
 
     @txl.kernel()
-    def bprep2(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), v: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), beta: txl.Tensor((txl.int64(),), txl.bf16), a_in: txl.Tensor((txl.int64(),), txl.bf16), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, n_chunks: txl.int32, scale: txl.float32, w_out: txl.Tensor((txl.int64(),), txl.bf16), u_out: txl.Tensor((txl.int64(),), txl.bf16), dvl_out: txl.Tensor((txl.int64(),), txl.bf16), num_ctas: txl.int32):
+    def bprep2(q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), v: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), do: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), a_in: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), nseg: txl.int32, n_chunks: txl.int32, scale: txl.float32, w_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), u_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dvl_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[num_ctas] if persistent else [n_chunks, HV], block=BPREP2_NW * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=2))
         sm = txl.alloc_tensor((BPREP2_SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
@@ -3410,7 +3410,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
         return tuple(maps)
 
     @txl.kernel()
-    def bgrad2(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), v: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), vn: txl.Tensor((txl.int64(),), txl.bf16), dv2: txl.Tensor((txl.int64(),), txl.bf16), h: txl.Tensor((txl.int64(),), txl.bf16), dh: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), beta: txl.Tensor((txl.int64(),), txl.bf16), a_in: txl.Tensor((txl.int64(),), txl.bf16), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, n_chunks: txl.int32, num_ctas: txl.int32, scale: txl.float32, dq_out: txl.Tensor((txl.int64(),), txl.bf16), dk_out: txl.Tensor((txl.int64(),), txl.bf16), dv_out: txl.Tensor((txl.int64(),), txl.bf16), dg_out: txl.Tensor((txl.int64(),), txl.f32), db_out: txl.Tensor((txl.int64(),), txl.bf16), S: txl.int32):
+    def bgrad2(q: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), k: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), v: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), do: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), vn: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dv2: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), h: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dh: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), g_cum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), beta: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), a_in: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), nseg: txl.int32, n_chunks: txl.int32, num_ctas: txl.int32, scale: txl.float32, dq_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dk_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dv_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dg_out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), db_out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), S: txl.int32):
         host = prepare_host(dict(q=q, k=k, do=do, v=v, S=S))
         if persistent:
             grid = [num_ctas] if static_ctas is None else [static_ctas]

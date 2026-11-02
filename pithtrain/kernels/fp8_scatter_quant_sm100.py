@@ -102,7 +102,7 @@ def count_kernel(gb):
     gpl = gb // 32
 
     @txl.kernel()
-    def count(expert_idxs: txl.Tensor((txl.int64(),), txl.i32), counts: txl.Tensor((txl.int64(),), txl.i32), offs: txl.Tensor((txl.int64(),), txl.i32), ks_t: txl.Tensor((txl.int64(),), txl.i32), m: txl.int32, num_groups: txl.int32):
+    def count(expert_idxs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), counts: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), ks_t: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), m: txl.int32, num_groups: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=(COUNT_WARPS) * 32))
         tid = txl.thread_id()
         lane = tid & 31
@@ -995,11 +995,11 @@ def fused_traced(n, gb, wide, big=False):
         txl.cuda.iket.range_end(tk_st[0])
 
     params = [
-        ("gathered", txl.Tensor((txl.int64(),), txl.i32)), ("experts", txl.Tensor((txl.int64(),), txl.i32)), ("expand", txl.Tensor((txl.int64(),), txl.i32)),
-        ("offs", txl.Tensor((txl.int64(),), txl.i32)), ("ks_t", txl.Tensor((txl.int64(),), txl.i32)),
-        ("reverse", txl.Tensor((txl.int64(),), txl.i64)), ("x_fp8", txl.Tensor((txl.int64(),), txl.i32)), ("x_scale", txl.Tensor((txl.int64(),), txl.f32)),
-        ("x_ch", txl.Tensor((txl.int64(),), txl.i32)), ("x_ch_scale", txl.Tensor((txl.int64(),), txl.f32)), ("ws", txl.Tensor((txl.int64(),), txl.i32)),
-        ("src_of_row", txl.Tensor((txl.int64(),), txl.i32)),
+        ("gathered", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("experts", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("expand", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+        ("offs", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("ks_t", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+        ("reverse", txl.Tensor((txl.int64(),), txl.i64, data_alignment=1)), ("x_fp8", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("x_scale", txl.Tensor((txl.int64(),), txl.f32, data_alignment=1)),
+        ("x_ch", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("x_ch_scale", txl.Tensor((txl.int64(),), txl.f32, data_alignment=1)), ("ws", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+        ("src_of_row", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
         ("m", txl.i32), ("num_groups", txl.i32), ("ntiles", txl.i32), ("identity", txl.i32), ("num_ctas", txl.i32),
         ("gunits", txl.i32),
     ] + [(f"hc{gi}", txl.i32) for gi in range(gb)]

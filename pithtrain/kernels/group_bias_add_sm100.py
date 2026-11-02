@@ -104,7 +104,7 @@ def kernel_flat(dtype: str, itype: str, H: int, W: int):
     var_M, var_G = txl.Var("M", "int32"), txl.Var("G", "int32")
 
     @txl.kernel()
-    def group_bias_add(y: txl.Tensor((var_M, H), dtype), bias: txl.Tensor((var_G, H), dtype), gidx: txl.Tensor((var_M,), itype), M: var_M, G: var_G, tail: txl.int32):
+    def group_bias_add(y: txl.Tensor((var_M, H), dtype, data_alignment=1), bias: txl.Tensor((var_G, H), dtype, data_alignment=1), gidx: txl.Tensor((var_M,), itype, data_alignment=1), M: var_M, G: var_G, tail: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.ceildiv(M * vpr, per_cta), block=(BLOCK // 32) * 32))
         nvec = M * vpr
         tid = txl.thread_id()
@@ -150,7 +150,7 @@ def kernel_h(dtype: str, itype: str, H: int):
     var_M, var_G = txl.Var("M", "int32"), txl.Var("G", "int32")
 
     @txl.kernel()
-    def group_bias_add_h(y: txl.Tensor((var_M, H), dtype), bias: txl.Tensor((var_G, H), dtype), gidx: txl.Tensor((var_M,), itype), M: var_M, G: var_G):
+    def group_bias_add_h(y: txl.Tensor((var_M, H), dtype, data_alignment=1), bias: txl.Tensor((var_G, H), dtype, data_alignment=1), gidx: txl.Tensor((var_M,), itype, data_alignment=1), M: var_M, G: var_G):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.ceildiv(M * H, BLOCK), block=(BLOCK // 32) * 32))
         v = txl.cta_id() * BLOCK + txl.thread_id()
         with txl.if_(v < M * H), txl.then_():
@@ -201,7 +201,7 @@ def kernel_rt(dtype: str, itype: str, H: int, W: int):
     var_M, var_G = txl.Var("M", "int32"), txl.Var("G", "int32")
 
     @txl.kernel()
-    def group_bias_add_rt(y: txl.Tensor((var_M, H), dtype), bias: txl.Tensor((var_G, H), dtype), gidx: txl.Tensor((var_M,), itype), M: var_M, G: var_G, tail: txl.int32):
+    def group_bias_add_rt(y: txl.Tensor((var_M, H), dtype, data_alignment=1), bias: txl.Tensor((var_G, H), dtype, data_alignment=1), gidx: txl.Tensor((var_M,), itype, data_alignment=1), M: var_M, G: var_G, tail: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=M // R, block=(block // 32) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=5))
         c0 = txl.cta_id()
         nt = M // R

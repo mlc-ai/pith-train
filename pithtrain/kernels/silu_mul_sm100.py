@@ -264,14 +264,14 @@ def scalar_kernel(dtype: str, n_in: int):
     if n_in == 2:
 
         @txl.kernel()
-        def silu_mul_fwd_scalar(gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+        def silu_mul_fwd_scalar(gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
             txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=256))
             body([gate, up, out], n)
 
         return compile_kernel(silu_mul_fwd_scalar)
 
     @txl.kernel()
-    def silu_mul_bwd_scalar(do: txl.Tensor((txl.int64(),), dtype), gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), grad_gate: txl.Tensor((txl.int64(),), dtype), grad_up: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+    def silu_mul_bwd_scalar(do: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=256))
         body([do, gate, up, grad_gate, grad_up], n)
 
@@ -389,14 +389,14 @@ def kernel_cfg(dtype: str, n_in: int, WARPS: int, VPT: int, VBYTES: int, LD_HINT
     if n_in == 2:
 
         @txl.kernel()
-        def silu_mul_fwd(gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+        def silu_mul_fwd(gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
             txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=(WARPS) * 32))
             body([gate, up, out], n)
 
         return compile_kernel(silu_mul_fwd)
 
     @txl.kernel()
-    def silu_mul_bwd(do: txl.Tensor((txl.int64(),), dtype), gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), grad_gate: txl.Tensor((txl.int64(),), dtype), grad_up: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+    def silu_mul_bwd(do: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=(WARPS) * 32))
         body([do, gate, up, grad_gate, grad_up], n)
 

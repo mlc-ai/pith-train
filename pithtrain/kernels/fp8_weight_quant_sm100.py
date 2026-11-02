@@ -39,7 +39,7 @@ def tensor_nd(dtype, nd):
     """
     A rank-nd global tensor parameter, every extent its own symbolic int64.
     """
-    return txl.Tensor(tuple(txl.int64() for _ in range(nd)), dtype)
+    return txl.Tensor(tuple(txl.int64() for _ in range(nd)), dtype, data_alignment=1)
 
 
 def cdiv(a, b):
@@ -275,7 +275,7 @@ def quant_vec():
     """
 
     @txl.kernel()
-    def fp8_quant_vec(x: txl.Tensor((txl.int64(),), txl.bf16), out: txl.Tensor((txl.int64(),), txl.u8), out_t: txl.Tensor((txl.int64(),), txl.u8), sc: txl.Tensor((txl.int64(),), txl.f32), sct: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, sxg: txl.int64, sxn: txl.int64, num_tiles: txl.int32):
+    def fp8_quant_vec(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), out_t: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), sc: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), sct: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, sxg: txl.int64, sxn: txl.int64, num_tiles: txl.int32):
         pdl_entry(num_tiles)
         pdl()
         tid = txl.thread_id()
@@ -350,7 +350,7 @@ def quant_vec_q128():
     """
 
     @txl.kernel()
-    def fp8_quant_vec_q128(x: txl.Tensor((txl.int64(),), txl.bf16), out: txl.Tensor((txl.int64(),), txl.u8), out_t: txl.Tensor((txl.int64(),), txl.u8), sc: txl.Tensor((txl.int64(),), txl.f32), sct: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, sxg: txl.int64, sxn: txl.int64, num_tiles: txl.int32):
+    def fp8_quant_vec_q128(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), out_t: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), sc: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), sct: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, sxg: txl.int64, sxn: txl.int64, num_tiles: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_tiles, block=NTQ, programmatic_stream_serialization=True))
         pdl()
         tid = txl.thread_id()
@@ -425,7 +425,7 @@ def quant_generic(dtype):
     is_bf16 = dtype == "bfloat16"
 
     @txl.kernel()
-    def fp8_quant_generic(x: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), txl.u8), out_t: txl.Tensor((txl.int64(),), txl.u8), sc: txl.Tensor((txl.int64(),), txl.f32), sct: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, sxg: txl.int64, sxn: txl.int64, sxk: txl.int64, num_tiles: txl.int32):
+    def fp8_quant_generic(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), out_t: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), sc: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), sct: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, sxg: txl.int64, sxn: txl.int64, sxk: txl.int64, num_tiles: txl.int32):
         pdl_entry(num_tiles)
         pdl()
         tid = txl.thread_id()
@@ -755,7 +755,7 @@ def pack_vec(dtype):
     """
 
     @txl.kernel()
-    def fp8_pack_vec(x: tensor_nd(dtype, 3), out: txl.Tensor((txl.int64(),), txl.u8), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, total: txl.int64, num_tiles: txl.int32):
+    def fp8_pack_vec(x: tensor_nd(dtype, 3), out: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, total: txl.int64, num_tiles: txl.int32):
         pdl_entry(num_tiles)
         pdl()
         tid = txl.thread_id()
@@ -793,7 +793,7 @@ def pack_vec(dtype):
 @functools.cache
 def pack_generic(dtype):
     @txl.kernel()
-    def fp8_pack_generic(x: tensor_nd(dtype, 3), out: txl.Tensor((txl.int64(),), txl.u8), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, total: txl.int64, num_tiles: txl.int32):
+    def fp8_pack_generic(x: tensor_nd(dtype, 3), out: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), N: txl.int32, K: txl.int32, R: txl.int32, C: txl.int32, total: txl.int64, num_tiles: txl.int32):
         pdl_entry(num_tiles)
         pdl()
         tid = txl.thread_id()
@@ -903,7 +903,7 @@ def shard_amax_multi_kernel(V):
     """
 
     @txl.kernel()
-    def fp8_shard_amax_multi(table: txl.Tensor((txl.int64(),), txl.i64), nw: txl.int32, total: txl.int32):
+    def fp8_shard_amax_multi(table: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), nw: txl.int32, total: txl.int32):
         pdl_entry(total)
         pdl()
         tid = txl.thread_id()
@@ -969,7 +969,7 @@ SC_FIELDS = 6
 @functools.cache
 def scales_multi_kernel(cap):
     @txl.kernel()
-    def fp8_scales_multi(table: txl.Tensor((txl.int64(),), txl.i64), nw: txl.int32, total: txl.int32, num_ctas: txl.int32):
+    def fp8_scales_multi(table: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), nw: txl.int32, total: txl.int32, num_ctas: txl.int32):
         pdl_entry(num_ctas)
         pdl()
         t_s, _ = load_table(table, nw, SC_FIELDS, cap)

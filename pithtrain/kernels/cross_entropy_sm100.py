@@ -197,7 +197,7 @@ def count_kernel(tdt):
     U = 4  # target loads in flight per thread
 
     @txl.kernel()
-    def ce_count(target: txl.Tensor((txl.int64(),), tdt), tstride: txl.int64, N: txl.int32, ii: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32), done: txl.Tensor((txl.int64(),), txl.i32), loss: txl.Tensor((txl.int64(),), txl.f32)):
+    def ce_count(target: txl.Tensor((txl.int64(),), tdt, data_alignment=1), tstride: txl.int64, N: txl.int32, ii: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), done: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=1024))
         tid = txl.thread_id()
         lane = txl.lane_id()
@@ -237,7 +237,7 @@ def count_kernel(tdt):
 @functools.cache
 def final_kernel():
     @txl.kernel()
-    def ce_final(row_loss: txl.Tensor((txl.int64(),), txl.f32), stats: txl.Tensor((txl.int64(),), txl.f32), loss: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32):
+    def ce_final(row_loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), stats: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=1024))
         tid = txl.thread_id()
         lane = txl.lane_id()
@@ -293,7 +293,7 @@ def stream_kernel(ldt, tdt):
             txl.ptx.st.global_.b16(inp.ptr_to([idx]), txl.reinterpret(txl.Cast(ldt, g), ty="uint16"))
 
     @txl.kernel()
-    def ce_stream(inp: txl.Tensor((txl.int64(),), ldt), target: txl.Tensor((txl.int64(),), tdt), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32), row_loss: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, V: txl.int32, ii: txl.int64):
+    def ce_stream(inp: txl.Tensor((txl.int64(),), ldt, data_alignment=1), target: txl.Tensor((txl.int64(),), tdt, data_alignment=1), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), row_loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32, V: txl.int32, ii: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=N, block=(warps) * 32))
         row = txl.cta_id()
         tid = txl.thread_id()
@@ -423,7 +423,7 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
     L2 = txl.cuda.make_float2(txl.float32(LOG2E), txl.float32(LOG2E))
 
     @txl.kernel()
-    def ce_cluster(inp: txl.Tensor((txl.int64(),), ldt), target: txl.Tensor((txl.int64(),), tdt), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32), row_loss: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, V: txl.int32, ii: txl.int64, done: txl.Tensor((txl.int64(),), txl.i32), loss: txl.Tensor((txl.int64(),), txl.f32)):
+    def ce_cluster(inp: txl.Tensor((txl.int64(),), ldt, data_alignment=1), target: txl.Tensor((txl.int64(),), tdt, data_alignment=1), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), row_loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32, V: txl.int32, ii: txl.int64, done: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=N * C, block=(warps) * 32, cluster=(C,) if C > 1 else None), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=blocks_per_sm(CAP_BYTES)))
         cta = txl.cta_id()
         rank = txl.cuda.mov_sreg(32, "cluster_ctarank") if C > 1 else txl.int32(0)  # %cluster_ctarank, as before: %cluster_ctaid.x costs a division by the cluster size

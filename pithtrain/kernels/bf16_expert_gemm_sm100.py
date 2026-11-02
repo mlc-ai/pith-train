@@ -170,30 +170,36 @@ def dact(g, u, dh, clamped, alpha, limit):
 
 def params2(kind, has_bias, clamped, far=False):
     i32, i64, f32 = "int32", "int64", "float32"
-    bf = txl.Tensor((txl.int64(),), txl.bf16)
-    u32 = txl.Tensor((txl.int64(),), txl.u32)
-    p = [("cu", txl.Tensor((txl.int64(),), txl.i32)), ("G", i32), ("M", i32), ("num_ctas", i32)]
+    # a fresh Tensor type (own symbolic extent) per parameter: a shared one would make the host
+    # check require equal lengths
+    def bf():
+        return txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1)
+
+    def u32():
+        return txl.Tensor((txl.int64(),), txl.u32, data_alignment=1)
+
+    p = [("cu", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("G", i32), ("M", i32), ("num_ctas", i32)]
     if kind == "gu_fwd":
-        p += [("x", bf), ("T", i32), ("a_idx", txl.Tensor((txl.int64(),), txl.i32)), ("w", bf), ("wdiff", i64),
-              ("ws0", i64), ("ws1", i64), ("preact", u32), ("h", u32), ("swapped", i32)]
+        p += [("x", bf()), ("T", i32), ("a_idx", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("w", bf()), ("wdiff", i64),
+              ("ws0", i64), ("ws1", i64), ("preact", u32()), ("h", u32()), ("swapped", i32)]
         if has_bias:
-            p += [("bias", u32)]
+            p += [("bias", u32())]
     elif kind == "down_fwd":
-        p += [("hin", bf), ("wd", bf), ("slot_of", txl.Tensor((txl.int64(),), txl.i32)), ("out", u32)]
+        p += [("hin", bf()), ("wd", bf()), ("slot_of", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("out", u32())]
         if has_bias:
-            p += [("bias", u32)]
+            p += [("bias", u32())]
     elif kind == "down_dgrad":
-        p += [("dy", bf), ("T", i32), ("slot_of", txl.Tensor((txl.int64(),), txl.i32)), ("wd", bf),
-              ("preact", u32), ("dpre", u32), ("h", u32), ("swapped", i32)]
+        p += [("dy", bf()), ("T", i32), ("slot_of", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("wd", bf()),
+              ("preact", u32()), ("dpre", u32()), ("h", u32()), ("swapped", i32)]
     elif kind == "gu_dgrad":
-        p += [("dpre", bf), ("w", bf), ("wdiff", i64), ("ws0", i64), ("ws1", i64), ("dx", u32)]
+        p += [("dpre", bf()), ("w", bf()), ("wdiff", i64), ("ws0", i64), ("ws1", i64), ("dx", u32())]
     elif kind == "gu_wgrad":
-        p += [("dpre", bf), ("x", bf), ("T", i32), ("a_idx", txl.Tensor((txl.int64(),), txl.i32)),
-              ("mg", txl.Tensor((txl.int64(),), txl.f32))] + ([("mg2", txl.Tensor((txl.int64(),), txl.f32))] if far else []) + [
+        p += [("dpre", bf()), ("x", bf()), ("T", i32), ("a_idx", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+              ("mg", txl.Tensor((txl.int64(),), txl.f32, data_alignment=1))] + ([("mg2", txl.Tensor((txl.int64(),), txl.f32, data_alignment=1))] if far else []) + [
               ("mgdiff", i64), ("ms0", i64), ("ms1", i64), ("flip", i32)]
     elif kind == "down_wgrad":
-        p += [("dy", bf), ("T", i32), ("slot_of", txl.Tensor((txl.int64(),), txl.i32)), ("hin", bf),
-              ("mg", txl.Tensor((txl.int64(),), txl.f32))]
+        p += [("dy", bf()), ("T", i32), ("slot_of", txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)), ("hin", bf()),
+              ("mg", txl.Tensor((txl.int64(),), txl.f32, data_alignment=1))]
     if clamped and kind in ("gu_fwd", "down_dgrad"):
         p += [("alpha", f32), ("limit", f32)]
     return p
@@ -1578,7 +1584,7 @@ def build_gather(H):
     CH = H // 8  # 16-byte chunks per row
     WPC = 8
 
-    def gather_rows(src: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32),
+    def gather_rows(src: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
                     M: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=WPC * 32, programmatic_stream_serialization=True))
         warp = txl.warp_id()

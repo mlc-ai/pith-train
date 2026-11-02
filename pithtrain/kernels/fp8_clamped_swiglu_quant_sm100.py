@@ -296,7 +296,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
     has_tail = C % BLOCK != 0
 
     @txl.kernel()
-    def kern(gu: txl.Tensor((txl.int64(),), txl.bf16), bias: txl.Tensor((txl.int64(),), txl.bf16), offs: txl.Tensor((txl.int64(),), txl.i32), dh: txl.Tensor((txl.int64(),), txl.bf16), x_fp8: txl.Tensor((txl.int64(),), txl.u8), x_scale: txl.Tensor((txl.int64(),), txl.f32), x_ch: txl.Tensor((txl.int64(),), txl.u8), x_ch_scale: txl.Tensor((txl.int64(),), txl.f32), partial: txl.Tensor((txl.int64(),), txl.f32), alpha: txl.float32, limit: txl.float32, num_groups: txl.int32, num_ctas: txl.int32):
+    def kern(gu: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), bias: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), dh: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), x_fp8: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), x_scale: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), x_ch: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), x_ch_scale: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), partial: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), alpha: txl.float32, limit: txl.float32, num_groups: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(WARPS) * 32))
         cta = txl.cta_id()
         tid = txl.thread_id()
@@ -541,7 +541,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
 @functools.cache
 def segsum_kernel(C: int):
     @txl.kernel()
-    def segsum(partial: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.bf16), num_groups: txl.int32, num_ctas: txl.int32):
+    def segsum(partial: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), num_groups: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=128))
         cta = txl.cta_id()
         tid = txl.thread_id()
@@ -587,7 +587,7 @@ def segsum4_kernel(C: int):
     assert C % 4 == 0
 
     @txl.kernel()
-    def segsum4(partial: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.bf16), num_groups: txl.int32, num_ctas: txl.int32):
+    def segsum4(partial: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), num_groups: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=256))
         cta = txl.cta_id()
         tid = txl.thread_id()
@@ -649,7 +649,7 @@ def segsum1_kernel(C: int):
     assert C % 4 == 0
 
     @txl.kernel()
-    def segsum1(partial: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.bf16), num_groups: txl.int32, num_ctas: txl.int32):
+    def segsum1(partial: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), num_groups: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=32))
         cta = txl.cta_id()
         lane = txl.thread_id()
@@ -842,17 +842,17 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
 
     @txl.kernel()
     def kern(
-        gu: txl.Tensor((txl.int64(),), txl.bf16),
-        bias: txl.Tensor((txl.int64(),), txl.bf16),
-        offs: txl.Tensor((txl.int64(),), txl.i32),
-        dh: txl.Tensor((txl.int64(),), txl.bf16),
-        x_fp8: txl.Tensor((txl.int64(),), txl.u8),
-        x_scale: txl.Tensor((txl.int64(),), txl.f32),
-        x_ch: txl.Tensor((txl.int64(),), txl.u8),
-        x_ch_scale: txl.Tensor((txl.int64(),), txl.f32),
-        partial: txl.Tensor((txl.int64(),), txl.f32),
-        sched: txl.Tensor((txl.int64(),), txl.u32),
-        dbias: txl.Tensor((txl.int64(),), txl.bf16),
+        gu: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        bias: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1),
+        dh: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        x_fp8: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
+        x_scale: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        x_ch: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1),
+        x_ch_scale: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        partial: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1),
+        sched: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1),
+        dbias: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         alpha: txl.float32,
         limit: txl.float32,
         num_groups: txl.int32,

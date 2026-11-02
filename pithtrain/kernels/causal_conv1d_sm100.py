@@ -306,9 +306,9 @@ def fwd_tma(C, K, wdt, shuffle_store):
 
     @txl.kernel()
     def conv_fwd_tma(
-        x: txl.Tensor((txl.int64(),), txl.bf16),
-        w: txl.Tensor((txl.int64(),), wdt),
-        y: txl.Tensor((txl.int64(),), txl.bf16),
+        x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        w: txl.Tensor((txl.int64(),), wdt, data_alignment=1),
+        y: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
         L: txl.int32,
         S: txl.int32,
         offset: txl.int32,
@@ -633,11 +633,11 @@ def bwd_tma(C, K, wdt, cf):
 
     @txl.kernel()
     def conv_bwd_tma(
-        g: txl.Tensor((txl.int64(),), txl.bf16),
-        x: txl.Tensor((txl.int64(),), txl.bf16),
-        w: txl.Tensor((txl.int64(),), wdt),
-        dx: txl.Tensor((txl.int64(),), txl.bf16),
-        dw: txl.Tensor((txl.int64(),), wdt),
+        g: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        w: txl.Tensor((txl.int64(),), wdt, data_alignment=1),
+        dx: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
+        dw: txl.Tensor((txl.int64(),), wdt, data_alignment=1),
         L: txl.int32,
         S: txl.int32,
         offset: txl.int32,
@@ -1174,7 +1174,7 @@ def fwd_plain(C, K, wdt):
     YP = T + 2
 
     @txl.kernel()
-    def conv_fwd_plain(x: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), wdt), y: txl.Tensor((txl.int64(),), txl.bf16), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
+    def conv_fwd_plain(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), wdt, data_alignment=1), y: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(S + T - 1) // T, NCB, B], block=NCW * 32))
         bt, bc, bb = txl.cta_id()
         tid = txl.thread_id()
@@ -1227,7 +1227,7 @@ def bwd_plain(C, K, wdt, mode):
     GP = CB + 2 if mode == "gen" else CB
 
     @txl.kernel()
-    def conv_bwd_plain(g: txl.Tensor((txl.int64(),), txl.bf16), x: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), wdt), dx: txl.Tensor((txl.int64(),), txl.bf16), dwp: txl.Tensor((txl.int64(),), txl.f32), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32, gsb: txl.int64, gst: txl.int64, gsc: txl.int64):
+    def conv_bwd_plain(g: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), wdt, data_alignment=1), dx: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dwp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32, gsb: txl.int64, gst: txl.int64, gsc: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(L + T - 1) // T, NCB, B], block=NCW * 32))
         bs, bc, bb = txl.cta_id()
         tid = txl.thread_id()
@@ -1300,7 +1300,7 @@ def dw_kernel(C, K, wdt):
     KF = kfac(cdiv(C, CB))
 
     @txl.kernel()
-    def dw_reduce(dwp: txl.Tensor((txl.int64(),), txl.f32), dw: txl.Tensor((txl.int64(),), wdt), nrt: txl.int32):
+    def dw_reduce(dwp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), dw: txl.Tensor((txl.int64(),), wdt, data_alignment=1), nrt: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(N + 255) // 256, block=256))
         idx = txl.cta_id() * 256 + txl.thread_id()
         k = idx // C

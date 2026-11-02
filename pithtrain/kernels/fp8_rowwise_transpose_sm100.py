@@ -133,7 +133,7 @@ def build_one():
     """
 
     @txl.kernel()
-    def fp8_quant_grad_one(x: txl.Tensor((txl.int64(),), txl.bf16), xq: txl.Tensor((txl.int64(),), txl.u8), xs: txl.Tensor((txl.int64(),), txl.i32), xtq: txl.Tensor((txl.int64(),), txl.u8), xts: txl.Tensor((txl.int64(),), txl.i32), M: txl.int32, N: txl.int32, ld: txl.int64, off: txl.int64, pf: txl.int32):
+    def fp8_quant_grad_one(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), xq: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), xs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), xtq: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), xts: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), M: txl.int32, N: txl.int32, ld: txl.int64, off: txl.int64, pf: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=((N + 127) // 128) * ((M + 127) // 128), block=(NTHREADS // 32) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=4))
         cid = txl.cta_id()
         warp = txl.warp_id()
@@ -294,7 +294,7 @@ def build_split4(MINB=6):
     """
 
     @txl.kernel()
-    def fp8_quant_grad_split4(x: txl.Tensor((txl.int64(),), txl.bf16), xq: txl.Tensor((txl.int64(),), txl.u8), xs: txl.Tensor((txl.int64(),), txl.i32), xtq: txl.Tensor((txl.int64(),), txl.u8), xts: txl.Tensor((txl.int64(),), txl.i32), M: txl.int32, N: txl.int32, ld: txl.int64, off: txl.int64):
+    def fp8_quant_grad_split4(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), xq: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), xs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), xtq: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), xts: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), M: txl.int32, N: txl.int32, ld: txl.int64, off: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=((N + 127) // 128) * ((M + 127) // 128) * 4, block=(NTHREADS // 32) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=MINB))
         cid = txl.cta_id()
         warp = txl.warp_id()
@@ -461,7 +461,7 @@ def generic_kernel(dtype):
     PITCH = BLOCK + 1
 
     @txl.kernel()
-    def fp8_quant_grad_generic(x: txl.Tensor((txl.int64(),), dtype), xq: txl.Tensor((txl.int64(),), txl.u8), xs: txl.Tensor((txl.int64(),), txl.i32), xtq: txl.Tensor((txl.int64(),), txl.u8), xts: txl.Tensor((txl.int64(),), txl.i32), M: txl.int32, N: txl.int32, s0: txl.int64, s1: txl.int64, off: txl.int64):
+    def fp8_quant_grad_generic(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), xq: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), xs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), xtq: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), xts: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), M: txl.int32, N: txl.int32, s0: txl.int64, s1: txl.int64, off: txl.int64):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(N + 127) // 128, (M + 127) // 128], block=(NTHREADS // 32) * 32))
         cid = txl.cta_id()
         tn = cid[0]

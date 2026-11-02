@@ -160,7 +160,7 @@ def recv_def(ep, epr):
     steps = max(1, nseg.bit_length())
 
     @txl.kernel()
-    def ep_recv_idx(meta: txl.Tensor((txl.int64(),), txl.i64), received: txl.Tensor((txl.int64(),), txl.i64), expert_out: txl.Tensor((txl.int64(),), txl.i64), expand_out: txl.Tensor((txl.int64(),), txl.i64), recv_stride: txl.int64, total: txl.int32, num_ctas: txl.int32):
+    def ep_recv_idx(meta: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), received: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), expert_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), expand_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), recv_stride: txl.int64, total: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(RECV_WARPS) * 32))
         tid = txl.thread_id()
         lane, warp = tid & 31, tid >> 5
@@ -283,7 +283,7 @@ def atom_s_add(buf, i, v):
 @functools.cache
 def zero_kernel(n):
     @txl.kernel()
-    def ep_ws_zero(ws: txl.Tensor((txl.int64(),), txl.i32)):
+    def ep_ws_zero(ws: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=128))
         tid = txl.thread_id()
         with txl.serial((n + 127) // 128) as it:
@@ -329,7 +329,7 @@ def send_def(k, ep, epr, ids_dtype):
     cb_off = w["cb_off"]
 
     @txl.kernel()
-    def ep_send_idx(topk: txl.Tensor((txl.int64(),), ids_dtype), meta_out: txl.Tensor((txl.int64(),), txl.i64), out: txl.Tensor((txl.int64(),), txl.i64), ws: txl.Tensor((txl.int64(),), txl.i32), m: txl.int32, row_stride: txl.int64, tpc: txl.int32, num_ctas: txl.int32):
+    def ep_send_idx(topk: txl.Tensor((txl.int64(),), ids_dtype, data_alignment=1), meta_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), ws: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), m: txl.int32, row_stride: txl.int64, tpc: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(SEND_WARPS) * 32))
         tid = txl.thread_id()
         lane, warp = tid & 31, tid >> 5

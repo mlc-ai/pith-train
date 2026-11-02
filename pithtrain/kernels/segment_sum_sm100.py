@@ -231,7 +231,7 @@ def tile_sum2(dtype, idtype, H):
     NT = TW * RG
 
     @txl.kernel()
-    def tile_sum(x: txl.Tensor((txl.int64(),), dtype), offs: txl.Tensor((txl.int64(),), idtype), part: txl.Tensor((txl.int64(),), txl.f32), M: txl.int32, G: txl.int32, n_units: txl.int32):
+    def tile_sum(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), offs: txl.Tensor((txl.int64(),), idtype, data_alignment=1), part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), M: txl.int32, G: txl.int32, n_units: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_units, block=(NT // 32) * 32))
         u = txl.cta_id()
         tid = txl.thread_id()
@@ -449,9 +449,9 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
 
     @txl.kernel()
     def tile_sum_ring(
-        x: txl.Tensor((txl.int64(),), dtype),
-        offs: txl.Tensor((txl.int64(),), idtype),
-        part: txl.Tensor((txl.int64(),), txl.u64 if tagged else txl.f32),
+        x: txl.Tensor((txl.int64(),), dtype, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), idtype, data_alignment=1),
+        part: txl.Tensor((txl.int64(),), txl.u64 if tagged else txl.f32, data_alignment=1),
         M: txl.int32,
         G: txl.int32,
         n_units: txl.int32,
@@ -853,9 +853,9 @@ def group_sum_ring2(dtype, idtype, odtype, H):
 
     @txl.kernel()
     def group_sum_ring(
-        x: txl.Tensor((txl.int64(),), dtype),
-        offs: txl.Tensor((txl.int64(),), idtype),
-        out: txl.Tensor((txl.int64(),), odtype),
+        x: txl.Tensor((txl.int64(),), dtype, data_alignment=1),
+        offs: txl.Tensor((txl.int64(),), idtype, data_alignment=1),
+        out: txl.Tensor((txl.int64(),), odtype, data_alignment=1),
         M: txl.int32,
         G: txl.int32,
     ):
@@ -1063,7 +1063,7 @@ def tile_reduce2(idtype, odtype, H):
     TB = RLANES * RU
 
     @txl.kernel()
-    def tile_reduce(part: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), idtype), out: txl.Tensor((txl.int64(),), odtype), M: txl.int32, G: txl.int32):
+    def tile_reduce(part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), offs: txl.Tensor((txl.int64(),), idtype, data_alignment=1), out: txl.Tensor((txl.int64(),), odtype, data_alignment=1), M: txl.int32, G: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(RLANES) * 32, programmatic_stream_serialization=True))
         u = txl.cta_id()
         g = u // NCB
@@ -1131,7 +1131,7 @@ def tile_reduce_wide2(idtype, odtype, H):
     U = 32
 
     @txl.kernel()
-    def tile_reduce(part: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), idtype), out: txl.Tensor((txl.int64(),), odtype), M: txl.int32, G: txl.int32):
+    def tile_reduce(part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), offs: txl.Tensor((txl.int64(),), idtype, data_alignment=1), out: txl.Tensor((txl.int64(),), odtype, data_alignment=1), M: txl.int32, G: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NC, block=(TW // 32) * 32, programmatic_stream_serialization=True))
         u = txl.cta_id()
         g = u // NC
@@ -1184,7 +1184,7 @@ def tile_reduce_tag2(idtype, odtype, H, CW, LANES, U):
     NTH = COLS * LANES
 
     @txl.kernel()
-    def tile_reduce_tag(part: txl.Tensor((txl.int64(),), txl.u64), offs: txl.Tensor((txl.int64(),), idtype), out: txl.Tensor((txl.int64(),), odtype), M: txl.int32, G: txl.int32, tag: txl.int32):
+    def tile_reduce_tag(part: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), offs: txl.Tensor((txl.int64(),), idtype, data_alignment=1), out: txl.Tensor((txl.int64(),), odtype, data_alignment=1), M: txl.int32, G: txl.int32, tag: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(CW * LANES) * 32, programmatic_stream_serialization=True))
         u = txl.cta_id()
         g = u // NCB

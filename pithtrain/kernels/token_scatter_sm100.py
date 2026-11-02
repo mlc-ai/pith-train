@@ -170,7 +170,7 @@ def bulk_cfg(row_bytes, vec, contiguous):
 @functools.cache
 def init_kernel():
     @txl.kernel()
-    def token_scatter_state_init(state: txl.Tensor((txl.int64(),), txl.i32)):
+    def token_scatter_state_init(state: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=128))
         with txl.serial(txl.thread_id(), STATE_WORDS, step=128) as i:
             txl.ptx["st.global.s32"](state.ptr_to([txl.cast(i, "int64")]), txl.int32(0))
@@ -225,7 +225,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
         R = TASK_ROWS
 
     @txl.kernel()
-    def token_scatter(x: txl.Tensor((txl.int64(),), txl.u8), eidx: txl.Tensor((txl.int64(),), txl.i64), out: txl.Tensor((txl.int64(),), txl.u8), rev: txl.Tensor((txl.int64(),), txl.i64), offs: txl.Tensor((txl.int64(),), txl.i32), ks_t: txl.Tensor((txl.int64(),), txl.i32), state: txl.Tensor((txl.int64(),), txl.i32), dbg: txl.Tensor((txl.int64(),), txl.u64), m: txl.int32, G: txl.int32, align: txl.int32, src_stride: txl.int64, tpc: txl.int32, num_ctas: txl.int32):
+    def token_scatter(x: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), eidx: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u8, data_alignment=1), rev: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), offs: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), ks_t: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), state: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), dbg: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), m: txl.int32, G: txl.int32, align: txl.int32, src_stride: txl.int64, tpc: txl.int32, num_ctas: txl.int32):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(WARPS) * 32, cooperative=True), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         c = txl.cta_id()
         tid = txl.thread_id()
@@ -1037,14 +1037,14 @@ def build_host(row_bytes: int, cfg):
 
     K = inspect.Parameter.POSITIONAL_OR_KEYWORD
     params = [
-        inspect.Parameter("x", K, annotation=txl.Tensor((txl.int64(),), txl.u8)),
-        inspect.Parameter("eidx", K, annotation=txl.Tensor((txl.int64(),), txl.i64)),
-        inspect.Parameter("out", K, annotation=txl.Tensor((txl.int64(),), txl.u8)),
-        inspect.Parameter("rev", K, annotation=txl.Tensor((txl.int64(),), txl.i64)),
-        inspect.Parameter("offs", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
-        inspect.Parameter("ks_t", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
-        inspect.Parameter("state", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
-        inspect.Parameter("state_nx", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
+        inspect.Parameter("x", K, annotation=txl.Tensor((txl.int64(),), txl.u8, data_alignment=1)),
+        inspect.Parameter("eidx", K, annotation=txl.Tensor((txl.int64(),), txl.i64, data_alignment=1)),
+        inspect.Parameter("out", K, annotation=txl.Tensor((txl.int64(),), txl.u8, data_alignment=1)),
+        inspect.Parameter("rev", K, annotation=txl.Tensor((txl.int64(),), txl.i64, data_alignment=1)),
+        inspect.Parameter("offs", K, annotation=txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+        inspect.Parameter("ks_t", K, annotation=txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+        inspect.Parameter("state", K, annotation=txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
+        inspect.Parameter("state_nx", K, annotation=txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)),
         inspect.Parameter("m", K, annotation=txl.i32),
         inspect.Parameter("G", K, annotation=txl.i32),
         inspect.Parameter("align", K, annotation=txl.i32),

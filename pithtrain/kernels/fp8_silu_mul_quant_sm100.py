@@ -945,7 +945,7 @@ def build(mode, N):
     body = ((body_runL if RUN_L else body_run) if run else body_persistent) if persistent else body_simple
 
     def T(dt, shape):
-        return txl.Tensor(shape, dt)
+        return txl.Tensor(shape, dt, data_alignment=1)
 
     var_M = txl.Var("M", "int32")
     var_MB = txl.Var("MB", "int32")
