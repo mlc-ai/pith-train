@@ -22,7 +22,7 @@ from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_l
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
-from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
+from pithtrain.kernels.silu_mul_sm90 import silu_mul_bwd_sm90, silu_mul_fwd_sm90
 
 __all__ = ["SiluMulQuant", "SiluMulQuantGU", "fp8_silu_mul_gu_bwd_sm90", "fp8_silu_mul_bwd_sm90", "silu_mul_quant_fusable", "fp8_silu_mul_fwd_sm90", "silu_mul_quant_gu_fusable", "fp8_silu_mul_gu_fwd_sm90"]
 
@@ -497,7 +497,7 @@ def silu_mul_quant_gu_fusable(N: int, M: int, grouped_mm_offs: torch.Tensor) -> 
 def fp8_silu_mul_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = g.shape
     if M != 0 and N != 0 and not silu_mul_quant_fusable(N, grouped_mm_offs):
-        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(g, u), grouped_mm_offs)
+        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd_sm90(g, u), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, N, g.device)
     if M == 0 or N == 0:
         return out
@@ -510,7 +510,7 @@ def fp8_silu_mul_bwd_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, gr
     if M == 0 or N == 0:
         return (alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device))
     if not silu_mul_quant_fusable(N, grouped_mm_offs):
-        grad_gate, grad_up = silu_mul_bwd(dh, g, u)
+        grad_gate, grad_up = silu_mul_bwd_sm90(dh, g, u)
         return fp8cast_rowwise_kmajor_sm90(grad_gate, grouped_mm_offs), fp8cast_rowwise_kmajor_sm90(grad_up, grouped_mm_offs)
     grad_gate_out, grad_up_out = alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device)
     get_kernel(N, True, g.device)(dh, g, u, grouped_mm_offs, *grad_gate_out, *grad_up_out)
@@ -523,7 +523,7 @@ def fp8_silu_mul_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) ->
         return alloc_rowwise_kmajor_outputs(0, N, gu.device)
     if not silu_mul_quant_gu_fusable(N, M, grouped_mm_offs):
         gate, up = gu[:, :N].contiguous(), gu[:, N:].contiguous()
-        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(gate, up), grouped_mm_offs)
+        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd_sm90(gate, up), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, N, gu.device)
     get_kernel_gu(N, False, gu.device)(None, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
     return out
@@ -535,7 +535,7 @@ def fp8_silu_mul_gu_bwd_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs
         return alloc_rowwise_kmajor_outputs(0, 2 * N, gu.device)
     if not silu_mul_quant_gu_fusable(N, M, grouped_mm_offs):
         gate, up = gu[:, :N].contiguous(), gu[:, N:].contiguous()
-        grad_gate, grad_up = silu_mul_bwd(dh, gate, up)
+        grad_gate, grad_up = silu_mul_bwd_sm90(dh, gate, up)
         return fp8cast_rowwise_kmajor_sm90(torch.cat([grad_gate, grad_up], 1), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, 2 * N, gu.device)
     get_kernel_gu(N, True, gu.device)(dh, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
