@@ -85,7 +85,7 @@ def i642(x):
 
 def scale_bits(amax_f32):
     """
-    (scale_bits, rcp_bits) of pith-train's compute_fp8_scale (SM100, native E8M0).
+    (scale_bits, rcp_bits) of the recipe's E8M0 scale (SM100, native E8M0).
     """
     amc = txl.local_scalar("float32")
     txl.ptx.max.f32(amc, amax_f32, txl.float32(1e-4))

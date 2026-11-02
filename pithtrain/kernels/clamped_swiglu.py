@@ -1,8 +1,8 @@
 """
 Picker of gpt-oss's clamped SwiGLU over an interleaved gate_up and its gradient.
 
-SM90 runs the CuTe-DSL kernels, SM100 the Triton kernels; both return the same values (bf16
-bit-identical).
+SM90 runs the CuTe-DSL kernels (clamped_swiglu_sm90), SM100 the TIRx kernels
+(clamped_swiglu_sm100); both return the same values (bf16 bit-identical).
 """
 
 import torch

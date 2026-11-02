@@ -2,7 +2,7 @@
 Picker of silu_mul, the fused silu(gate) * up of a SwiGLU MLP and its gradients. SM90 runs the
 CuTe-DSL kernels (silu_mul_sm90) in eager; inside a torch.compile region, which cannot trace a CuTe
 launch, it emits the same fp32 formulas as plain PyTorch for Inductor to fuse with the neighbouring
-ops (a cheaper launch than an opaque op, and no graph break). SM100 runs the Triton kernels
+ops (a cheaper launch than an opaque op, and no graph break). SM100 runs the TIRx kernels
 (silu_mul_sm100) in both. All compute in fp32 and round once to the dtype; the eager SM90 and the
 SM100 kernels give the same bf16 bytes, the compiled SM90 path may differ from them by an output ulp.
 """

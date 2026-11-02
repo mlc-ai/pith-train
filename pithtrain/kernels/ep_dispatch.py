@@ -13,7 +13,7 @@ def ep_dispatch_send_idx(topk_ids: torch.Tensor, num_experts: int, ep_size: int,
 
     - topk_ids: (m, k), values in [0, num_experts), not modified. A token's k experts must be
       distinct. num_experts == ep_size * experts_per_rank (expert e lives on rank e //
-      experts_per_rank), ep_size <= 32. Integer dtype: SM100 (Triton) reads int8/16/32/64 and uint8
+      experts_per_rank), ep_size <= 32. Integer dtype: SM100 (TIRx) reads int8/16/32/64 and uint8
       with unit inner stride; SM90 also takes uint16/32/64 and any strides.
     - meta_out: optional int64 buffer of at least 2 * ep_size elements; the first two outputs are
       views of its first 2 * ep_size elements (a fresh buffer when None).
@@ -30,7 +30,7 @@ def ep_dispatch_send_idx(topk_ids: torch.Tensor, num_experts: int, ep_size: int,
       all-to-all). Valid until the next call on the same stream (it may be reused scratch).
 
     Order within a bucket (a rank's chunk of dispatch_token_idxs, an expert's run of idxs) is token
-    order on SM90 (deterministic, every input) and atomic order on SM100 (Triton). Counts and
+    order on SM90 (deterministic, every input) and atomic order on SM100 (TIRx). Counts and
     per-bucket sets are identical on both. m == 0 gives zero counts and empty index outputs.
 
     SM90 limits, checked before anything is allocated (ValueError): ep_size * (experts_per_rank +

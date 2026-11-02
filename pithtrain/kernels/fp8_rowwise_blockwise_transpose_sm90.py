@@ -1,6 +1,7 @@
 """
 CuTe-DSL (SM90) rowwise FP8 quantization of x and 128x128 blockwise FP8 quantization of x.T from one
-read of x, bit-identical to the Triton kernel in fp8_rowwise_blockwise_transpose_sm100. Covers every
+read of x, the same bytes and scales as fp8_rowwise_blockwise_transpose_sm100 and the Triton kernel
+it replaced. Covers every
 input, so there is no fallback.
 
 One CTA of 1024 / R threads per 128x128 tile, R = 8 (large grids) or 4 (small grids); each thread

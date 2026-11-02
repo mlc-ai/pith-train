@@ -175,7 +175,7 @@ def sigmoid(g):
 
 def scale_rcp(amax):
     """
-    E8M0 scale and its exact reciprocal (pith-train compute_fp8_scale, native cvt).
+    E8M0 scale and its exact reciprocal (the recipe's E8M0 scale, native cvt).
     """
     s16 = txl.local_scalar("uint16")
     arg = txl.local_scalar("float32")

@@ -6,7 +6,7 @@ Every call goes through opaque torch.library ops whose kernels are C++ (OPS_SOUR
 host compiler at first import), so eager calls and torch.compile regions launch the CuTe kernel the
 same way, without re-entering Python.
 
-Numerics follow the SM90 E8M0 recipe (compute_fp8_scale's SM90 branch) exactly. The tile amax is an
+Numerics follow the SM90 E8M0 recipe (its SM90 E8M0 scale) exactly. The tile amax is an
 integer max over the magnitude bits (|x| of finite non-negative floats orders like its bit pattern),
 so a NaN orders above inf: NaN inputs are out of contract.
 """
@@ -140,7 +140,7 @@ def cast4(x0_bits: Uint32, x1_bits: Uint32, x2_bits: Uint32, x3_bits: Uint32, rc
 @dsl_user_op
 def compute_scale_bits(amax_bits: Uint32, *, loc=None, ip=None) -> Uint32:
     """
-    E8M0 scale bits from amax bits, exactly as compute_fp8_scale (SM90 branch).
+    E8M0 scale bits from amax bits, exactly as the recipe's SM90 E8M0 scale.
     """
     return Uint32(
         asm(
