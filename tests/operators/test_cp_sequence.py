@@ -213,8 +213,8 @@ def verify_recurrence(req: RecurrenceRequest) -> None:
     """
     The sharded recurrence must reproduce the dense one on the concatenated sequence.
 
-    This is the gate the layout tests cannot provide: FLA merges a per-shard transition summary
-    across ranks, so a wrong merge yields a plausible loss curve rather than a crash.
+    This is the gate the layout tests cannot provide: the CP kernels merge a per-shard transition
+    summary across ranks, so a wrong merge yields a plausible loss curve rather than a crash.
     """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
@@ -259,16 +259,17 @@ def verify_recurrence(req: RecurrenceRequest) -> None:
             raise AssertionError(f"{name} control too close under cp={cp_size}: {error=:.2e} {control=:.2e}")  # fmt: skip
 
 
+# Qwen3.5's geometry (32 heads, q / k given per value head), the one the kernels cover: the CP
+# kernels against the pinned dense kernels, which round differently, while a mis-merged summary
+# still errs by O(1). B > 1 runs the batch through the CP kernels one sample at a time where they
+# take one sample's heads only.
 RECURRENCE = [
-    pytest.param(2, RecurrenceRequest(B=1, S=512, H=4), id="CP2-B1"),
-    pytest.param(2, RecurrenceRequest(B=3, S=512, H=4), id="CP2-B3"),
-    pytest.param(4, RecurrenceRequest(B=1, S=1024, H=8), id="CP4-B1"),
-    pytest.param(4, RecurrenceRequest(B=2, S=4096, H=4), id="CP4-B2-S4K"),
-    # Qwen3.5's geometry, where SM100 runs the library's CP kernels against the pinned dense
-    # kernels (FLA on both sides on SM90); the two SM100 paths round differently, and a mis-merged
-    # summary still errs by O(1).
-    pytest.param(2, RecurrenceRequest(B=1, S=4096, H=32, atol=1e-2), id="CP2-B1-H32"),
-    pytest.param(4, RecurrenceRequest(B=1, S=2048, H=32, atol=1e-2), id="CP4-B1-H32"),
+    pytest.param(2, RecurrenceRequest(B=1, S=512, H=32, atol=1e-2), id="CP2-B1"),
+    pytest.param(2, RecurrenceRequest(B=3, S=512, H=32, atol=1e-2), id="CP2-B3"),
+    pytest.param(4, RecurrenceRequest(B=1, S=1024, H=32, atol=1e-2), id="CP4-B1"),
+    pytest.param(4, RecurrenceRequest(B=2, S=4096, H=32, atol=1e-2), id="CP4-B2-S4K"),
+    pytest.param(2, RecurrenceRequest(B=1, S=4096, H=32, atol=1e-2), id="CP2-B1-S4K"),
+    pytest.param(4, RecurrenceRequest(B=1, S=2048, H=32, atol=1e-2), id="CP4-B1-S2K"),
 ]
 
 

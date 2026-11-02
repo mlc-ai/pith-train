@@ -177,8 +177,9 @@ def chunk_gdr_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
 def gated_delta_rule_cp_plan(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor, rank: int, is_first_rank: bool, is_last_rank: bool, pre_num_ranks: int, post_num_ranks: int) -> dict:
     """
     The host-side plan of one rank's chunk_gdr_cp_* calls for a CP layout; build it once per layout
-    and pass it to every stage. The arguments are FLA's CP context of the rank (what
-    fla.ops.cp.build_cp_context returns) and its rank in the CP group:
+    and pass it to every stage. The arguments are the rank's CP context, as FLA 0.5.2's
+    build_cp_context derives it from the global sequence boundaries over contiguous equal shards,
+    and its rank in the CP group:
 
     cu_seqlens: int32 (n + 1,) on the device, the local sequence boundaries of the rank's shard,
     cu_seqlens_cpu the same values on the host. Only the first local sequence may continue from
@@ -187,8 +188,7 @@ def gated_delta_rule_cp_plan(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Ten
     pre_num_ranks / post_num_ranks: how many preceding / following ranks those sequences span.
 
     The plan is opaque (its contents are the implementation's); it holds cu_seqlens, which must
-    stay alive and unchanged while the plan is used. Only where gated_delta_rule_cp_supported is
-    True.
+    stay alive and unchanged while the plan is used. Only where chunk_gdr_cp_supported is True.
     """
     match ARCH_MAJOR:
         case 10:

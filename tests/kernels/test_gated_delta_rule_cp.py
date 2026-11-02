@@ -8,25 +8,24 @@ A sequence is split into W consecutive rank slices. Rank r's affine state map (h
 he) comes from its own inputs. The maps are gathered and folded into each rank's initial state h0,
 and the backward does the same in reverse for the gradient of each rank's final state.
 
-Checked, against PyTorch and, as test-only oracles, against FLA's own context-parallel kernels
-(fla/ops/cp/chunk_delta_h.py) with their autotuners pinned to the configs FLA picks on H200:
+Checked against PyTorch (FLA is no longer a dependency, so its kernels no longer serve as
+oracles; the references below evaluate FLA's chunk algorithm in float64 or run the fp32
+recurrence):
 
 - the capability query: True at Qwen3.5's geometry and its batch folds (H 16 b / HV 32 b), False
   off it;
-- the exactness ladder (kda-task/docs/r3-preregistration.md), single GPU, synthetic inputs, model
-  and mild gates, resets, aligned and ragged slices, HV 32 and 96:
-  - the forward map hm, he and M, bit for bit FLA's pre_process_fwd_kernel_merged;
-  - the merge in both directions, bit for bit FLA's merge_fwd_bwd_kernel, never reading the slots
-    outside its ranks (they are NaN-poisoned);
-  - the backward map's M^T half bit for bit FLA's pre_process_bwd_kernel_merged. Its dh half is
-    no further from a float64 evaluation of the same chunk algorithm than FLA's is: calc_diff
-    within 1.001 x FLA's + 1e-12, max-abs within 1.10 x FLA's;
-  - the states recomputed from h0 bit for bit FLA's chunk_gated_delta_rule_fwd_h(h0), and the
-    output from h0 within calc_diff 1e-6 of FLA's fwd_h(h0) + chunk_fwd_o;
-  - the gradients from h0 and dht no further from the fp32 recurrence (with h0, and with <h_T,
-    dht> added to the loss) than FLA's chunk_gated_delta_rule_bwd: 1.10 x FLA's + 1e-7 in
-    calc_diff and in max-abs, per gradient;
-  - a reset (g = -128) at chunk residue 0, 1 or 63 zeroes M and M^T exactly, and a merge through
+- single GPU, synthetic inputs, model and mild gates, resets, aligned and ragged slices, HV 32 and
+  96:
+  - the forward map hm (he and the M chain) against its float64 evaluation from the rank's own w,
+    u and g_cum: calc_diff below 1e-5 and max-abs within 2e-2 of the largest magnitude;
+  - the merge in both directions against the float64 fold of the gathered maps, never reading the
+    slots outside its ranks (they are NaN-poisoned), and seeing a wrong order or membership;
+  - the backward map's M^T and dh halves against their float64 evaluation, the same bounds;
+  - the states and v_new recomputed from h0 against the float64 state recurrence, and the output
+    from h0 against the fp32 recurrence (calc_diff below 1e-4);
+  - the gradients from h0 and dht against the fp32 recurrence (with h0, and with <h_T, dht> added
+    to the loss): calc_diff below 1e-3 and max-abs within 2e-2 of the largest magnitude;
+- a reset (g = -128) at chunk residue 0, 1 or 63 zeroes M and M^T exactly, and a merge through
     such a rank yields exactly that rank's he;
 - the whole chain emulated in one process (W ranks run one after another, the all-gather a stack)
   against the fp32 recurrence over the whole sequence, output and the five gradients, documents
@@ -35,11 +34,10 @@ Checked, against PyTorch and, as test-only oracles, against FLA's own context-pa
   per kernel variant over a sweep of lengths, ranks and group sizes.
 
 The SM100 TIRx family (chunk_gdr_cp_supported, gated_delta_rule_cp_plan, chunk_gdr_cp_fwd_pre /
-_post, chunk_gdr_cp_bwd_pre / _post; every such test skips where its query is False):
-Verifier of one rank's share of the chunked gated delta rule under context parallelism
-(gated_delta_rule_cp_supported, gated_delta_rule_cp_plan, chunk_gdr_cp_fwd_pre / _post,
-chunk_gdr_cp_bwd_pre / _post), the CP path of Qwen3.5's Gated DeltaNet on the B200 (SM90 has no
-kernel: the capability query is False there and the whole file skips).
+_post, chunk_gdr_cp_bwd_pre / _post; every such test skips where its query is False). Verifier of
+one rank's share of the chunked gated delta rule under context parallelism
+(chunk_gdr_cp_supported, gated_delta_rule_cp_plan, chunk_gdr_cp_fwd_pre / _post,
+chunk_gdr_cp_bwd_pre / _post), the CP path of Qwen3.5's Gated DeltaNet on the B200.
 
 The recurrence, per value head with state S of shape (K, V) and scale = K ** -0.5:
 
@@ -153,60 +151,75 @@ def per_value_head(x: torch.Tensor, hv: int) -> torch.Tensor:
     return x.repeat_interleave(hv // x.shape[2], dim=2).contiguous()
 
 
-# FLA's autotuned picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1), pinned so the oracle
-# is the same kernel on every run.
-RECORDED = {
-    "pre_fwd": dict(num_warps=4, num_stages=2),
-    "merge": dict(BV=32, num_warps=4, num_stages=2),
-    "pre_bwd": dict(num_warps=4, num_stages=3),
-}
-
-
-@pytest.fixture
-def fla(monkeypatch: pytest.MonkeyPatch):
+def chunk_transitions_float64(k, w, g_cum) -> list[torch.Tensor]:
     """
-    FLA's context-parallel kernels with their autotuners restricted to RECORDED.
+    Each chunk's state transition in float64, (HV, K, K), h_end = M_c h_start for the part of the
+    chunk recurrence that is linear in h: M_c = exp2(g_last) I - (k * exp2(g_last - g))^T w, with
+    k per value head and g_cum in log2 units (FLA's chunk algorithm without its roundings).
     """
-    import triton
-    from fla.ops.cp import chunk_delta_h
-
-    kernels = {
-        "pre_fwd": chunk_delta_h.pre_process_fwd_kernel_merged,
-        "merge": chunk_delta_h.merge_fwd_bwd_kernel,
-        "pre_bwd": chunk_delta_h.pre_process_bwd_kernel_merged,
-    }
-    for name, kernel in kernels.items():
-        tuner = kernel
-        while not isinstance(tuner, triton.runtime.autotuner.Autotuner):
-            tuner = tuner.fn
-        pick = dict(RECORDED[name])
-        launch = {key: pick.pop(key) for key in ("num_warps", "num_stages")}
-        monkeypatch.setattr(tuner, "configs", [triton.Config(pick, **launch)])
-        monkeypatch.setattr(tuner, "cache", {})
-    return kernels
+    T, HV = w.shape[1], w.shape[2]
+    k, w, g = per_value_head(k, HV)[0].double(), w[0].double(), g_cum[0].double()
+    eye = torch.eye(D, dtype=torch.float64, device="cuda")
+    out = []
+    for start in range(0, T, BT):
+        rows = slice(start, min(start + BT, T))
+        g_c, g_last = g[rows], g[rows][-1]
+        kd = k[rows] * torch.exp2(g_last - g_c)[..., None]
+        out.append(torch.exp2(g_last)[:, None, None] * eye - torch.einsum("thk,thj->hkj", kd, w[rows]))  # fmt: skip
+    return out
 
 
-def fla_pre_fwd(kernels, k, w, u, g_cum) -> torch.Tensor:
-    T, H, HV = k.shape[1], k.shape[2], u.shape[2]
-    hm = torch.zeros(HV, D, 2 * D, device="cuda")
-    cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
-    kernels["pre_fwd"][(4, HV)](k=k, v=u, w=w, g=g_cum, gk=None, bg=None, u=u, hm=hm, cu_seqlens=cu, T=T, H=H, HV=HV, K=D, V=D, BT=BT, BK1=D, BLOCK_SIZE=64, MULTI_SEQS=False)  # fmt: skip
-    return hm
+def chunk_states_float64(k, w, u, g_cum, h0=None) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:  # fmt: skip
+    """
+    FLA's forward state recurrence in float64 from h0 (HV, K, V) or zero: (the chunk-entry states,
+    each (HV, K, V); v_new = u - w h per chunk, (T, HV, V); the final state).
+    """
+    T, HV = u.shape[1], u.shape[2]
+    k, w, u, g = per_value_head(k, HV)[0].double(), w[0].double(), u[0].double(), g_cum[0].double()
+    h = torch.zeros(HV, D, D, dtype=torch.float64, device="cuda") if h0 is None else h0.double()
+    states, v_new = [], []
+    for start in range(0, T, BT):
+        rows = slice(start, min(start + BT, T))
+        g_c, g_last = g[rows], g[rows][-1]
+        states.append(h)
+        vn = u[rows] - torch.einsum("thk,hkv->thv", w[rows], h)
+        v_new.append(vn)
+        kd = k[rows] * torch.exp2(g_last - g_c)[..., None]
+        h = h * torch.exp2(g_last)[:, None, None] + torch.einsum("thk,thv->hkv", kd, vn)
+    return states, torch.cat(v_new), h
 
 
-def fla_pre_bwd(kernels, q, k, w, do, dv_local, g_cum) -> torch.Tensor:
-    T, H, HV = k.shape[1], k.shape[2], do.shape[2]
-    dhm = torch.zeros(HV, D, 2 * D, device="cuda")
-    cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
-    kernels["pre_bwd"][(4, HV)](q=q, k=k, w=w, g=g_cum, gk=None, do=do, dhm=dhm, dv=dv_local, cu_seqlens=cu, scale=D**-0.5, T=T, H=H, HV=HV, K=D, V=D, BT=BT, BK1=D, BLOCK_SIZE=64, USE_BG=False)  # fmt: skip
-    return dhm
+def forward_map_float64(k, w, u, g_cum) -> torch.Tensor:
+    """
+    The rank's forward map in float64, (HV, K, V + K): he, the final state from zero (columns :V),
+    and M, the product of the chunk transitions M_L ... M_1 (columns V:).
+    """
+    M = None
+    for M_c in chunk_transitions_float64(k, w, g_cum):
+        M = M_c if M is None else M_c @ M
+    return torch.cat([chunk_states_float64(k, w, u, g_cum)[2], M], -1)
 
 
-def fla_merge(kernels, ag, rank, count, forward) -> torch.Tensor:
-    HV = ag.shape[1]
-    h = torch.zeros(HV, D, D, device="cuda")
-    kernels["merge"][(D // RECORDED["merge"]["BV"], HV)](h=h, ag_hm=ag, pre_or_post_num_ranks=count, rank=rank, seq_offsets=None, init_offsets=None, h0_seq_ids=None, h0=None, HV=HV, K=D, V=D, BK=D, FORWARD=forward, INTRACARD_MODE=False, NUM_SEQ_ENTRIES=0, STATE_V_FIRST=False)  # fmt: skip
+def merge_float64(ag, sources) -> torch.Tensor:
+    """
+    h = M_s h + he_s over the source ranks in order, from zero, in float64: (HV, K, V).
+    """
+    h = torch.zeros(ag.shape[1], D, D, dtype=torch.float64, device="cuda")
+    for s_rank in sources:
+        h = ag[s_rank, :, :, D:].double() @ h + ag[s_rank, :, :, :D].double()
     return h
+
+
+def assert_near(got: torch.Tensor, ref: torch.Tensor, name: str, diff: float) -> None:
+    """
+    calc_diff below diff and the largest absolute error within 2e-2 of the reference's largest
+    magnitude (the dense verifier's bounds), every value finite.
+    """
+    assert got.shape == ref.shape, name
+    assert torch.isfinite(got).all(), name
+    assert calc_diff(got, ref) < diff, f"{name}: calc_diff {calc_diff(got, ref):.2e}"
+    bound = 2e-2 * float(ref.abs().max())
+    assert max_abs(got, ref) <= bound, f"{name}: max abs err {max_abs(got, ref):.3e} > {bound:.3e}"
 
 
 def chunk_dh_float64(q, k, w, do, dv_local, g_cum) -> torch.Tensor:
@@ -306,28 +319,33 @@ TRANSITION_CASES = [
 
 @pytest.mark.parametrize("T,b,gate,resets", TRANSITION_CASES)
 @SM90
-def test_forward_map_is_fla(fla, T: int, b: int, gate: str, resets: tuple[int, ...]) -> None:
+def test_forward_map(T: int, b: int, gate: str, resets: tuple[int, ...]) -> None:
+    """
+    he and M against their float64 evaluation from the rank's own w, u and g_cum (M a TF32 chain).
+    """
     q, k, v, g, beta, _ = make_inputs(T, b, gate, seed=T + b, resets=resets)
     g_cum, A, w, u, hm = gdr_cp_fwd_local(k, v, g, beta, True)
     assert hm.shape == (32 * b, D, 2 * D) and hm.dtype == torch.float32
-    assert torch.equal(hm, fla_pre_fwd(fla, k, w, u, g_cum))
+    ref = forward_map_float64(k, w, u, g_cum)
+    assert_near(hm[..., :D], ref[..., :D], "he", 1e-5)
+    assert_near(hm[..., D:], ref[..., D:], "M", 1e-5)
 
 
 @pytest.mark.parametrize("T,b,gate,resets", TRANSITION_CASES)
 @SM90
-def test_backward_map(fla, T: int, b: int, gate: str, resets: tuple[int, ...]) -> None:
+def test_backward_map(T: int, b: int, gate: str, resets: tuple[int, ...]) -> None:
     """
-    M^T bit for bit FLA's; the dh half no further from the float64 chunk algorithm than FLA's.
+    The dh half and M^T (the transposed chain M_1^T ... M_L^T) against their float64 evaluation of
+    the chunk algorithm from the rank's own w, do, dv_local and g_cum.
     """
     q, k, v, g, beta, do = make_inputs(T, b, gate, seed=T + b + 1, resets=resets)
     g_cum, A, *_ = gdr_cp_fwd_local(k, v, g, beta, False)
     w, u, dv_local, dhm = gdr_cp_bwd_local(q, k, v, g_cum, beta, A, do, True)
-    ref = fla_pre_bwd(fla, q, k, w, do, dv_local, g_cum)
-    assert torch.equal(dhm[..., D:], ref[..., D:]), "M^T"
-    exact = chunk_dh_float64(q, k, w, do, dv_local, g_cum)
-    ours, theirs = dhm[..., :D], ref[..., :D]
-    assert calc_diff(ours, exact) <= 1.001 * calc_diff(theirs, exact) + 1e-12
-    assert max_abs(ours, exact) <= 1.10 * max_abs(theirs, exact)
+    M = None
+    for M_c in chunk_transitions_float64(k, w, g_cum):
+        M = M_c if M is None else M_c @ M
+    assert_near(dhm[..., D:], M.transpose(-1, -2), "M^T", 1e-5)
+    assert_near(dhm[..., :D], chunk_dh_float64(q, k, w, do, dv_local, g_cum), "dh", 1e-5)
 
 
 def gathered_maps(W: int, T: int, b: int, gate: str, backward: bool) -> torch.Tensor:
@@ -345,7 +363,7 @@ def gathered_maps(W: int, T: int, b: int, gate: str, backward: bool) -> torch.Te
 @pytest.mark.parametrize("gate", ["model", "mild"])
 @pytest.mark.parametrize("backward", [False, True])
 @SM90
-def test_merge_is_fla_and_reads_only_its_ranks(fla, gate: str, backward: bool) -> None:
+def test_merge_and_reads_only_its_ranks(gate: str, backward: bool) -> None:
     W, b = 4, 1
     ag = gathered_maps(W, 512, b, gate, backward)
     for rank in range(W):
@@ -359,47 +377,50 @@ def test_merge_is_fla_and_reads_only_its_ranks(fla, gate: str, backward: bool) -
         if count == 0:
             assert torch.equal(got, torch.zeros_like(got)), rank
         else:
-            assert torch.equal(got, fla_merge(fla, ag, rank, count, not backward)), rank
+            order = reversed(sources) if backward else sources
+            assert_near(got, merge_float64(ag, order), f"rank {rank}", 1e-6)
 
 
 @SM90
-def test_merge_order_and_membership_are_checked(fla) -> None:
+def test_merge_order_and_membership_are_checked() -> None:
     """
     The merge comparison sees a fold in the wrong order and a fold that includes the rank itself.
     """
     ag = gathered_maps(4, 512, 1, "mild", False)
-    reference = fla_merge(fla, ag, 3, 3, True)
-    assert torch.equal(gdr_cp_merge(ag, 3, 3, False), reference)
+    reference = merge_float64(ag, range(3))
+    assert_near(gdr_cp_merge(ag, 3, 3, False), reference, "merge", 1e-6)
     reversed_order = gdr_cp_merge(ag[[2, 1, 0, 3]].contiguous(), 3, 3, False)
     including_self = gdr_cp_merge(ag, 4, 4, False)  # ranks 0 .. 3, the rank 3 itself among them
-    assert not torch.equal(reversed_order, reference)
-    assert not torch.equal(including_self, reference)
+    assert calc_diff(reversed_order, reference) > 1e-4
+    assert calc_diff(including_self, reference) > 1e-4
 
 
 @pytest.mark.parametrize("T,gate", [(64, "model"), (4000, "mild"), (4096, "model")])
 @SM90
 def test_states_and_output_from_h0(T: int, gate: str) -> None:
-    from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-    from fla.ops.common.chunk_o import chunk_fwd_o
-
+    """
+    The chunk-entry states and v_new against FLA's state recurrence in float64 from the same w, u
+    and h0, and the output against the fp32 token-by-token recurrence from h0.
+    """
     q, k, v, g, beta, _ = make_inputs(T, 1, gate, seed=T + 7)
     g_cum, A, w, u, _ = gdr_cp_fwd_local(k, v, g, beta, False)
     h0 = torch.randn(32, D, D, device="cuda") * 0.1
     h, v_new = gdr_cp_bwd_states(k, w, u, g_cum, h0)
-    k_rep, q_rep = per_value_head(k, 32), per_value_head(q, 32)
-    h_ref, v_new_ref, _ = chunk_gated_delta_rule_fwd_h(k=k_rep, w=w, u=u, g=g_cum, initial_state=h0[None])  # fmt: skip
-    assert torch.equal(h, h_ref.transpose(-1, -2)), "h"
-    assert torch.equal(v_new, v_new_ref), "v_new"
+    states, v_new_ref, _ = chunk_states_float64(k, w, u, g_cum, h0)
+    assert_near(h[0], torch.stack(states).transpose(-1, -2), "h", 1e-5)  # stored V-first
+    assert_near(v_new[0], v_new_ref, "v_new", 1e-5)
     o = gdr_cp_fwd_output(q, k, w, u, g_cum, h0)
-    o_ref = chunk_fwd_o(q=q_rep, k=k_rep, v=v_new_ref, h=h_ref, g=g_cum, scale=D**-0.5)
-    assert calc_diff(o, o_ref) < 1e-6
+    o_ref, _ = naive_gdr(per_value_head(q, 32).float(), per_value_head(k, 32).float(), v.float(), g, beta.float(), h0=h0)  # fmt: skip
+    assert_near(o, o_ref, "o", 1e-4)
 
 
 @pytest.mark.parametrize("T,gate", [(256, "model"), (1000, "mild"), (2048, "model")])
 @SM90
-def test_gradients_from_h0_and_dht_no_worse_than_fla(T: int, gate: str) -> None:
-    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
-
+def test_gradients_from_h0_and_dht(T: int, gate: str) -> None:
+    """
+    The five gradients from h0 and dht against the fp32 recurrence's autograd (with h0, and with
+    <h_T, dht> added to the loss), with the dense verifier's bounds.
+    """
     q, k, v, g, beta, do = make_inputs(T, 1, gate, seed=T + 9)
     gen = torch.Generator(device="cuda").manual_seed(T)
     h0 = torch.randn(32, D, D, device="cuda", generator=gen) * 0.1
@@ -409,15 +430,11 @@ def test_gradients_from_h0_and_dht_no_worse_than_fla(T: int, gate: str) -> None:
     h, v_new = gdr_cp_bwd_states(k, w, u, g_cum, h0)
     ours = gdr_cp_bwd_output(q, k, v, w, v_new, do, dv_local, h, g_cum, beta, A, u, dht)
     q_rep, k_rep = per_value_head(q, 32), per_value_head(k, 32)
-    dq, dk, dv, db, dg, *_ = chunk_gated_delta_rule_bwd(q=q_rep, k=k_rep, v=v, g=g_cum, beta=beta, A=A, scale=D**-0.5, initial_state=h0[None], do=do, dht=dht[None])  # fmt: skip
-    theirs = (dq, dk, dv, dg, db)
     leaves = [x.detach().float().requires_grad_() for x in (q_rep, k_rep, v, g, beta)]
     o_ref, ht_ref = naive_gdr(*leaves, h0=h0)
     ((o_ref * do.float()).sum() + (ht_ref * dht).sum()).backward()
-    for name, got, fla_grad, leaf in zip(GRADS, ours, theirs, leaves):
-        assert got.shape == fla_grad.shape, name
-        assert calc_diff(got, leaf.grad) <= 1.10 * calc_diff(fla_grad, leaf.grad) + 1e-7, name
-        assert max_abs(got, leaf.grad) <= 1.10 * max_abs(fla_grad, leaf.grad) + 1e-7, name
+    for name, got, leaf in zip(GRADS, ours, leaves):
+        assert_near(got, leaf.grad, name, 1e-3)
 
 
 @pytest.mark.parametrize("residue", [0, 1, 63])
@@ -669,7 +686,7 @@ def tirx_stack(payloads: list[torch.Tensor]) -> torch.Tensor:
     """
     What the all-gather returns: every rank's payload in rank order.
     """
-    return torch.tirx_stack(payloads)
+    return torch.stack(payloads)
 
 
 def tirx_run_cp(q, k, v, g, beta, do, world: int, cu: list[int], gather=tirx_stack) -> dict:
@@ -725,12 +742,12 @@ def tirx_naive_gdr(q, k, v, g, beta, cu: list[int]):
         u = beta[:, t, :, None] * (v[:, t] - torch.einsum("bhk,bhkv->bhv", k_t, state))
         state = state + k_t[..., :, None] * u[..., None, :]
         out.append(torch.einsum("bhk,bhkv->bhv", q[:, t] * scale, state))
-    return torch.tirx_stack(out, 1)
+    return torch.stack(out, 1)
 
 
 def tirx_chunked_gdr(q, k, v, g, beta, cu: list[int], chunk: int = 64):
     """
-    tirx_naive_gdr in chunked form: within a chunk entering with state S0 and cumulative gate G (Gamma =
+    The naive recurrence in chunked form: within a chunk entering with state S0 and cumulative gate G (Gamma =
     exp(G)), U solves (I + A) U = beta * (V - Gamma * (K S0)) with A[t, i] = beta_t exp(G_t - G_i)
     k_t . k_i for i < t; o = scale * (Gamma * (Q S0) + (exp(G_t - G_i) q_t . k_i)_{i <= t} U); the
     state leaving is exp(G_L) S0 + sum_i exp(G_L - G_i) outer(k_i, u_i).
@@ -762,7 +779,7 @@ def tirx_assert_close_to(got: torch.Tensor, ref: torch.Tensor, name: str, diff: 
     assert got.shape == ref.shape, name
     assert torch.isfinite(got).all(), name
     diff_value = tirx_calc_diff(got, ref)
-    assert diff_value < diff, f"{name}: tirx_calc_diff {diff_value:.2e}"
+    assert diff_value < diff, f"{name}: calc_diff {diff_value:.2e}"
     err = float((got.float() - ref).abs().max())
     bound = 2e-2 * float(ref.abs().max())
     assert err <= bound, f"{name}: max abs err {err:.3e} > {bound:.3e}"
@@ -863,8 +880,6 @@ def test_comparison_is_sensitive() -> None:
     ref = tirx_chunked_gdr(q.double(), k.double(), v.double(), g.double(), beta.double(), cu)
     assert tirx_calc_diff(tirx_run_cp(q, k, v, g, beta, None, world, cu)["o"], ref) < 1e-4
     assert tirx_calc_diff(tirx_run_cp(q, k, v, g * 0.9, beta, None, world, cu)["o"], ref) > 1e-4
-    # The merge reads every predecessor's payload by its rank: a tirx_stack out of rank order fails.
-    reverse = tirx_run_cp(
-        q, k, v, g, beta, None, world, cu, gather=lambda p: torch.tirx_stack(p[::-1])
-    )
+    # The merge reads every predecessor's payload by its rank: a stack out of rank order fails.
+    reverse = tirx_run_cp(q, k, v, g, beta, None, world, cu, gather=lambda p: torch.stack(p[::-1]))
     assert tirx_calc_diff(reverse["o"], ref) > 1e-4

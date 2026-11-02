@@ -10,7 +10,8 @@ Qwen3.5 geometry, H = 16 key heads over HV = 32 value heads, where they run the 
 - batch 2 and 3 through gated_delta_rule, folded into the heads before the key-head repeat onto the
   pinned kernels (batch 1, H 16 b / HV 32 b; one sample at a time where the kernels take only one
   sample's heads), against the same recurrence;
-- geometries the capability query rejects, also batched, taking FLA's path against the recurrence.
+- geometries no kernel covers, also batched, raising ValueError; a supported one given as strided
+  views taking the pinned path against the recurrence.
 """
 
 import pytest
@@ -219,8 +220,8 @@ def to_dtypes(case: str, q, k, v, g, beta):
     return q, k, v, g, beta
 
 
-# (B, S, H, HV, K, V): geometries the predicate rejects, plus a supported one given as strided views.
-FALLBACK_CASES = {
+# (B, S, H, HV, K, V): geometries no kernel covers, plus a supported one given as strided views.
+REJECTED_CASES = {
     "batch 2, key dim 64": (2, 192, 16, 32, 64, 128),
     "48 value heads": (1, 192, 16, 48, 128, 128),
     "batch 3, 96 value heads over 32 key heads": (3, 64, 32, 96, 128, 128),
@@ -229,20 +230,29 @@ FALLBACK_CASES = {
     "value dim 64": (1, 192, 16, 32, 128, 64),
     "fp32 beta": (1, 192, 16, 32, 128, 128),
     "fp32 q / k / v": (1, 192, 16, 32, 128, 128),
-    "non-contiguous q / k / v": (1, 192, 16, 32, 128, 128),
 }
 
 
-@pytest.mark.parametrize("case", list(FALLBACK_CASES))
-def test_rejected_geometries_through_the_operator(case: str) -> None:
+@pytest.mark.parametrize("case", list(REJECTED_CASES))
+def test_rejected_geometries_raise(case: str) -> None:
     """
-    gated_delta_rule on each geometry: off the pinned path (or on it after the operator's own
-    contiguous copy, for strided views), output and gradients against the fp32 recurrence.
+    gated_delta_rule on a geometry or dtype no kernel covers raises ValueError naming the covered
+    geometry, before launching anything.
     """
-    q, k, v, g, beta, do = general_inputs(*FALLBACK_CASES[case], seed=11)
+    q, k, v, g, beta, _ = general_inputs(*REJECTED_CASES[case], seed=11)
     q, k, v, g, beta = to_dtypes(case, q, k, v, g, beta)
-    if case != "non-contiguous q / k / v":
-        assert not gated_delta_rule_pinned_supported(q, k, v, g, beta), case
+    assert not gated_delta_rule_pinned_supported(q, k, v, g, beta), case
+    with pytest.raises(ValueError, match="Qwen3.5's Gated DeltaNet geometry"):
+        gated_delta_rule(q, k, v, g, beta)
+
+
+def test_strided_views_take_the_pinned_path() -> None:
+    """
+    A supported geometry given as strided views runs the pinned kernels after the operator's own
+    contiguous copy: output and gradients against the fp32 recurrence.
+    """
+    q, k, v, g, beta, do = general_inputs(1, 192, 16, 32, 128, 128, seed=11)
+    q, k, v, g, beta = to_dtypes("non-contiguous q / k / v", q, k, v, g, beta)
     leaves = [x.detach().clone().requires_grad_() for x in (q, k, v, g, beta)]
     out = gated_delta_rule(*leaves)
     out.backward(do.to(out.dtype))
@@ -250,8 +260,8 @@ def test_rejected_geometries_through_the_operator(case: str) -> None:
     ref = general_recurrence(*refs)
     ref.backward(do.float())
     assert out.shape == ref.shape
-    assert calc_diff(out, ref) < 1e-4, f"{case}: out calc_diff {calc_diff(out, ref):.2e}"
+    assert calc_diff(out, ref) < 1e-4, f"out calc_diff {calc_diff(out, ref):.2e}"
     for name, leaf, ref_leaf in zip(("dq", "dk", "dv", "dg", "dbeta"), leaves, refs):
-        assert leaf.grad.shape == leaf.shape and leaf.grad.dtype == leaf.dtype, (case, name)
+        assert leaf.grad.shape == leaf.shape and leaf.grad.dtype == leaf.dtype, name
         diff = calc_diff(leaf.grad, ref_leaf.grad)
-        assert diff < 1e-3, f"{case} {name}: calc_diff {diff:.2e}"
+        assert diff < 1e-3, f"{name} calc_diff {diff:.2e}"

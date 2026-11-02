@@ -9,7 +9,6 @@ dependencies = [
     "apache-tvm-tirx==0.1.0a6",
     "deep-gemm",
     "flash-attn-4[cu13]==4.0.0b28",
-    "flash-linear-attention==0.5.2",
     "quack-kernels==0.6.5",
     "tirx-kernels",
     "transformers",

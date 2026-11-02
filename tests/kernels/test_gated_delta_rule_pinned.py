@@ -22,13 +22,9 @@ Checked, each test on its own (none skips on the H200):
   partial last chunk, on the final token, and 64 in a row ending on it. The kernels keep some chunk
   intermediates in bf16, so the check is calc_diff below 1e-4 (output) and 1e-3 (gradients), plus a
   max absolute error within 2e-2 of the reference's largest magnitude, and every value finite;
-- given FLA's own g_cum and A (FLA's chunked gated delta rule on q / k repeated to the value heads,
-  its autotuners restricted to the recorded launch configs, a test-only oracle), the backward's
-  error against the fp32 recurrence is at most 1.10 x FLA's backward's plus 1e-7, per gradient, in
-  calc_diff and in max absolute error, so the backward is no less precise than FLA's apart from
-  summation order, at aligned and ragged T;
-- the forward against FLA's within bf16 rounding, and its saved g_cum and A bit for bit FLA's at
-  ragged T;
+- at long and ragged T (4096 .. 8192, with resets), the forward and backward against the
+  recurrence in fp64, in its chunked form (itself checked against the token-by-token one), with the
+  same bounds;
 - determinism: repeated calls, and a call in a fresh process (cold compile), are bit-identical, at
   aligned and ragged T; the same results on non-default streams;
 - which kernels run: only the CuTe kernels, once each, in both directions at aligned and ragged T,
@@ -357,156 +353,89 @@ def test_comparison_is_sensitive() -> None:
         assert calc_diff(wrong, ref_grads["dg"]) > 1e-3
 
 
-# The launch configs FLA's autotuner picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1). The
-# test-only FLA oracle is restricted to them so its kernels are the same on every run.
-RECORDED = {
-    "cumsum": dict(num_warps=1, num_stages=3),
-    "kkt_solve": dict(BK=64, num_warps=1, num_stages=3),
-    "w_u": dict(num_warps=4, num_stages=4),
-    "fwd_h": dict(BV=32, num_warps=4, num_stages=3),
-    "fwd_o": dict(BK=64, BV=64, num_warps=4, num_stages=3),
-    "dv_local": dict(num_warps=2, num_stages=3),
-    "bwd_dhu": dict(BV=32, num_warps=4, num_stages=3),
-    "dqkwg": dict(num_warps=4, num_stages=3),
-    "wy_bwd": dict(num_warps=4, num_stages=4),
-}
-LAUNCH = ("num_warps", "num_stages")
-
-
-def fla_kernels() -> dict:
-    from fla.ops.common.chunk_delta_h import (
-        chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
-        chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-    )
-    from fla.ops.common.chunk_o import (
-        chunk_bwd_kernel_dqkwg,
-        chunk_bwd_kernel_dv_local,
-        chunk_fwd_kernel_o,
-    )
-    from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_kkt_solve_kernel
-    from fla.ops.gated_delta_rule.wy_fast import (
-        prepare_wy_repr_bwd_kernel,
-        recompute_w_u_fwd_kernel,
-    )
-    from fla.ops.utils.cumsum import chunk_local_cumsum_scalar_kernel
-
-    return {
-        "cumsum": chunk_local_cumsum_scalar_kernel,
-        "kkt_solve": chunk_gated_delta_rule_fwd_kkt_solve_kernel,
-        "w_u": recompute_w_u_fwd_kernel,
-        "fwd_h": chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-        "fwd_o": chunk_fwd_kernel_o,
-        "dv_local": chunk_bwd_kernel_dv_local,
-        "bwd_dhu": chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
-        "dqkwg": chunk_bwd_kernel_dqkwg,
-        "wy_bwd": prepare_wy_repr_bwd_kernel,
-    }
-
-
-def pin_fla(monkeypatch: pytest.MonkeyPatch, configs: dict) -> None:
-    import triton
-
-    for name, kernel in fla_kernels().items():
-        tuner, pick = kernel.fn, configs[name]
-        meta = {key: val for key, val in pick.items() if key not in LAUNCH}
-        launch = {key: pick[key] for key in LAUNCH}
-        monkeypatch.setattr(tuner, "configs", [triton.Config(meta, **launch)])
-        monkeypatch.setattr(tuner, "cache", {})
-
-
-def fla_reference(q, k, v, g, beta, do):
-    from fla.ops.gated_delta_rule.chunk import (
-        chunk_gated_delta_rule_bwd,
-        chunk_gated_delta_rule_fwd,
-    )
-
-    q, k = per_value_head(q, v.shape[2]).contiguous(), per_value_head(k, v.shape[2]).contiguous()
-    scale = D**-0.5
-    g_cum, o, A, *_ = chunk_gated_delta_rule_fwd(
-        q=q, k=k, v=v, g=g, beta=beta, scale=scale, initial_state=None, output_final_state=False
-    )
-    dq, dk, dv, dbeta, dg, *_ = chunk_gated_delta_rule_bwd(
-        q=q, k=k, v=v, g=g_cum, beta=beta, A=A, scale=scale, initial_state=None, do=do, dht=None
-    )
-    return o, g_cum, A, dq, dk, dv, dg, dbeta
-
-
-NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
-
-
-@pytest.mark.parametrize(
-    "S,H,gate,resets",
-    [
-        (4096, 16, "mild", ()),
-        (4096, 32, "model", (0, 63, 64, 127, 4095)),
-        (4096, 16, "model", (0, 300, 1777, 2048, 4091)),
-        (8192, 16, "mild", ()),
-        (1000, 16, "model", (0, 959, 960, 980, 999)),
-        (4097, 32, "model", (0, 4095, 4096)),
-        (4097, 16, "mild", ()),
-    ],
-)
-def test_backward_no_less_precise_than_fla(
-    monkeypatch: pytest.MonkeyPatch, S: int, H: int, gate: str, resets
-) -> None:
+def chunked_reference(q, k, v, g, beta, do, chunk: int = BT) -> tuple[torch.Tensor, dict]:
     """
-    On the same saved tensors (FLA's g_cum and A), the pinned backward against the fp32 recurrence
-    within 1.10 x FLA's backward's error + 1e-7 per gradient, in calc_diff and max absolute error.
+    The recurrence's output and autograd gradients (dq, dk per value head) in fp64, in its chunked
+    form, whose autograd stays small at long lengths: within a chunk entering with state S0 and
+    cumulative gate G, U solves (I + A) U = beta * (V - exp(G) * (K S0)) with A[t, i] = beta_t
+    exp(G_t - G_i) k_t . k_i for i < t; o = scale * (exp(G) * (Q S0) + (exp(G_t - G_i) q_t .
+    k_i)_{i <= t} U); the state leaving is exp(G_L) S0 + sum_i exp(G_L - G_i) outer(k_i, u_i).
     """
-    pin_fla(monkeypatch, RECORDED)
+    hv = v.shape[2]
+    leaves = [per_value_head(q, hv), per_value_head(k, hv), v, g, beta]
+    leaves = [x.detach().double().requires_grad_() for x in leaves]
+    qd, kd, vd, gd, bd = leaves
+    scale = qd.shape[-1] ** -0.5
+    state = qd.new_zeros(hv, qd.shape[-1], vd.shape[-1])
+    out = []
+    for c0 in range(0, qd.shape[1], chunk):
+        span = slice(c0, min(c0 + chunk, qd.shape[1]))
+        qc, kc, vc = (t[0, span].transpose(0, 1) for t in (qd, kd, vd))
+        gc, bc = gd[0, span].transpose(0, 1).cumsum(-1), bd[0, span].transpose(0, 1)
+        L = gc.shape[-1]
+        lower = torch.ones(L, L, dtype=torch.bool, device=qd.device).tril()
+        decay = torch.where(lower, gc[:, :, None] - gc[:, None, :], float("-inf")).exp()
+        strict = decay * (~torch.eye(L, dtype=torch.bool, device=qd.device))
+        A = bc[:, :, None] * strict * (kc @ kc.transpose(-1, -2))
+        rhs = bc[..., None] * (vc - gc.exp()[..., None] * (kc @ state))
+        eye = torch.eye(L, dtype=qd.dtype, device=qd.device)
+        u = torch.linalg.solve_triangular(eye + A, rhs, upper=False, unitriangular=True)
+        o = scale * (gc.exp()[..., None] * (qc @ state) + (decay * (qc @ kc.transpose(-1, -2))) @ u)  # fmt: skip
+        out.append(o.transpose(0, 1))
+        k_decayed = kc * (gc[:, -1:] - gc).exp()[..., None]
+        state = gc[:, -1].exp()[:, None, None] * state + k_decayed.transpose(-1, -2) @ u
+    ref = torch.cat(out, 0).unsqueeze(0)
+    ref.backward(do.double())
+    return ref.detach(), {name: leaf.grad for name, leaf in zip(GRADS, leaves)}
+
+
+def test_chunked_reference_is_the_recurrence() -> None:
+    """
+    The fp64 chunked reference equals the token-by-token recurrence (in fp64) to rounding, ragged
+    last chunk and resets included.
+    """
+    q, k, v, g, beta, do = make_inputs(150, H=16, gate="model", seed=9, resets=(0, 64, 100))
+    ref, ref_grads = chunked_reference(q, k, v, g, beta, do)
+    leaves = [per_value_head(q, HV), per_value_head(k, HV), v, g, beta]
+    leaves = [x.detach().double().requires_grad_() for x in leaves]
+    naive = naive_gdr(*leaves)
+    naive.backward(do.double())
+    torch.testing.assert_close(ref, naive.detach(), rtol=1e-9, atol=1e-9)
+    for name, leaf in zip(GRADS, leaves):
+        torch.testing.assert_close(ref_grads[name], leaf.grad, rtol=1e-8, atol=1e-8)
+
+
+# (S, H, gate, resets): the long and ragged cases the FLA oracle used to cover, now against the
+# fp64 chunked recurrence with the verifier's bounds.
+LONG_CASES = [
+    (4096, 16, "mild", ()),
+    (4096, 32, "model", (0, 63, 64, 127, 4095)),
+    (4096, 16, "model", (0, 300, 1777, 2048, 4091)),
+    (4096, 32, "mild", (0, 300, 1777, 2048, 4091)),
+    (8192, 16, "mild", ()),
+    (8192, 32, "mild", ()),
+    (1000, 16, "model", (0, 959, 960, 980, 999)),
+    (4097, 32, "model", (0, 4095, 4096)),
+    (4097, 16, "mild", ()),
+    (300, 32, "mild", (0, 77, 128, 250)),
+    (8191, 16, "mild", (8190,)),
+]
+
+
+@pytest.mark.parametrize("S,H,gate,resets", LONG_CASES)
+def test_long_against_chunked_reference(S: int, H: int, gate: str, resets) -> None:
+    """
+    Forward and backward at long and ragged T against the fp64 chunked recurrence: calc_diff below
+    1e-4 (output) and 1e-3 (gradients) plus a max absolute error within 2e-2 of the reference's
+    largest magnitude, as test_against_naive_recurrence.
+    """
     q, k, v, g, beta, do = make_inputs(S, H=H, gate=gate, seed=S + H, resets=resets)
-    ref = fla_reference(q, k, v, g, beta, do)
-    _, ref_grads = naive_reference(q, k, v, g, beta, do)
-    grads = chunk_gdr_bwd_pinned(q, k, v, ref[1], beta, ref[2], do)
-    for name, got, fla_grad in zip(GRADS, grads, ref[3:]):
-        assert got.dtype == fla_grad.dtype and got.shape == fla_grad.shape, name
-        reference = ref_grads[name]
-        assert_close_to(got, reference, name, 1e-3)
-        ours, theirs = calc_diff(got, reference), calc_diff(fla_grad, reference)
-        assert ours <= 1.10 * theirs + 1e-7, f"{name}: calc_diff {ours:.3e} vs FLA {theirs:.3e}"
-        ours, theirs = (
-            float((got.float() - reference).abs().max()),
-            float((fla_grad.float() - reference).abs().max()),
-        )
-        assert ours <= 1.10 * theirs + 1e-7, f"{name}: max abs err {ours:.3e} vs FLA {theirs:.3e}"
-
-
-@pytest.mark.parametrize("H", [32, 16])
-@pytest.mark.parametrize("S,resets", [(4096, ()), (4096, (0, 300, 1777, 2048, 4091)), (8192, ())])
-def test_forward_close_to_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int) -> None:
-    """
-    The aligned forward within bf16 rounding of FLA's (its A in TF32 block merges, like FLA's). H =
-    16 runs grouped value heads on unrepeated q / k; FLA gets them repeated.
-    """
-    pin_fla(monkeypatch, RECORDED)
-    q, k, v, g, beta, do = make_inputs(S, H=H, gate="mild", seed=S, resets=resets)
-    ref = fla_reference(q, k, v, g, beta, do)
-    for name, got_part, ref_part in zip(NAMES[:3], chunk_gdr_fwd_pinned(q, k, v, g, beta), ref[:3]):
-        assert got_part.dtype == ref_part.dtype and got_part.shape == ref_part.shape, name
-        assert calc_diff(got_part, ref_part) < 1e-6, (
-            f"{name}: calc_diff {calc_diff(got_part, ref_part):.2e}"
-        )
-
-
-@pytest.mark.parametrize("H", [32, 16])
-@pytest.mark.parametrize(
-    "S,resets", [(100, ()), (300, (0, 77, 128, 250)), (1000, (0, 999)), (4097, ()), (8191, (8190,))]
-)
-def test_ragged_forward_saved_tensors_are_fla(
-    monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int
-) -> None:
-    """
-    At ragged T the saved g_cum and A are bit for bit FLA's (FLA loads the rows past T as zeros, as
-    the ragged kernels do), and o is within bf16 rounding of FLA's.
-    """
-    pin_fla(monkeypatch, RECORDED)
-    q, k, v, g, beta, do = make_inputs(S, H=H, gate="mild", seed=S, resets=resets)
-    ref = fla_reference(q, k, v, g, beta, do)
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
-    assert torch.equal(g_cum, ref[1]), "g_cum"
-    assert torch.equal(A, ref[2]), "A"
-    assert o.dtype == ref[0].dtype and o.shape == ref[0].shape
-    assert calc_diff(o, ref[0]) < 1e-6, f"o: calc_diff {calc_diff(o, ref[0]):.2e}"
+    grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
+    ref, ref_grads = chunked_reference(q, k, v, g, beta, do)
+    assert_close_to(o, ref, "o", 1e-4)
+    for name, got in zip(GRADS, grads):
+        assert_close_to(got, ref_grads[name], name, 1e-3)
 
 
 COLD_RUN = """

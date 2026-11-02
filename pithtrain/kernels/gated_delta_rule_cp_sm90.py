@@ -1,6 +1,6 @@
 """
 SM90 context-parallel chunked gated delta rule (chunk size 64): FLA 0.5.2's context-parallel
-structure (fla/ops/cp/chunk_delta_h.py) on CuTe-DSL kernels, no Triton kernel. Each rank holds a
+structure (FLA's ops/cp/chunk_delta_h.py) on CuTe-DSL kernels, no Triton kernel. Each rank holds a
 contiguous slice of one sequence. In the forward it computes its affine state map from zero,
 h_end = M h_start + he, where he is the recurrence run from a zero state (StateRecompute with a
 final state and no per-chunk stores, FLA's pre-process h half) and M is the product of the per-chunk

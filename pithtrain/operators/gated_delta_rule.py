@@ -1,23 +1,20 @@
 """
 Chunked gated delta rule of the Qwen3.5 Gated DeltaNet as custom ops, so that the linear-attention
-region compiles as one graph (FLA's own entry point is excluded from torch.compile).
+region compiles as one graph.
 
 The recurrence is independent per head, so the batch folds into the head axis first (batch 1 at b
-times the heads). Without context parallelism the pinned kernels run where
-gated_delta_rule_pinned_supported says so. Under context parallelism (contiguous layout), where
-chunk_gdr_cp_supported says so (SM100 at Qwen3.5's geometry) it runs the library's CP kernels, each
-direction as two stages around one all-gather of the ranks' state summaries over the CP group, run
-here; elsewhere FLA's context-parallel path, which runs the same all-gather itself.
+times the heads); where the kernels take only one sample's heads the samples run one at a time.
+Without context parallelism it runs the pinned kernels where gated_delta_rule_pinned_supported says
+so. Under context parallelism (contiguous layout) it runs the library's CP kernels where
+chunk_gdr_cp_supported says so (SM100 at Qwen3.5's geometry), each direction as two stages around
+one all-gather of the ranks' state summaries over the CP group, run here. Any other call raises
+ValueError naming the geometry the kernels cover: no other implementation is kept.
 """
 
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
-import fla.ops.common.chunk_o
 import torch
-from fla.ops.cp import build_cp_context
-from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd, chunk_gated_delta_rule_fwd
-from fla.ops.utils import prepare_chunk_indices
 from torch.distributed import ProcessGroup, all_gather_into_tensor, get_rank, get_world_size
 from torch.distributed.distributed_c10d import _resolve_process_group
 
@@ -37,44 +34,40 @@ __all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
 
 # mypy: ignore-errors
 
-# Turn off FLA's issue 640 guard: the BK=64 backward miscompile it avoids does not occur at
-# head_k_dim=128.
-fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
+CHUNK_SIZE = 64  # the kernels' chunk size (FLA's BT)
 
-CHUNK_SIZE = 64  # FLA's chunk size (BT)
+SUPPORTED_GEOMETRY = (
+    "Qwen3.5's Gated DeltaNet geometry: q, k [b, s, 16, 128] (or 32 key heads), v [b, s, 32, 128], "
+    "beta [b, s, 32] in bf16 and g [b, s, 32] in fp32, s > 0, on a device the kernels run on "
+    "(under context parallelism, 16 key heads)"
+)
 
 
-@lru_cache(maxsize=None)
-def cp_state(group_name: Optional[str], seq_len: int) -> Tuple:
-    """
-    FLA's context-parallel context and chunk indices for this rank. Cached because build_cp_context
-    reaches host memory.
-    """
-    if group_name is None:
-        return None, None
-    group = _resolve_process_group(group_name)
-    device = torch.cuda.current_device()
-    # One global sequence spanning the group, which is the shape FLA merges state over.
-    cu_seqlens = torch.tensor([0, seq_len * get_world_size(group)], dtype=torch.int32, device=device)  # fmt: skip
-    context = build_cp_context(cu_seqlens, group)
-    chunk_indices = prepare_chunk_indices(context.cu_seqlens, CHUNK_SIZE, cu_seqlens_cpu=context.cu_seqlens_cpu)  # fmt: skip
-    return context, chunk_indices
+def unsupported(q, k, v, g, beta, cp: bool) -> ValueError:
+    shapes = ", ".join(f"{n} {tuple(t.shape)} {t.dtype}" for n, t in zip(("q", "k", "v", "g", "beta"), (q, k, v, g, beta)))  # fmt: skip
+    where = "under context parallelism" if cp else "without context parallelism"
+    return ValueError(f"gated_delta_rule has no kernel for {shapes} {where}; the kernels cover {SUPPORTED_GEOMETRY}")  # fmt: skip
 
 
 @lru_cache(maxsize=None)
 def cp_plan(group_name: str, seq_len: int) -> dict:
     """
-    The CP kernels' host-side plan for this rank, from FLA's context of cp_state.
+    The CP kernels' host-side plan for this rank: one sequence of seq_len * world_size tokens spans
+    the group in rank order, so the rank's shard is one local sequence that continues from every
+    preceding rank and on every following one (the context FLA's build_cp_context derives for that
+    layout). Cached because the plan reaches host memory.
     """
-    context, _ = cp_state(group_name, seq_len)
-    rank = get_rank(_resolve_process_group(group_name))
-    return gated_delta_rule_cp_plan(context.cu_seqlens, context.cu_seqlens_cpu, rank, context.is_first_rank, context.is_last_rank, context.pre_num_ranks, context.post_num_ranks)  # fmt: skip
+    group = _resolve_process_group(group_name)
+    rank, world_size = get_rank(group), get_world_size(group)
+    cu_seqlens_cpu = torch.tensor([0, seq_len], dtype=torch.int32)
+    cu_seqlens = cu_seqlens_cpu.to(torch.cuda.current_device())
+    return gated_delta_rule_cp_plan(cu_seqlens, cu_seqlens_cpu, rank, rank == 0, rank == world_size - 1, rank, world_size - 1 - rank)  # fmt: skip
 
 
 def cp_all_gather(payload: torch.Tensor, group_name: str) -> torch.Tensor:
     """
     Every rank's payload stacked in rank order, (world_size, *payload.shape): the one collective of
-    each CP direction, as FLA's CP path runs it.
+    each CP direction.
     """
     group = _resolve_process_group(group_name)
     gathered = payload.new_empty(get_world_size(group), *payload.shape)
@@ -83,64 +76,53 @@ def cp_all_gather(payload: torch.Tensor, group_name: str) -> torch.Tensor:
 
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_fwd", mutates_args=())
-def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str], cp_kernels: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
+def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
     """
-    cp_kernels (decided once by the caller, so the backward takes the same path): run the
-    library's CP kernels instead of FLA's CP path; only with a cp_group_name.
+    The CP forward of one rank on the library's CP kernels (callers check chunk_gdr_cp_supported):
+    (o, g_cum, A, [initial_state]), the last three for the backward, which recomputes the states
+    from the merged initial state rather than paying a second all-gather.
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
-    if cp_kernels:
-        plan = cp_plan(cp_group_name, q.shape[1])
-        payload, saved = chunk_gdr_cp_fwd_pre(q, k, v, g, beta, plan)
-        o, g_out, A, initial_state = chunk_gdr_cp_fwd_post(cp_all_gather(payload, cp_group_name), saved, plan)  # fmt: skip
-        return o, g_out, A, [initial_state]
-    cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
-    g_out, o, A, _, initial_state, _ = chunk_gated_delta_rule_fwd(q=q, k=k, v=v, g=g, beta=beta, scale=q.shape[-1] ** -0.5, initial_state=None, output_final_state=False, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, A_log=None, dt_bias=None)  # fmt: skip
-    # Under CP initial_state is the merged predecessor state; the backward recomputes h from it
-    # rather than paying a second all-gather. Without CP it is None.
-    return o.to(q.dtype), g_out, A, [] if initial_state is None else [initial_state]
+    plan = cp_plan(cp_group_name, q.shape[1])
+    payload, saved = chunk_gdr_cp_fwd_pre(q, k, v, g, beta, plan)
+    o, g_out, A, initial_state = chunk_gdr_cp_fwd_post(cp_all_gather(payload, cp_group_name), saved, plan)  # fmt: skip
+    return o, g_out, A, [initial_state]
 
 
 @gdr_fwd.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str], cp_kernels: bool):  # fmt: skip
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: str):  # fmt: skip
     b, s, hv, vd = v.shape
     o = torch.empty((b, s, hv, vd), dtype=q.dtype, device=q.device)
     A = torch.empty((b, s, hv, CHUNK_SIZE), dtype=q.dtype, device=q.device)
-    state = [] if cp_group_name is None else [torch.empty((1, hv, q.shape[-1], vd), dtype=torch.float32, device=q.device)]  # fmt: skip
+    state = [torch.empty((1, hv, q.shape[-1], vd), dtype=torch.float32, device=q.device)]
     return o, torch.empty_like(g, dtype=torch.float32), A, state
 
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_bwd", mutates_args=())
-def gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str], cp_kernels: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+def gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
     q, k, v, g_out, beta, A, do = (t.contiguous() for t in (q, k, v, g_out, beta, A, do))
-    if cp_kernels:
-        # g_out, A and initial_state are the CP kernels' own, so the forward's path is taken.
-        plan = cp_plan(cp_group_name, q.shape[1])
-        payload, saved = chunk_gdr_cp_bwd_pre(q, k, v, g_out, beta, A, do, initial_state[0], plan)
-        return chunk_gdr_cp_bwd_post(cp_all_gather(payload, cp_group_name), saved, plan)
-    cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
-    dq, dk, dv, db, dg, _, _, _ = chunk_gated_delta_rule_bwd(q=q, k=k, v=v, g=g_out, beta=beta, A=A, scale=q.shape[-1] ** -0.5, initial_state=initial_state[0] if initial_state else None, do=do, dht=None, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, g_input=None, A_log=None, dt_bias=None)  # fmt: skip
-    return dq.to(q.dtype).contiguous(), dk.to(k.dtype).contiguous(), dv.to(v.dtype).contiguous(), dg.to(g_out.dtype).contiguous(), db.to(beta.dtype).contiguous()  # fmt: skip
+    plan = cp_plan(cp_group_name, q.shape[1])
+    payload, saved = chunk_gdr_cp_bwd_pre(q, k, v, g_out, beta, A, do, initial_state[0], plan)
+    return chunk_gdr_cp_bwd_post(cp_all_gather(payload, cp_group_name), saved, plan)
 
 
 @gdr_bwd.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str], cp_kernels: bool):  # fmt: skip
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: str):  # fmt: skip
     # Contiguous like the real gradients; plain empty_like would inherit the input strides.
     contiguous = torch.contiguous_format
     return torch.empty_like(q, memory_format=contiguous), torch.empty_like(k, memory_format=contiguous), torch.empty_like(v, memory_format=contiguous), torch.empty_like(g_out, memory_format=contiguous), torch.empty_like(beta, memory_format=contiguous)  # fmt: skip
 
 
 def gdr_setup_context(ctx: torch.autograd.function.FunctionCtx, inputs: Tuple, output: Tuple) -> None:  # fmt: skip
-    q, k, v, _, beta, cp_group_name, cp_kernels = inputs
+    q, k, v, _, beta, cp_group_name = inputs
     _, g_out, A, state = output
     ctx.save_for_backward(q, k, v, g_out, beta, A, *state)
-    ctx.cp_group_name, ctx.cp_kernels = cp_group_name, cp_kernels
+    ctx.cp_group_name = cp_group_name
 
 
 def gdr_backward(ctx: torch.autograd.function.FunctionCtx, do: torch.Tensor, *_) -> Tuple:
     q, k, v, g_out, beta, A, *state = ctx.saved_tensors
-    grads = gdr_bwd(q, k, v, g_out, beta, A, do, state, ctx.cp_group_name, ctx.cp_kernels)
-    return *grads, None, None
+    return *gdr_bwd(q, k, v, g_out, beta, A, do, state, ctx.cp_group_name), None
 
 
 gdr_fwd.register_autograd(gdr_backward, setup_context=gdr_setup_context)
@@ -214,7 +196,7 @@ def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
     to FLA's. Against the fp32 recurrence, measured against FLA: calc_diff within 1.001x of FLA's
     and the largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 /
     8192, 3 seeds), and within the verifier's 1.10x bounds in its cases. On SM100 TIRx kernels at
-    Qwen3.5's geometry. Calls off the pinned geometry still run FLA (gdr_fwd / gdr_bwd).
+    Qwen3.5's geometry.
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape
@@ -249,32 +231,31 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
 
     The recurrence is independent per head, so the batch folds into the head axis before anything
     else: value head j = b * value_heads + h of the fold reads key head j // (value_heads / heads)
-    = b * heads + h // (value_heads / heads), the same grouping, and the pinned kernels run batch
-    b at b times the heads where they take that geometry (SM90); where they take only one sample's
-    heads (SM100) the samples run one at a time.
+    = b * heads + h // (value_heads / heads), the same grouping, and the kernels run batch b at b
+    times the heads where they take that geometry (SM90's pinned kernels); where they take only one
+    sample's heads (SM100) the samples run one at a time. Raises ValueError (before launching
+    anything) for a geometry, dtype or device no kernel covers; see SUPPORTED_GEOMETRY.
     """
     b = q.shape[0]
     if cp_group is None:
-        # Contiguous before the check: the pinned kernels take contiguous tensors, and both paths copy
-        # anyway (dense_gated_delta_rule and gdr_fwd).
+        # Contiguous before the check: the pinned kernels take contiguous tensors, and
+        # dense_gated_delta_rule copies anyway.
         folded = tuple(fold_batch(t).contiguous() for t in (q, k, v, g, beta))
         if gated_delta_rule_pinned_supported(*folded):
             return unfold_batch(dense_gated_delta_rule(*folded), b)
         if b > 1 and gated_delta_rule_pinned_supported(*(t[:1].contiguous() for t in (q, k, v, g, beta))):  # fmt: skip
             # The kernels take one sample's heads but not the fold (SM100): one sample at a time.
             return torch.cat([dense_gated_delta_rule(*(t[i : i + 1] for t in (q, k, v, g, beta))) for i in range(b)])  # fmt: skip
-        repeats = v.shape[2] // q.shape[2]
-        if repeats > 1:
-            q = q.repeat_interleave(repeats, dim=2)
-            k = k.repeat_interleave(repeats, dim=2)
-        o, *_ = gdr_fwd(q, k, v, g, beta, None, False)
-        return o
-    # Under CP: q and k repeated to the value heads, then folded; the library's CP kernels where
-    # chunk_gdr_cp_supported says so, else FLA's context-parallel path.
-    repeats = v.shape[2] // q.shape[2]
-    if repeats > 1:
-        q = q.repeat_interleave(repeats, dim=2)
-        k = k.repeat_interleave(repeats, dim=2)
-    folded = [fold_batch(t) for t in (q, k, v, g, beta)]
-    o, *_ = gdr_fwd(*folded, cp_group.group_name, chunk_gdr_cp_supported(*folded))
-    return unfold_batch(o, b)
+        raise unsupported(q, k, v, g, beta, cp=False)
+    # Under CP the kernels take q and k per value head: repeated, then folded.
+    repeats = v.shape[2] // q.shape[2] if q.dim() == v.dim() == 4 and q.shape[2] > 0 else 1
+    qr, kr = (t.repeat_interleave(repeats, dim=2) if repeats > 1 else t for t in (q, k))
+    folded = [fold_batch(t) for t in (qr, kr, v, g, beta)]
+    if chunk_gdr_cp_supported(*folded):
+        o, *_ = gdr_fwd(*folded, cp_group.group_name)
+        return unfold_batch(o, b)
+    if b > 1 and chunk_gdr_cp_supported(*(t[:1] for t in (qr, kr, v, g, beta))):
+        # The CP kernels take one sample's heads but not the fold: one sample at a time, each with
+        # its own pair of all-gathers (every rank of the group holds the same batch size).
+        return torch.cat([gdr_fwd(*(t[i : i + 1] for t in (qr, kr, v, g, beta)), cp_group.group_name)[0] for i in range(b)])  # fmt: skip
+    raise unsupported(q, k, v, g, beta, cp=True)
