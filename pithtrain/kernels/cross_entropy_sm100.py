@@ -647,6 +647,8 @@ def cross_entropy_fwd_bwd_sm100(inp: torch.Tensor, target: torch.Tensor, ignore_
     N, V = inp.shape
     if inp.stride(-1) != 1 or inp.stride(-2) != V:
         inp = inp.contiguous()
+    if N == 0:  # no rows: loss 0 and the empty gradient, as cross_entropy_fwd_bwd_sm90 returns
+        return torch.zeros((), dtype=torch.float32, device=inp.device), inp
     if inp.dtype not in LDT:
         return cross_entropy_torch(inp, target, ignore_index), inp
     if target.dtype not in TDT:  # other integer targets: the same values as int64
