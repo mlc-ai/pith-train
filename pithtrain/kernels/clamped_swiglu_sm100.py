@@ -14,15 +14,18 @@ compute in fp32 and round once).
 
 Evolved with TIRx-harness: run clamped_swiglu, frontier member flat-f32x2 (commit e4d94613, 336.6
 us vs 660.6 us, 1.963x over the previous SM100 path, the Triton kernels, in the task's benchmark).
-Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on
-torch's current stream.
+Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through
+tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
 
 __all__ = ["clamped_swiglu_bwd_sm100", "clamped_swiglu_fwd_sm100"]
 
@@ -45,7 +48,7 @@ DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "floa
 
 
 def f32_bits(bits):
-    return txl.reinterpret("float32", txl.uint32(bits))
+    return txl.reinterpret(txl.uint32(bits), ty="float32")
 
 
 def op(chain, *args, dtype="float32"):
@@ -102,12 +105,12 @@ def pack2(a, b):
     """
     f32 pair (a in the low lane) as one .b64 f32x2 operand.
     """
-    lo, hi = txl.cast(txl.reinterpret("uint32", a), "uint64"), txl.cast(txl.reinterpret("uint32", b), "uint64")
+    lo, hi = txl.cast(txl.reinterpret(a, ty="uint32"), "uint64"), txl.cast(txl.reinterpret(b, ty="uint32"), "uint64")
     return (hi << txl.uint64(32)) | lo
 
 
 def lanes(p):
-    return txl.reinterpret("float32", txl.cast(p, "uint32")), txl.reinterpret("float32", txl.cast(p >> txl.uint64(32), "uint32"))
+    return txl.reinterpret(txl.cast(p, "uint32"), ty="float32"), txl.reinterpret(txl.cast(p >> txl.uint64(32), "uint32"), ty="float32")
 
 
 def op2(chain, *args):
@@ -174,10 +177,10 @@ class IO:
         vals = []
         for word in words:
             if self.dtype == "float32":
-                vals.append(txl.reinterpret("float32", word))
+                vals.append(txl.reinterpret(word, ty="float32"))
             elif self.dtype == "bfloat16":  # bf16 -> f32 is exact: the bits move to the high half
-                vals.append(txl.reinterpret("float32", word << txl.uint32(16)))
-                vals.append(txl.reinterpret("float32", word & txl.uint32(0xFFFF0000)))
+                vals.append(txl.reinterpret(word << txl.uint32(16), ty="float32"))
+                vals.append(txl.reinterpret(word & txl.uint32(0xFFFF0000), ty="float32"))
             else:
                 vals.append(op(self.cvt_in, txl.cast(word & txl.uint32(0xFFFF), "uint16")))
                 vals.append(op(self.cvt_in, txl.cast(word >> txl.uint32(16), "uint16")))
@@ -185,7 +188,7 @@ class IO:
 
     def pack(self, vals):
         if self.dtype == "float32":
-            return [txl.reinterpret("uint32", v) for v in vals]
+            return [txl.reinterpret(v, ty="uint32") for v in vals]
         return [op(self.cvt_out2, vals[2 * i + 1], vals[2 * i], dtype="uint32") for i in range(len(vals) // 2)]
 
     def scalar_load(self, buf, idx):
@@ -221,9 +224,9 @@ class IO:
             txl.ptx[insn](buf.ptr_to([idx + w * 4 // self.esize]), *words[w : w + step])
 
 
-def grid_of(threads, vec, unroll):
+def grid_of(threads, vec, unroll, n):
     tile = vec * threads * unroll
-    return lambda p: txl.cast((p["n"] + tile - 1) // tile, "int32")
+    return txl.cast((n + tile - 1) // tile, "int32")
 
 
 @functools.cache
@@ -231,16 +234,17 @@ def fwd_kernel(dtype, threads, vec, unroll):
     io, cfg = IO(dtype), CFG["fwd"]
     tile = vec * threads
 
-    @txl.kernel(warps=threads // 32, grid=grid_of(threads, vec, unroll))
-    def clamped_swiglu_fwd(gate_up: txl.gptr[dtype], out: txl.gptr[dtype], n: txl.i64, alpha: txl.f32, limit: txl.f32):
+    @txl.kernel()
+    def clamped_swiglu_fwd(gate_up: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), dtype), n: txl.int64, alpha: txl.float32, limit: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_of(threads, vec, unroll, n), block=(threads // 32) * 32))
         neg_limit = op("neg.f32", limit)
         base = txl.cast(txl.cta_id(), "int64") * (tile * unroll) + txl.cast(txl.thread_id(), "int64") * vec
         if vec == 1:  # unaligned fallback: one output per thread, scalar accesses only
-            with txl.If(base < n), txl.Then():
+            with txl.if_(base < n), txl.then_():
                 io.scalar_store(out, base, fwd_one(io.scalar_load(gate_up, 2 * base), io.scalar_load(gate_up, 2 * base + 1), alpha, limit, neg_limit))
             return
-        with txl.If(base + (tile * (unroll - 1) + vec) <= n):
-            with txl.Then():
+        with txl.if_(base + (tile * (unroll - 1) + vec) <= n):
+            with txl.then_():
                 nw = 2 * vec // io.per_word
                 words = [io.load_words(gate_up, (base + u * tile) * 2, nw, cfg["ld"]) for u in range(unroll)]
                 for u in range(unroll):
@@ -249,14 +253,14 @@ def fwd_kernel(dtype, threads, vec, unroll):
                     for i in range(0, vec, 2):
                         res += list(fwd_two(vals[2 * i : 2 * i + 4 : 2], vals[2 * i + 1 : 2 * i + 4 : 2], alpha, limit, neg_limit))
                     io.store_words(out, base + u * tile, io.pack(res), cfg["st"])
-            with txl.Else():
+            with txl.else_():
                 with txl.serial(unroll * vec) as k:
                     i = base + txl.cast(k // vec, "int64") * tile + txl.cast(k % vec, "int64")
-                    with txl.If(i < n), txl.Then():
+                    with txl.if_(i < n), txl.then_():
                         r = fwd_one(io.scalar_load(gate_up, 2 * i), io.scalar_load(gate_up, 2 * i + 1), alpha, limit, neg_limit)
                         io.scalar_store(out, i, r)
 
-    return entry_function(clamped_swiglu_fwd.compile())
+    return entry_function(clamped_swiglu_fwd.compile(TARGET))
 
 
 @functools.cache
@@ -264,18 +268,19 @@ def bwd_kernel(dtype, threads, vec, unroll):
     io, cfg = IO(dtype), CFG["bwd"]
     tile = vec * threads
 
-    @txl.kernel(warps=threads // 32, grid=grid_of(threads, vec, unroll))
-    def clamped_swiglu_bwd(grad_out: txl.gptr[dtype], gate_up: txl.gptr[dtype], grad_gate_up: txl.gptr[dtype], n: txl.i64, alpha: txl.f32, limit: txl.f32):
+    @txl.kernel()
+    def clamped_swiglu_bwd(grad_out: txl.Tensor((txl.int64(),), dtype), gate_up: txl.Tensor((txl.int64(),), dtype), grad_gate_up: txl.Tensor((txl.int64(),), dtype), n: txl.int64, alpha: txl.float32, limit: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_of(threads, vec, unroll, n), block=(threads // 32) * 32))
         neg_limit = op("neg.f32", limit)
         base = txl.cast(txl.cta_id(), "int64") * (tile * unroll) + txl.cast(txl.thread_id(), "int64") * vec
         if vec == 1:  # unaligned fallback: one output per thread, scalar accesses only
-            with txl.If(base < n), txl.Then():
+            with txl.if_(base < n), txl.then_():
                 dg, du = bwd_one(io.scalar_load(grad_out, base), io.scalar_load(gate_up, 2 * base), io.scalar_load(gate_up, 2 * base + 1), alpha, limit, neg_limit)
                 io.scalar_store(grad_gate_up, 2 * base, dg)
                 io.scalar_store(grad_gate_up, 2 * base + 1, du)
             return
-        with txl.If(base + (tile * (unroll - 1) + vec) <= n):
-            with txl.Then():
+        with txl.if_(base + (tile * (unroll - 1) + vec) <= n):
+            with txl.then_():
                 nw = vec // io.per_word
                 gw = [io.load_words(gate_up, (base + u * tile) * 2, 2 * nw, cfg["ld"]) for u in range(unroll)]
                 ow = [io.load_words(grad_out, base + u * tile, nw, cfg["ld"]) for u in range(unroll)]
@@ -285,15 +290,15 @@ def bwd_kernel(dtype, threads, vec, unroll):
                     for i in range(0, vec, 2):
                         res += bwd_two(gos[i : i + 2], vals[2 * i : 2 * i + 4 : 2], vals[2 * i + 1 : 2 * i + 4 : 2], alpha, limit, neg_limit)
                     io.store_words(grad_gate_up, (base + u * tile) * 2, io.pack(res), cfg["st"])
-            with txl.Else():
+            with txl.else_():
                 with txl.serial(unroll * vec) as k:
                     i = base + txl.cast(k // vec, "int64") * tile + txl.cast(k % vec, "int64")
-                    with txl.If(i < n), txl.Then():
+                    with txl.if_(i < n), txl.then_():
                         dg, du = bwd_one(io.scalar_load(grad_out, i), io.scalar_load(gate_up, 2 * i), io.scalar_load(gate_up, 2 * i + 1), alpha, limit, neg_limit)
                         io.scalar_store(grad_gate_up, 2 * i, dg)
                         io.scalar_store(grad_gate_up, 2 * i + 1, du)
 
-    return entry_function(clamped_swiglu_bwd.compile())
+    return entry_function(clamped_swiglu_bwd.compile(TARGET))
 
 
 def plan(entry, *tensors):

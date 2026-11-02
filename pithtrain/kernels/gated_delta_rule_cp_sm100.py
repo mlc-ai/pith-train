@@ -30,19 +30,19 @@ forward / backward pair.
 
 Evolved with TIRx-harness: run gated_delta_rule_cp, frontier member tma-intra-bulk-state-layout
 (commit fe5e80ca, 4551 us vs 12948 us, 2.845x over FLA 0.5.2's Triton CP path, the previous SM100
-path, in the task's benchmark). Compiled once per process by tvm.compile(..., tir_pipeline="tirx")
-with nvcc's fast math off, as the member was evolved, and launched through tvm-ffi on torch's
-current stream.
+path, in the task's benchmark). Compiled once per process by tvm_tirx.tirx.compile(...,
+pipeline="tirx") with nvcc's fast math off, as the member was evolved, and launched through tvm-ffi
+on torch's current stream.
 """
 
 import functools
-import os
-import re
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin", "nvcc": []}}})  # nvcc without --use_fast_math (as TVM_CUDA_NVCC_NO_FAST_MATH=1 built it before); a cubin (sm_100a SASS only, as the old -gencode build)
 
 __all__ = ["chunk_gdr_cp_bwd_post_sm100", "chunk_gdr_cp_bwd_pre_sm100", "chunk_gdr_cp_fwd_post_sm100", "chunk_gdr_cp_fwd_pre_sm100", "gated_delta_rule_cp_plan_sm100"]
 
@@ -78,7 +78,7 @@ def KERN_COMMON_bf16_round(x):
     """
     fp32 -> bf16 (RN) -> fp32.
     """
-    bits = txl.reinterpret('uint16', txl.cast(x, 'bfloat16'))
+    bits = txl.reinterpret(txl.cast(x, 'bfloat16'), ty='uint16')
     v = txl.local_scalar('float32')
     txl.ptx.cvt.f32.bf16(v, bits)
     return v
@@ -108,11 +108,11 @@ def KERN_COMMON_tf32(x, mode):
     Operand conversion of an fp32 value fed to a TF32 tensor-core dot.
     """
     if mode == 'trunc':
-        return txl.reinterpret('float32', txl.bitwise_and(txl.reinterpret('uint32', x), txl.uint32(4294959104)))
+        return txl.reinterpret(txl.bitwise_and(txl.reinterpret(x, ty='uint32'), txl.uint32(4294959104)), ty='float32')
     if mode == 'rna':
         r = txl.local_scalar('uint32')
         txl.ptx.cvt.rna.tf32.f32(r, x)
-        return txl.reinterpret('float32', r)
+        return txl.reinterpret(r, ty='float32')
     return x
 
 
@@ -199,8 +199,9 @@ def KERN_COMMON_make_zero(HV):
     Zero an unused (HV, K, V + K) fp32 all-gather payload, so every returned tensor is defined.
     """
 
-    @txl.kernel(warps=4, arch='sm_100a', grid=[HV, 1])
-    def zero_payload(p: txl.gptr[txl.f32]):
+    @txl.kernel()
+    def zero_payload(p: txl.Tensor((txl.int64(),), txl.f32)):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[HV, 1], block=128))
         head = txl.cta_id()[0]
         tid = txl.thread_id()
         for it in range(KERN_COMMON_D * 2 * KERN_COMMON_D // 4 // 128):
@@ -222,7 +223,7 @@ def INTRA_chunk_lookup(cu, nseg, c):
         b = KERN_COMMON_ld_s32(cu.ptr_to([s]))
         e = KERN_COMMON_ld_s32(cu.ptr_to([s + 1]))
         nch = (e - b + 63) // 64
-        with txl.If(KERN_COMMON_all_(c >= acc, c < acc + nch)), txl.Then():
+        with txl.if_(KERN_COMMON_all_(c >= acc, c < acc + nch)), txl.then_():
             txl.assign(t0, b + (c - acc) * 64)
             txl.assign(nv, txl.min(e - b - (c - acc) * 64, 64))
         txl.assign(acc, acc + nch)
@@ -276,10 +277,12 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
             maps.append(desc)
         return tuple(maps)
 
-    @txl.kernel(warps=4, arch='sm_100a', grid=(lambda p: [p['num_ctas']]) if persistent else (lambda p: [p['n_chunks'], HV]), host_prelude=prepare_host, **dict(min_blocks_per_sm=3) if diet else {})
-    def intra2(q: txl.gptr[txl.bf16], k: txl.gptr[txl.bf16], v: txl.gptr[txl.bf16], g: txl.gptr[txl.f32], beta: txl.gptr[txl.bf16], cu: txl.gptr[txl.i32], nseg: txl.i32, n_chunks: txl.i32, g_cum: txl.gptr[txl.f32], a_out: txl.gptr[txl.bf16], w_out: txl.gptr[txl.bf16], u_out: txl.gptr[txl.bf16], aqk_out: txl.gptr[txl.bf16], payload: txl.gptr[txl.f32], zero_payload: txl.i32, num_ctas: txl.i32, S: txl.i32, *, host):
+    @txl.kernel()
+    def intra2(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), v: txl.Tensor((txl.int64(),), txl.bf16), g: txl.Tensor((txl.int64(),), txl.f32), beta: txl.Tensor((txl.int64(),), txl.bf16), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, n_chunks: txl.int32, g_cum: txl.Tensor((txl.int64(),), txl.f32), a_out: txl.Tensor((txl.int64(),), txl.bf16), w_out: txl.Tensor((txl.int64(),), txl.bf16), u_out: txl.Tensor((txl.int64(),), txl.bf16), aqk_out: txl.Tensor((txl.int64(),), txl.bf16), payload: txl.Tensor((txl.int64(),), txl.f32), zero_payload: txl.int32, num_ctas: txl.int32, S: txl.int32):
+        host = prepare_host(dict(q=q, k=k, v=v, S=S))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[num_ctas] if persistent else [n_chunks, HV], block=4 * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=3) if diet else None)
         q_map, k_map, v_map = host
-        sm = txl.alloc_buffer((SMEM,), txl.u8, scope='shared.dyn', align=1024)
+        sm = txl.alloc_tensor((SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
         tpar = txl.local_scalar('int32', init=txl.int32(0))
         tid = txl.thread_id()
@@ -289,10 +292,10 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
         t4 = lane % 4
         r0 = wid * 16
         scr = SCR_S + wid * 1024
-        with txl.If(txl.And(zero_payload != 0, tid < 32)), txl.Then():
+        with txl.if_(txl.And(zero_payload != 0, tid < 32)), txl.then_():
             zi = txl.local_scalar('int32', init=cta * 32 + tid)
             zstride = num_ctas * 32
-            with txl.While(zi < HV * 128 * 64):
+            with txl.while_(zi < HV * 128 * 64):
                 txl.ptx.st.global_.v4.f32(payload.ptr_to([zi * 4]), txl.float32(0.0), txl.float32(0.0), txl.float32(0.0), txl.float32(0.0))
                 txl.assign(zi, zi + zstride)
 
@@ -306,8 +309,8 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
 
         def shfl(x, src):
             r = txl.local_scalar('uint32')
-            txl.ptx.shfl_sync.idx.b32(r, txl.reinterpret('uint32', x), txl.cast(src, 'uint32'), txl.uint32(31), txl.uint32(4294967295))
-            return txl.reinterpret('float32', r)
+            txl.ptx.shfl_sync.idx.b32(r, txl.reinterpret(x, ty='uint32'), txl.cast(src, 'uint32'), txl.uint32(31), txl.uint32(4294967295))
+            return txl.reinterpret(r, ty='float32')
 
         def xr(a, b):
             return a ^ b if isinstance(a, int) and isinstance(b, int) else txl.bitwise_xor(a, b)
@@ -339,10 +342,10 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                     kb_ = 2 * t4 + ks if perm else ks * 8 + t4
                     a = txl.alloc_local((4,), 'uint32')
                     for j, (dr, dc) in enumerate(((0, 0), (8, 0), (0, dk), (8, dk))):
-                        txl.assign(a[j], txl.reinterpret('uint32', KERN_COMMON_tf32(ld_sf(fa(xb, xr0 + g8 + dr, xc0 + kb_ + dc, xs)), tf32_mode)))
+                        txl.assign(a[j], txl.reinterpret(KERN_COMMON_tf32(ld_sf(fa(xb, xr0 + g8 + dr, xc0 + kb_ + dc, xs)), tf32_mode), ty='uint32'))
                     for nt in range(2):
-                        b0 = txl.reinterpret('uint32', KERN_COMMON_tf32(ld_sf(fa(yb, yr0 + kb_, yc0 + nt * 8 + g8, ys)), tf32_mode))
-                        b1 = txl.reinterpret('uint32', KERN_COMMON_tf32(ld_sf(fa(yb, yr0 + kb_ + dk, yc0 + nt * 8 + g8, ys)), tf32_mode))
+                        b0 = txl.reinterpret(KERN_COMMON_tf32(ld_sf(fa(yb, yr0 + kb_, yc0 + nt * 8 + g8, ys)), tf32_mode), ty='uint32')
+                        b1 = txl.reinterpret(KERN_COMMON_tf32(ld_sf(fa(yb, yr0 + kb_ + dk, yc0 + nt * 8 + g8, ys)), tf32_mode), ty='uint32')
                         KERN_COMMON_mma_tf32(acc, nt * 4, a, b0, b1)
 
         def st_c16(acc, tile, neg):
@@ -355,11 +358,11 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
         def warp_sync():
             txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
         if tg:
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 for i_ in range(5):
                     txl.ptx.mbarrier.init.shared.b64(sm.ptr_to([BARS_S + i_ * 8]), txl.uint32(1))
             txl.ptx.fence.mbarrier_init.release.cluster()
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([HOLD_S]), txl.uint32(128))
                 txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.fence::before_thread_sync']()
@@ -377,7 +380,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                 D[64 x 64] = A[64 x 128] @ B[64 x 128]^T, both su64 K-major, K steps in increasing
                 order.
                 """
-                with txl.If(wid == 0), txl.Then():
+                with txl.if_(wid == 0), txl.then_():
                     leader = txl.cuda.elect_sync()
                     txl.ptx['tcgen05.fence::after_thread_sync']()
                     txl.ptx['fence.proxy.async.shared::cta']()
@@ -392,7 +395,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                 D[64 x 128] = A[64 x 64] (sw128 K-major bf16 A) @ B[64 tok][128] (su64, MN-major), K
                 = 64.
                 """
-                with txl.If(wid == 0), txl.Then():
+                with txl.if_(wid == 0), txl.then_():
                     leader = txl.cuda.elect_sync()
                     txl.ptx['tcgen05.fence::after_thread_sync']()
                     txl.ptx['fence.proxy.async.shared::cta']()
@@ -408,7 +411,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                 mma.sync C order.
                 """
                 ready = txl.local_scalar('uint32', init=txl.uint32(0))
-                with txl.While(ready == txl.uint32(0)):
+                with txl.while_(ready == txl.uint32(0)):
                     txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, sm.ptr_to([BARS_S + bar_i * 8]), txl.cast(tpar, 'uint32'))
                 if fence:
                     txl.ptx['fence.proxy.async.shared::cta']()
@@ -417,13 +420,13 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                 txl.ptx[BGRAD2_LD256X8](*[raw[i] for i in range(32)], txl.cast(tbase + txl.shift_left(txl.cast(wid * 32, 'uint32'), txl.uint32(16)) + d_col, 'uint32'))
                 txl.ptx['tcgen05.wait::ld.sync.aligned']()
                 for i in range(32):
-                    txl.assign(dst[i], txl.reinterpret('float32', raw[i]))
+                    txl.assign(dst[i], txl.reinterpret(raw[i], ty='float32'))
         def tile(c_in, head_in):
             c = txl.local_scalar('int32', init=c_in)
             head = txl.local_scalar('int32', init=head_in)
             t0, nv = INTRA_chunk_lookup(cu, nseg, c)
-            with txl.If(nv > 0), txl.Then():
-                with txl.If(tid == 0), txl.Then():
+            with txl.if_(nv > 0), txl.then_():
+                with txl.if_(tid == 0), txl.then_():
                     txl.ptx['fence.proxy.async.shared::cta']()
                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(sm.ptr_to([BARS_S + 32]), txl.uint32(3 * 16384))
                     for tmap, dst in ((k_map, INTRA2_K_S), (q_map, INTRA2_Q_S), (v_map, INTRA2_V_S)):
@@ -432,32 +435,32 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                             txl.cast(2 * head, 'int32'), sm.ptr_to([BARS_S + 32]),
                             txl.uint64(0x12F0000000000000),
                         )
-                with txl.If(tid < 64), txl.Then():
+                with txl.if_(tid < 64), txl.then_():
                     gv = txl.local_scalar('float32', init=txl.float32(0.0))
                     bv = txl.local_scalar('float32', init=txl.float32(0.0))
-                    with txl.If(tid < nv), txl.Then():
+                    with txl.if_(tid < nv), txl.then_():
                         txl.assign(gv, KERN_COMMON_ld_f32(g.ptr_to([(t0 + tid) * HV + head])))
                         txl.assign(bv, KERN_COMMON_ld_bf16_f32(beta.ptr_to([(t0 + tid) * HV + head])))
                     st_sf(G_S + tid * 4, gv)
                     st_sf(B_S + tid * 4, bv)
                 txl.cuda.cta_sync()
-                with txl.If(wid == 0), txl.Then():
+                with txl.if_(wid == 0), txl.then_():
                     x0 = txl.local_scalar('float32', init=ld_sf(G_S + lane * 4))
                     x1 = txl.local_scalar('float32', init=ld_sf(G_S + 128 + lane * 4))
                     for off in (1, 2, 4, 8, 16):
                         for x in (x0, x1):
                             up = txl.local_scalar('uint32')
-                            txl.ptx.shfl_sync.up.b32(up, txl.reinterpret('uint32', x), txl.uint32(off), txl.uint32(0), txl.uint32(4294967295))
-                            txl.assign(x, txl.if_then_else(lane >= off, txl.reinterpret('float32', up) + x, x))
+                            txl.ptx.shfl_sync.up.b32(up, txl.reinterpret(x, ty='uint32'), txl.uint32(off), txl.uint32(0), txl.uint32(4294967295))
+                            txl.assign(x, txl.if_then_else(lane >= off, txl.reinterpret(up, ty='float32') + x, x))
                     tot = shfl(x0, 31)
                     st_sf(G_S + lane * 4, x0 * txl.float32(KERN_COMMON_RCP_LN2))
                     st_sf(G_S + 128 + lane * 4, (x1 + tot) * txl.float32(KERN_COMMON_RCP_LN2))
                 txl.cuda.cta_sync()
-                with txl.If(tid < nv), txl.Then():
+                with txl.if_(tid < nv), txl.then_():
                     txl.ptx.st.global_.f32(g_cum.ptr_to([(t0 + tid) * HV + head]), ld_sf(G_S + tid * 4))
-                with txl.If(tid == 0), txl.Then():
+                with txl.if_(tid == 0), txl.then_():
                     ready_tma = txl.local_scalar('uint32', init=txl.uint32(0))
-                    with txl.While(ready_tma == txl.uint32(0)):
+                    with txl.while_(ready_tma == txl.uint32(0)):
                         txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(
                             ready_tma, sm.ptr_to([BARS_S + 32]), txl.cast(tpar, 'uint32'))
                 txl.cuda.cta_sync()
@@ -551,7 +554,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                         idx = it * 128 + tid
                         row = idx // 8
                         ch = idx % 8
-                        with txl.If(row < nv), txl.Then():
+                        with txl.if_(row < nv), txl.then_():
                             wd = txl.alloc_local((4,), 'uint32')
                             txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([SCR_S + row * 128 + txl.bitwise_xor(ch, txl.bitwise_and(row, 7)) * 16]))
                             txl.ptx.st.global_.v4.b32(aqk_out.ptr_to([((t0 + row) * HV + head) * 64 + ch * 8]), wd[0], wd[1], wd[2], wd[3])
@@ -581,14 +584,14 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                     s_ = add_rn(add_rn(add_rn(L[0], L[4]), add_rn(L[2], L[6])), add_rn(add_rn(L[1], L[5]), add_rn(L[3], L[7])))
                     a_c = txl.if_then_else(colc < i, X[i], txl.float32(0.0))
                     txl.assign(X[i], add_rn(a_c, s_))
-                with txl.If(lane < 16), txl.Then():
+                with txl.if_(lane < 16), txl.then_():
                     for r in range(16):
                         st_sf(fa(AI_S, d0 + r, d0 + colc, 64), X[r] + txl.if_then_else(colc == r, txl.float32(1.0), txl.float32(0.0)))
                 for it in range(0 if diet else 4):
                     idx = it * 128 + tid
                     row = idx // 8
                     ch = idx % 8
-                    with txl.If(row < nv), txl.Then():
+                    with txl.if_(row < nv), txl.then_():
                         wd = txl.alloc_local((4,), 'uint32')
                         txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([INTRA2_AQ_S + row * 128 + ch * 16]))
                         txl.ptx.st.global_.v4.b32(aqk_out.ptr_to([((t0 + row) * HV + head) * 64 + ch * 8]), wd[0], wd[1], wd[2], wd[3])
@@ -603,7 +606,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                 def SCR():
                     return (scr, 0, 0, 16)
                 for d in range(3):
-                    with txl.If(wid == d + 1), txl.Then():
+                    with txl.if_(wid == d + 1), txl.then_():
                         p = txl.alloc_local((8,), 'float32')
                         KERN_COMMON_zero(p, 8)
                         tf32_mm(p, [(AI(d + 1, d + 1), AF(d + 1, d))], perm=kperm)
@@ -615,7 +618,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                         st_c16(r, AI(d + 1, d), True)
                 txl.cuda.cta_sync()
                 for br, bc, wsel in ((2, 0, 2), (3, 1, 3)):
-                    with txl.If(wid == wsel), txl.Then():
+                    with txl.if_(wid == wsel), txl.then_():
                         p = txl.alloc_local((8,), 'float32')
                         KERN_COMMON_zero(p, 8)
                         tf32_mm(p, [(AF(br, bc), AI(bc, bc)), (AF(br, bc + 1), AI(bc + 1, bc))], perm=kperm)
@@ -626,7 +629,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                         tf32_mm(r, [(AI(br, br), SCR())])
                         st_c16(r, AI(br, bc), True)
                 txl.cuda.cta_sync()
-                with txl.If(wid == 3), txl.Then():
+                with txl.if_(wid == 3), txl.then_():
                     p = txl.alloc_local((8,), 'float32')
                     KERN_COMMON_zero(p, 8)
                     tf32_mm(p, [(AF(3, 0), AI(0, 0)), (AF(3, 1), AI(1, 0)), (AF(3, 2), AI(2, 0))], perm=kperm)
@@ -649,7 +652,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                         hi = txl.if_then_else(keep, ld_sf(fa(AI_S, row, cl + 1, 64)), txl.float32(0.0))
                         txl.assign(words[j], KERN_COMMON_pack_bf16(lo, hi))
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([AB_S + KERN_COMMON_sw128(row, ch)]), words[0], words[1], words[2], words[3])
-                    with txl.If(row < nv), txl.Then():
+                    with txl.if_(row < nv), txl.then_():
                         txl.ptx.st.global_.v4.b32(a_out.ptr_to([((t0 + row) * HV + head) * 64 + ch * 8]), words[0], words[1], words[2], words[3])
                 if tg:
                     pass
@@ -693,7 +696,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
                     idx = it * 128 + tid
                     row = idx // 16
                     ch = idx % 16
-                    with txl.If(row < nv), txl.Then():
+                    with txl.if_(row < nv), txl.then_():
                         for stg, dst in ((INTRA2_AF_S, u_out), (AI_S, w_out)):
                             wd = txl.alloc_local((4,), 'uint32')
                             txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([stg + KERN_COMMON_sw256(row, ch)]))
@@ -710,7 +713,7 @@ def INTRA2_make_intra2(HV, tf32_mode, kperm=False, diet=False, fsw=False, tg=Fal
             txl.ptx['tcgen05.fence::before_thread_sync']()
             txl.cuda.cta_sync()
             txl.ptx['tcgen05.fence::after_thread_sync']()
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](txl.cast(tbase, 'uint32'), txl.uint32(128))
     return intra2
 
@@ -730,7 +733,7 @@ def REC2_chunk_info(cu, nseg, c):
         b = KERN_COMMON_ld_s32(cu.ptr_to([s]))
         e = KERN_COMMON_ld_s32(cu.ptr_to([s + 1]))
         nch = (e - b + 63) // 64
-        with txl.If(txl.And(c >= acc, c < acc + nch)), txl.Then():
+        with txl.if_(txl.And(c >= acc, c < acc + nch)), txl.then_():
             txl.assign(t0, b + (c - acc) * 64)
             txl.assign(nv, txl.min(e - b - (c - acc) * 64, 64))
             txl.assign(bos, b)
@@ -758,7 +761,7 @@ class REC2_Cursor:
 
     def advance(self):
         txl.assign(self.t0, self.t0 + 64)
-        with txl.While(txl.And(self.t0 >= self.eos, self.seg < self.nseg - 1)):
+        with txl.while_(txl.And(self.t0 >= self.eos, self.seg < self.nseg - 1)):
             txl.assign(self.seg, self.seg + 1)
             txl.assign(self.bos, self.eos)
             txl.assign(self.eos, KERN_COMMON_ld_s32(self.cu.ptr_to([self.seg + 1])))
@@ -766,7 +769,7 @@ class REC2_Cursor:
 
     def retreat(self):
         txl.assign(self.t0, self.t0 - 64)
-        with txl.While(txl.And(self.t0 < self.bos, self.seg > 0)):
+        with txl.while_(txl.And(self.t0 < self.bos, self.seg > 0)):
             txl.assign(self.seg, self.seg - 1)
             txl.assign(self.eos, self.bos)
             txl.assign(self.bos, KERN_COMMON_ld_s32(self.cu.ptr_to([self.seg])))
@@ -879,14 +882,14 @@ def REC7_ck_base(kt, head, t, vb32, HV):
     return ((kt + ci * 64 + r0) * HV + ha) * 64 + uu * 8
 
 
-def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, hkv=True, hst=False, v16=False, vb=32, nz=1, ckw=False, static_nz=None):
+def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, hkv=True, hst=False, v16=False, vb=32, nz=1, ckw=False, static_nz=None, pdl=False):
     """
     vb: value columns per CTA (NSG = vb / 32 state warpgroups, each the 32-column state WG on its
     own column block; N = vb UMMAs). nz > 1: up to nz sub-chains per (v-block, head) (nzr at run
     time, grid NVB * nzr): sub-chain z covers [b_z, b_{z+1}) with b = (c_lo, ck1, ck2, ck3)[:nzr] +
     (c_hi,), starting from h0 (z = 0), the checkpoint at token kt_z of A (passed as aqk; bit z of
     ckm) or zero. ckw: write the fp32 state entering chunk ck_z (bit z of ckm) to checkpoint kt_z of
-    A (passed as h_out).
+    A (passed as h_out). pdl: launched with programmatic dependent launch.
     """
     hst = hst and store_h and not with_o
     v16 = v16 and (hst or not store_h)
@@ -910,9 +913,10 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
     assert SMEM <= 227 * 1024, SMEM
     NCONS = 3 if with_o else NSG + 1
 
-    @txl.kernel(warps=NWARPS, arch='sm_100a', grid=(lambda p: [NVB * p['nzr'], HV]) if (nz > 1 and static_nz is None) else [NVB * (static_nz or 1), HV])
-    def rec7(q: txl.gptr[txl.bf16], k: txl.gptr[txl.bf16], w: txl.gptr[txl.bf16], u: txl.gptr[txl.bf16], aqk: txl.gptr[txl.bf16], g_cum: txl.gptr[txl.f32], cu: txl.gptr[txl.i32], nseg: txl.i32, c_lo0: txl.i32, c_hi0: txl.i32, h0: txl.gptr[txl.f32], use_h0: txl.i32, scale: txl.f32, o: txl.gptr[txl.bf16], h_out: txl.gptr[txl.bf16], vn_out: txl.gptr[txl.bf16], summ: txl.gptr[txl.f32], ag: txl.gptr[txl.f32], m_first: txl.i32, m_step: txl.i32, m_n: txl.i32, nzr: txl.i32, ck1: txl.i32, ck2: txl.i32, ck3: txl.i32, kt1: txl.i32, kt2: txl.i32, kt3: txl.i32, ckm: txl.i32):
-        sm = txl.alloc_buffer((SMEM,), txl.u8, scope='shared.dyn', align=1024)
+    @txl.kernel()
+    def rec7(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), u: txl.Tensor((txl.int64(),), txl.bf16), aqk: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, c_lo0: txl.int32, c_hi0: txl.int32, h0: txl.Tensor((txl.int64(),), txl.f32), use_h0: txl.int32, scale: txl.float32, o: txl.Tensor((txl.int64(),), txl.bf16), h_out: txl.Tensor((txl.int64(),), txl.bf16), vn_out: txl.Tensor((txl.int64(),), txl.bf16), summ: txl.Tensor((txl.int64(),), txl.f32), ag: txl.Tensor((txl.int64(),), txl.f32), m_first: txl.int32, m_step: txl.int32, m_n: txl.int32, nzr: txl.int32, ck1: txl.int32, ck2: txl.int32, ck3: txl.int32, kt1: txl.int32, kt2: txl.int32, kt3: txl.int32, ckm: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[NVB * nzr, HV] if (nz > 1 and static_nz is None) else [NVB * (static_nz or 1), HV], block=NWARPS * 32, programmatic_stream_serialization=True if pdl else None))
+        sm = txl.alloc_tensor((SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
         m_n1 = txl.local_scalar('int32', init=txl.if_then_else(m_n > 1, m_n - 1, 0))
         if nz > 1:
@@ -944,7 +948,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
 
         def mwait(i, parity):
             ready = txl.local_scalar('uint32', init=txl.uint32(0))
-            with txl.While(ready == txl.uint32(0)):
+            with txl.while_(ready == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, mbar(i), txl.cast(parity, 'uint32'))
 
         def arrive(i):
@@ -960,29 +964,29 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
 
         def wg_sync_arrive_one(bar, t):
             txl.ptx.bar.sync(txl.uint32(1 + wid // 4), txl.uint32(128))
-            with txl.If(t == 0), txl.Then():
+            with txl.if_(t == 0), txl.then_():
                 arrive(bar)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for s_ in range(REC7_NS):
                 txl.ptx.mbarrier.init.shared.b64(mbar(REC7_B_FULL + s_), txl.uint32(64))
                 txl.ptx.mbarrier.init.shared.b64(mbar(REC7_B_EMPTY + s_), txl.uint32(NCONS))
             for i_, cnt in ((REC7_B_HB, 4 * NSG), (REC7_B_VD, 1), (REC7_B_VN, 4 * NSG), (REC7_B_UPD, 1), (REC7_B_MRDY, 128), (REC7_B_MDONE, 1), (REC7_B_OX, 1), (REC7_B_OX + 1, 1), (REC7_B_OFREE, 128), (REC7_B_OFREE + 1, 128), (REC7_B_HBF, 128)):
                 txl.ptx.mbarrier.init.shared.b64(mbar(i_), txl.uint32(cnt))
         txl.ptx.fence.mbarrier_init.release.cluster()
-        with txl.If(wid == WM), txl.Then():
+        with txl.if_(wid == WM), txl.then_():
             txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([HOLD_S]), txl.uint32(TM_COLS))
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
         tbase = txl.local_scalar('int32')
         txl.ptx.ld.volatile.shared.s32(tbase, sm.ptr_to([HOLD_S]))
-        with txl.If(wid >= WM + 1), txl.Then():
+        with txl.if_(wid >= WM + 1), txl.then_():
             lt = tid - 32 * (WM + 1)
             cur = REC2_Cursor(cu, nseg, c_lo)
             with txl.serial(nchunks) as it_c:
                 stage = it_c % REC7_NS
                 sb = stage * STAGE
-                with txl.If(it_c >= REC7_NS), txl.Then():
+                with txl.if_(it_c >= REC7_NS), txl.then_():
                     mwait(REC7_B_EMPTY + stage, (it_c // REC7_NS - 1) % 2)
                     txl.ptx['fence.proxy.async.shared::cta']()
                 t0 = txl.local_scalar('int32', init=cur.t0)
@@ -1016,7 +1020,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                 txl.ptx[REC7_CP4](sm.ptr_to([sb + G_S + lt * 4]), g_cum.ptr_to([src_row * HV + head]), 4, txl.cast(txl.if_then_else(ok, 4, 0), 'uint32'))
                 txl.ptx['cp.async.mbarrier.arrive.noinc.shared::cta.b64'](mbar(REC7_B_FULL + stage))
                 cur.advance()
-        with txl.If(wid == WM), txl.Then():
+        with txl.if_(wid == WM), txl.then_():
             leader = txl.cuda.elect_sync()
 
             def mma(op, d, a, b, idesc, acc):
@@ -1053,7 +1057,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                     mma(REC7_MMA_F16, tbase + REC7_TM_H, k_d + txl.uint64(kp * 128), vg_d + txl.uint64(kp * 128), ID_UPD, 1)
                 txl.ptx[REC7_COMMIT](mbar(REC7_B_UPD), pred=leader)
                 if with_o:
-                    with txl.If(it_c >= 2), txl.Then():
+                    with txl.if_(it_c >= 2), txl.then_():
                         mwait(REC7_B_OFREE + s2, (it_c // 2 - 1) % 2)
                     txl.ptx['tcgen05.fence::after_thread_sync']()
                     q_d = desc(sb + Q_S, REC7_DESC_K)
@@ -1065,7 +1069,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                         mma(REC7_MMA_F16, tbase + REC7_TM_OX + s2 * 64, a_d + txl.uint64(kp * 2), vn_d + txl.uint64(kp * 128), REC7_ID_M64, 0 if kp == 0 else 1)
                     txl.ptx[REC7_COMMIT](mbar(REC7_B_OX + s2), pred=leader)
                 txl.ptx[REC7_COMMIT](mbar(REC7_B_EMPTY + stage), pred=leader)
-        with txl.If(wid < 4 * NSG), txl.Then():
+        with txl.if_(wid < 4 * NSG), txl.then_():
             t = tid % 128
             gq = tid // 128
             vq = v0 + 32 * gq
@@ -1079,15 +1083,15 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                 txl.assign(hv[i], txl.uint32(0))
             if merge:
                 hb_ = (txl.cast(m_first, 'int64') * HV + head) * (128 * 256)
-                with txl.If(m_n > 0), txl.Then():
+                with txl.if_(m_n > 0), txl.then_():
                     agv = txl.alloc_local((32,), 'uint32')
                     for i4 in range(8):
                         txl.ptx.ld.global_.nc.v4.b32(agv[4 * i4], agv[4 * i4 + 1], agv[4 * i4 + 2], agv[4 * i4 + 3], ag.ptr_to([hb_ + t * 256 + vq + 4 * i4]))
                     for i in range(32):
-                        txl.assign(hv[i], txl.reinterpret('uint32', txl.reinterpret('float32', hv[i]) + txl.reinterpret('float32', agv[i])))
+                        txl.assign(hv[i], txl.reinterpret(txl.reinterpret(hv[i], ty='float32') + txl.reinterpret(agv[i], ty='float32'), ty='uint32'))
                 with txl.serial(m_n1) as jj:
                     base = (txl.cast(m_first + (jj + 1) * m_step, 'int64') * HV + head) * (128 * 256)
-                    with txl.If(jj > 0), txl.Then():
+                    with txl.if_(jj > 0), txl.then_():
                         mwait(REC7_B_MDONE, (jj - 1) % 2)
                         txl.ptx['tcgen05.fence::after_thread_sync']()
                         txl.ptx[REC7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + REC7_TM_H, 'uint32'))
@@ -1096,7 +1100,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                         for i4 in range(8):
                             txl.ptx.ld.global_.nc.v4.b32(agv[4 * i4], agv[4 * i4 + 1], agv[4 * i4 + 2], agv[4 * i4 + 3], ag.ptr_to([base - txl.cast(m_step, 'int64') * HV * (128 * 256) + t * 256 + vq + 4 * i4]))
                         for i in range(32):
-                            txl.assign(hv[i], txl.reinterpret('uint32', txl.reinterpret('float32', hv[i]) + txl.reinterpret('float32', agv[i])))
+                            txl.assign(hv[i], txl.reinterpret(txl.reinterpret(hv[i], ty='float32') + txl.reinterpret(agv[i], ty='float32'), ty='uint32'))
                     txl.ptx['fence.proxy.async.shared::cta']()
                     for c4 in range(8):
                         tv = [txl.bitwise_and(hv[c4 * 4 + e], txl.uint32(4294959104)) for e in range(4)]
@@ -1112,7 +1116,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                     txl.ptx['fence.proxy.async.shared::cta']()
                     txl.ptx['tcgen05.fence::before_thread_sync']()
                     arrive(REC7_B_MRDY)
-                with txl.If(m_n > 1), txl.Then():
+                with txl.if_(m_n > 1), txl.then_():
                     mwait(REC7_B_MDONE, (m_n - 2) % 2)
                     txl.ptx['tcgen05.fence::after_thread_sync']()
                     txl.ptx[REC7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + REC7_TM_H, 'uint32'))
@@ -1122,15 +1126,15 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                     for i4 in range(8):
                         txl.ptx.ld.global_.nc.v4.b32(agv[4 * i4], agv[4 * i4 + 1], agv[4 * i4 + 2], agv[4 * i4 + 3], ag.ptr_to([lastb + t * 256 + vq + 4 * i4]))
                     for i in range(32):
-                        txl.assign(hv[i], txl.reinterpret('uint32', txl.reinterpret('float32', hv[i]) + txl.reinterpret('float32', agv[i])))
+                        txl.assign(hv[i], txl.reinterpret(txl.reinterpret(hv[i], ty='float32') + txl.reinterpret(agv[i], ty='float32'), ty='uint32'))
                 for i4 in range(8):
                     txl.ptx.st.global_.v4.b32(h0.ptr_to([(head * 128 + t) * 128 + vq + 4 * i4]), hv[4 * i4], hv[4 * i4 + 1], hv[4 * i4 + 2], hv[4 * i4 + 3])
             elif not summary:
-                with txl.If(txl.And(use_h0 != 0, zc == 0) if nz > 1 else use_h0 != 0), txl.Then():
+                with txl.if_(txl.And(use_h0 != 0, zc == 0) if nz > 1 else use_h0 != 0), txl.then_():
                     for i4 in range(8):
                         txl.ptx.ld.global_.v4.b32(hv[4 * i4], hv[4 * i4 + 1], hv[4 * i4 + 2], hv[4 * i4 + 3], h0.ptr_to([(head * 128 + t) * 128 + vq + 4 * i4]))
             if nz > 1:
-                with txl.If(zck != 0), txl.Then():
+                with txl.if_(zck != 0), txl.then_():
                     ckb = txl.local_scalar('int32', init=REC7_ck_base(zkt, head, t, vq // 32, HV))
                     for i8 in range(8):
                         txl.ptx.ld.global_.nc.v4.b32(hv[4 * i8], hv[4 * i8 + 1], hv[4 * i8 + 2], hv[4 * i8 + 3], aqk.ptr_to([ckb + i8 * HV * 64]))
@@ -1150,26 +1154,26 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                 nv = txl.local_scalar('int32', init=cur.nv())
                 reset = txl.And(t0 == cur.bos, it_c != 0)
                 mwait(REC7_B_FULL + stage, it_c // REC7_NS % 2)
-                with txl.If(it_c >= 1), txl.Then():
+                with txl.if_(it_c >= 1), txl.then_():
                     mwait(REC7_B_UPD, (it_c - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx[REC7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + REC7_TM_H, 'uint32'))
                 txl.ptx['tcgen05.wait::ld.sync.aligned']()
-                with txl.If(reset), txl.Then():
+                with txl.if_(reset), txl.then_():
                     for i in range(32):
                         txl.assign(hv[i], txl.uint32(0))
                 if hst:
-                    with txl.If(it_c >= 1), txl.Then():
+                    with txl.if_(it_c >= 1), txl.then_():
                         mwait(REC7_B_HBF, (it_c - 1) % 2)
                 hb4 = txl.alloc_local((16,), 'uint32')
                 for p in range(16):
-                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])))
+                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')))
                 txl.ptx['fence.proxy.async.shared::cta']()
                 for c in range(4):
                     hc = c + 4 * (it_c % 2) if with_o else c + g4
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([hbq + t * 128 + txl.bitwise_xor(hc, txl.bitwise_and(t, 7)) * 16]), hb4[4 * c], hb4[4 * c + 1], hb4[4 * c + 2], hb4[4 * c + 3])
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(REC7_B_HB)
                 gl = ld_sf(sb + G_S + (nv - 1) * 4)
                 egl = KERN_COMMON_exp2(gl)
@@ -1189,18 +1193,18 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                 else:
                     uw = txl.alloc_local((16,), 'uint32')
                     fr = txl.local_scalar('float32', init=txl.float32(0.0))
-                    with txl.If(act), txl.Then():
+                    with txl.if_(act), txl.then_():
                         for c in range(4):
                             txl.ptx.ld.shared.v4.b32(uw[4 * c], uw[4 * c + 1], uw[4 * c + 2], uw[4 * c + 3], sm.ptr_to([sb + U_S + mrow * UR + 64 * gq + c * 16]))
                         txl.assign(fr, txl.if_then_else(mrow < nv, KERN_COMMON_exp2(gl - ld_sf(sb + G_S + mrow * 4)), txl.float32(0.0)))
                 if ckw:
-                    with txl.If(txl.Or(txl.Or(it_c == cw1, it_c == cw2), it_c == cw3)), txl.Then():
+                    with txl.if_(txl.Or(txl.Or(it_c == cw1, it_c == cw2), it_c == cw3)), txl.then_():
                         txl.ptx[REC7_ST32](txl.cast(taddr + 256 + txl.if_then_else(it_c == cw1, 0, txl.if_then_else(it_c == cw2, 32, 64)), 'uint32'), *[hv[i] for i in range(32)])
                 for p in range(16):
                     scaled = txl.local_scalar('uint64')
-                    txl.ptx['mul.rn.f32x2'](scaled, txl.cuda.make_float2(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])), txl.cuda.make_float2(egl, egl))
-                    txl.assign(hv[2 * p], txl.reinterpret('uint32', txl.cuda.float2_x(scaled)))
-                    txl.assign(hv[2 * p + 1], txl.reinterpret('uint32', txl.cuda.float2_y(scaled)))
+                    txl.ptx['mul.rn.f32x2'](scaled, txl.cuda.make_float2(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')), txl.cuda.make_float2(egl, egl))
+                    txl.assign(hv[2 * p], txl.reinterpret(txl.cuda.float2_x(scaled), ty='uint32'))
+                    txl.assign(hv[2 * p + 1], txl.reinterpret(txl.cuda.float2_y(scaled), ty='uint32'))
                 txl.ptx[REC7_ST32](txl.cast(taddr + REC7_TM_H, 'uint32'), *[hv[i] for i in range(32)])
                 txl.ptx['tcgen05.wait::st.sync.aligned']()
                 mwait(REC7_B_VD, it_c % 2)
@@ -1220,7 +1224,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                             hi = txl.local_scalar('float32')
                             KERN_COMMON_unpack_bf16(uw2[j * 2 + hh], lo, hi)
                             vn2 = txl.local_scalar('uint64')
-                            txl.ptx['sub.rn.f32x2'](vn2, txl.cuda.make_float2(lo, hi), txl.cuda.make_float2(txl.reinterpret('float32', vd16[j * 4 + hh * 2]), txl.reinterpret('float32', vd16[j * 4 + hh * 2 + 1])))
+                            txl.ptx['sub.rn.f32x2'](vn2, txl.cuda.make_float2(lo, hi), txl.cuda.make_float2(txl.reinterpret(vd16[j * 4 + hh * 2], ty='float32'), txl.reinterpret(vd16[j * 4 + hh * 2 + 1], ty='float32')))
                             vg2 = txl.local_scalar('uint64')
                             txl.ptx['mul.rn.f32x2'](vg2, vn2, txl.cuda.make_float2(frh[hh], frh[hh]))
                             ii = j * 4 + hh * 2
@@ -1244,14 +1248,14 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                     txl.ptx['tcgen05.wait::ld.sync.aligned']()
                     txl.ptx['fence.proxy.async.shared::cta']()
                     vnb = txl.alloc_local((16,), 'uint32')
-                    with txl.If(act), txl.Then():
+                    with txl.if_(act), txl.then_():
                         vgb = txl.alloc_local((16,), 'uint32')
                         for p in range(16):
                             lo = txl.local_scalar('float32')
                             hi = txl.local_scalar('float32')
                             KERN_COMMON_unpack_bf16(uw[p], lo, hi)
                             vn2 = txl.local_scalar('uint64')
-                            txl.ptx['sub.rn.f32x2'](vn2, txl.cuda.make_float2(lo, hi), txl.cuda.make_float2(txl.reinterpret('float32', vd[2 * p]), txl.reinterpret('float32', vd[2 * p + 1])))
+                            txl.ptx['sub.rn.f32x2'](vn2, txl.cuda.make_float2(lo, hi), txl.cuda.make_float2(txl.reinterpret(vd[2 * p], ty='float32'), txl.reinterpret(vd[2 * p + 1], ty='float32')))
                             vn0 = txl.cuda.float2_x(vn2)
                             vn1 = txl.cuda.float2_y(vn2)
                             txl.assign(vnb[p], KERN_COMMON_pack_bf16(vn0, vn1))
@@ -1265,10 +1269,10 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                             txl.ptx.st.shared.v4.b32(sm.ptr_to([vgq + off]), vgb[4 * c], vgb[4 * c + 1], vgb[4 * c + 2], vgb[4 * c + 3])
                 txl.ptx['tcgen05.fence::before_thread_sync']()
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(REC7_B_VN)
                 if store_h and not hst:
-                    with txl.If(txl.And(act, mrow < nv)), txl.Then():
+                    with txl.if_(txl.And(act, mrow < nv)), txl.then_():
                         ci = c_lo + it_c
                         for c in range(4):
                             txl.ptx.st.global_.v4.b32(vn_out.ptr_to([(txl.cast(ci, 'int64') * HV + head) * 8192 + KERN_COMMON_su64(mrow, vq // 8 + c) // 2]), vnb[4 * c], vnb[4 * c + 1], vnb[4 * c + 2], vnb[4 * c + 3])
@@ -1282,7 +1286,7 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                 for i4 in range(8):
                     txl.ptx.st.global_.v4.b32(summ.ptr_to([(head * 128 + t) * 256 + vq + 4 * i4]), hv[4 * i4], hv[4 * i4 + 1], hv[4 * i4 + 2], hv[4 * i4 + 3])
         if hst:
-            with txl.If(txl.And(wid >= 4 * NSG, wid < 4 * NSG + 4)), txl.Then():
+            with txl.if_(txl.And(wid >= 4 * NSG, wid < 4 * NSG + 4)), txl.then_():
                 u = tid - 128 * NSG
                 cur = REC2_Cursor(cu, nseg, c_lo)
                 with txl.serial(nchunks) as it_c:
@@ -1305,13 +1309,13 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                         wd = txl.alloc_local((4,), 'uint32')
                         for e in range(4):
                             txl.assign(wd[e], txl.uint32(0))
-                        with txl.If(row < nv), txl.Then():
+                        with txl.if_(row < nv), txl.then_():
                             txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([VN_S + c // 8 * 8192 + row * 128 + txl.bitwise_xor(c % 8, txl.bitwise_and(row, 7)) * 16]))
                         txl.ptx.st.global_.v4.b32(vn_out.ptr_to([(txl.cast(ci, 'int64') * HV + head) * 8192 + KERN_COMMON_su64(row, v0 // 8 + c) // 2]), wd[0], wd[1], wd[2], wd[3])
                     arrive(REC7_B_HBF)
                     cur.advance()
         if with_o:
-            with txl.If(txl.And(wid >= 4, wid < 8)), txl.Then():
+            with txl.if_(txl.And(wid >= 4, wid < 8)), txl.then_():
                 t = tid - 128
                 taddr = tbase + trow(t)
                 mrow = 16 * (t // 32) + lane % 16
@@ -1338,20 +1342,20 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
                     arrive(REC7_B_OFREE + s2)
                     eg = txl.local_scalar('float32', init=KERN_COMMON_exp2(ld_sf(sb + G_S + mrow * 4)))
                     wg_sync_arrive_one(REC7_B_EMPTY + stage, t)
-                    with txl.If(txl.And(act, mrow < nv)), txl.Then():
+                    with txl.if_(txl.And(act, mrow < nv)), txl.then_():
                         ob = txl.alloc_local((16,), 'uint32')
                         for p in range(16):
                             oi2 = txl.local_scalar('uint64')
                             ox2 = txl.local_scalar('uint64')
                             out2 = txl.local_scalar('uint64')
-                            txl.ptx['mul.rn.f32x2'](oi2, txl.cuda.make_float2(txl.reinterpret('float32', oi[2 * p]), txl.reinterpret('float32', oi[2 * p + 1])), txl.cuda.make_float2(eg, eg))
-                            txl.ptx['mul.rn.f32x2'](ox2, txl.cuda.make_float2(txl.reinterpret('float32', ox[2 * p]), txl.reinterpret('float32', ox[2 * p + 1])), txl.cuda.make_float2(scale, scale))
+                            txl.ptx['mul.rn.f32x2'](oi2, txl.cuda.make_float2(txl.reinterpret(oi[2 * p], ty='float32'), txl.reinterpret(oi[2 * p + 1], ty='float32')), txl.cuda.make_float2(eg, eg))
+                            txl.ptx['mul.rn.f32x2'](ox2, txl.cuda.make_float2(txl.reinterpret(ox[2 * p], ty='float32'), txl.reinterpret(ox[2 * p + 1], ty='float32')), txl.cuda.make_float2(scale, scale))
                             txl.ptx['fma.rn.f32x2'](out2, txl.cuda.make_float2(scale, scale), oi2, ox2)
                             txl.assign(ob[p], KERN_COMMON_pack_bf16(txl.cuda.float2_x(out2), txl.cuda.float2_y(out2)))
                         for c in range(4):
                             txl.ptx.st.global_.v4.b32(o.ptr_to([((t0 + mrow) * HV + head) * 128 + v0 + c * 8]), ob[4 * c], ob[4 * c + 1], ob[4 * c + 2], ob[4 * c + 3])
                     if ckw:
-                        with txl.If(txl.Or(txl.Or(it_c == ow1, it_c == ow2), it_c == ow3)), txl.Then():
+                        with txl.if_(txl.Or(txl.Or(it_c == ow1, it_c == ow2), it_c == ow3)), txl.then_():
                             ckv = txl.alloc_local((32,), 'uint32')
                             txl.ptx[REC7_LD32](*[ckv[i] for i in range(32)], txl.cast(taddr + 256 + txl.if_then_else(it_c == ow1, 0, txl.if_then_else(it_c == ow2, 32, 64)), 'uint32'))
                             txl.ptx['tcgen05.wait::ld.sync.aligned']()
@@ -1362,13 +1366,13 @@ def REC7_make_rec7(HV, with_o=True, merge=False, summary=False, store_h=False, h
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
-        with txl.If(wid == WM), txl.Then():
+        with txl.if_(wid == WM), txl.then_():
             txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](txl.cast(tbase, 'uint32'), txl.uint32(TM_COLS))
         if nz > 1:
             # PDL-launched behind bsum7 (s21-pdl-pack): no data dependency, but the grid must not complete before
             # its prerequisite; only the last CTA (dispatched last) waits.  No-op without PDL.
-            with txl.If(txl.And(cta[0] == NVB * nzr - 1, cta[1] == HV - 1)), txl.Then():
+            with txl.if_(txl.And(cta[0] == NVB * nzr - 1, cta[1] == HV - 1)), txl.then_():
                 txl.ptx.griddepcontrol.wait()
     return rec7
 
@@ -1491,10 +1495,12 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
         maps.append(desc)
         return tuple(maps)
 
-    @txl.kernel(warps=NW, arch='sm_100a', grid=[4, HV], host_prelude=prepare_host)
-    def fsum7(k: txl.gptr[txl.bf16], w: txl.gptr[txl.bf16], u: txl.gptr[txl.bf16], g_cum: txl.gptr[txl.f32], bos: txl.i32, eos: txl.i32, payload: txl.gptr[txl.f32], q: txl.gptr[txl.bf16], aqk: txl.gptr[txl.bf16], o: txl.gptr[txl.bf16], scale: txl.f32, a_ck: txl.gptr[txl.bf16], ck1: txl.i32, ck2: txl.i32, ck3: txl.i32, kt1: txl.i32, kt2: txl.i32, kt3: txl.i32, ckm: txl.i32, S: txl.i32, *, host):
+    @txl.kernel()
+    def fsum7(k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), u: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), bos: txl.int32, eos: txl.int32, payload: txl.Tensor((txl.int64(),), txl.f32), q: txl.Tensor((txl.int64(),), txl.bf16), aqk: txl.Tensor((txl.int64(),), txl.bf16), o: txl.Tensor((txl.int64(),), txl.bf16), scale: txl.float32, a_ck: txl.Tensor((txl.int64(),), txl.bf16), ck1: txl.int32, ck2: txl.int32, ck3: txl.int32, kt1: txl.int32, kt2: txl.int32, kt3: txl.int32, ckm: txl.int32, S: txl.int32):
+        host = prepare_host(dict(k=k, w=w, q=q, aqk=aqk, S=S))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[4, HV], block=NW * 32))
         k_map, w_map, q_map, aqk_map = host
-        sm = txl.alloc_buffer((FSUM7_SMEM,), txl.u8, scope='shared.dyn', align=1024)
+        sm = txl.alloc_tensor((FSUM7_SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
         cb = cta[0]
         head = cta[1]
@@ -1514,7 +1520,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
 
         def mwait(i, parity):
             ready = txl.local_scalar('uint32', init=txl.uint32(0))
-            with txl.While(ready == txl.uint32(0)):
+            with txl.while_(ready == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, mbar(i), txl.cast(parity, 'uint32'))
 
         def arrive(i):
@@ -1531,33 +1537,33 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
         def group_arrive_one(bar_id, bar, t):
             txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
             txl.ptx.bar.sync(txl.uint32(bar_id), txl.uint32(128))
-            with txl.If(t == 0), txl.Then():
+            with txl.if_(t == 0), txl.then_():
                 arrive(bar)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for s_ in range(FSUM7_NS):
                 txl.ptx.mbarrier.init.shared.b64(mbar(FSUM7_B_FULL + s_), txl.uint32(65))
                 txl.ptx.mbarrier.init.shared.b64(mbar(FSUM7_B_EMPTY + s_), txl.uint32(5 if with_o else 4))
             for i_, cnt in ((FSUM7_B_KG, 4), (FSUM7_B_KG + 1, 4), (FSUM7_B_MIACC, 1), (FSUM7_B_MIFREE, 1 if inplace else 128), (FSUM7_B_AREADY, 128), (FSUM7_B_AREADY + 1, 128), (FSUM7_B_AFREE, 1), (FSUM7_B_AFREE + 1, 1), (FSUM7_B_BREADY, 4), (FSUM7_B_MCACC, 1), (FSUM7_B_HB, 4), (FSUM7_B_VD, 1), (FSUM7_B_VN, 4), (FSUM7_B_UPD, 1)) + (((B_OX, 1), (B_OFREE, 128)) if with_o else ()):
                 txl.ptx.mbarrier.init.shared.b64(mbar(i_), txl.uint32(cnt))
         txl.ptx.fence.mbarrier_init.release.cluster()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([FSUM7_HOLD_S]), txl.uint32(512))
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
         tbase = txl.local_scalar('int32')
         txl.ptx.ld.volatile.shared.s32(tbase, sm.ptr_to([FSUM7_HOLD_S]))
-        with txl.If(txl.And(wid >= 9, wid < 11)), txl.Then():
+        with txl.if_(txl.And(wid >= 9, wid < 11)), txl.then_():
             lt = tid - 288
             with txl.serial(nch) as it:
                 stage = it % FSUM7_NS
                 sb = stage * FSUM7_STAGE
-                with txl.If(it >= FSUM7_NS), txl.Then():
+                with txl.if_(it >= FSUM7_NS), txl.then_():
                     mwait(FSUM7_B_EMPTY + stage, (it // FSUM7_NS - 1) % 2)
                     txl.ptx['fence.proxy.async.shared::cta']()
                 t0 = txl.local_scalar('int32', init=bos + it * 64)
                 nv = txl.local_scalar('int32', init=txl.min(eos - t0, 64))
-                with txl.If(txl.And(nv == 64, lt == 0)), txl.Then():
+                with txl.if_(txl.And(nv == 64, lt == 0)), txl.then_():
                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(mbar(FSUM7_B_FULL + stage), txl.uint32(16384 * (4 if with_o else 2) - (8192 if with_o else 0)))
                     for tmap, dst in ((k_map, FSUM7_K_S), (w_map, FSUM7_W_S)) + (((q_map, Q_S),) if with_o else ()):
                         txl.ptx['cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint'](
@@ -1567,7 +1573,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                         txl.ptx['cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint'](
                             sm.ptr_to([sb + AQ_S]), txl.address_of(aqk_map), txl.int32(0), t0,
                             txl.cast(head, 'int32'), mbar(FSUM7_B_FULL + stage), txl.uint64(0x12F0000000000000))
-                with txl.If(nv < 64), txl.Then():
+                with txl.if_(nv < 64), txl.then_():
                     for rep in range(16):
                         idx = rep * 64 + lt
                         row = idx // 16
@@ -1584,7 +1590,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                             ok = row < nv
                             src_row = txl.if_then_else(ok, t0 + row, t0)
                             txl.ptx[FSUM7_CP16](sm.ptr_to([sb + AQ_S + row * 128 + txl.bitwise_xor(ch, txl.bitwise_and(row, 7)) * 16]), aqk.ptr_to([(src_row * HV + head) * 64 + ch * 8]), 16, txl.cast(txl.if_then_else(ok, 16, 0), 'uint32'))
-                    with txl.If(lt == 0), txl.Then():
+                    with txl.if_(lt == 0), txl.then_():
                         txl.ptx.mbarrier.arrive.shared.b64(mbar(FSUM7_B_FULL + stage))
                 for rep in range(4):
                     idx = rep * 64 + lt
@@ -1597,7 +1603,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 src_row = txl.if_then_else(ok, t0 + lt, t0)
                 txl.ptx[FSUM7_CP4](sm.ptr_to([sb + FSUM7_G_S + lt * 4]), g_cum.ptr_to([src_row * HV + head]), 4, txl.cast(txl.if_then_else(ok, 4, 0), 'uint32'))
                 txl.ptx['cp.async.mbarrier.arrive.noinc.shared::cta.b64'](mbar(FSUM7_B_FULL + stage))
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             leader = txl.cuda.elect_sync()
 
             def issue_mi(it):
@@ -1609,7 +1615,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 if inplace:
                     pass
                 else:
-                    with txl.If(it >= 1), txl.Then():
+                    with txl.if_(it >= 1), txl.then_():
                         mwait(FSUM7_B_MIFREE, (it - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 a_d = desc(FSUM7_KG_S + it % 2 * 16384, FSUM7_DESC_MN)
@@ -1619,10 +1625,10 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     txl.ptx[FSUM7_MMA_F16](txl.cast(tbase + d_col, 'uint32'), a_d + txl.uint64(kp * 128), b_d + txl.uint64(kp * 128), txl.uint32(FSUM7_ID_MI), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.ptx.pred(txl.uint32(0 if kp == 0 else 1)), pred=leader)
                 txl.ptx[FSUM7_COMMIT](mbar(FSUM7_B_MIACC + (it % 2 if inplace else 0)), pred=leader)
                 txl.ptx[FSUM7_COMMIT](mbar(FSUM7_B_EMPTY + stage), pred=leader)
-            with txl.If(nch > 0), txl.Then():
+            with txl.if_(nch > 0), txl.then_():
                 issue_mi(0)
             if inplace:
-                with txl.If(nch > 1), txl.Then():
+                with txl.if_(nch > 1), txl.then_():
                     issue_mi(1)
             with txl.serial(nch) as it:
                 s2 = it % 2
@@ -1639,12 +1645,12 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 if inplace:
                     # M_i(it + 2) overwrites the A slot chain(it) reads: tcgen05.mma A reads -> later D writes
                     # from the same warp are pipelined, so no AFREE wait is needed.
-                    with txl.If(it + 2 < nch), txl.Then():
+                    with txl.if_(it + 2 < nch), txl.then_():
                         issue_mi(it + 2)
                 else:
-                    with txl.If(it + 1 < nch), txl.Then():
+                    with txl.if_(it + 1 < nch), txl.then_():
                         issue_mi(it + 1)
-        with txl.If(wid == 11), txl.Then():
+        with txl.if_(wid == 11), txl.then_():
             leader = txl.cuda.elect_sync()
 
             def mma(op, d, a, b, idesc, acc):
@@ -1656,7 +1662,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 mwait(FSUM7_B_HB, it % 2)
                 txl.ptx['fence.proxy.async.shared::cta']()
                 if with_o:
-                    with txl.If(it >= 1), txl.Then():
+                    with txl.if_(it >= 1), txl.then_():
                         mwait(B_OFREE, (it - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 hb_d = desc(FSUM7_HB_S, FSUM7_DESC_MN)
@@ -1683,7 +1689,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                         mma(FSUM7_MMA_F16, tbase + TM_OX, a_d + txl.uint64(kp * 2), vn_d + txl.uint64(kp * 128), FSUM7_ID_M64, 0 if kp == 0 else 1)
                     txl.ptx[FSUM7_COMMIT](mbar(B_OX), pred=leader)
                 txl.ptx[FSUM7_COMMIT](mbar(FSUM7_B_EMPTY + stage), pred=leader)
-        with txl.If(wid < 4), txl.Then():
+        with txl.if_(wid < 4), txl.then_():
             r = tid
             taddr = tbase + trow(tid)
 
@@ -1721,15 +1727,15 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     ch = idx % 16
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([FSUM7_KG_S + it % 2 * 16384 + TRANS7_uma(row, ch)]), kw[4 * rep], kw[4 * rep + 1], kw[4 * rep + 2], kw[4 * rep + 3])
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(FSUM7_B_KG + it % 2)
                 group_arrive_one(1, FSUM7_B_EMPTY + stage, tid)
                 return gl_
             glc = txl.local_scalar('float32', init=txl.float32(0.0))
             gln = txl.local_scalar('float32', init=txl.float32(0.0))
-            with txl.If(nch > 0), txl.Then():
+            with txl.if_(nch > 0), txl.then_():
                 txl.assign(glc, build_kg(0))
-            with txl.If(nch > 1), txl.Then():
+            with txl.if_(nch > 1), txl.then_():
                 txl.assign(gln, build_kg(1))
             with txl.serial(nch) as it:
                 s2 = it % 2
@@ -1737,7 +1743,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     mwait(FSUM7_B_MIACC + s2, it // 2 % 2)
                 else:
                     mwait(FSUM7_B_MIACC, it % 2)
-                    with txl.If(it >= 2), txl.Then():
+                    with txl.if_(it >= 2), txl.then_():
                         mwait(FSUM7_B_AFREE + s2, (it // 2 - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 egl = KERN_COMMON_exp2(glc)
@@ -1746,24 +1752,24 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     txl.ptx[FSUM7_LD32](*[dv[i] for i in range(32)], txl.cast(taddr + FSUM7_TM_A + s2 * 128 + wid * 32, 'uint32'))
                     txl.ptx['tcgen05.wait::ld.sync.aligned']()
                     for i in range(32):
-                        txl.assign(dv[i], txl.if_then_else(lane == i, txl.reinterpret('uint32', txl.reinterpret('float32', dv[i]) - egl), dv[i]))
+                        txl.assign(dv[i], txl.if_then_else(lane == i, txl.reinterpret(txl.reinterpret(dv[i], ty='float32') - egl, ty='uint32'), dv[i]))
                     txl.ptx[FSUM7_ST32](txl.cast(taddr + FSUM7_TM_A + s2 * 128 + wid * 32, 'uint32'), *[dv[i] for i in range(32)])
                 for q4 in range(0 if inplace and rawneg else 4):
                     txl.ptx[FSUM7_LD32](*[dv[i] for i in range(32)], txl.cast(taddr + (FSUM7_TM_A + s2 * 128 if inplace else FSUM7_TM_DMI) + q4 * 32, 'uint32'))
                     txl.ptx['tcgen05.wait::ld.sync.aligned']()
                     if rawneg:
-                        with txl.If(r // 32 == q4), txl.Then():
+                        with txl.if_(r // 32 == q4), txl.then_():
                             for i in range(32):
-                                txl.assign(dv[i], txl.if_then_else(r % 32 == i, txl.reinterpret('uint32', txl.reinterpret('float32', dv[i]) - egl), dv[i]))
+                                txl.assign(dv[i], txl.if_then_else(r % 32 == i, txl.reinterpret(txl.reinterpret(dv[i], ty='float32') - egl, ty='uint32'), dv[i]))
                     else:
-                        with txl.If(r // 32 == q4), txl.Then():
+                        with txl.if_(r // 32 == q4), txl.then_():
                             for i in range(32):
-                                d = txl.if_then_else(r % 32 == i, egl, txl.float32(0.0)) - txl.reinterpret('float32', dv[i])
-                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret('uint32', d), txl.uint32(4294959104)))
-                        with txl.If(r // 32 != q4), txl.Then():
+                                d = txl.if_then_else(r % 32 == i, egl, txl.float32(0.0)) - txl.reinterpret(dv[i], ty='float32')
+                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret(d, ty='uint32'), txl.uint32(4294959104)))
+                        with txl.if_(r // 32 != q4), txl.then_():
                             for i in range(32):
-                                d = txl.float32(0.0) - txl.reinterpret('float32', dv[i])
-                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret('uint32', d), txl.uint32(4294959104)))
+                                d = txl.float32(0.0) - txl.reinterpret(dv[i], ty='float32')
+                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret(d, ty='uint32'), txl.uint32(4294959104)))
                     txl.ptx[FSUM7_ST32](txl.cast(taddr + FSUM7_TM_A + s2 * 128 + q4 * 32, 'uint32'), *[dv[i] for i in range(32)])
                 txl.ptx['tcgen05.wait::st.sync.aligned']()
                 txl.ptx['tcgen05.fence::before_thread_sync']()
@@ -1771,10 +1777,10 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     arrive(FSUM7_B_MIFREE)
                 arrive(FSUM7_B_AREADY + s2)
                 txl.assign(glc, gln)
-                with txl.If(it + 2 < nch), txl.Then():
+                with txl.if_(it + 2 < nch), txl.then_():
                     txl.ptx['fence.proxy.async.shared::cta']()
                     txl.assign(gln, build_kg(it + 2))
-        with txl.If(txl.And(wid >= 4, wid < 8)), txl.Then():
+        with txl.if_(txl.And(wid >= 4, wid < 8)), txl.then_():
             t = tid - 128
             row = t
             taddr = tbase + trow(t)
@@ -1784,7 +1790,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     z.append(txl.if_then_else(cb * 32 + c4 * 4 + e == row, txl.float32(1.0), txl.float32(0.0)))
                 txl.ptx.st.shared.v4.f32(sm.ptr_to([FSUM7_MB_S + TRANS7_mb_off(row, c4)]), z[0], z[1], z[2], z[3])
             txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 arrive(FSUM7_B_BREADY)
             mv = txl.alloc_local((32,), 'uint32')
             with txl.serial(nch) as it:
@@ -1792,22 +1798,22 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx[FSUM7_LD32](*[mv[i] for i in range(32)], txl.cast(taddr + FSUM7_TM_DM, 'uint32'))
                 txl.ptx['tcgen05.wait::ld.sync.aligned']()
-                with txl.If(it + 1 < nch), txl.Then():
+                with txl.if_(it + 1 < nch), txl.then_():
                     txl.ptx['fence.proxy.async.shared::cta']()
                     for c4 in range(8):
                         tv = [txl.bitwise_and(mv[c4 * 4 + e], txl.uint32(4294959104)) for e in range(4)]
                         txl.ptx.st.shared.v4.b32(sm.ptr_to([FSUM7_MB_S + TRANS7_mb_off(row, c4)]), tv[0], tv[1], tv[2], tv[3])
                     txl.ptx['tcgen05.fence::before_thread_sync']()
                     txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                    with txl.If(lane == 0), txl.Then():
+                    with txl.if_(lane == 0), txl.then_():
                         arrive(FSUM7_B_BREADY)
-            with txl.If(nch == 0), txl.Then():
+            with txl.if_(nch == 0), txl.then_():
                 for c4 in range(8):
                     for e in range(4):
-                        txl.assign(mv[c4 * 4 + e], txl.reinterpret('uint32', txl.if_then_else(cb * 32 + c4 * 4 + e == row, txl.float32(1.0), txl.float32(0.0))))
+                        txl.assign(mv[c4 * 4 + e], txl.reinterpret(txl.if_then_else(cb * 32 + c4 * 4 + e == row, txl.float32(1.0), txl.float32(0.0)), ty='uint32'))
             for c4 in range(8):
                 txl.ptx.st.global_.v4.b32(payload.ptr_to([(head * 128 + row) * 256 + 128 + cb * 32 + c4 * 4]), mv[c4 * 4], mv[c4 * 4 + 1], mv[c4 * 4 + 2], mv[c4 * 4 + 3])
-        with txl.If(txl.And(wid >= 12, wid < 16)), txl.Then():
+        with txl.if_(txl.And(wid >= 12, wid < 16)), txl.then_():
             t = tid - 384
             taddr = tbase + trow(t)
             if with_o:
@@ -1827,19 +1833,19 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 t0 = bos + it * 64
                 nv = txl.min(eos - t0, 64)
                 mwait(FSUM7_B_FULL + stage, it // FSUM7_NS % 2)
-                with txl.If(it >= 1), txl.Then():
+                with txl.if_(it >= 1), txl.then_():
                     mwait(FSUM7_B_UPD, (it - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx[FSUM7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + FSUM7_TM_H, 'uint32'))
                 txl.ptx['tcgen05.wait::ld.sync.aligned']()
                 hb4 = txl.alloc_local((16,), 'uint32')
                 for p in range(16):
-                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])))
+                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')))
                 txl.ptx['fence.proxy.async.shared::cta']()
                 for c in range(4):
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([FSUM7_HB_S + t * 128 + txl.bitwise_xor(c, txl.bitwise_and(t, 7)) * 16]), hb4[4 * c], hb4[4 * c + 1], hb4[4 * c + 2], hb4[4 * c + 3])
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(FSUM7_B_HB)
                 gl = ld_sf(sb + FSUM7_G_S + (nv - 1) * 4)
                 egl = KERN_COMMON_exp2(gl)
@@ -1852,13 +1858,13 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     for hh in range(2):
                         txl.ptx.ld.shared.b32(lw2[j * 2 + hh], sm.ptr_to([sb + FSUM7_U_S + vrow[hh] * FSUM7_UR + (8 * j + 2 * t4) * 2]))
                 if with_o:
-                    with txl.If(txl.Or(txl.Or(it == cw1, it == cw2), it == cw3)), txl.Then():
+                    with txl.if_(txl.Or(txl.Or(it == cw1, it == cw2), it == cw3)), txl.then_():
                         txl.ptx[FSUM7_ST32](txl.cast(taddr + txl.if_then_else(it == cw1, 64, txl.if_then_else(it == cw2, 96, 480)), 'uint32'), *[hv[i] for i in range(32)])
                 for p in range(16):
                     scaled = txl.local_scalar('uint64')
-                    txl.ptx['mul.rn.f32x2'](scaled, txl.cuda.make_float2(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])), txl.cuda.make_float2(egl, egl))
-                    txl.assign(hv[2 * p], txl.reinterpret('uint32', txl.cuda.float2_x(scaled)))
-                    txl.assign(hv[2 * p + 1], txl.reinterpret('uint32', txl.cuda.float2_y(scaled)))
+                    txl.ptx['mul.rn.f32x2'](scaled, txl.cuda.make_float2(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')), txl.cuda.make_float2(egl, egl))
+                    txl.assign(hv[2 * p], txl.reinterpret(txl.cuda.float2_x(scaled), ty='uint32'))
+                    txl.assign(hv[2 * p + 1], txl.reinterpret(txl.cuda.float2_y(scaled), ty='uint32'))
                 txl.ptx[FSUM7_ST32](txl.cast(taddr + FSUM7_TM_H, 'uint32'), *[hv[i] for i in range(32)])
                 txl.ptx['tcgen05.wait::st.sync.aligned']()
                 mwait(FSUM7_B_VD, it % 2)
@@ -1876,7 +1882,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                         hi = txl.local_scalar('float32')
                         KERN_COMMON_unpack_bf16(lw2[j * 2 + hh], lo, hi)
                         vn2 = txl.local_scalar('uint64')
-                        txl.ptx['sub.rn.f32x2'](vn2, txl.cuda.make_float2(lo, hi), txl.cuda.make_float2(txl.reinterpret('float32', acc16[j * 4 + hh * 2]), txl.reinterpret('float32', acc16[j * 4 + hh * 2 + 1])))
+                        txl.ptx['sub.rn.f32x2'](vn2, txl.cuda.make_float2(lo, hi), txl.cuda.make_float2(txl.reinterpret(acc16[j * 4 + hh * 2], ty='float32'), txl.reinterpret(acc16[j * 4 + hh * 2 + 1], ty='float32')))
                         vg2 = txl.local_scalar('uint64')
                         txl.ptx['mul.rn.f32x2'](vg2, vn2, txl.cuda.make_float2(frh[hh], frh[hh]))
                         ii = j * 4 + hh * 2
@@ -1890,10 +1896,10 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                 KERN_COMMON_stsm_c(sm, lambda row, nt: FSUM7_VG_S + row * 128 + txl.bitwise_xor(nt, txl.bitwise_and(row, 7)) * 16, vgf, 4, rbase, lane)
                 txl.ptx['tcgen05.fence::before_thread_sync']()
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(FSUM7_B_VN)
                 group_arrive_one(2, FSUM7_B_EMPTY + stage, t)
-            with txl.If(nch > 0), txl.Then():
+            with txl.if_(nch > 0), txl.then_():
                 mwait(FSUM7_B_UPD, (nch - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx[FSUM7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + FSUM7_TM_H, 'uint32'))
@@ -1901,7 +1907,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
             for i4 in range(8):
                 txl.ptx.st.global_.v4.b32(payload.ptr_to([(head * 128 + t) * 256 + v0 + 4 * i4]), hv[4 * i4], hv[4 * i4 + 1], hv[4 * i4 + 2], hv[4 * i4 + 3])
         if with_o:
-            with txl.If(wid >= 16), txl.Then():
+            with txl.if_(wid >= 16), txl.then_():
                 t = tid - 512
                 taddr = tbase + trow(t)
                 if True:
@@ -1928,19 +1934,19 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
                     # stores (the two-stage ring otherwise waits on this release)
                     eg = txl.local_scalar('float32', init=KERN_COMMON_exp2(ld_sf(sb + FSUM7_G_S + mrow * 4)))
                     group_arrive_one(3, FSUM7_B_EMPTY + stage, t)
-                    with txl.If(txl.And(act, mrow < nv)), txl.Then():
+                    with txl.if_(txl.And(act, mrow < nv)), txl.then_():
                         ob = txl.alloc_local((16,), 'uint32')
                         for p in range(16):
                             oi2 = txl.local_scalar('uint64')
                             ox2 = txl.local_scalar('uint64')
                             out2 = txl.local_scalar('uint64')
-                            txl.ptx['mul.rn.f32x2'](oi2, txl.cuda.make_float2(txl.reinterpret('float32', oi[2 * p]), txl.reinterpret('float32', oi[2 * p + 1])), txl.cuda.make_float2(eg, eg))
-                            txl.ptx['mul.rn.f32x2'](ox2, txl.cuda.make_float2(txl.reinterpret('float32', ox[2 * p]), txl.reinterpret('float32', ox[2 * p + 1])), txl.cuda.make_float2(scale, scale))
+                            txl.ptx['mul.rn.f32x2'](oi2, txl.cuda.make_float2(txl.reinterpret(oi[2 * p], ty='float32'), txl.reinterpret(oi[2 * p + 1], ty='float32')), txl.cuda.make_float2(eg, eg))
+                            txl.ptx['mul.rn.f32x2'](ox2, txl.cuda.make_float2(txl.reinterpret(ox[2 * p], ty='float32'), txl.reinterpret(ox[2 * p + 1], ty='float32')), txl.cuda.make_float2(scale, scale))
                             txl.ptx['fma.rn.f32x2'](out2, txl.cuda.make_float2(scale, scale), oi2, ox2)
                             txl.assign(ob[p], KERN_COMMON_pack_bf16(txl.cuda.float2_x(out2), txl.cuda.float2_y(out2)))
                         for c in range(4):
                             txl.ptx.st.global_.v4.b32(o.ptr_to([((t0 + mrow) * HV + head) * 128 + v0 + c * 8]), ob[4 * c], ob[4 * c + 1], ob[4 * c + 2], ob[4 * c + 3])
-                    with txl.If(txl.Or(txl.Or(it == cw1, it == cw2), it == cw3)), txl.Then():
+                    with txl.if_(txl.Or(txl.Or(it == cw1, it == cw2), it == cw3)), txl.then_():
                         ckv = txl.alloc_local((32,), 'uint32')
                         txl.ptx[FSUM7_LD32](*[ckv[i] for i in range(32)], txl.cast(taddr + txl.if_then_else(it == cw1, 64, txl.if_then_else(it == cw2, 96, 480)), 'uint32'))
                         txl.ptx['tcgen05.wait::ld.sync.aligned']()
@@ -1950,7 +1956,7 @@ def FSUM7_make_fsum7(HV, rawneg=False, inplace=False, with_o=False):
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](txl.cast(tbase, 'uint32'), txl.uint32(512))
     return fsum7
@@ -2058,12 +2064,14 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
             maps.append(desc)
         return tuple(maps)
 
-    @txl.kernel(warps=BSUM7_NWARPS, arch='sm_100a', grid=[4, HV], host_prelude=prepare_host)
-    def bsum7(q: txl.gptr[txl.bf16], k: txl.gptr[txl.bf16], w: txl.gptr[txl.bf16], do: txl.gptr[txl.bf16], dv_local: txl.gptr[txl.bf16], g_cum: txl.gptr[txl.f32], bos: txl.i32, eos: txl.i32, scale: txl.f32, payload: txl.gptr[txl.f32], dh_out: txl.gptr[txl.bf16], dv2_out: txl.gptr[txl.bf16], S: txl.i32, *, host):
+    @txl.kernel()
+    def bsum7(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), dv_local: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), bos: txl.int32, eos: txl.int32, scale: txl.float32, payload: txl.Tensor((txl.int64(),), txl.f32), dh_out: txl.Tensor((txl.int64(),), txl.bf16), dv2_out: txl.Tensor((txl.int64(),), txl.bf16), S: txl.int32):
+        host = prepare_host(dict(q=q, k=k, w=w, S=S))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[4, HV], block=BSUM7_NWARPS * 32))
         q_map, k_map, w_map = host
-        sm = txl.alloc_buffer((BSUM7_SMEM,), txl.u8, scope='shared.dyn', align=1024)
+        sm = txl.alloc_tensor((BSUM7_SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
-        with txl.If(txl.thread_id() == 0), txl.Then():
+        with txl.if_(txl.thread_id() == 0), txl.then_():
             txl.ptx.griddepcontrol.launch_dependents()
         cb = cta[0]
         head = cta[1]
@@ -2083,13 +2091,13 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
 
         def mwait(i, parity):
             ready = txl.local_scalar('uint32', init=txl.uint32(0))
-            with txl.While(ready == txl.uint32(0)):
+            with txl.while_(ready == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, mbar(i), txl.cast(parity, 'uint32'))
 
         def mwait_n(name, i, parity):
             token = txl.alloc_local((1,), 'uint32')
             txl.assign(token[0], txl.cuda.iket.sentinel_token(name))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.assign(token[0], txl.cuda.iket.range_start(name))
             mwait(i, parity)
             txl.cuda.iket.range_end(token[0])
@@ -2111,9 +2119,9 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
         def group_arrive_one(bar_id, bar, t):
             txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
             txl.ptx.bar.sync(txl.uint32(bar_id), txl.uint32(128))
-            with txl.If(t == 0), txl.Then():
+            with txl.if_(t == 0), txl.then_():
                 arrive(bar)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for s_ in range(BSUM7_NS):
                 txl.ptx.mbarrier.init.shared.b64(mbar(BSUM7_B_FULL + s_), txl.uint32(65))
                 txl.ptx.mbarrier.init.shared.b64(mbar(BSUM7_B_EMPTY + s_), txl.uint32(5))
@@ -2123,14 +2131,14 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
             for i_, cnt in ((BSUM7_B_KG, 4), (BSUM7_B_MIACC, 1), (BSUM7_B_MIACC + 1, 1), (BSUM7_B_AREADY, 128), (BSUM7_B_AREADY + 1, 128), (BSUM7_B_AFREE, 1), (BSUM7_B_AFREE + 1, 1), (BSUM7_B_BREADY, 4), (BSUM7_B_MCACC, 1), (BSUM7_B_HB, 4), (BSUM7_B_DVP, 1), (BSUM7_B_DVA, 4), (BSUM7_B_T2, 1), (BSUM7_B_TOP, 128), (BSUM7_B_T1, 1), (BSUM7_B_T1 + 1, 1), (BSUM7_B_T1F, 128), (BSUM7_B_T1F + 1, 128), (BSUM7_B_HBF, 64), (BSUM7_B_HBF + 1, 64)) + (((BSUM7_B_HBF + 2, 4), (BSUM7_B_HBF + 3, 4)) if lst else ()):
                 txl.ptx.mbarrier.init.shared.b64(mbar(i_), txl.uint32(cnt))
         txl.ptx.fence.mbarrier_init.release.cluster()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([BSUM7_HOLD_S]), txl.uint32(512))
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
         tbase = txl.local_scalar('int32')
         txl.ptx.ld.volatile.shared.s32(tbase, sm.ptr_to([BSUM7_HOLD_S]))
-        with txl.If(txl.And(wid >= 9, wid < 11)), txl.Then():
+        with txl.if_(txl.And(wid >= 9, wid < 11)), txl.then_():
             lt = tid - 288
 
             def copy_chunk(j):
@@ -2153,7 +2161,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     wd = txl.alloc_local((4,), 'uint32')
                     for e in range(4):
                         txl.assign(wd[e], txl.uint32(0))
-                    with txl.If(row < nvc), txl.Then():
+                    with txl.if_(row < nvc), txl.then_():
                         txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([BSUM7_DVA_S + row * 128 + txl.bitwise_xor(c + 4 * (j % 2), txl.bitwise_and(row, 7)) * 16]))
                     txl.ptx.st.global_.v4.b32(dv2_out.ptr_to([(txl.cast(ci, 'int64') * HV + head) * 8192 + KERN_COMMON_su64(row, v0 // 8 + c) // 2]), wd[0], wd[1], wd[2], wd[3])
                 arrive(BSUM7_B_HBF + j % 2)
@@ -2163,21 +2171,21 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 qstage = it % BSUM7_QDO_NS
                 sb = stage * BSUM7_STAGE
                 qb = BSUM7_QDO_BASE + qstage * BSUM7_QDO_STAGE
-                with txl.If(it >= BSUM7_NS), txl.Then():
+                with txl.if_(it >= BSUM7_NS), txl.then_():
                     mwait_n('loader-main-empty', BSUM7_B_EMPTY + stage, (it // BSUM7_NS - 1) % 2)
                     txl.ptx['fence.proxy.async.shared::cta']()
-                with txl.If(it >= BSUM7_QDO_NS), txl.Then():
+                with txl.if_(it >= BSUM7_QDO_NS), txl.then_():
                     mwait_n('loader-q-empty', BSUM7_B_QEMPTY + qstage, (it // BSUM7_QDO_NS - 1) % 2)
                     txl.ptx['fence.proxy.async.shared::cta']()
                 t0 = txl.local_scalar('int32', init=chunk_t0(it))
                 nv = txl.local_scalar('int32', init=txl.min(eos - t0, 64))
-                with txl.If(txl.And(nv == 64, lt == 0)), txl.Then():
+                with txl.if_(txl.And(nv == 64, lt == 0)), txl.then_():
                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(mbar(BSUM7_B_FULL + stage), txl.uint32(32768))
                     for tmap, dst in ((k_map, sb + BSUM7_K_S), (w_map, sb + BSUM7_W_S)):
                         txl.ptx['cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint'](
                             sm.ptr_to([dst]), txl.address_of(tmap), txl.int32(0), t0,
                             txl.cast(2 * head, 'int32'), mbar(BSUM7_B_FULL + stage), txl.uint64(0x12F0000000000000))
-                with txl.If(nv < 64), txl.Then():
+                with txl.if_(nv < 64), txl.then_():
                     for rep in range(16):
                         idx = rep * 64 + lt
                         row = idx // 16
@@ -2186,7 +2194,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                         src_row = txl.if_then_else(ok, t0 + row, t0)
                         for src, dst in ((k, BSUM7_K_S), (w, BSUM7_W_S)):
                             txl.ptx[BSUM7_CP16](sm.ptr_to([sb + dst + TRANS7_uma(row, ch)]), src.ptr_to([(src_row * HV + head) * 128 + ch * 8]), 16, txl.cast(txl.if_then_else(ok, 16, 0), 'uint32'))
-                    with txl.If(lt == 0), txl.Then():
+                    with txl.if_(lt == 0), txl.then_():
                         txl.ptx.mbarrier.arrive.shared.b64(mbar(BSUM7_B_FULL + stage))
                 for rep in range(4):
                     idx = rep * 64 + lt
@@ -2199,13 +2207,13 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 src_row = txl.if_then_else(ok, t0 + lt, t0)
                 txl.ptx[BSUM7_CP4](sm.ptr_to([sb + BSUM7_G_S + lt * 4]), g_cum.ptr_to([src_row * HV + head]), 4, txl.cast(txl.if_then_else(ok, 4, 0), 'uint32'))
                 txl.ptx['cp.async.mbarrier.arrive.noinc.shared::cta.b64'](mbar(BSUM7_B_FULL + stage))
-                with txl.If(txl.And(nv == 64, lt == 0)), txl.Then():
+                with txl.if_(txl.And(nv == 64, lt == 0)), txl.then_():
                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(mbar(BSUM7_B_QFULL + qstage), txl.uint32(16384))
                     for tmap, dst in ((q_map, qb + BSUM7_Q_S),):
                         txl.ptx['cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint'](
                             sm.ptr_to([dst]), txl.address_of(tmap), txl.int32(0), t0,
                             txl.cast(2 * head, 'int32'), mbar(BSUM7_B_QFULL + qstage), txl.uint64(0x12F0000000000000))
-                with txl.If(nv < 64), txl.Then():
+                with txl.if_(nv < 64), txl.then_():
                     for rep in range(16):
                         idx = rep * 64 + lt
                         row = idx // 16
@@ -2213,7 +2221,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                         ok = row < nv
                         src_row = txl.if_then_else(ok, t0 + row, t0)
                         txl.ptx[BSUM7_CP16](sm.ptr_to([qb + BSUM7_Q_S + TRANS7_uma(row, ch)]), q.ptr_to([(src_row * HV + head) * 128 + ch * 8]), 16, txl.cast(txl.if_then_else(ok, 16, 0), 'uint32'))
-                    with txl.If(lt == 0), txl.Then():
+                    with txl.if_(lt == 0), txl.then_():
                         txl.ptx.mbarrier.arrive.shared.b64(mbar(BSUM7_B_QFULL + qstage))
                 for rep in range(4):
                     idx = rep * 64 + lt
@@ -2224,14 +2232,14 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     txl.ptx[BSUM7_CP16](sm.ptr_to([qb + BSUM7_DO_S + row * BSUM7_QDO_UR + ch * 16]), do.ptr_to([(src_row * HV + head) * 128 + v0 + ch * 8]), 16, txl.cast(txl.if_then_else(ok, 16, 0), 'uint32'))
                 txl.ptx['cp.async.mbarrier.arrive.noinc.shared::cta.b64'](mbar(BSUM7_B_QFULL + qstage))
                 if lst:
-                    with txl.If(it >= 2), txl.Then():
+                    with txl.if_(it >= 2), txl.then_():
                         copy_chunk(it - 2)
                 txl.cuda.iket.mark('loader-end')
             if lst:
                 with txl.serial(2) as jt:
-                    with txl.If(nch - 2 + jt >= 0), txl.Then():
+                    with txl.if_(nch - 2 + jt >= 0), txl.then_():
                         copy_chunk(nch - 2 + jt)
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             leader = txl.cuda.elect_sync()
 
             def issue_mi(it):
@@ -2241,7 +2249,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 mwait_n('issue-full', BSUM7_B_FULL + stage, it // BSUM7_NS % 2)
                 mwait_n('issue-kg', BSUM7_B_KG, it % 2)
                 txl.ptx['fence.proxy.async.shared::cta']()
-                with txl.If(it >= 2), txl.Then():
+                with txl.if_(it >= 2), txl.then_():
                     mwait_n('issue-afree', BSUM7_B_AFREE + s2, (it // 2 - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 a_d = desc(sb + BSUM7_W_S, BSUM7_DESC_MN)
@@ -2250,7 +2258,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     txl.ptx[BSUM7_MMA_F16](txl.cast(tbase + BSUM7_TM_D + s2 * 128, 'uint32'), a_d + txl.uint64(kp * 128), b_d + txl.uint64(kp * 128), txl.uint32(BSUM7_ID_MI), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.ptx.pred(txl.uint32(0 if kp == 0 else 1)), pred=leader)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_MIACC + s2), pred=leader)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_EMPTY + stage), pred=leader)
-            with txl.If(nch > 0), txl.Then():
+            with txl.if_(nch > 0), txl.then_():
                 issue_mi(0)
             with txl.serial(nch) as it:
                 txl.cuda.iket.mark('issue-start')
@@ -2264,10 +2272,10 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     txl.ptx[BSUM7_MMA_TF32](txl.cast(tbase + BSUM7_TM_DM, 'uint32'), txl.cast(tbase + BSUM7_TM_D + s2 * 128 + kp * 8, 'uint32'), b_d + txl.uint64(kp * 64), txl.uint32(id_chain), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.ptx.pred(txl.uint32(0 if kp == 0 else 1)), pred=leader)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_MCACC), pred=leader)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_AFREE + s2), pred=leader)
-                with txl.If(it + 1 < nch), txl.Then():
+                with txl.if_(it + 1 < nch), txl.then_():
                     issue_mi(it + 1)
                 txl.cuda.iket.mark('issue-end')
-        with txl.If(wid == 11), txl.Then():
+        with txl.if_(wid == 11), txl.then_():
             leader = txl.cuda.elect_sync()
 
             def mma(op, d, a, b, idesc, acc):
@@ -2277,14 +2285,14 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 s2 = it % 2
                 mwait_n('issue2-top', BSUM7_B_TOP, it % 2)
                 txl.ptx['fence.proxy.async.shared::cta']()
-                with txl.If(it >= 2), txl.Then():
+                with txl.if_(it >= 2), txl.then_():
                     mwait_n('issue2-t1free', BSUM7_B_T1F + s2, (it // 2 - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 bd = desc(BSUM7_DOB_S + s2 * 8192, BSUM7_DESC_MN_TF32)
                 for kp in range(8):
                     mma(BSUM7_MMA_TF32, tbase + BSUM7_TM_T1 + s2 * 32, txl.cast(tbase + BSUM7_TM_QA + kp * 8, 'uint32'), bd + txl.uint64(kp * 64), BSUM7_ID_TF32, 0 if kp == 0 else 1)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_T1 + s2), pred=leader)
-            with txl.If(nch > 0), txl.Then():
+            with txl.if_(nch > 0), txl.then_():
                 issue_t1(0)
             with txl.serial(nch) as it:
                 txl.cuda.iket.mark('issue2-start')
@@ -2308,10 +2316,10 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     mma(BSUM7_MMA_F16, tbase + BSUM7_TM_T2, w_d + txl.uint64(kp * 128), dva_d + txl.uint64(kp * 128), BSUM7_ID_UPD, 0 if kp == 0 else 1)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_T2), pred=leader)
                 txl.ptx[BSUM7_COMMIT](mbar(BSUM7_B_EMPTY + stage), pred=leader)
-                with txl.If(it + 1 < nch), txl.Then():
+                with txl.if_(it + 1 < nch), txl.then_():
                     issue_t1(it + 1)
                 txl.cuda.iket.mark('issue2-end')
-        with txl.If(wid < 4), txl.Then():
+        with txl.if_(wid < 4), txl.then_():
             t = tid
             taddr = tbase + trow(t)
             with txl.serial(nch) as it:
@@ -2324,7 +2332,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 t0 = chunk_t0(it)
                 nv = txl.min(eos - t0, 64)
                 gl = ld_sf(sb + BSUM7_G_S + (nv - 1) * 4)
-                with txl.If(it >= 1), txl.Then():
+                with txl.if_(it >= 1), txl.then_():
                     mwait_n('state-mi-prev', BSUM7_B_MIACC + (it - 1) % 2, (it - 1) // 2 % 2)
                 txl.ptx['fence.proxy.async.shared::cta']()
                 # KG(it) is on the M chain's critical path (single buffer): issue all eight k / g loads first,
@@ -2354,7 +2362,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     ch = idx % 16
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([BSUM7_KG_S + TRANS7_uma(row, ch)]), kw[4 * rep], kw[4 * rep + 1], kw[4 * rep + 2], kw[4 * rep + 3])
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(BSUM7_B_KG)
                 mwait_n('state-mi', BSUM7_B_MIACC + s2, it // 2 % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
@@ -2364,27 +2372,27 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     txl.ptx[BSUM7_LD32](*[dv[i] for i in range(32)], txl.cast(taddr + BSUM7_TM_D + s2 * 128 + wid * 32, 'uint32'))
                     txl.ptx['tcgen05.wait::ld.sync.aligned']()
                     for i in range(32):
-                        txl.assign(dv[i], txl.if_then_else(lane == i, txl.reinterpret('uint32', txl.reinterpret('float32', dv[i]) - egl), dv[i]))
+                        txl.assign(dv[i], txl.if_then_else(lane == i, txl.reinterpret(txl.reinterpret(dv[i], ty='float32') - egl, ty='uint32'), dv[i]))
                     txl.ptx[BSUM7_ST32](txl.cast(taddr + BSUM7_TM_D + s2 * 128 + wid * 32, 'uint32'), *[dv[i] for i in range(32)])
                 else:
                     for q4 in range(4):
                         txl.ptx[BSUM7_LD32](*[dv[i] for i in range(32)], txl.cast(taddr + BSUM7_TM_D + s2 * 128 + q4 * 32, 'uint32'))
                         txl.ptx['tcgen05.wait::ld.sync.aligned']()
-                        with txl.If(wid == q4), txl.Then():
+                        with txl.if_(wid == q4), txl.then_():
                             for i in range(32):
-                                d = txl.if_then_else(lane == i, egl, txl.float32(0.0)) - txl.reinterpret('float32', dv[i])
-                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret('uint32', d), txl.uint32(4294959104)))
-                        with txl.If(wid != q4), txl.Then():
+                                d = txl.if_then_else(lane == i, egl, txl.float32(0.0)) - txl.reinterpret(dv[i], ty='float32')
+                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret(d, ty='uint32'), txl.uint32(4294959104)))
+                        with txl.if_(wid != q4), txl.then_():
                             for i in range(32):
-                                d = txl.float32(0.0) - txl.reinterpret('float32', dv[i])
-                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret('uint32', d), txl.uint32(4294959104)))
+                                d = txl.float32(0.0) - txl.reinterpret(dv[i], ty='float32')
+                                txl.assign(dv[i], txl.bitwise_and(txl.reinterpret(d, ty='uint32'), txl.uint32(4294959104)))
                         txl.ptx[BSUM7_ST32](txl.cast(taddr + BSUM7_TM_D + s2 * 128 + q4 * 32, 'uint32'), *[dv[i] for i in range(32)])
                 txl.ptx['tcgen05.wait::st.sync.aligned']()
                 txl.ptx['tcgen05.fence::before_thread_sync']()
                 arrive(BSUM7_B_AREADY + s2)
                 group_arrive_one(1, BSUM7_B_EMPTY + stage, t)
                 txl.cuda.iket.mark('state-end')
-        with txl.If(txl.And(wid >= 4, wid < 8)), txl.Then():
+        with txl.if_(txl.And(wid >= 4, wid < 8)), txl.then_():
             t = tid - 128
             row = t
             taddr = tbase + trow(t)
@@ -2394,7 +2402,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                     z.append(txl.if_then_else(cb * 32 + c4 * 4 + e == row, txl.float32(1.0), txl.float32(0.0)))
                 txl.ptx.st.shared.v4.f32(sm.ptr_to([BSUM7_MB_S + TRANS7_mb_off(row, c4)]), z[0], z[1], z[2], z[3])
             txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 arrive(BSUM7_B_BREADY)
             mv = txl.alloc_local((32,), 'uint32')
 
@@ -2406,11 +2414,11 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 s2 = it % 2
                 mwait_n('qdo-full', BSUM7_B_FULL + stage, it // BSUM7_NS % 2)
                 mwait_n('qdo-qfull', BSUM7_B_QFULL + qstage, it // BSUM7_QDO_NS % 2)
-                with txl.If(t < 64), txl.Then():
+                with txl.if_(t < 64), txl.then_():
                     txl.ptx.st.shared.f32(sm.ptr_to([BSUM7_EG_S + t * 4]), KERN_COMMON_exp2(ld_sf(sb + BSUM7_G_S + t * 4)))
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
                 txl.ptx.bar.sync(txl.uint32(3), txl.uint32(128))
-                with txl.If(it >= 1), txl.Then():
+                with txl.if_(it >= 1), txl.then_():
                     mwait_n('qdo-t1-prev', BSUM7_B_T1 + (it - 1) % 2, (it - 1) // 2 % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 for h_ in range(2):
@@ -2428,8 +2436,8 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                         txl.ptx.cvt.f32.bf16(fv1, bits1)
                         qg2 = txl.local_scalar('uint64')
                         txl.ptx['mul.rn.f32x2'](qg2, txl.cuda.make_float2(fv0, fv1), txl.cuda.make_float2(ld_sf(BSUM7_EG_S + tok * 4), ld_sf(BSUM7_EG_S + (tok + 1) * 4)))
-                        txl.assign(qa[i], txl.bitwise_and(txl.reinterpret('uint32', txl.cuda.float2_x(qg2)), txl.uint32(4294959104)))
-                        txl.assign(qa[i + 1], txl.bitwise_and(txl.reinterpret('uint32', txl.cuda.float2_y(qg2)), txl.uint32(4294959104)))
+                        txl.assign(qa[i], txl.bitwise_and(txl.reinterpret(txl.cuda.float2_x(qg2), ty='uint32'), txl.uint32(4294959104)))
+                        txl.assign(qa[i + 1], txl.bitwise_and(txl.reinterpret(txl.cuda.float2_y(qg2), ty='uint32'), txl.uint32(4294959104)))
                     txl.ptx[BSUM7_ST32](txl.cast(taddr + BSUM7_TM_QA + h_ * 32, 'uint32'), *[qa[i] for i in range(32)])
                 drow = t // 2
                 c0 = t % 2 * 16
@@ -2449,36 +2457,36 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 txl.ptx['tcgen05.fence::before_thread_sync']()
                 arrive(BSUM7_B_TOP)
                 group_arrive_one(3, BSUM7_B_EMPTY + stage, t)
-                with txl.If(t == 0), txl.Then():
+                with txl.if_(t == 0), txl.then_():
                     arrive(BSUM7_B_QEMPTY + qstage)
 
-            with txl.If(nch > 0), txl.Then():
+            with txl.if_(nch > 0), txl.then_():
                 qdo_top(0)
             with txl.serial(nch) as it:
                 txl.cuda.iket.mark('qdo-start')
-                with txl.If(it + 1 < nch), txl.Then():
+                with txl.if_(it + 1 < nch), txl.then_():
                     qdo_top(it + 1)
                 mwait_n('qdo-mcacc', BSUM7_B_MCACC, it % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx[BSUM7_LD32](*[mv[i] for i in range(32)], txl.cast(taddr + BSUM7_TM_DM, 'uint32'))
                 txl.ptx['tcgen05.wait::ld.sync.aligned']()
-                with txl.If(it + 1 < nch), txl.Then():
+                with txl.if_(it + 1 < nch), txl.then_():
                     txl.ptx['fence.proxy.async.shared::cta']()
                     for c4 in range(8):
                         tv = [txl.bitwise_and(mv[c4 * 4 + e], txl.uint32(4294959104)) for e in range(4)]
                         txl.ptx.st.shared.v4.b32(sm.ptr_to([BSUM7_MB_S + TRANS7_mb_off(row, c4)]), tv[0], tv[1], tv[2], tv[3])
                     txl.ptx['tcgen05.fence::before_thread_sync']()
                     txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                    with txl.If(lane == 0), txl.Then():
+                    with txl.if_(lane == 0), txl.then_():
                         arrive(BSUM7_B_BREADY)
                 txl.cuda.iket.mark('qdo-end')
-            with txl.If(nch == 0), txl.Then():
+            with txl.if_(nch == 0), txl.then_():
                 for c4 in range(8):
                     for e in range(4):
-                        txl.assign(mv[c4 * 4 + e], txl.reinterpret('uint32', txl.if_then_else(cb * 32 + c4 * 4 + e == row, txl.float32(1.0), txl.float32(0.0))))
+                        txl.assign(mv[c4 * 4 + e], txl.reinterpret(txl.if_then_else(cb * 32 + c4 * 4 + e == row, txl.float32(1.0), txl.float32(0.0)), ty='uint32'))
             for c4 in range(8):
                 txl.ptx.st.global_.v4.b32(payload.ptr_to([(head * 128 + row) * 256 + 128 + cb * 32 + c4 * 4]), mv[c4 * 4], mv[c4 * 4 + 1], mv[c4 * 4 + 2], mv[c4 * 4 + 3])
-        with txl.If(wid >= 12), txl.Then():
+        with txl.if_(wid >= 12), txl.then_():
             t = tid - 384
             taddr = tbase + trow(t)
             hv = txl.alloc_local((32,), 'uint32')
@@ -2495,16 +2503,16 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 if lst:
                     # HB / DVA alternate between the two 64 B halves of their swizzle-atom rows, so HB(it) only
                     # waits for the loader-side copy of chunk it - 2 (one HBF barrier per half).
-                    with txl.If(it >= 2), txl.Then():
+                    with txl.if_(it >= 2), txl.then_():
                         mwait(BSUM7_B_HBF + it % 2, (it - 2) // 2 % 2)
                 hb4 = txl.alloc_local((16,), 'uint32')
                 for p in range(16):
-                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])))
+                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')))
                 txl.ptx['fence.proxy.async.shared::cta']()
                 for c in range(4):
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([BSUM7_HB_S + t * 128 + txl.bitwise_xor(c + (it % 2 * 4 if lst else 0), txl.bitwise_and(t, 7)) * 16]), hb4[4 * c], hb4[4 * c + 1], hb4[4 * c + 2], hb4[4 * c + 3])
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(hb_bar(it))
                 if store and not lst:
                     ci = nch - 1 - it
@@ -2533,14 +2541,14 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                         hi = txl.local_scalar('float32')
                         KERN_COMMON_unpack_bf16(lw2[j * 2 + hh], lo, hi)
                         dv2 = txl.local_scalar('uint64')
-                        txl.ptx['fma.rn.f32x2'](dv2, txl.cuda.make_float2(txl.reinterpret('float32', acc16[j * 4 + hh * 2]), txl.reinterpret('float32', acc16[j * 4 + hh * 2 + 1])), txl.cuda.make_float2(frh[hh], frh[hh]), txl.cuda.make_float2(lo, hi))
+                        txl.ptx['fma.rn.f32x2'](dv2, txl.cuda.make_float2(txl.reinterpret(acc16[j * 4 + hh * 2], ty='float32'), txl.reinterpret(acc16[j * 4 + hh * 2 + 1], ty='float32')), txl.cuda.make_float2(frh[hh], frh[hh]), txl.cuda.make_float2(lo, hi))
                         ii = j * 4 + hh * 2
                         txl.assign(dvf[ii], txl.cuda.float2_x(dv2))
                         txl.assign(dvf[ii + 1], txl.cuda.float2_y(dv2))
                 rbase = 16 * (t // 32)
                 KERN_COMMON_stsm_c(sm, lambda row, nt: BSUM7_DVA_S + row * 128 + txl.bitwise_xor(nt + (it % 2 * 4 if lst else 0), txl.bitwise_and(row, 7)) * 16, dvf, 4, rbase, lane)
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(dva_bar(it))
                 if store and not lst:
                     assert False, 'v16 bsum7 needs lst for dv2_out'
@@ -2556,13 +2564,13 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
                 arrive(BSUM7_B_T1F + s2)
                 for p in range(16):
                     scaled = txl.local_scalar('uint64')
-                    txl.ptx['mul.rn.f32x2'](scaled, txl.cuda.make_float2(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])), txl.cuda.make_float2(egl, egl))
+                    txl.ptx['mul.rn.f32x2'](scaled, txl.cuda.make_float2(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')), txl.cuda.make_float2(egl, egl))
                     step = txl.local_scalar('uint64')
                     updated = txl.local_scalar('uint64')
-                    txl.ptx['fma.rn.f32x2'](step, txl.cuda.make_float2(txl.reinterpret('float32', t1v[2 * p]), txl.reinterpret('float32', t1v[2 * p + 1])), txl.cuda.make_float2(scale, scale), txl.cuda.make_float2(-txl.reinterpret('float32', t2v[2 * p]), -txl.reinterpret('float32', t2v[2 * p + 1])))
+                    txl.ptx['fma.rn.f32x2'](step, txl.cuda.make_float2(txl.reinterpret(t1v[2 * p], ty='float32'), txl.reinterpret(t1v[2 * p + 1], ty='float32')), txl.cuda.make_float2(scale, scale), txl.cuda.make_float2(-txl.reinterpret(t2v[2 * p], ty='float32'), -txl.reinterpret(t2v[2 * p + 1], ty='float32')))
                     txl.ptx['add.rn.f32x2'](updated, scaled, step)
-                    txl.assign(hv[2 * p], txl.reinterpret('uint32', txl.cuda.float2_x(updated)))
-                    txl.assign(hv[2 * p + 1], txl.reinterpret('uint32', txl.cuda.float2_y(updated)))
+                    txl.assign(hv[2 * p], txl.reinterpret(txl.cuda.float2_x(updated), ty='uint32'))
+                    txl.assign(hv[2 * p + 1], txl.reinterpret(txl.cuda.float2_y(updated), ty='uint32'))
                 txl.cuda.iket.mark('output-end')
                 group_arrive_one(2, BSUM7_B_EMPTY + stage, t)
             for i4 in range(8):
@@ -2570,7 +2578,7 @@ def BSUM7_make_bsum7(HV, store=False, rawneg=False, lst=False):
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](txl.cast(tbase, 'uint32'), txl.uint32(512))
     return bsum7
@@ -2648,10 +2656,12 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
             maps.append(desc)
         return tuple(maps)
 
-    @txl.kernel(warps=NWARPS, arch='sm_100a', grid=[4, HV], host_prelude=prepare_host)
-    def brec7(q: txl.gptr[txl.bf16], k: txl.gptr[txl.bf16], w: txl.gptr[txl.bf16], do: txl.gptr[txl.bf16], dv_local: txl.gptr[txl.bf16], g_cum: txl.gptr[txl.f32], cu: txl.gptr[txl.i32], nseg: txl.i32, c_lo: txl.i32, c_hi: txl.i32, scale: txl.f32, dh_out: txl.gptr[txl.bf16], dv2_out: txl.gptr[txl.bf16], summ: txl.gptr[txl.f32], ag: txl.gptr[txl.f32], m_first: txl.i32, m_step: txl.i32, m_n: txl.i32, S: txl.i32, *, host):
+    @txl.kernel()
+    def brec7(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), dv_local: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, c_lo: txl.int32, c_hi: txl.int32, scale: txl.float32, dh_out: txl.Tensor((txl.int64(),), txl.bf16), dv2_out: txl.Tensor((txl.int64(),), txl.bf16), summ: txl.Tensor((txl.int64(),), txl.f32), ag: txl.Tensor((txl.int64(),), txl.f32), m_first: txl.int32, m_step: txl.int32, m_n: txl.int32, S: txl.int32):
+        host = prepare_host(dict(q=q, k=k, w=w, S=S))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[4, HV], block=NWARPS * 32))
         q_map, k_map, w_map = host
-        sm = txl.alloc_buffer((BREC7_SMEM,), txl.u8, scope='shared.dyn', align=1024)
+        sm = txl.alloc_tensor((BREC7_SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
         m_n1 = txl.local_scalar('int32', init=txl.if_then_else(m_n > 1, m_n - 1, 0))
         vblk = cta[0]
@@ -2673,7 +2683,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
 
         def mwait(i, parity):
             ready = txl.local_scalar('uint32', init=txl.uint32(0))
-            with txl.While(ready == txl.uint32(0)):
+            with txl.while_(ready == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, mbar(i), txl.cast(parity, 'uint32'))
 
         def arrive(i):
@@ -2689,40 +2699,40 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
 
         def wg_sync_arrive_one(bar, t):
             txl.ptx.bar.sync(txl.uint32(1 + wid // 4), txl.uint32(128))
-            with txl.If(t == 0), txl.Then():
+            with txl.if_(t == 0), txl.then_():
                 arrive(bar)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for s_ in range(BREC7_NS):
                 txl.ptx.mbarrier.init.shared.b64(mbar(BREC7_B_FULL + s_), txl.uint32(65))
                 txl.ptx.mbarrier.init.shared.b64(mbar(BREC7_B_EMPTY + s_), txl.uint32(3))
             for i_, cnt in ((BREC7_B_HB, 4), (BREC7_B_DVP, 1), (BREC7_B_DVA, 4), (BREC7_B_T2, 1), (BREC7_B_DH, 128), (BREC7_B_TOP, 128), (BREC7_B_TOP + 1, 128), (BREC7_B_T1, 1), (BREC7_B_T1 + 1, 1), (BREC7_B_T1F, 128), (BREC7_B_T1F + 1, 128), (BREC7_B_MRDY, 128), (BREC7_B_MDONE, 1), (BREC7_B_HBF, 32)):
                 txl.ptx.mbarrier.init.shared.b64(mbar(i_), txl.uint32(cnt))
         txl.ptx.fence.mbarrier_init.release.cluster()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([BREC7_HOLD_S]), txl.uint32(BREC7_TM_COLS))
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
         tbase = txl.local_scalar('int32')
         txl.ptx.ld.volatile.shared.s32(tbase, sm.ptr_to([BREC7_HOLD_S]))
-        with txl.If(txl.And(wid >= 9, wid < 11)), txl.Then():
+        with txl.if_(txl.And(wid >= 9, wid < 11)), txl.then_():
             lt = tid - 288
             cur = REC2_Cursor(cu, nseg, cl)
             with txl.serial(nchunks) as it_c:
                 stage = it_c % BREC7_NS
                 sb = stage * BREC7_STAGE
-                with txl.If(it_c >= BREC7_NS), txl.Then():
+                with txl.if_(it_c >= BREC7_NS), txl.then_():
                     mwait(BREC7_B_EMPTY + stage, (it_c // BREC7_NS - 1) % 2)
                     txl.ptx['fence.proxy.async.shared::cta']()
                 t0 = txl.local_scalar('int32', init=cur.t0)
                 nv = txl.local_scalar('int32', init=cur.nv())
-                with txl.If(txl.And(nv == 64, lt == 0)), txl.Then():
+                with txl.if_(txl.And(nv == 64, lt == 0)), txl.then_():
                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(mbar(BREC7_B_FULL + stage), txl.uint32(49152))
                     for tmap, dst in ((q_map, sb + BREC7_Q_S), (k_map, sb + BREC7_K_S), (w_map, sb + BREC7_W_S)):
                         txl.ptx['cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint'](
                             sm.ptr_to([dst]), txl.address_of(tmap), txl.int32(0), t0,
                             txl.cast(2 * head, 'int32'), mbar(BREC7_B_FULL + stage), txl.uint64(0x12F0000000000000))
-                with txl.If(nv < 64), txl.Then():
+                with txl.if_(nv < 64), txl.then_():
                     for rep in range(16):
                         idx = rep * 64 + lt
                         row = idx // 16
@@ -2731,7 +2741,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                         src_row = txl.if_then_else(ok, t0 + row, t0)
                         for src, dst in ((q, BREC7_Q_S), (k, BREC7_K_S), (w, BREC7_W_S)):
                             txl.ptx[BREC7_CP16](sm.ptr_to([sb + dst + TRANS7_uma(row, ch)]), src.ptr_to([(src_row * HV + head) * 128 + ch * 8]), 16, txl.cast(txl.if_then_else(ok, 16, 0), 'uint32'))
-                    with txl.If(lt == 0), txl.Then():
+                    with txl.if_(lt == 0), txl.then_():
                         txl.ptx.mbarrier.arrive.shared.b64(mbar(BREC7_B_FULL + stage))
                 for rep in range(4):
                     idx = rep * 64 + lt
@@ -2746,7 +2756,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 txl.ptx[BREC7_CP4](sm.ptr_to([sb + BREC7_G_S + lt * 4]), g_cum.ptr_to([src_row * HV + head]), 4, txl.cast(txl.if_then_else(ok, 4, 0), 'uint32'))
                 txl.ptx['cp.async.mbarrier.arrive.noinc.shared::cta.b64'](mbar(BREC7_B_FULL + stage))
                 cur.retreat()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             leader = txl.cuda.elect_sync()
 
             def mma(op, d, a, b, idesc, acc):
@@ -2756,7 +2766,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 s2 = it % 2
                 mwait(BREC7_B_TOP + s2, it // 2 % 2)
                 txl.ptx['fence.proxy.async.shared::cta']()
-                with txl.If(it >= 2), txl.Then():
+                with txl.if_(it >= 2), txl.then_():
                     mwait(BREC7_B_T1F + s2, (it // 2 - 1) % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 bd = desc(BREC7_DOB_S + s2 * 8192, BREC7_DESC_MN_TF32)
@@ -2771,7 +2781,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                     for kp in range(16):
                         mma(BREC7_MMA_TF32, tbase + BREC7_TM_DH, txl.cast(tbase + BREC7_TM_MA + kp * 8, 'uint32'), bd + txl.uint64(kp * 64), BREC7_ID_TF32, 0 if kp == 0 else 1)
                     txl.ptx[BREC7_COMMIT](mbar(BREC7_B_MDONE), pred=leader)
-            with txl.If(nchunks > 0), txl.Then():
+            with txl.if_(nchunks > 0), txl.then_():
                 issue_t1(0)
             with txl.serial(nchunks) as it_c:
                 stage = it_c % BREC7_NS
@@ -2794,9 +2804,9 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                     mma(BREC7_MMA_F16, tbase + BREC7_TM_T2, w_d + txl.uint64(kp * 128), dva_d + txl.uint64(kp * 128), BREC7_ID_UPD, 0 if kp == 0 else 1)
                 txl.ptx[BREC7_COMMIT](mbar(BREC7_B_T2), pred=leader)
                 txl.ptx[BREC7_COMMIT](mbar(BREC7_B_EMPTY + stage), pred=leader)
-                with txl.If(it_c + 1 < nchunks), txl.Then():
+                with txl.if_(it_c + 1 < nchunks), txl.then_():
                     issue_t1(it_c + 1)
-        with txl.If(txl.And(wid >= 4, wid < 8)), txl.Then():
+        with txl.if_(txl.And(wid >= 4, wid < 8)), txl.then_():
             t = tid - 128
             taddr = tbase + trow(t)
             with txl.serial(nchunks) as it_c:
@@ -2804,9 +2814,9 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 sb = stage * BREC7_STAGE
                 s2 = it_c % 2
                 mwait(BREC7_B_FULL + stage, it_c // BREC7_NS % 2)
-                with txl.If(it_c >= 2), txl.Then():
+                with txl.if_(it_c >= 2), txl.then_():
                     mwait(BREC7_B_T1 + s2, (it_c // 2 - 1) % 2)
-                with txl.If(t < 64), txl.Then():
+                with txl.if_(t < 64), txl.then_():
                     txl.ptx.st.shared.f32(sm.ptr_to([BREC7_EG_S + t * 4]), KERN_COMMON_exp2(ld_sf(sb + BREC7_G_S + t * 4)))
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
                 txl.ptx.bar.sync(txl.uint32(2), txl.uint32(128))
@@ -2824,8 +2834,8 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                     txl.ptx.cvt.f32.bf16(fv1, bits1)
                     qg2 = txl.local_scalar('uint64')
                     txl.ptx['mul.rn.f32x2'](qg2, txl.cuda.make_float2(fv0, fv1), txl.cuda.make_float2(ld_sf(BREC7_EG_S + tok * 4), ld_sf(BREC7_EG_S + (tok + 1) * 4)))
-                    txl.assign(qa[tok], txl.bitwise_and(txl.reinterpret('uint32', txl.cuda.float2_x(qg2)), txl.uint32(4294959104)))
-                    txl.assign(qa[tok + 1], txl.bitwise_and(txl.reinterpret('uint32', txl.cuda.float2_y(qg2)), txl.uint32(4294959104)))
+                    txl.assign(qa[tok], txl.bitwise_and(txl.reinterpret(txl.cuda.float2_x(qg2), ty='uint32'), txl.uint32(4294959104)))
+                    txl.assign(qa[tok + 1], txl.bitwise_and(txl.reinterpret(txl.cuda.float2_y(qg2), ty='uint32'), txl.uint32(4294959104)))
                 for h_ in range(2):
                     txl.ptx[BREC7_ST32](txl.cast(taddr + BREC7_TM_QA + s2 * 64 + h_ * 32, 'uint32'), *[qa[h_ * 32 + i] for i in range(32)])
                 row = t // 2
@@ -2847,7 +2857,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 arrive(BREC7_B_TOP + s2)
                 wg_sync_arrive_one(BREC7_B_EMPTY + stage, t)
         if bst:
-            with txl.If(wid == 11), txl.Then():
+            with txl.if_(wid == 11), txl.then_():
                 curc = REC2_Cursor(cu, nseg, cl)
                 with txl.serial(nchunks) as it_c:
                     ci = c_hi - 1 - it_c
@@ -2869,12 +2879,12 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                         wd = txl.alloc_local((4,), 'uint32')
                         for e in range(4):
                             txl.assign(wd[e], txl.uint32(0))
-                        with txl.If(row < nv), txl.Then():
+                        with txl.if_(row < nv), txl.then_():
                             txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([BREC7_DVA_S + row * 128 + txl.bitwise_xor(c, txl.bitwise_and(row, 7)) * 16]))
                         txl.ptx.st.global_.v4.b32(dv2_out.ptr_to([(txl.cast(ci, 'int64') * HV + head) * 8192 + KERN_COMMON_su64(row, v0 // 8 + c) // 2]), wd[0], wd[1], wd[2], wd[3])
                     arrive(BREC7_B_HBF)
                     curc.retreat()
-        with txl.If(wid < 4), txl.Then():
+        with txl.if_(wid < 4), txl.then_():
             t = tid
             taddr = tbase + trow(t)
             hv = txl.alloc_local((32,), 'uint32')
@@ -2882,15 +2892,15 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 txl.assign(hv[i], txl.uint32(0))
             if merge:
                 hb_ = (txl.cast(m_first, 'int64') * HV + head) * (128 * 256)
-                with txl.If(m_n > 0), txl.Then():
+                with txl.if_(m_n > 0), txl.then_():
                     agv = txl.alloc_local((32,), 'uint32')
                     for i4 in range(8):
                         txl.ptx.ld.global_.nc.v4.b32(agv[4 * i4], agv[4 * i4 + 1], agv[4 * i4 + 2], agv[4 * i4 + 3], ag.ptr_to([hb_ + t * 256 + v0 + 4 * i4]))
                     for i in range(32):
-                        txl.assign(hv[i], txl.reinterpret('uint32', txl.reinterpret('float32', hv[i]) + txl.reinterpret('float32', agv[i])))
+                        txl.assign(hv[i], txl.reinterpret(txl.reinterpret(hv[i], ty='float32') + txl.reinterpret(agv[i], ty='float32'), ty='uint32'))
                 with txl.serial(m_n1) as jj:
                     base = (txl.cast(m_first + (jj + 1) * m_step, 'int64') * HV + head) * (128 * 256)
-                    with txl.If(jj > 0), txl.Then():
+                    with txl.if_(jj > 0), txl.then_():
                         mwait(BREC7_B_MDONE, (jj - 1) % 2)
                         txl.ptx['tcgen05.fence::after_thread_sync']()
                         txl.ptx[BREC7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + BREC7_TM_DH, 'uint32'))
@@ -2899,7 +2909,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                         for i4 in range(8):
                             txl.ptx.ld.global_.nc.v4.b32(agv[4 * i4], agv[4 * i4 + 1], agv[4 * i4 + 2], agv[4 * i4 + 3], ag.ptr_to([base - txl.cast(m_step, 'int64') * HV * (128 * 256) + t * 256 + v0 + 4 * i4]))
                         for i in range(32):
-                            txl.assign(hv[i], txl.reinterpret('uint32', txl.reinterpret('float32', hv[i]) + txl.reinterpret('float32', agv[i])))
+                            txl.assign(hv[i], txl.reinterpret(txl.reinterpret(hv[i], ty='float32') + txl.reinterpret(agv[i], ty='float32'), ty='uint32'))
                     txl.ptx['fence.proxy.async.shared::cta']()
                     for c4 in range(8):
                         tv = [txl.bitwise_and(hv[c4 * 4 + e], txl.uint32(4294959104)) for e in range(4)]
@@ -2915,7 +2925,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                     txl.ptx['fence.proxy.async.shared::cta']()
                     txl.ptx['tcgen05.fence::before_thread_sync']()
                     arrive(BREC7_B_MRDY)
-                with txl.If(m_n > 1), txl.Then():
+                with txl.if_(m_n > 1), txl.then_():
                     mwait(BREC7_B_MDONE, (m_n - 2) % 2)
                     txl.ptx['tcgen05.fence::after_thread_sync']()
                     txl.ptx[BREC7_LD32](*[hv[i] for i in range(32)], txl.cast(taddr + BREC7_TM_DH, 'uint32'))
@@ -2925,7 +2935,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                     for i4 in range(8):
                         txl.ptx.ld.global_.nc.v4.b32(agv[4 * i4], agv[4 * i4 + 1], agv[4 * i4 + 2], agv[4 * i4 + 3], ag.ptr_to([lastb + t * 256 + v0 + 4 * i4]))
                     for i in range(32):
-                        txl.assign(hv[i], txl.reinterpret('uint32', txl.reinterpret('float32', hv[i]) + txl.reinterpret('float32', agv[i])))
+                        txl.assign(hv[i], txl.reinterpret(txl.reinterpret(hv[i], ty='float32') + txl.reinterpret(agv[i], ty='float32'), ty='uint32'))
             cur = REC2_Cursor(cu, nseg, cl)
             with txl.serial(nchunks) as it_c:
                 ci = c_hi - 1 - it_c
@@ -2934,21 +2944,21 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 s2 = it_c % 2
                 t0 = txl.local_scalar('int32', init=cur.t0)
                 nv = txl.local_scalar('int32', init=cur.nv())
-                with txl.If(txl.And(it_c != 0, cur.eos - cur.t0 <= 64)), txl.Then():
+                with txl.if_(txl.And(it_c != 0, cur.eos - cur.t0 <= 64)), txl.then_():
                     for i in range(32):
                         txl.assign(hv[i], txl.uint32(0))
                 mwait(BREC7_B_FULL + stage, it_c // BREC7_NS % 2)
                 if bst:
-                    with txl.If(it_c >= 1), txl.Then():
+                    with txl.if_(it_c >= 1), txl.then_():
                         mwait(BREC7_B_HBF, (it_c - 1) % 2)
                 hb4 = txl.alloc_local((16,), 'uint32')
                 for p in range(16):
-                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])))
+                    txl.assign(hb4[p], KERN_COMMON_pack_bf16(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')))
                 txl.ptx['fence.proxy.async.shared::cta']()
                 for c in range(4):
                     txl.ptx.st.shared.v4.b32(sm.ptr_to([BREC7_HB_S + t * 128 + txl.bitwise_xor(c, txl.bitwise_and(t, 7)) * 16]), hb4[4 * c], hb4[4 * c + 1], hb4[4 * c + 2], hb4[4 * c + 3])
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(BREC7_B_HB)
                 if not summary and not bst:
                     for c in range(4):
@@ -2976,14 +2986,14 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                         hi = txl.local_scalar('float32')
                         KERN_COMMON_unpack_bf16(lw2[j * 2 + hh], lo, hi)
                         dv2 = txl.local_scalar('uint64')
-                        txl.ptx['fma.rn.f32x2'](dv2, txl.cuda.make_float2(txl.reinterpret('float32', acc16[j * 4 + hh * 2]), txl.reinterpret('float32', acc16[j * 4 + hh * 2 + 1])), txl.cuda.make_float2(frh[hh], frh[hh]), txl.cuda.make_float2(lo, hi))
+                        txl.ptx['fma.rn.f32x2'](dv2, txl.cuda.make_float2(txl.reinterpret(acc16[j * 4 + hh * 2], ty='float32'), txl.reinterpret(acc16[j * 4 + hh * 2 + 1], ty='float32')), txl.cuda.make_float2(frh[hh], frh[hh]), txl.cuda.make_float2(lo, hi))
                         ii = j * 4 + hh * 2
                         txl.assign(dvf[ii], txl.cuda.float2_x(dv2))
                         txl.assign(dvf[ii + 1], txl.cuda.float2_y(dv2))
                 rbase = 16 * (t // 32)
                 KERN_COMMON_stsm_c(sm, lambda row, nt: BREC7_DVA_S + row * 128 + txl.bitwise_xor(nt, txl.bitwise_and(row, 7)) * 16, dvf, 4, rbase, lane)
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     arrive(BREC7_B_DVA)
                 if not summary and not bst:
                     assert False, 'v16 brec7 needs bst for dv2_out'
@@ -2997,9 +3007,9 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 arrive(BREC7_B_T1F + s2)
                 for p in range(16):
                     pre = txl.local_scalar('uint64')
-                    txl.ptx['mul.rn.f32x2'](pre, txl.cuda.make_float2(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1])), txl.cuda.make_float2(egl, egl))
-                    txl.assign(hv[2 * p], txl.reinterpret('uint32', txl.cuda.float2_x(pre)))
-                    txl.assign(hv[2 * p + 1], txl.reinterpret('uint32', txl.cuda.float2_y(pre)))
+                    txl.ptx['mul.rn.f32x2'](pre, txl.cuda.make_float2(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32')), txl.cuda.make_float2(egl, egl))
+                    txl.assign(hv[2 * p], txl.reinterpret(txl.cuda.float2_x(pre), ty='uint32'))
+                    txl.assign(hv[2 * p + 1], txl.reinterpret(txl.cuda.float2_y(pre), ty='uint32'))
                 mwait(BREC7_B_T2, it_c % 2)
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 t2v = txl.alloc_local((32,), 'uint32')
@@ -3007,13 +3017,13 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
                 txl.ptx['tcgen05.wait::ld.sync.aligned']()
                 txl.ptx['tcgen05.fence::before_thread_sync']()
                 for p in range(16):
-                    scaled = txl.cuda.make_float2(txl.reinterpret('float32', hv[2 * p]), txl.reinterpret('float32', hv[2 * p + 1]))
+                    scaled = txl.cuda.make_float2(txl.reinterpret(hv[2 * p], ty='float32'), txl.reinterpret(hv[2 * p + 1], ty='float32'))
                     step = txl.local_scalar('uint64')
                     updated = txl.local_scalar('uint64')
-                    txl.ptx['fma.rn.f32x2'](step, txl.cuda.make_float2(txl.reinterpret('float32', t1v[2 * p]), txl.reinterpret('float32', t1v[2 * p + 1])), txl.cuda.make_float2(scale, scale), txl.cuda.make_float2(-txl.reinterpret('float32', t2v[2 * p]), -txl.reinterpret('float32', t2v[2 * p + 1])))
+                    txl.ptx['fma.rn.f32x2'](step, txl.cuda.make_float2(txl.reinterpret(t1v[2 * p], ty='float32'), txl.reinterpret(t1v[2 * p + 1], ty='float32')), txl.cuda.make_float2(scale, scale), txl.cuda.make_float2(-txl.reinterpret(t2v[2 * p], ty='float32'), -txl.reinterpret(t2v[2 * p + 1], ty='float32')))
                     txl.ptx['add.rn.f32x2'](updated, scaled, step)
-                    txl.assign(hv[2 * p], txl.reinterpret('uint32', txl.cuda.float2_x(updated)))
-                    txl.assign(hv[2 * p + 1], txl.reinterpret('uint32', txl.cuda.float2_y(updated)))
+                    txl.assign(hv[2 * p], txl.reinterpret(txl.cuda.float2_x(updated), ty='uint32'))
+                    txl.assign(hv[2 * p + 1], txl.reinterpret(txl.cuda.float2_y(updated), ty='uint32'))
                 cur.retreat()
             if summary:
                 for i4 in range(8):
@@ -3021,7 +3031,7 @@ def BREC7_make_brec7(HV, summary=False, merge=False, hkv=True, bst=False):
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
-        with txl.If(wid == 8), txl.Then():
+        with txl.if_(wid == 8), txl.then_():
             txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](txl.cast(tbase, 'uint32'), txl.uint32(BREC7_TM_COLS))
     return brec7
@@ -3073,9 +3083,10 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
     """
     sT = BPREP2_su64 if ptg else KERN_COMMON_sw256
 
-    @txl.kernel(warps=BPREP2_NW, arch='sm_100a', min_blocks_per_sm=2, grid=(lambda p: [p['num_ctas']]) if persistent else (lambda p: [p['n_chunks'], HV]))
-    def bprep2(q: txl.gptr[txl.bf16], k: txl.gptr[txl.bf16], v: txl.gptr[txl.bf16], do: txl.gptr[txl.bf16], g_cum: txl.gptr[txl.f32], beta: txl.gptr[txl.bf16], a_in: txl.gptr[txl.bf16], cu: txl.gptr[txl.i32], nseg: txl.i32, n_chunks: txl.i32, scale: txl.f32, w_out: txl.gptr[txl.bf16], u_out: txl.gptr[txl.bf16], dvl_out: txl.gptr[txl.bf16], num_ctas: txl.i32):
-        sm = txl.alloc_buffer((BPREP2_SMEM,), txl.u8, scope='shared.dyn', align=1024)
+    @txl.kernel()
+    def bprep2(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), v: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), beta: txl.Tensor((txl.int64(),), txl.bf16), a_in: txl.Tensor((txl.int64(),), txl.bf16), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, n_chunks: txl.int32, scale: txl.float32, w_out: txl.Tensor((txl.int64(),), txl.bf16), u_out: txl.Tensor((txl.int64(),), txl.bf16), dvl_out: txl.Tensor((txl.int64(),), txl.bf16), num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[num_ctas] if persistent else [n_chunks, HV], block=BPREP2_NW * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=2))
+        sm = txl.alloc_tensor((BPREP2_SMEM,), txl.u8, scope='shared.dyn', align=1024)
         cta = txl.cta_id()
         tpar = txl.local_scalar('int32', init=txl.int32(0))
         tid = txl.thread_id()
@@ -3087,11 +3098,11 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
         chh = wid // 4
         r0 = rs * 16
         if ptg:
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 for i_ in range(4):
                     txl.ptx.mbarrier.init.shared.b64(sm.ptr_to([BPREP2_BARS_S + i_ * 8]), txl.uint32(1))
             txl.ptx.fence.mbarrier_init.release.cluster()
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([BPREP2_BARS_S + 32]), txl.uint32(256))
                 txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.fence::before_thread_sync']()
@@ -3106,7 +3117,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
             return txl.bitwise_or(txl.uint64(base), txl.cast(txl.bitwise_and(txl.shift_right(addr, txl.uint32(4)), txl.uint32(16383)), 'uint64'))
 
         def issue(d_col, a_off, a_base, a_step, b_off, b_base, b_step, nk, idesc, bar_i):
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 leader = txl.cuda.elect_sync()
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3118,7 +3129,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
 
         def tm_ld(dst, d_col, bar_i, ncols, fence=True):
             ready = txl.local_scalar('uint32', init=txl.uint32(0))
-            with txl.While(ready == txl.uint32(0)):
+            with txl.while_(ready == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, sm.ptr_to([BPREP2_BARS_S + bar_i * 8]), txl.cast(tpar, 'uint32'))
             if fence:
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3128,7 +3139,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
             txl.ptx[BPREP2_LD256X8 if ncols == 64 else BPREP2_LD256X4](*[raw[i] for i in range(nr)], txl.cast(tbase + txl.shift_left(txl.cast(rs * 32, 'uint32'), txl.uint32(16)) + d_col + chh * ncols, 'uint32'))
             txl.ptx['tcgen05.wait::ld.sync.aligned']()
             for i in range(nr):
-                txl.assign(dst[i], txl.reinterpret('float32', raw[i]))
+                txl.assign(dst[i], txl.reinterpret(raw[i], ty='float32'))
 
         def ld_sf(off):
             r = txl.local_scalar('float32')
@@ -3138,7 +3149,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
             c = txl.local_scalar('int32', init=c_in)
             head = txl.local_scalar('int32', init=head_in)
             t0, nv = INTRA_chunk_lookup(cu, nseg, c)
-            with txl.If(nv > 0), txl.Then():
+            with txl.if_(nv > 0), txl.then_():
                 for it in range(16 * 64 // BPREP2_NT):
                     idx = it * BPREP2_NT + tid
                     row = idx // 16
@@ -3154,14 +3165,14 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
                     ok = row < nv
                     srow = txl.if_then_else(ok, t0 + row, t0)
                     txl.ptx[BPREP2_CP16](sm.ptr_to([BPREP2_AB_S + KERN_COMMON_sw128(row, ch)]), a_in.ptr_to([(srow * HV + head) * 64 + ch * 8]), 16, txl.cast(txl.if_then_else(txl.And(ok, ch <= row // 8), 16, 0), 'uint32'))
-                with txl.If(tid < 64), txl.Then():
+                with txl.if_(tid < 64), txl.then_():
                     ok = tid < nv
                     srow = txl.if_then_else(ok, t0 + tid, t0)
                     txl.ptx[BPREP2_CP4](sm.ptr_to([BPREP2_G_S + tid * 4]), g_cum.ptr_to([srow * HV + head]), 4, txl.cast(txl.if_then_else(ok, 4, 0), 'uint32'))
                 txl.ptx.cp.async_.commit_group()
-                with txl.If(tid < 64), txl.Then():
+                with txl.if_(tid < 64), txl.then_():
                     bv = txl.local_scalar('float32', init=txl.float32(0.0))
-                    with txl.If(tid < nv), txl.Then():
+                    with txl.if_(tid < nv), txl.then_():
                         bits = txl.local_scalar('uint16')
                         txl.ptx.ld.global_.b16(bits, beta.ptr_to([(t0 + tid) * HV + head]))
                         txl.ptx.cvt.f32.bf16(bv, bits)
@@ -3273,7 +3284,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
                     idx = it * BPREP2_NT + tid
                     row = idx // 16
                     ch = idx % 16
-                    with txl.If(row < nv), txl.Then():
+                    with txl.if_(row < nv), txl.then_():
                         for stg, dst in ((BPREP2_K_S, u_out), (BPREP2_Q_S, w_out), (BPREP2_DO_S, dvl_out)):
                             wd = txl.alloc_local((4,), 'uint32')
                             txl.ptx.ld.shared.v4.b32(wd[0], wd[1], wd[2], wd[3], sm.ptr_to([stg + KERN_COMMON_sw256(row, ch)]))
@@ -3290,7 +3301,7 @@ def BPREP2_make_bprep2(HV, ptg=False, persistent=False):
             txl.ptx['tcgen05.fence::before_thread_sync']()
             txl.cuda.cta_sync()
             txl.ptx['tcgen05.fence::after_thread_sync']()
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](tbase, txl.uint32(256))
     return bprep2
 
@@ -3384,11 +3395,6 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
     sA = BGRAD2_su64 if tgemm else KERN_COMMON_sw256
     sH = BGRAD2_su128 if tgemm else KERN_COMMON_sw256
     # kvl: h / dh arrive as [chunk, HV, K, V] (FLA's orientation): conflict-free tree loads.
-    if persistent:
-        grid = (lambda p: [p['num_ctas']]) if static_ctas is None else [static_ctas]
-    else:
-        grid = (lambda p: [p['n_chunks'], HV]) if static_chunks is None else [static_chunks, HV]
-
     def prepare_host(params):
         maps = []
         for name in ('q', 'k', 'do', 'v'):
@@ -3403,10 +3409,16 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             maps.append(desc)
         return tuple(maps)
 
-    @txl.kernel(warps=BGRAD2_NW, arch='sm_100a', grid=grid, host_prelude=prepare_host)
-    def bgrad2(q: txl.gptr[txl.bf16], k: txl.gptr[txl.bf16], v: txl.gptr[txl.bf16], do: txl.gptr[txl.bf16], vn: txl.gptr[txl.bf16], dv2: txl.gptr[txl.bf16], h: txl.gptr[txl.bf16], dh: txl.gptr[txl.bf16], g_cum: txl.gptr[txl.f32], beta: txl.gptr[txl.bf16], a_in: txl.gptr[txl.bf16], cu: txl.gptr[txl.i32], nseg: txl.i32, n_chunks: txl.i32, num_ctas: txl.i32, scale: txl.f32, dq_out: txl.gptr[txl.bf16], dk_out: txl.gptr[txl.bf16], dv_out: txl.gptr[txl.bf16], dg_out: txl.gptr[txl.f32], db_out: txl.gptr[txl.bf16], S: txl.i32, *, host):
+    @txl.kernel()
+    def bgrad2(q: txl.Tensor((txl.int64(),), txl.bf16), k: txl.Tensor((txl.int64(),), txl.bf16), v: txl.Tensor((txl.int64(),), txl.bf16), do: txl.Tensor((txl.int64(),), txl.bf16), vn: txl.Tensor((txl.int64(),), txl.bf16), dv2: txl.Tensor((txl.int64(),), txl.bf16), h: txl.Tensor((txl.int64(),), txl.bf16), dh: txl.Tensor((txl.int64(),), txl.bf16), g_cum: txl.Tensor((txl.int64(),), txl.f32), beta: txl.Tensor((txl.int64(),), txl.bf16), a_in: txl.Tensor((txl.int64(),), txl.bf16), cu: txl.Tensor((txl.int64(),), txl.i32), nseg: txl.int32, n_chunks: txl.int32, num_ctas: txl.int32, scale: txl.float32, dq_out: txl.Tensor((txl.int64(),), txl.bf16), dk_out: txl.Tensor((txl.int64(),), txl.bf16), dv_out: txl.Tensor((txl.int64(),), txl.bf16), dg_out: txl.Tensor((txl.int64(),), txl.f32), db_out: txl.Tensor((txl.int64(),), txl.bf16), S: txl.int32):
+        host = prepare_host(dict(q=q, k=k, do=do, v=v, S=S))
+        if persistent:
+            grid = [num_ctas] if static_ctas is None else [static_ctas]
+        else:
+            grid = [n_chunks, HV] if static_chunks is None else [static_chunks, HV]
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid, block=BGRAD2_NW * 32))
         q_map, k_map, do_map, v_map = host
-        sm = txl.alloc_buffer((BGRAD2_SMEM + 512 + 64,), txl.u8, scope='shared.dyn', align=1024)
+        sm = txl.alloc_tensor((BGRAD2_SMEM + 512 + 64,), txl.u8, scope='shared.dyn', align=1024)
         bnext = txl.local_scalar('uint16', init=txl.uint16(0))
         cta = txl.cta_id()
         tpar = txl.local_scalar('int32', init=txl.int32(0))
@@ -3419,14 +3431,14 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
         chh = wid // 4
         r0 = rs * 16
         if tgemm:
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 for i_ in range(14):
                     txl.ptx.mbarrier.init.shared.b64(sm.ptr_to([BGRAD2_BARS_S + i_ * 8]), txl.uint32(1))
                 txl.ptx.mbarrier.init.shared.b64(sm.ptr_to([BGRAD2_BARS_S + 14 * 8]), txl.uint32(BGRAD2_NW))
                 txl.ptx.mbarrier.init.shared.b64(sm.ptr_to([BGRAD2_BARS_S + 15 * 8]), txl.uint32(1))
                 txl.ptx.mbarrier.init.shared.b64(sm.ptr_to([BGRAD2_SMEM + 512]), txl.uint32(1))
             txl.ptx.fence.mbarrier_init.release.cluster()
-        with txl.If(wid == 0), txl.Then():
+        with txl.if_(wid == 0), txl.then_():
             txl.ptx['tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32'](sm.ptr_to([BGRAD2_RED_S]), txl.uint32(TCOLS))
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
@@ -3445,7 +3457,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             order), all K-major SW128 (A: 64-row atoms, B: n-row atoms); K steps in increasing order
             like the mma.sync chains.
             """
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 leader = txl.cuda.elect_sync()
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3461,7 +3473,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             D[64 x 128] = A^T @ B with A the [64 i][64 j] bf16 sw128 tile (A^T: M = j MN-major) and
             B a [64 i][128 n] su64 tile (MN-major); K = i in 4 steps of 16 rows.
             """
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 leader = txl.cuda.elect_sync()
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3480,7 +3492,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             """
             Write a 64-column fragment back to its accumulator position (16x256b, the tm_ld layout).
             """
-            txl.ptx[BGRAD2_ST256X8](frag_addr(d_col), *[txl.reinterpret('uint32', src[i]) for i in range(32)])
+            txl.ptx[BGRAD2_ST256X8](frag_addr(d_col), *[txl.reinterpret(src[i], ty='uint32') for i in range(32)])
             txl.ptx['tcgen05.wait::st.sync.aligned']()
 
         def issue_acc(d_col, a_off, a_base, b_off, idesc, bar_i, fresh=False):
@@ -3489,7 +3501,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             ds, MN-major: ds^T), B a [64 tok][128] su64 tile read MN-major. Accumulates onto the
             written-back D.
             """
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 leader = txl.cuda.elect_sync()
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3507,7 +3519,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             D[64 x 64] = A @ B over K = 64 with sw128 [64][64] operand tiles (K-major: +32 B per
             k-step, MN-major: +16 rows per k-step).
             """
-            with txl.If(wid == 0), txl.Then():
+            with txl.if_(wid == 0), txl.then_():
                 leader = txl.cuda.elect_sync()
                 txl.ptx['tcgen05.fence::after_thread_sync']()
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3528,7 +3540,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             t4, 2 t4 + 1).
             """
             ready = txl.local_scalar('uint32', init=txl.uint32(0))
-            with txl.While(ready == txl.uint32(0)):
+            with txl.while_(ready == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(ready, sm.ptr_to([BGRAD2_BARS_S + bar_i * 8]), txl.cast(tpar, 'uint32'))
             if fence:
                 txl.ptx['fence.proxy.async.shared::cta']()
@@ -3538,7 +3550,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             txl.ptx[BGRAD2_LD256X8 if ncols == 64 else BGRAD2_LD256X4](*[raw[i] for i in range(nr)], txl.cast(tbase + txl.shift_left(txl.cast(rs * 32, 'uint32'), txl.uint32(16)) + d_col + chh * ncols, 'uint32'))
             txl.ptx['tcgen05.wait::ld.sync.aligned']()
             for i in range(nr):
-                txl.assign(dst[i], txl.reinterpret('float32', raw[i]))
+                txl.assign(dst[i], txl.reinterpret(raw[i], ty='float32'))
 
         def ld_sf(off):
             r = txl.local_scalar('float32')
@@ -3632,16 +3644,16 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             out = txl.local_scalar('float32', init=x)
             for off in (1, 2):
                 sh = txl.local_scalar('uint32')
-                txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret('uint32', out), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
-                txl.assign(out, out + txl.reinterpret('float32', sh))
+                txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret(out, ty='uint32'), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
+                txl.assign(out, out + txl.reinterpret(sh, ty='float32'))
             return out
 
         def warp_sum(x):
             out = txl.local_scalar('float32', init=x)
             for off in (16, 8, 4, 2, 1):
                 sh = txl.local_scalar('uint32')
-                txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret('uint32', out), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
-                txl.assign(out, out + txl.reinterpret('float32', sh))
+                txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret(out, ty='uint32'), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
+                txl.assign(out, out + txl.reinterpret(sh, ty='float32'))
             return out
 
         def row_partial(slot, vals):
@@ -3650,7 +3662,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             """
             for hh in range(2):
                 s_ = quad_sum(vals[hh])
-                with txl.If(t4 == 0), txl.Then():
+                with txl.if_(t4 == 0), txl.then_():
                     st_sf(BGRAD2_RED_S + ((slot * 2 + chh) * 64 + r0 + g8 + 8 * hh) * 4, s_)
 
         def row_total(slot, row):
@@ -3670,10 +3682,10 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             # Private recurrence scratch is produced in the exact physical
             # su64/su128 layouts consumed here: six contiguous 16 KiB copies
             # replace the h, dh, vn and dv2 per-lane issue trains.
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.ptx['fence.proxy.async.shared::cta']()
                 txl.ptx.mbarrier.arrive.expect_tx.shared.b64(sm.ptr_to([BGRAD2_BARS_S + 15 * 8]), txl.uint32(98304 - 16384 + 2 * 16384))
-                with txl.If(need_early), txl.Then():
+                with txl.if_(need_early), txl.then_():
                     txl.ptx['fence.proxy.async.shared::cta']()
                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(sm.ptr_to([BGRAD2_SMEM + 512]), txl.uint32(3 * 16384))
                     for tmap, dst in ((q_map, BGRAD2_Q_S), (v_map, BGRAD2_V_S)):
@@ -3699,14 +3711,14 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 ok = row < nv
                 srow = txl.if_then_else(ok, t0 + row, t0)
                 txl.ptx[BGRAD2_CP16](sm.ptr_to([BGRAD2_A_S + KERN_COMMON_sw128(row, ch)]), a_in.ptr_to([(srow * HV + head) * 64 + ch * 8]), 16, txl.cast(txl.if_then_else(txl.And(ok, ch <= row // 8), 16, 0), 'uint32'))
-            with txl.If(tid < 64), txl.Then():
+            with txl.if_(tid < 64), txl.then_():
                 ok = tid < nv
                 srow = txl.if_then_else(ok, t0 + tid, t0)
                 txl.ptx[BGRAD2_CP4](sm.ptr_to([gS_ + tid * 4]), g_cum.ptr_to([srow * HV + head]), 4, txl.cast(txl.if_then_else(ok, 4, 0), 'uint32'))
             txl.ptx.cp.async_.commit_group()
-            with txl.If(tid < 64), txl.Then():
+            with txl.if_(tid < 64), txl.then_():
                 txl.assign(bnext, txl.uint16(0))
-                with txl.If(tid < nv), txl.Then():
+                with txl.if_(tid < nv), txl.then_():
                     txl.ptx.ld.global_.b16(bnext, beta.ptr_to([(t0 + tid) * HV + head]))
 
         def tile(c_in, head_in, par, active, nxt_in):
@@ -3717,7 +3729,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             bS = txl.if_then_else(tpar == 0, BGRAD2_B_S, B3B_S)
             t0 = txl.local_scalar('int32', init=p_t0)
             nv = txl.local_scalar('int32', init=p_nv)
-            with txl.If(nxt >= 0), txl.Then():
+            with txl.if_(nxt >= 0), txl.then_():
                 nx_c = txl.local_scalar('int32', init=nxt // HV)
                 nt0_, nnv_ = INTRA_chunk_lookup(cu, nseg, nx_c)
                 txl.assign(q_t0, nt0_)
@@ -3725,7 +3737,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
             # The persistent CTA will bulk-copy these four contiguous private
             # tensors only after finishing the current tile.  Pull the next
             # tile toward L2 now, while the current tensor-core DAG executes.
-            with txl.If(txl.And(nxt >= 0, tid == 0)), txl.Then():
+            with txl.if_(txl.And(nxt >= 0, tid == 0)), txl.then_():
                 pf128 = txl.cast(nxt, 'int64') * 16384
                 pf64 = txl.cast(nxt, 'int64') * 8192
                 txl.ptx['cp.async.bulk.prefetch.L2.global'](h.ptr_to([pf128]), txl.uint32(32768))
@@ -3733,17 +3745,17 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 txl.ptx['cp.async.bulk.prefetch.L2.global'](vn.ptr_to([pf64]), txl.uint32(16384))
                 txl.ptx['cp.async.bulk.prefetch.L2.global'](dv2.ptr_to([pf64]), txl.uint32(16384))
             gl_t = txl.local_scalar('float32', init=txl.float32(0.0))
-            with txl.If(txl.And(active, nv > 0)), txl.Then():
-                with txl.If(tid < 64), txl.Then():
+            with txl.if_(txl.And(active, nv > 0)), txl.then_():
+                with txl.if_(tid < 64), txl.then_():
                     bv = txl.local_scalar('float32')
                     txl.ptx.cvt.f32.bf16(bv, bnext)
                     st_sf(bS + tid * 4, bv)
                 txl.ptx.cp.async_.wait_group(0)
                 bulk_ready = txl.local_scalar('uint32', init=txl.uint32(0))
-                with txl.While(bulk_ready == txl.uint32(0)):
+                with txl.while_(bulk_ready == txl.uint32(0)):
                     txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(bulk_ready, sm.ptr_to([BGRAD2_BARS_S + 15 * 8]), txl.cast(tpar, 'uint32'))
                 early_ready = txl.local_scalar('uint32', init=txl.uint32(0))
-                with txl.While(early_ready == txl.uint32(0)):
+                with txl.while_(early_ready == txl.uint32(0)):
                     txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(early_ready, sm.ptr_to([BGRAD2_SMEM + 512]), txl.cast(tpar, 'uint32'))
                 txl.ptx['fence.proxy.async.shared::cta']()
                 if tgemm:
@@ -3753,7 +3765,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     issue_64x128(BGRAD2_TM_DS, BGRAD2_DO_S, BGRAD2_VN_S, 3, n=64)
                     issue_64x128(BGRAD2_TM_ACC0, BGRAD2_DO_S, BGRAD2_HT_S, 0)
                     issue_64x128(BGRAD2_TM_ACC1, BGRAD2_VN_S, BGRAD2_DHT_S, 1)
-                with txl.If(txl.And(nxt >= 0, tid == 0)), txl.Then():
+                with txl.if_(txl.And(nxt >= 0, tid == 0)), txl.then_():
                     nx_h = txl.local_scalar('int32', init=nxt % HV)
                     for tmap in (do_map, q_map, k_map, v_map):
                         txl.ptx['cp.async.bulk.prefetch.tensor.3d.L2.global.tile'](
@@ -3766,7 +3778,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 egli_r = [txl.local_scalar('float32', init=txl.if_then_else(r0 + g8 + 8 * h_ < nv, KERN_COMMON_exp2(gl - gi_r[h_]), txl.float32(0.0))) for h_ in range(2)]
                 jq0 = chh * 32
                 gj_r = [txl.local_scalar('float32', init=ld_sf(gS + (jq0 + nt_ * 8 + 2 * t4 + e_) * 4)) for nt_ in range(4) for e_ in range(2)]
-                with txl.If(wid < 4), txl.Then():
+                with txl.if_(wid < 4), txl.then_():
 
                     def vec_(base, p_):
                         r_ = p_ // 4
@@ -3806,9 +3818,9 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     txl.ptx.cvt.f32.bf16(bacc, tsum)
                     for off in (16, 8, 4, 2, 1):
                         sh = txl.local_scalar('uint32')
-                        txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret('uint32', bacc), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
-                        txl.assign(bacc, KERN_COMMON_bf16_round(bacc + txl.reinterpret('float32', sh)))
-                    with txl.If(lane == 0), txl.Then():
+                        txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret(bacc, ty='uint32'), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
+                        txl.assign(bacc, KERN_COMMON_bf16_round(bacc + txl.reinterpret(sh, ty='float32')))
+                    with txl.if_(lane == 0), txl.then_():
                         st_sf(BGRAD2_RED_S + (384 + wid) * 4, bacc)
                 ds = txl.alloc_local((16,), 'float32')
                 KERN_COMMON_zero(ds, 16)
@@ -3855,7 +3867,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     for e in range(4):
                         txl.assign(p2, p2 + dk[nt * 4 + e] * c_val(kpk, nt, e))
                 wsum2 = warp_sum(p2)
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     st_sf(BGRAD2_RED_S + (392 + wid) * 4, wsum2)
                 tm_st(dk, BGRAD2_TM_ACC1)
                 txl.ptx['tcgen05.fence::before_thread_sync']()
@@ -3867,7 +3879,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 for nt in range(8):
                     for half in range(2):
                         row = r0 + g8 + 8 * half
-                        with txl.If(row < nv), txl.Then():
+                        with txl.if_(row < nv), txl.then_():
                             txl.ptx.st.global_.b32(dq_out.ptr_to([((t0 + row) * HV + head) * 128 + kc + nt * 8 + 2 * t4]), KERN_COMMON_pack_bf16(dq[nt * 4 + half * 2], dq[nt * 4 + half * 2 + 1]))
                 tm_ld(dk, BGRAD2_TM_ACC1, 9, fence=False)
                 dgp = txl.alloc_local((2,), 'float32')
@@ -3879,7 +3891,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                         txl.ptx[BGRAD2_LD256X4](*[rq[i] for i in range(16)], frag_addr(BGRAD2_TM_ACC0 + strip * 32))
                         txl.ptx['tcgen05.wait::ld.sync.aligned']()
                         for i in range(16):
-                            txl.assign(dqs[i], txl.reinterpret('float32', rq[i]))
+                            txl.assign(dqs[i], txl.reinterpret(rq[i], ty='float32'))
                     else:
                         txl.ptx[BGRAD2_TMEM_LD16](*(dqs[i] for i in range(16)), txl.cast(tbase + wid * 32 + strip * 16, 'uint32'))
                         txl.ptx['tcgen05.wait::ld.sync.aligned']()
@@ -3890,11 +3902,11 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 row_partial(0, dgp)
                 txl.ptx['tcgen05.fence::before_thread_sync']()
                 txl.ptx['bar.warp.sync'](txl.uint32(4294967295))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     txl.ptx.mbarrier.arrive.shared.b64(sm.ptr_to([BGRAD2_BARS_S + 14 * 8]))
-                with txl.If(wid == 0), txl.Then():
+                with txl.if_(wid == 0), txl.then_():
                     retired = txl.local_scalar('uint32', init=txl.uint32(0))
-                    with txl.While(retired == txl.uint32(0)):
+                    with txl.while_(retired == txl.uint32(0)):
                         txl.ptx.mbarrier.try_wait.parity.acquire.cta.shared__cta.b64(retired, sm.ptr_to([BGRAD2_BARS_S + 14 * 8]), txl.cast(tpar, 'uint32'))
                 if tgemm:
                     issue_64x128(BGRAD2_TM_ACC1, BGRAD2_K_S, BGRAD2_K_S, 4, n=64)
@@ -4003,7 +4015,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 for nt in range(8):
                     for half in range(2):
                         row = r0 + g8 + 8 * half
-                        with txl.If(row < nv), txl.Then():
+                        with txl.if_(row < nv), txl.then_():
                             txl.ptx.st.global_.b32(dv_out.ptr_to([((t0 + row) * HV + head) * 128 + kc + nt * 8 + 2 * t4]), KERN_COMMON_pack_bf16(dvb[nt * 4 + half * 2], dvb[nt * 4 + half * 2 + 1]))
                 for nt in range(4):
                     for e in range(4):
@@ -4027,7 +4039,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 KERN_COMMON_zero(d1, 16)
                 if tgemm:
                     issue_6464(128, BGRAD2_DA0_S, BGRAD2_DESC_K, BGRAD2_A_S, BGRAD2_DESC_K, BGRAD2_ID_64x64_KK, 12)
-                    with txl.If(txl.And(nxt >= 0, tid == 0)), txl.Then():
+                    with txl.if_(txl.And(nxt >= 0, tid == 0)), txl.then_():
                         ex_h = txl.local_scalar('int32', init=nxt % HV)
                         txl.ptx['fence.proxy.async.shared::cta']()
                         txl.ptx.mbarrier.arrive.expect_tx.shared.b64(sm.ptr_to([BGRAD2_SMEM + 512]), txl.uint32(3 * 16384))
@@ -4070,9 +4082,9 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 for i in range(8):
                     for off in (4, 8, 16):
                         sh = txl.local_scalar('uint32')
-                        txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret('uint32', colp[i]), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
-                        txl.assign(colp[i], colp[i] + txl.reinterpret('float32', sh))
-                with txl.If(g8 == 0), txl.Then():
+                        txl.ptx.shfl_sync.bfly.b32(sh, txl.reinterpret(colp[i], ty='uint32'), txl.uint32(off), txl.uint32(31), txl.uint32(4294967295))
+                        txl.assign(colp[i], colp[i] + txl.reinterpret(sh, ty='float32'))
+                with txl.if_(g8 == 0), txl.then_():
                     for nt in range(4):
                         for e2 in range(2):
                             st_sf(BGRAD2_RED_S + (512 + rs * 64 + jq0 + nt * 8 + 2 * t4 + e2) * 4, colp[nt * 2 + e2])
@@ -4100,7 +4112,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     txl.ptx[BGRAD2_LD256X4](*[rk[i] for i in range(16)], frag_addr(BGRAD2_TM_ACC0 + strip * 32))
                     txl.ptx['tcgen05.wait::ld.sync.aligned']()
                     for i in range(16):
-                        txl.assign(dkws[i], txl.reinterpret('float32', rk[i]))
+                        txl.assign(dkws[i], txl.reinterpret(rk[i], ty='float32'))
                     txl.ptx['tcgen05.wait::ld.sync.aligned']()
                     for jp in range(8):
                         j = jp * 2
@@ -4125,22 +4137,22 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                 for nt in range(8):
                     for half in range(2):
                         row = r0 + g8 + 8 * half
-                        with txl.If(row < nv), txl.Then():
+                        with txl.if_(row < nv), txl.then_():
                             txl.ptx.st.global_.b32(dk_out.ptr_to([((t0 + row) * HV + head) * 128 + kc + nt * 8 + 2 * t4]), KERN_COMMON_pack_bf16(dkb[nt * 4 + half * 2], dkb[nt * 4 + half * 2 + 1]))
                 row_partial(1, dbp)
                 row_partial(2, g2p)
                 txl.cuda.cta_sync()
-            with txl.If(nxt >= 0), txl.Then():
+            with txl.if_(nxt >= 0), txl.then_():
                 # Head-fast work IDs make neighboring persistent CTAs consume the same
                 # chunk's contiguous head slabs.  This preserves per-tile arithmetic while
                 # improving locality for every [token, head, channel] input/output.
                 issue_loads(nxt // HV, nxt % HV, txl.if_then_else(tpar == 0, B3G_S, BGRAD2_G_S), txl.Not(txl.And(active, nv > 0)))
-            with txl.If(txl.And(active, nv > 0)), txl.Then():
-                with txl.If(tid < 64), txl.Then():
+            with txl.if_(txl.And(active, nv > 0)), txl.then_():
+                with txl.if_(tid < 64), txl.then_():
                     i = tid
                     db_ = row_total(1, i)
-                    with txl.If(i < nv), txl.Then():
-                        txl.ptx.st.global_.b16(db_out.ptr_to([(t0 + i) * HV + head]), txl.reinterpret('uint16', txl.cast(db_, 'bfloat16')))
+                    with txl.if_(i < nv), txl.then_():
+                        txl.ptx.st.global_.b16(db_out.ptr_to([(t0 + i) * HV + head]), txl.reinterpret(txl.cast(db_, 'bfloat16'), ty='uint16'))
                     hdh = KERN_COMMON_bf16_round(KERN_COMMON_bf16_round(ld_sf(BGRAD2_RED_S + 384 * 4) + ld_sf(BGRAD2_RED_S + 386 * 4)) + KERN_COMMON_bf16_round(ld_sf(BGRAD2_RED_S + 385 * 4) + ld_sf(BGRAD2_RED_S + 387 * 4)))
                     dkk = txl.local_scalar('float32', init=txl.float32(0.0))
                     for w_ in range(BGRAD2_NW):
@@ -4151,7 +4163,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     dga2 = txl.if_then_else(i == nv - 1, dga + dgl, dga)
                     st_sf(gS + i * 4, txl.if_then_else(i < nv, dga2 + (row_total(2, i) - colsum), txl.float32(0.0)))
                 txl.cuda.cta_sync()
-                with txl.If(wid == 0), txl.Then():
+                with txl.if_(wid == 0), txl.then_():
                     x0 = txl.local_scalar('float32', init=ld_sf(gS + lane * 4))
                     x1 = txl.local_scalar('float32', init=ld_sf(gS + 128 + lane * 4))
                     c0 = txl.local_scalar('float32', init=x0)
@@ -4159,15 +4171,15 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     for off in (1, 2, 4, 8, 16):
                         for x in (c0, c1):
                             up = txl.local_scalar('uint32')
-                            txl.ptx.shfl_sync.up.b32(up, txl.reinterpret('uint32', x), txl.uint32(off), txl.uint32(0), txl.uint32(4294967295))
-                            txl.assign(x, txl.if_then_else(lane >= off, txl.reinterpret('float32', up) + x, x))
+                            txl.ptx.shfl_sync.up.b32(up, txl.reinterpret(x, ty='uint32'), txl.uint32(off), txl.uint32(0), txl.uint32(4294967295))
+                            txl.assign(x, txl.if_then_else(lane >= off, txl.reinterpret(up, ty='float32') + x, x))
                     sh = txl.local_scalar('uint32')
-                    txl.ptx.shfl_sync.idx.b32(sh, txl.reinterpret('uint32', c0), txl.uint32(31), txl.uint32(31), txl.uint32(4294967295))
-                    txl.assign(c1, c1 + txl.reinterpret('float32', sh))
+                    txl.ptx.shfl_sync.idx.b32(sh, txl.reinterpret(c0, ty='uint32'), txl.uint32(31), txl.uint32(31), txl.uint32(4294967295))
+                    txl.assign(c1, c1 + txl.reinterpret(sh, ty='float32'))
                     z = warp_sum(x0 + x1)
-                    with txl.If(lane < nv), txl.Then():
+                    with txl.if_(lane < nv), txl.then_():
                         txl.ptx.st.global_.f32(dg_out.ptr_to([(t0 + lane) * HV + head]), -c0 + z + x0)
-                    with txl.If(lane + 32 < nv), txl.Then():
+                    with txl.if_(lane + 32 < nv), txl.then_():
                         txl.ptx.st.global_.f32(dg_out.ptr_to([(t0 + lane + 32) * HV + head]), -c1 + z + x1)
             txl.assign(p_t0, q_t0)
             txl.assign(p_nv, q_nv)
@@ -4187,7 +4199,7 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
         txl.ptx['tcgen05.fence::before_thread_sync']()
         txl.cuda.cta_sync()
         txl.ptx['tcgen05.fence::after_thread_sync']()
-        with txl.If(wid == 0), txl.Then():
+        with txl.if_(wid == 0), txl.then_():
             txl.ptx['tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned']()
             txl.ptx['tcgen05.dealloc.cta_group::1.sync.aligned.b32'](tbase, txl.uint32(TCOLS))
     return bgrad2
@@ -4204,47 +4216,20 @@ PACK_P = 3
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def launch_tags(func):
-    """
-    Launch-parameter tags of a TIRx-lite entry: one blockIdx axis per T.cta_id dimension, then
-    threadIdx.x.
-    """
-    m = re.search(r"T\.cta_id\(\[([^\]]*)\]", func.script())
-    ndim = len(m.group(1).split(",")) if m else 1
-    return ["blockIdx.x", "blockIdx.y", "blockIdx.z"][:ndim] + ["threadIdx.x"]
-
-
-def compile_kernel(kernel, pdl=False):
+def compile_kernel(kernel):
     """
     Compile a traced kernel once and return its entry function (Executable.__call__ re-resolves it
-    on every call); the executable stays alive in EXECUTABLES. pdl adds the programmatic dependent
-    launch attribute. nvcc runs without --use_fast_math, as the kernels were evolved, for these
-    kernels only.
+    on every call); the executable stays alive in EXECUTABLES. TARGET runs nvcc without
+    --use_fast_math, as the kernels were evolved.
     """
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
-    mod = kernel.mod
-    if pdl:
-        func = mod["main"]
-        params = launch_tags(func) + ["tirx.use_programtic_dependent_launch", "tirx.use_dyn_shared_memory"]
-        mod = tvm.IRModule({"main": func.with_attr("tirx.kernel_launch_params", params)})
-    previous = os.environ.get("TVM_CUDA_NVCC_NO_FAST_MATH")
-    os.environ["TVM_CUDA_NVCC_NO_FAST_MATH"] = "1"
-    try:
-        with target:
-            ex = tvm.compile(mod, target=target, tir_pipeline="tirx")
-    finally:
-        if previous is None:
-            os.environ.pop("TVM_CUDA_NVCC_NO_FAST_MATH", None)
-        else:
-            os.environ["TVM_CUDA_NVCC_NO_FAST_MATH"] = previous
+    ex = kernel.compile(TARGET)
     EXECUTABLES.append(ex)
     return ex["main"]
 
 
 class LazyKernels:
     """
-    Trace and compile each kernel on first use (a name ending in _pdl gets programmatic dependent
-    launch).
+    Trace and compile each kernel on first use.
     """
 
     def __init__(self, builders):
@@ -4253,7 +4238,7 @@ class LazyKernels:
 
     def __getitem__(self, name):
         if name not in self.done:
-            self.done[name] = compile_kernel(self.builders[name](), pdl=name.endswith("_pdl"))
+            self.done[name] = compile_kernel(self.builders[name]())
         return self.done[name]
 
 
@@ -4274,7 +4259,7 @@ def bwd_kernels(HV):
         "rec_h": lambda: REC7_make_rec7(HV, with_o=False, store_h=True, hst=True, v16=True),
         "rec_h64": lambda: REC7_make_rec7(HV, with_o=False, store_h=True, hst=True, v16=True, vb=64, nz=2),
         "rec_h128": lambda: REC7_make_rec7(HV, with_o=False, store_h=True, hst=True, v16=True, vb=128, nz=4),
-        "rec_h64x4_pdl": lambda: REC7_make_rec7(HV, with_o=False, store_h=True, hst=True, v16=True, vb=64, nz=4),
+        "rec_h64x4_pdl": lambda: REC7_make_rec7(HV, with_o=False, store_h=True, hst=True, v16=True, vb=64, nz=4, pdl=True),
         "bsum7": lambda: BSUM7_make_bsum7(HV, rawneg=True),
         "bsum7s": lambda: BSUM7_make_bsum7(HV, store=True, rawneg=True, lst=True),
         "brec7m": lambda: BREC7_make_brec7(HV, merge=True, bst=True),

@@ -29,17 +29,19 @@ replay's words).
 
 Evolved with TIRx-harness: run segment_sum, frontier member compact-swizzle-tagreduce (commit
 3bc9af80, 181.894 us vs 640.179 us, 3.52x over the previous SM100 path in the task's benchmark).
-Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on
-torch's current stream.
+Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through
+tvm-ffi on torch's current stream.
 """
 
 import functools
 import math
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
 
 __all__ = ["segment_sum_sm100"]
 
@@ -110,7 +112,7 @@ def load_vec(x, idx, dtype, vec, esz, dst, pred):
         w = txl.alloc_local([nw], "uint32")
         for i in range(nw):
             txl.assign(w[i], txl.uint32(0))
-        with txl.If(pred), txl.Then():
+        with txl.if_(pred), txl.then_():
             if nw == 4:
                 txl.ptx.ld.global_.v4.b32(w[0], w[1], w[2], w[3], x.ptr_to([idx]))
             elif nw == 2:
@@ -119,19 +121,19 @@ def load_vec(x, idx, dtype, vec, esz, dst, pred):
                 txl.ptx.ld.global_.b32(w[0], x.ptr_to([idx]))
         for i in range(nw):
             if dtype == "float32":
-                txl.assign(dst[i], txl.reinterpret("float32", w[i]))
+                txl.assign(dst[i], txl.reinterpret(w[i], ty="float32"))
             elif dtype == "bfloat16":
-                txl.assign(dst[2 * i], txl.reinterpret("float32", w[i] << txl.uint32(16)))
-                txl.assign(dst[2 * i + 1], txl.reinterpret("float32", w[i] & txl.uint32(0xFFFF0000)))
+                txl.assign(dst[2 * i], txl.reinterpret(w[i] << txl.uint32(16), ty="float32"))
+                txl.assign(dst[2 * i + 1], txl.reinterpret(w[i] & txl.uint32(0xFFFF0000), ty="float32"))
             else:
                 txl.idioms.cast_f16x2_to_f32x2(dst, i, w[i])
     else:  # one 16-bit element
         h = txl.alloc_local([1], "uint16")
         txl.assign(h[0], txl.uint16(0))
-        with txl.If(pred), txl.Then():
+        with txl.if_(pred), txl.then_():
             txl.ptx.ld.global_.b16(h[0], x.ptr_to([idx]))
         if dtype == "bfloat16":
-            txl.assign(dst[0], txl.reinterpret("float32", txl.cast(h[0], "uint32") << txl.uint32(16)))
+            txl.assign(dst[0], txl.reinterpret(txl.cast(h[0], "uint32") << txl.uint32(16), ty="float32"))
         else:
             txl.ptx.cvt.f32.f16(dst[0], h[0])
 
@@ -141,7 +143,7 @@ def store_vec(out, idx, dtype, vec, src):
     out[idx : idx + vec] = src[0:vec] rounded to dtype.
     """
     if dtype == "float32":
-        w = [txl.reinterpret("uint32", src[i]) for i in range(vec)]
+        w = [txl.reinterpret(src[i], ty="uint32") for i in range(vec)]
     else:
         if vec == 1:
             h = txl.alloc_local([1], "uint16")
@@ -182,8 +184,8 @@ def store_tagged(part, idx, vec, src, tag):
     """
     hi = txl.cast(txl.cast(tag, "uint32"), "uint64") << txl.uint64(32)
     for i in range(0, vec, 2):
-        w0 = hi | txl.cast(txl.reinterpret("uint32", src[i]), "uint64")
-        w1 = hi | txl.cast(txl.reinterpret("uint32", src[i + 1]), "uint64")
+        w0 = hi | txl.cast(txl.reinterpret(src[i], ty="uint32"), "uint64")
+        w1 = hi | txl.cast(txl.reinterpret(src[i + 1], ty="uint32"), "uint64")
         txl.ptx["st.relaxed.gpu.global.L2::cache_hint.v2.b64"](part.ptr_to([idx + i]), w0, w1, txl.uint64(EVICT_LAST))
 
 
@@ -228,15 +230,9 @@ def tile_sum2(dtype, idtype, H):
     NLOOP = RPG // U
     NT = TW * RG
 
-    @txl.kernel(warps=NT // 32, grid="n_units")
-    def tile_sum(
-        x: txl.gptr[dtype],
-        offs: txl.gptr[idtype],
-        part: txl.gptr[txl.f32],
-        M: txl.i32,
-        G: txl.i32,
-        n_units: txl.i32,
-    ):
+    @txl.kernel()
+    def tile_sum(x: txl.Tensor((txl.int64(),), dtype), offs: txl.Tensor((txl.int64(),), idtype), part: txl.Tensor((txl.int64(),), txl.f32), M: txl.int32, G: txl.int32, n_units: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_units, block=(NT // 32) * 32))
         u = txl.cta_id()
         tid = txl.thread_id()
         lane = tid & 31
@@ -261,7 +257,7 @@ def tile_sum2(dtype, idtype, H):
         s, e = bounds(offs, grp, M, idtype)
         r0 = s + (sigma - grp - s // TILE) * TILE
         nvalid = e - r0
-        with txl.If(nvalid > 0), txl.Then():
+        with txl.if_(nvalid > 0), txl.then_():
             rg = tid // TW
             lc = tid % TW
             v = c * CV + lc
@@ -280,11 +276,11 @@ def tile_sum2(dtype, idtype, H):
                     for k in range(vec):
                         txl.assign(acc[k], acc[k] + vals[i * vec + k])
             if RG > 1:
-                with txl.If(rg > 0), txl.Then():
+                with txl.if_(rg > 0), txl.then_():
                     for k in range(vec):
                         txl.ptx.st.shared.f32(red.ptr_to([((rg - 1) * TW + lc) * vec + k]), acc[k])
                 txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NT))
-            with txl.If(txl.And(rg == 0, act)), txl.Then():
+            with txl.if_(txl.And(rg == 0, act)), txl.then_():
                 tmp = txl.alloc_local([1], "float32")
                 for r in range(1, RG):
                     for k in range(vec):
@@ -403,10 +399,10 @@ def search_smem(ends, sigma):
 
 
 def start_of(ends, g, sv):
-    with txl.If(g > 0):
-        with txl.Then():
+    with txl.if_(g > 0):
+        with txl.then_():
             txl.ptx.ld.shared.s32(sv, ends.ptr_to([txl.max(g - 1, 0)]))
-        with txl.Else():
+        with txl.else_():
             txl.assign(sv, txl.int32(0))
     return sv
 
@@ -435,7 +431,7 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
 
     esz = 16 // vec
 
-    def host_prelude(params):
+    def prepare_host(params):
         xmap = txl.stack_alloca("tensormap", 1)
         if SWIZZLE:
             txl.call_packed(
@@ -451,20 +447,19 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
             )
         return xmap
 
-    @txl.kernel(warps=NWC + 1, grid="n_ctas", host_prelude=host_prelude)
+    @txl.kernel()
     def tile_sum_ring(
-        x: txl.gptr[dtype],
-        offs: txl.gptr[idtype],
-        part: txl.gptr[txl.u64 if tagged else txl.f32],
-        M: txl.i32,
-        G: txl.i32,
-        n_units: txl.i32,
-        n_ctas: txl.i32,
-        tag: txl.i32,
-        *,
-        host,
+        x: txl.Tensor((txl.int64(),), dtype),
+        offs: txl.Tensor((txl.int64(),), idtype),
+        part: txl.Tensor((txl.int64(),), txl.u64 if tagged else txl.f32),
+        M: txl.int32,
+        G: txl.int32,
+        n_units: txl.int32,
+        n_ctas: txl.int32,
+        tag: txl.int32,
     ):
-        xmap = host
+        xmap = prepare_host({"x": x, "M": M})
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_ctas, block=(NWC + 1) * 32))
         cta = txl.cta_id()
         tid = txl.thread_id()
         warp = tid >> 5
@@ -492,18 +487,18 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
         ctr = part.ptr_to([txl.cast(G + (M + (TILE - 1)) // TILE, "int64") * H])
         thi = txl.cast(txl.cast(tag, "uint32"), "uint64") << txl.uint64(32)
         if TAILK > 0:
-            with txl.If(txl.And(cta == 0, tid == NWC * 32)), txl.Then():
+            with txl.if_(txl.And(cta == 0, tid == NWC * 32)), txl.then_():
                 # pool counter, (tag << 32) | claims: a claim that sees another tag (stale scratch, or this store not
                 # yet performed) is retried, so the counter needs no zeroed scratch
                 txl.ptx["st.relaxed.gpu.global.b64"](ctr, thi)
-        with txl.If(tid == NWC * 32), txl.Then():
+        with txl.if_(tid == NWC * 32), txl.then_():
             txl.ptx.prefetch.tensormap(txl.address_of(xmap))
             # L2 prefetch of the first unit, guessing compact tile sigma at row sigma * TILE (exact when every group
             # before it is a multiple of 128 rows); a wrong guess only costs bandwidth. One unit measured best (two or
             # more, or only part of one, start the stream slower).
             for k2 in range(1):
                 uu = cta + k2 * n_ctas
-                with txl.If((uu // NC) * TILE < M), txl.Then():
+                with txl.if_((uu // NC) * TILE < M), txl.then_():
                     for k in range(KPU):
                         if SWIZZLE:
                             txl.ptx["cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint"](
@@ -517,18 +512,18 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                                 (uu % NC) * (CV * vec), (uu // NC) * TILE + k * SR,
                                 txl.uint64(EVICT_FIRST),
                             )
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for i in range(NS):
                 txl.ptx.mbarrier.init.shared.b64(full.ptr_to([i]), txl.uint32(1))
                 txl.ptx.mbarrier.init.shared.b64(empty.ptr_to([i]), txl.uint32(NWC))
             txl.ptx.fence.mbarrier_init.release.cluster()
         with txl.serial((G + NT - 1) // NT) as gi:
             g = gi * NT + tid
-            with txl.If(g < G), txl.Then():
+            with txl.if_(g < G), txl.then_():
                 txl.ptx.st.shared.s32(ends.ptr_to([g]), txl.min(load_off(offs, g, idtype), M))
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NT))
         # compact tile numbering: fpre[g] = real tiles of groups < g (no units for the empty slots)
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             run = txl.local_scalar("int32")
             en = txl.local_scalar("int32")
             sv0 = txl.local_scalar("int32")
@@ -539,20 +534,20 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                 g = gi * 32 + lane
                 txl.assign(en, txl.int32(0))
                 txl.assign(sv0, txl.int32(0))
-                with txl.If(g < G), txl.Then():
+                with txl.if_(g < G), txl.then_():
                     txl.ptx.ld.shared.s32(en, ends.ptr_to([g]))
-                    with txl.If(g > 0), txl.Then():
+                    with txl.if_(g > 0), txl.then_():
                         txl.ptx.ld.shared.s32(sv0, ends.ptr_to([txl.max(g - 1, 0)]))
                 nt = (txl.max(en, sv0) - sv0 + (TILE - 1)) // TILE
                 txl.assign(incl, nt)
                 for d in (1, 2, 4, 8, 16):
                     txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(d), txl.uint32(0), txl.uint32(0xFFFFFFFF))
                     txl.assign(incl, incl + txl.Select(lane >= d, peer, txl.int32(0)))
-                with txl.If(g < G), txl.Then():
+                with txl.if_(g < G), txl.then_():
                     txl.ptx.st.shared.s32(fpre.ptr_to([g]), run + incl - nt)
                 txl.ptx.shfl_sync.idx.b32(peer, incl, txl.uint32(31), txl.uint32(31), txl.uint32(0xFFFFFFFF))
                 txl.assign(run, run + peer)
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.st.shared.s32(fpre.ptr_to([G]), run)
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NT))
         tot = txl.local_scalar("int32")
@@ -570,8 +565,8 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
             my_stat = txl.Select(cta < n_eff, n_stat, txl.int32(0))
             joins = txl.Or(cta < n_eff, txl.int32(IDLE_JOIN) == 1)
 
-        with txl.If(warp == NWC):
-            with txl.Then():  # producer warp
+        with txl.if_(warp == NWC):
+            with txl.then_():  # producer warp
                 role_token = iket_range("ring-producer")
                 if TAILK > 0:
                     it = txl.local_scalar("int32")
@@ -582,7 +577,7 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                     blo = txl.local_scalar("uint32")
 
                     def claim():
-                        with txl.If(lane == 0), txl.Then():
+                        with txl.if_(lane == 0), txl.then_():
                             txl.ptx["atom.relaxed.gpu.global.add.u64"](pend, ctr, txl.uint64(1))
 
                     def bcast():
@@ -592,30 +587,30 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                     def take():  # the pending claim's unit (warp-uniform), retrying claims that saw a stale tag
                         txl.assign(polls, txl.int32(0))
                         bcast()
-                        with txl.While(txl.And(bhi != txl.cast(tag, "uint32"), polls < POLL_LIMIT)):
+                        with txl.while_(txl.And(bhi != txl.cast(tag, "uint32"), polls < POLL_LIMIT)):
                             txl.cuda.nano_sleep(txl.uint32(TR_SLEEP))
                             claim()
                             bcast()
                             txl.assign(polls, polls + 1)
                         txl.assign(u, txl.Select(polls < POLL_LIMIT, S0 + txl.cast(blo, "int32"), n_all))
-                        with txl.If(u < n_all), txl.Then():
+                        with txl.if_(u < n_all), txl.then_():
                             claim()  # one claim ahead
 
                     txl.assign(it, txl.int32(0))
                     txl.assign(u, n_all)
-                    with txl.If(my_stat > 0):
-                        with txl.Then():
+                    with txl.if_(my_stat > 0):
+                        with txl.then_():
                             txl.assign(u, cta)
-                        with txl.Else():
-                            with txl.If(joins), txl.Then():
+                        with txl.else_():
+                            with txl.if_(joins), txl.then_():
                                 claim()
                                 take()
-                    loop = txl.While(u < n_all)
+                    loop = txl.while_(u < n_all)
                 else:
                     loop = txl.serial(n_mine)
                 with loop as it_:
                     if TAILK > 0:
-                        with txl.If(txl.And(my_stat > 0, it == txl.max(my_stat - LEAD, txl.int32(0)))), txl.Then():
+                        with txl.if_(txl.And(my_stat > 0, it == txl.max(my_stat - LEAD, txl.int32(0)))), txl.then_():
                             claim()
                     else:
                         it = it_
@@ -629,26 +624,26 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                     grp = txl.local_scalar("int32")
                     # Above the small-G crossover, load one warp of the prefix table in parallel and derive the
                     # upper-bound index with one ballot.  Binary search is cheaper for G < 16 and handles G > 32.
-                    with txl.If(txl.And(G >= 16, G <= 32)):
-                        with txl.Then():
+                    with txl.if_(txl.And(G >= 16, G <= 32)):
+                        with txl.then_():
                             fg = txl.local_scalar("int32")
                             txl.assign(fg, txl.int32(0))
-                            with txl.If(lane < G), txl.Then():
+                            with txl.if_(lane < G), txl.then_():
                                 txl.ptx.ld.shared.s32(fg, fpre.ptr_to([lane]))
                             bal = txl.alloc_local([1], "uint32")
                             txl.ptx.vote_sync.ballot.b32(
                                 bal[0], txl.And(lane < G, fg <= sigma), txl.uint32(0xFFFFFFFF)
                             )
                             txl.assign(grp, txl.cast(txl.popcount(bal[0]), "int32") - 1)
-                        with txl.Else():
+                        with txl.else_():
                             txl.assign(hi, G - 1)
-                            with txl.While(lo < hi):
+                            with txl.while_(lo < hi):
                                 txl.assign(mid, (lo + hi + 1) >> 1)
                                 txl.ptx.ld.shared.s32(fv, fpre.ptr_to([mid]))
-                                with txl.If(fv <= sigma):
-                                    with txl.Then():
+                                with txl.if_(fv <= sigma):
+                                    with txl.then_():
                                         txl.assign(lo, mid)
-                                    with txl.Else():
+                                    with txl.else_():
                                         txl.assign(hi, mid - 1)
                             txl.assign(grp, lo)
                     st = start_of(ends, grp, sv)
@@ -664,12 +659,12 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                         ph = (q // NS) & 1
                         txl.cuda.mbarrier_wait(empty.ptr_to([s]), ph ^ 1)
                         txl.ptx.fence.proxy.async_.shared__cta()
-                        with txl.If(lane == 0), txl.Then():
+                        with txl.if_(lane == 0), txl.then_():
                             txl.ptx.st.shared.s32(meta.ptr_to([s]), nvalid)
                             txl.ptx.st.shared.s32(msig.ptr_to([s]), slot)
                             txl.ptx.st.shared.s32(munit.ptr_to([s]), u)
-                            with txl.If(nvalid > k * SR):
-                                with txl.Then():
+                            with txl.if_(nvalid > k * SR):
+                                with txl.then_():
                                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([s]), txl.uint32(SR * CV * 16))
                                     if SWIZZLE:
                                         txl.ptx[TMA_G2S_3D](
@@ -688,24 +683,24 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                                             txl.cuda.cvta_generic_to_shared(full.ptr_to([s])),
                                             txl.uint64(EVICT_FIRST),
                                         )
-                                with txl.Else():
+                                with txl.else_():
                                     txl.ptx.mbarrier.arrive.shared.b64(full.ptr_to([s]), txl.uint32(1))
                     if TAILK > 0:
                         txl.assign(it, it + 1)
-                        with txl.If(it < my_stat):
-                            with txl.Then():
+                        with txl.if_(it < my_stat):
+                            with txl.then_():
                                 txl.assign(u, cta + it * n_eff)
-                            with txl.Else():
+                            with txl.else_():
                                 take()
                 if TAILK > 0:  # end marker for the consumers
                     q = it * KPU
                     s = q % NS
                     txl.cuda.mbarrier_wait(empty.ptr_to([s]), ((q // NS) & 1) ^ 1)
-                    with txl.If(lane == 0), txl.Then():
+                    with txl.if_(lane == 0), txl.then_():
                         txl.ptx.st.shared.s32(munit.ptr_to([s]), txl.int32(-1))
                         txl.ptx.mbarrier.arrive.shared.b64(full.ptr_to([s]), txl.uint32(1))
                 txl.cuda.iket.range_end(role_token[0])
-            with txl.Else():  # consumer warps
+            with txl.else_():  # consumer warps
                 role_token = iket_range("ring-consumer")
                 if RG <= NWC and CV <= 32:
                     lc = lane
@@ -727,7 +722,7 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                     txl.assign(it, txl.int32(0))
                     txl.cuda.mbarrier_wait(full.ptr_to([0]), 0)
                     txl.ptx.ld.shared.s32(u, munit.ptr_to([0]))
-                    loop = txl.While(u >= 0)
+                    loop = txl.while_(u >= 0)
                 else:
                     loop = txl.serial(n_mine)
                 with loop as it_:
@@ -755,7 +750,7 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                             okr = txl.And(txl.And(act, lc < cv_c), txl.And(i < SR, k * SR + i < nv))
                             for kk in range(4):
                                 txl.assign(w[j * 4 + kk], txl.uint32(0))
-                            with txl.If(okr), txl.Then():
+                            with txl.if_(okr), txl.then_():
                                 if SWIZZLE:
                                     txl.ptx.ld.shared.v4.b32(
                                         w[j * 4], w[j * 4 + 1], w[j * 4 + 2], w[j * 4 + 3],
@@ -764,16 +759,16 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                                 else:
                                     txl.ptx.ld.shared.v4.b32(w[j * 4], w[j * 4 + 1], w[j * 4 + 2], w[j * 4 + 3], ring.ptr_to([(s * SR + i) * (RB // 4) + lc * 4]))
                         txl.cuda.warp_sync()
-                        with txl.If(lane == 0), txl.Then():
+                        with txl.if_(lane == 0), txl.then_():
                             txl.ptx.mbarrier.arrive.shared.b64(empty.ptr_to([s]), txl.uint32(1))
                         for j in range(NPR):
                             for kk in range(4):
                                 wd = w[j * 4 + kk]
                                 if dtype == "float32":
-                                    txl.assign(vals[j * vec + kk], txl.reinterpret("float32", wd))
+                                    txl.assign(vals[j * vec + kk], txl.reinterpret(wd, ty="float32"))
                                 elif dtype == "bfloat16":
-                                    txl.assign(vals[j * vec + 2 * kk], txl.reinterpret("float32", wd << txl.uint32(16)))
-                                    txl.assign(vals[j * vec + 2 * kk + 1], txl.reinterpret("float32", wd & txl.uint32(0xFFFF0000)))
+                                    txl.assign(vals[j * vec + 2 * kk], txl.reinterpret(wd << txl.uint32(16), ty="float32"))
+                                    txl.assign(vals[j * vec + 2 * kk + 1], txl.reinterpret(wd & txl.uint32(0xFFFF0000), ty="float32"))
                                 else:
                                     txl.idioms.cast_f16x2_to_f32x2(View(vals, j * vec), kk, wd)
                             for kk in range(0, vec, 2):
@@ -785,11 +780,11 @@ def tile_sum_ring2(dtype, idtype, H, tagged=False):
                                 txl.ptx.mov.b64(acc[kk], acc[kk + 1], packed_add)
                     rb = (it & 1) * (max(RG - 1, 1) * CV * vec)
                     if RG > 1:
-                        with txl.If(txl.And(rg > 0, act)), txl.Then():
+                        with txl.if_(txl.And(rg > 0, act)), txl.then_():
                             for kk in range(vec):
                                 txl.ptx.st.shared.f32(red.ptr_to([rb + ((rg - 1) * CV + lc) * vec + kk]), acc[kk])
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NWC * 32))
-                    with txl.If(txl.And(txl.And(rg == 0, lc < cv_c), nv > 0)), txl.Then():
+                    with txl.if_(txl.And(txl.And(rg == 0, lc < cv_c), nv > 0)), txl.then_():
                         pair = txl.alloc_local([2], "float32")
                         for r in range(1, RG):
                             for kk in range(0, vec, 2):
@@ -840,7 +835,7 @@ def group_sum_ring2(dtype, idtype, odtype, H):
     BC = CV * vec
     esz = 16 // vec
 
-    def host_prelude(params):
+    def prepare_host(params):
         xmap = txl.stack_alloca("tensormap", 1)
         if SWIZZLE:
             txl.call_packed(
@@ -856,17 +851,16 @@ def group_sum_ring2(dtype, idtype, odtype, H):
             )
         return xmap
 
-    @txl.kernel(warps=NWC + 1, grid=lambda p: p["G"] * NC, host_prelude=host_prelude)
+    @txl.kernel()
     def group_sum_ring(
-        x: txl.gptr[dtype],
-        offs: txl.gptr[idtype],
-        out: txl.gptr[odtype],
-        M: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        x: txl.Tensor((txl.int64(),), dtype),
+        offs: txl.Tensor((txl.int64(),), idtype),
+        out: txl.Tensor((txl.int64(),), odtype),
+        M: txl.int32,
+        G: txl.int32,
     ):
-        xmap = host
+        xmap = prepare_host({"x": x, "M": M})
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NC, block=(NWC + 1) * 32))
         u = txl.cta_id()
         g = u // NC
         c = u % NC
@@ -889,9 +883,9 @@ def group_sum_ring2(dtype, idtype, odtype, H):
         else:
             ring = smem.alloc([NS * SR * RB // 4], "uint32", align=128)
         start, end = bounds(offs, g, M, idtype)  # issued before the barrier setup: overlaps its latency
-        with txl.If(tid == NWC * 32), txl.Then():
+        with txl.if_(tid == NWC * 32), txl.then_():
             txl.ptx.prefetch.tensormap(txl.address_of(xmap))
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for i in range(NS):
                 txl.ptx.mbarrier.init.shared.b64(full.ptr_to([i]), txl.uint32(1))
                 txl.ptx.mbarrier.init.shared.b64(empty.ptr_to([i]), txl.uint32(NWC))
@@ -899,8 +893,8 @@ def group_sum_ring2(dtype, idtype, odtype, H):
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NT))
         ntiles = (end - start + (TILE - 1)) // TILE
 
-        with txl.If(warp == NWC):
-            with txl.Then():
+        with txl.if_(warp == NWC):
+            with txl.then_():
                 role_token = iket_range("group-producer")
                 with txl.serial(ntiles) as it:
                     r0 = start + it * TILE
@@ -911,10 +905,10 @@ def group_sum_ring2(dtype, idtype, odtype, H):
                         ph = (q // NS) & 1
                         txl.cuda.mbarrier_wait(empty.ptr_to([sl]), ph ^ 1)
                         txl.ptx.fence.proxy.async_.shared__cta()
-                        with txl.If(lane == 0), txl.Then():
+                        with txl.if_(lane == 0), txl.then_():
                             txl.ptx.st.shared.s32(meta.ptr_to([sl]), nvalid)
-                            with txl.If(nvalid > k * SR):
-                                with txl.Then():
+                            with txl.if_(nvalid > k * SR):
+                                with txl.then_():
                                     txl.ptx.mbarrier.arrive.expect_tx.shared.b64(
                                         full.ptr_to([sl]), txl.uint32(SR * CV * 16)
                                     )
@@ -935,10 +929,10 @@ def group_sum_ring2(dtype, idtype, odtype, H):
                                             txl.cuda.cvta_generic_to_shared(full.ptr_to([sl])),
                                             txl.uint64(EVICT_FIRST),
                                         )
-                                with txl.Else():
+                                with txl.else_():
                                     txl.ptx.mbarrier.arrive.shared.b64(full.ptr_to([sl]), txl.uint32(1))
                 txl.cuda.iket.range_end(role_token[0])
-            with txl.Else():
+            with txl.else_():
                 role_token = iket_range("group-consumer")
                 if RG <= NWC and CV <= 32:
                     lc = lane
@@ -976,7 +970,7 @@ def group_sum_ring2(dtype, idtype, odtype, H):
                             )
                             for kk in range(4):
                                 txl.assign(words[j * 4 + kk], txl.uint32(0))
-                            with txl.If(okr), txl.Then():
+                            with txl.if_(okr), txl.then_():
                                 if SWIZZLE:
                                     txl.ptx.ld.shared.v4.b32(
                                         words[j * 4], words[j * 4 + 1],
@@ -990,16 +984,16 @@ def group_sum_ring2(dtype, idtype, odtype, H):
                                         ring.ptr_to([(sl * SR + i) * (RB // 4) + lc * 4]),
                                     )
                         txl.cuda.warp_sync()
-                        with txl.If(lane == 0), txl.Then():
+                        with txl.if_(lane == 0), txl.then_():
                             txl.ptx.mbarrier.arrive.shared.b64(empty.ptr_to([sl]), txl.uint32(1))
                         for j in range(NPR):
                             for kk in range(4):
                                 wd = words[j * 4 + kk]
                                 if dtype == "float32":
-                                    txl.assign(vals[j * vec + kk], txl.reinterpret("float32", wd))
+                                    txl.assign(vals[j * vec + kk], txl.reinterpret(wd, ty="float32"))
                                 elif dtype == "bfloat16":
-                                    txl.assign(vals[j * vec + 2 * kk], txl.reinterpret("float32", wd << txl.uint32(16)))
-                                    txl.assign(vals[j * vec + 2 * kk + 1], txl.reinterpret("float32", wd & txl.uint32(0xFFFF0000)))
+                                    txl.assign(vals[j * vec + 2 * kk], txl.reinterpret(wd << txl.uint32(16), ty="float32"))
+                                    txl.assign(vals[j * vec + 2 * kk + 1], txl.reinterpret(wd & txl.uint32(0xFFFF0000), ty="float32"))
                                 else:
                                     txl.idioms.cast_f16x2_to_f32x2(View(vals, j * vec), kk, wd)
                             for kk in range(0, vec, 2):
@@ -1011,13 +1005,13 @@ def group_sum_ring2(dtype, idtype, odtype, H):
                                 txl.ptx.mov.b64(acc[kk], acc[kk + 1], packed_add)
                     rb = (it & 1) * (max(RG - 1, 1) * CV * vec)
                     if RG > 1:
-                        with txl.If(txl.And(rg > 0, act)), txl.Then():
+                        with txl.if_(txl.And(rg > 0, act)), txl.then_():
                             for kk in range(vec):
                                 txl.ptx.st.shared.f32(
                                     red.ptr_to([rb + ((rg - 1) * CV + lc) * vec + kk]), acc[kk]
                                 )
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NWC * 32))
-                    with txl.If(txl.And(rg == 0, lc < cv_c)), txl.Then():
+                    with txl.if_(txl.And(rg == 0, lc < cv_c)), txl.then_():
                         pair = txl.alloc_local([2], "float32")
                         for r in range(1, RG):
                             for kk in range(0, vec, 2):
@@ -1039,7 +1033,7 @@ def group_sum_ring2(dtype, idtype, odtype, H):
                             )
                             txl.ptx.mov.b64(gacc[kk], gacc[kk + 1], packed_add)
                     txl.cuda.iket.range_end(tile_token[0])
-                with txl.If(txl.And(rg == 0, lc < cv_c)), txl.Then():
+                with txl.if_(txl.And(rg == 0, lc < cv_c)), txl.then_():
                     store_vec(
                         out,
                         txl.cast(g, "int64") * H + txl.cast((c * CV + lc) * vec, "int64"),
@@ -1068,14 +1062,9 @@ def tile_reduce2(idtype, odtype, H):
     NCB = cdiv(H, CTA_COLS)
     TB = RLANES * RU
 
-    @txl.kernel(warps=RLANES, grid=lambda p: p["G"] * NCB)
-    def tile_reduce(
-        part: txl.gptr[txl.f32],
-        offs: txl.gptr[idtype],
-        out: txl.gptr[odtype],
-        M: txl.i32,
-        G: txl.i32,
-    ):
+    @txl.kernel()
+    def tile_reduce(part: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), idtype), out: txl.Tensor((txl.int64(),), odtype), M: txl.int32, G: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(RLANES) * 32, programmatic_stream_serialization=True))
         u = txl.cta_id()
         g = u // NCB
         cb = u % NCB
@@ -1107,13 +1096,13 @@ def tile_reduce2(idtype, odtype, H):
             for i in range(RU):
                 bp = buf.ptr_to([(tl * RU + i) * CTA_COLS + (tid & 31) * PC])
                 if PC == 2:
-                    txl.ptx.st.shared.v2.b32(bp, txl.reinterpret("uint32", vals[i * PC]), txl.reinterpret("uint32", vals[i * PC + 1]))
+                    txl.ptx.st.shared.v2.b32(bp, txl.reinterpret(vals[i * PC], ty="uint32"), txl.reinterpret(vals[i * PC + 1], ty="uint32"))
                 else:
                     txl.ptx.st.shared.f32(bp, vals[i])
             txl.ptx.bar.sync(txl.uint32(1), txl.uint32(RLANES * 32))
-            with txl.If(tl == 0), txl.Then():
+            with txl.if_(tl == 0), txl.then_():
                 for i in range(TB):
-                    with txl.If(base + i < ntiles), txl.Then():
+                    with txl.if_(base + i < ntiles), txl.then_():
                         bp = buf.ptr_to([i * CTA_COLS + (tid & 31) * PC])
                         if PC == 2:
                             txl.ptx.ld.shared.v2.b32(tmp[0], tmp[1], bp)
@@ -1127,7 +1116,7 @@ def tile_reduce2(idtype, odtype, H):
                             txl.ptx.ld.shared.f32(tmp[0], bp)
                             txl.assign(acc[0], acc[0] + tmp[0])
             txl.ptx.bar.sync(txl.uint32(1), txl.uint32(RLANES * 32))
-        with txl.If(txl.And(tl == 0, col < H)), txl.Then():
+        with txl.if_(txl.And(tl == 0, col < H)), txl.then_():
             store_vec(out, txl.cast(g, "int64") * H + txl.cast(col, "int64"), odtype, PC, acc)
 
     return tile_reduce
@@ -1141,21 +1130,16 @@ def tile_reduce_wide2(idtype, odtype, H):
     NC = cdiv(NV, TW)
     U = 32
 
-    @txl.kernel(warps=TW // 32, grid=lambda p: p["G"] * NC)
-    def tile_reduce(
-        part: txl.gptr[txl.f32],
-        offs: txl.gptr[idtype],
-        out: txl.gptr[odtype],
-        M: txl.i32,
-        G: txl.i32,
-    ):
+    @txl.kernel()
+    def tile_reduce(part: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), idtype), out: txl.Tensor((txl.int64(),), odtype), M: txl.int32, G: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NC, block=(TW // 32) * 32, programmatic_stream_serialization=True))
         u = txl.cta_id()
         g = u // NC
         c = u % NC
         tid = txl.thread_id()
         v = c * TW + tid
         txl.ptx.griddepcontrol.wait()
-        with txl.If(v < NV), txl.Then():
+        with txl.if_(v < NV), txl.then_():
             s, e = bounds(offs, g, M, idtype)
             ntiles = (e - s + (TILE - 1)) // TILE
             f = g + s // TILE
@@ -1170,7 +1154,7 @@ def tile_reduce_wide2(idtype, odtype, H):
                     load_vec(part, idx, "float32", vec, 4, View(vals, i * vec), j < ntiles)
                 for i in range(U):
                     j = li * U + i
-                    with txl.If(j < ntiles), txl.Then():
+                    with txl.if_(j < ntiles), txl.then_():
                         for k in range(vec):
                             txl.assign(acc[k], acc[k] + vals[i * vec + k])
             store_vec(out, txl.cast(g, "int64") * H + txl.cast(v * vec, "int64"), odtype, vec, acc)
@@ -1199,15 +1183,9 @@ def tile_reduce_tag2(idtype, odtype, H, CW, LANES, U):
     TB = LANES * U
     NTH = COLS * LANES
 
-    @txl.kernel(warps=CW * LANES, grid=lambda p: p["G"] * NCB)
-    def tile_reduce_tag(
-        part: txl.gptr[txl.u64],
-        offs: txl.gptr[idtype],
-        out: txl.gptr[odtype],
-        M: txl.i32,
-        G: txl.i32,
-        tag: txl.i32,
-    ):
+    @txl.kernel()
+    def tile_reduce_tag(part: txl.Tensor((txl.int64(),), txl.u64), offs: txl.Tensor((txl.int64(),), idtype), out: txl.Tensor((txl.int64(),), odtype), M: txl.int32, G: txl.int32, tag: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(CW * LANES) * 32, programmatic_stream_serialization=True))
         u = txl.cta_id()
         g = u // NCB
         cb = u % NCB
@@ -1223,12 +1201,12 @@ def tile_reduce_tag2(idtype, odtype, H, CW, LANES, U):
         f = g + s // TILE
         polls = txl.local_scalar("int32")
         pend = txl.local_scalar("int32")
-        with txl.If(txl.And(tid == 0, ntiles > 0)), txl.Then():
+        with txl.if_(txl.And(tid == 0, ntiles > 0)), txl.then_():
             lw = txl.local_scalar("uint64")
             lp = txl.cast(f + ntiles - 1, "int64") * H + txl.cast(cb * COLS, "int64")
             txl.ptx["ld.relaxed.gpu.global.b64"](lw, part.ptr_to([lp]))
             txl.assign(polls, txl.int32(0))
-            with txl.While(txl.And((lw >> txl.uint64(32)) != hi, polls < POLL_LIMIT)):
+            with txl.while_(txl.And((lw >> txl.uint64(32)) != hi, polls < POLL_LIMIT)):
                 txl.cuda.nano_sleep(txl.uint32(TR_SLEEP))
                 txl.ptx["ld.relaxed.gpu.global.b64"](lw, part.ptr_to([lp]))
                 txl.assign(polls, polls + 1)
@@ -1242,33 +1220,33 @@ def tile_reduce_tag2(idtype, odtype, H, CW, LANES, U):
             for i in range(U):
                 j = base + tl * U + i
                 txl.assign(wv[i], hi << txl.uint64(32))  # absent tiles / columns: +0.0 with a valid tag
-                with txl.If(txl.And(j < ntiles, col < H)), txl.Then():
+                with txl.if_(txl.And(j < ntiles, col < H)), txl.then_():
                     txl.ptx["ld.relaxed.gpu.global.b64"](wv[i], part.ptr_to([txl.cast(f + j, "int64") * H + txl.cast(col, "int64")]))
             # words whose tag is not this call's yet are re-loaded together, one round trip per round
             txl.assign(polls, txl.int32(0))
             txl.assign(pend, txl.int32(1))
-            with txl.While(txl.And(pend == 1, polls < POLL_LIMIT)):
+            with txl.while_(txl.And(pend == 1, polls < POLL_LIMIT)):
                 txl.assign(pend, txl.int32(0))
                 for i in range(U):
-                    with txl.If((wv[i] >> txl.uint64(32)) != hi), txl.Then():
+                    with txl.if_((wv[i] >> txl.uint64(32)) != hi), txl.then_():
                         txl.assign(pend, txl.int32(1))
-                with txl.If(pend == 1), txl.Then():
+                with txl.if_(pend == 1), txl.then_():
                     txl.cuda.nano_sleep(txl.uint32(TR_SLEEP))
                     for i in range(U):
                         j = base + tl * U + i
-                        with txl.If((wv[i] >> txl.uint64(32)) != hi), txl.Then():
+                        with txl.if_((wv[i] >> txl.uint64(32)) != hi), txl.then_():
                             txl.ptx["ld.relaxed.gpu.global.b64"](wv[i], part.ptr_to([txl.cast(f + j, "int64") * H + txl.cast(col, "int64")]))
                     txl.assign(polls, polls + 1)
             for i in range(U):
-                v = txl.reinterpret("float32", txl.cast(wv[i] & txl.uint64(0xFFFFFFFF), "uint32"))
-                v = txl.Select(polls < POLL_LIMIT, v, txl.reinterpret("float32", txl.uint32(0x7FC00000)))
+                v = txl.reinterpret(txl.cast(wv[i] & txl.uint64(0xFFFFFFFF), "uint32"), ty="float32")
+                v = txl.Select(polls < POLL_LIMIT, v, txl.reinterpret(txl.uint32(0x7FC00000), ty="float32"))
                 if LANES > 1:
                     txl.ptx.st.shared.f32(buf.ptr_to([(tl * U + i) * COLS + cl]), v)
                 else:
                     txl.assign(tmp[i], v)
             if LANES > 1:
                 txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NTH))
-                with txl.If(tl == 0), txl.Then():
+                with txl.if_(tl == 0), txl.then_():
                     for i in range(TB):
                         txl.ptx.ld.shared.f32(tmp[i], buf.ptr_to([i * COLS + cl]))
                     for i in range(TB):
@@ -1277,7 +1255,7 @@ def tile_reduce_tag2(idtype, odtype, H, CW, LANES, U):
             else:
                 for i in range(TB):
                     txl.assign(acc[0], acc[0] + tmp[i])
-        with txl.If(txl.And(tl == 0, col < H)), txl.Then():
+        with txl.if_(txl.And(tl == 0, col < H)), txl.then_():
             store_vec(out, txl.cast(g, "int64") * H + txl.cast(col, "int64"), odtype, 1, acc)
 
     return tile_reduce_tag
@@ -1293,12 +1271,9 @@ def compiled(which, *key):
         "reduce_wide": tile_reduce_wide2,
         "reduce_tag": tile_reduce_tag2,
     }[which](*key)
-    func = kern.func
-    if which in ("reduce", "reduce_wide", "reduce_tag"):  # programmatic dependent launch: resident while the ring streams
-        func = func.with_attr("tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_programtic_dependent_launch", "tirx.use_dyn_shared_memory"])
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
-    with target:
-        return entry_function(tvm.compile(tvm.IRModule({"main": func}), target=target, tir_pipeline="tirx"))
+    # the reduce kernels ("reduce", "reduce_wide", "reduce_tag") declare programmatic dependent launch in
+    # their LaunchConfig: resident while the ring streams
+    return entry_function(kern.compile(TARGET))
 
 
 def segment_sum_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:

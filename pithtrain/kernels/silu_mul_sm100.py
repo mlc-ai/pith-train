@@ -15,15 +15,18 @@ back, the same bits as the Triton kernels (which also compute in fp32 and round 
 
 Evolved with TIRx-harness: run silu_mul, frontier member packed-f32x2-stream (commit 6ce8ceb4,
 487.818 us vs 493.082 us, 1.011x over the previous SM100 path, the Triton kernels, in the task's
-benchmark). Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched through
-tvm-ffi on torch's current stream.
+benchmark). Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and
+launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
 
 __all__ = ["silu_mul_bwd_sm100", "silu_mul_fwd_sm100"]
 
@@ -163,7 +166,7 @@ def bwd_math_packed(inputs):
 
 
 def to_f32(bits16, dtype):
-    return txl.cast(txl.reinterpret(dtype, bits16), "float32")
+    return txl.cast(txl.reinterpret(bits16, ty=dtype), "float32")
 
 
 def unpack(word, dtype):
@@ -171,12 +174,12 @@ def unpack(word, dtype):
     One b32 word -> list of fp32 values (2 for 16-bit dtypes, 1 for fp32).
     """
     if dtype == "float32":
-        return [txl.reinterpret("float32", word)]
+        return [txl.reinterpret(word, ty="float32")]
     if dtype == "bfloat16":
         # BF16 widening is exact bit placement: the source bits become the high
         # half of FP32 and the low mantissa bits are zero. Avoid two CVTs/word.
         lo, hi = txl.shift_left(word, txl.uint32(16)), txl.bitwise_and(word, txl.uint32(0xFFFF0000))
-        return [txl.reinterpret("float32", lo), txl.reinterpret("float32", hi)]
+        return [txl.reinterpret(lo, ty="float32"), txl.reinterpret(hi, ty="float32")]
     lo, hi = to_f32(txl.cast(txl.bitwise_and(word, txl.uint32(0xFFFF)), "uint16"), dtype), to_f32(txl.cast(txl.shift_right(word, txl.uint32(16)), "uint16"), dtype)
     return [lo, hi]
 
@@ -187,7 +190,7 @@ def pack(dst, vals, dtype):
     """
     if dtype == "float32":
         for i, v in enumerate(vals):
-            txl.ptx.mov.b32(dst[i], txl.reinterpret("uint32", v))
+            txl.ptx.mov.b32(dst[i], txl.reinterpret(v, ty="uint32"))
         return
     for p in range(len(vals) // 2):
         if dtype == "float16":
@@ -197,9 +200,7 @@ def pack(dst, vals, dtype):
 
 
 def compile_kernel(kernel):
-    target = kernel.target()
-    with target:  # nvcc reads the arch from the current target
-        return entry_function(kernel.compile(target))
+    return entry_function(kernel.compile(TARGET))
 
 
 SMALL = 1 << 22  # elements; at or below, the whole problem is one latency-bound wave
@@ -235,41 +236,43 @@ def scalar_kernel(dtype: str, n_in: int):
     def body(ptrs, n):
         ins, outs = ptrs[:n_in], ptrs[n_in:]
         idx = txl.cast(txl.cta_id(), "int64") * threads + txl.cast(txl.thread_id(), "int64")
-        with txl.If(idx < n):
-            with txl.Then():
+        with txl.if_(idx < n):
+            with txl.then_():
                 vals = []
                 for src in ins:
                     if dtype == "float32":
                         w = txl.local_scalar("uint32")
                         txl.ptx.ld.global_.nc.b32(w, txl.address_of(src[idx]))
-                        vals.append(txl.reinterpret("float32", w))
+                        vals.append(txl.reinterpret(w, ty="float32"))
                     else:
                         h = txl.local_scalar("uint16")
                         txl.ptx.ld.global_.nc.b16(h, txl.address_of(src[idx]))
                         if dtype == "bfloat16":
-                            vals.append(txl.reinterpret("float32", txl.shift_left(txl.cast(h, "uint32"), txl.uint32(16))))
+                            vals.append(txl.reinterpret(txl.shift_left(txl.cast(h, "uint32"), txl.uint32(16)), ty="float32"))
                         else:
                             vals.append(to_f32(h, dtype))
                 res = math(*vals)
                 for o in range(n_out):
                     if dtype == "float32":
-                        txl.ptx.st.global_.b32(txl.address_of(outs[o][idx]), txl.reinterpret("uint32", res[o]))
+                        txl.ptx.st.global_.b32(txl.address_of(outs[o][idx]), txl.reinterpret(res[o], ty="uint32"))
                     else:
                         h = txl.local_scalar("uint16")
                         getattr(txl.ptx.cvt.rn, store16).f32(h, res[o])
                         txl.ptx.st.global_.b16(txl.address_of(outs[o][idx]), h)
 
-    grid = lambda p: txl.cast((p["n"] + threads - 1) // threads, txl.i32)  # noqa: E731
+    grid = lambda n: txl.cast((n + threads - 1) // threads, "int32")  # noqa: E731
     if n_in == 2:
 
-        @txl.kernel(warps=8, arch="sm_100a", grid=grid)
-        def silu_mul_fwd_scalar(gate: txl.gptr[dtype], up: txl.gptr[dtype], out: txl.gptr[dtype], n: txl.i64):
+        @txl.kernel()
+        def silu_mul_fwd_scalar(gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=256))
             body([gate, up, out], n)
 
         return compile_kernel(silu_mul_fwd_scalar)
 
-    @txl.kernel(warps=8, arch="sm_100a", grid=grid)
-    def silu_mul_bwd_scalar(do: txl.gptr[dtype], gate: txl.gptr[dtype], up: txl.gptr[dtype], grad_gate: txl.gptr[dtype], grad_up: txl.gptr[dtype], n: txl.i64):
+    @txl.kernel()
+    def silu_mul_bwd_scalar(do: txl.Tensor((txl.int64(),), dtype), gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), grad_gate: txl.Tensor((txl.int64(),), dtype), grad_up: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=256))
         body([do, gate, up, grad_gate, grad_up], n)
 
     return compile_kernel(silu_mul_bwd_scalar)
@@ -341,18 +344,18 @@ def kernel_cfg(dtype: str, n_in: int, WARPS: int, VPT: int, VBYTES: int, LD_HINT
                 if dtype == "float32":
                     w = txl.local_scalar("uint32")
                     txl.ptx.ld.global_.nc.b32(w, txl.address_of(ins[t][idx]))
-                    vals.append(txl.reinterpret("float32", w))
+                    vals.append(txl.reinterpret(w, ty="float32"))
                 else:
                     h = txl.local_scalar("uint16")
                     txl.ptx.ld.global_.nc.b16(h, txl.address_of(ins[t][idx]))
                     if dtype == "bfloat16":
-                        vals.append(txl.reinterpret("float32", txl.shift_left(txl.cast(h, "uint32"), txl.uint32(16))))
+                        vals.append(txl.reinterpret(txl.shift_left(txl.cast(h, "uint32"), txl.uint32(16)), ty="float32"))
                     else:
                         vals.append(to_f32(h, dtype))
             res = math(*vals)
             for o in range(n_out):
                 if dtype == "float32":
-                    txl.ptx.st.global_.b32(txl.address_of(outs[o][idx]), txl.reinterpret("uint32", res[o]))
+                    txl.ptx.st.global_.b32(txl.address_of(outs[o][idx]), txl.reinterpret(res[o], ty="uint32"))
                 else:
                     h = txl.local_scalar("uint16")
                     getattr(txl.ptx.cvt.rn, store16).f32(h, res[o])
@@ -364,35 +367,37 @@ def kernel_cfg(dtype: str, n_in: int, WARPS: int, VPT: int, VBYTES: int, LD_HINT
             for j in range(VPT):
                 compute_store(j)
         else:
-            with txl.If(base + per_cta <= n):
-                with txl.Then():
+            with txl.if_(base + per_cta <= n):
+                with txl.then_():
                     for j in range(VPT):
                         load(j)
                     for j in range(VPT):
                         compute_store(j)
-                with txl.Else():
+                with txl.else_():
                     for j in range(VPT):
                         off = offset(j)
-                        with txl.If(off + vec <= n):
-                            with txl.Then():
+                        with txl.if_(off + vec <= n):
+                            with txl.then_():
                                 vector(j)
-                            with txl.Else():
+                            with txl.else_():
                                 for e in range(vec):
-                                    with txl.If(off + e < n):
-                                        with txl.Then():
+                                    with txl.if_(off + e < n):
+                                        with txl.then_():
                                             scalar(off + e)
 
-    grid = lambda p: txl.cast((p["n"] + (per_cta - 1)) // per_cta, txl.i32)  # noqa: E731
+    grid = lambda n: txl.cast((n + (per_cta - 1)) // per_cta, "int32")  # noqa: E731
     if n_in == 2:
 
-        @txl.kernel(warps=WARPS, arch="sm_100a", grid=grid)
-        def silu_mul_fwd(gate: txl.gptr[dtype], up: txl.gptr[dtype], out: txl.gptr[dtype], n: txl.i64):
+        @txl.kernel()
+        def silu_mul_fwd(gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), out: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=(WARPS) * 32))
             body([gate, up, out], n)
 
         return compile_kernel(silu_mul_fwd)
 
-    @txl.kernel(warps=WARPS, arch="sm_100a", grid=grid)
-    def silu_mul_bwd(do: txl.gptr[dtype], gate: txl.gptr[dtype], up: txl.gptr[dtype], grad_gate: txl.gptr[dtype], grad_up: txl.gptr[dtype], n: txl.i64):
+    @txl.kernel()
+    def silu_mul_bwd(do: txl.Tensor((txl.int64(),), dtype), gate: txl.Tensor((txl.int64(),), dtype), up: txl.Tensor((txl.int64(),), dtype), grad_gate: txl.Tensor((txl.int64(),), dtype), grad_up: txl.Tensor((txl.int64(),), dtype), n: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=(WARPS) * 32))
         body([do, gate, up, grad_gate, grad_up], n)
 
     return compile_kernel(silu_mul_bwd)

@@ -11,15 +11,18 @@ formula; quantization is an exact power-of-two bf16x2 multiply plus cvt.rn.satfi
 Everything else (fp32/fp16, odd shapes, arbitrary strides) takes a scalar generic kernel.
 
 Evolved with TIRx-harness: run grad, frontier member oneshot-regload-tile (commit f103d83, 217.9 us vs 379.1 us, 1.74x over the
-previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+previous SM100 path in the task's benchmark). Compiled once per process by
+tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
 
 __all__ = ["fp8_quant_grad_sm100"]
 
@@ -52,7 +55,7 @@ def i642(v):
 
 
 def rc(v, ty):
-    return txl.reinterpret(ty, v)
+    return txl.reinterpret(v, ty=ty)
 
 
 def u322(v):
@@ -107,7 +110,7 @@ def iket_range(name):
     """
     token = txl.alloc_local([1], "uint32")
     txl.assign(token[0], txl.cuda.iket.sentinel_token(name))
-    with txl.If(txl.lane_id() == 0), txl.Then():
+    with txl.if_(txl.lane_id() == 0), txl.then_():
         txl.assign(token[0], txl.cuda.iket.range_start(name))
     return token
 
@@ -129,19 +132,9 @@ def build_one():
     tile, runs the row phase from registers, then one barrier and the column phase from smem.
     """
 
-    @txl.kernel(warps=NTHREADS // 32, arch="sm_100a", grid=lambda p: ((p["N"] + 127) // 128) * ((p["M"] + 127) // 128), min_blocks_per_sm=4)
-    def fp8_quant_grad_one(
-        x: txl.gptr[txl.bf16],
-        xq: txl.gptr[txl.u8],
-        xs: txl.gptr[txl.i32],
-        xtq: txl.gptr[txl.u8],
-        xts: txl.gptr[txl.i32],
-        M: txl.i32,
-        N: txl.i32,
-        ld: txl.i64,
-        off: txl.i64,
-        pf: txl.i32,
-    ):
+    @txl.kernel()
+    def fp8_quant_grad_one(x: txl.Tensor((txl.int64(),), txl.bf16), xq: txl.Tensor((txl.int64(),), txl.u8), xs: txl.Tensor((txl.int64(),), txl.i32), xtq: txl.Tensor((txl.int64(),), txl.u8), xts: txl.Tensor((txl.int64(),), txl.i32), M: txl.int32, N: txl.int32, ld: txl.int64, off: txl.int64, pf: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=((N + 127) // 128) * ((M + 127) // 128), block=(NTHREADS // 32) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=4))
         cid = txl.cta_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -161,19 +154,19 @@ def build_one():
         tbase = txl.local_scalar("int64", init=off + i642(R0) * ld + i642(C0))
         interior = (R0 + 128 <= M) & (C0 + 128 <= N)
         tok_load = iket_range("global-load")
-        with txl.If(interior):
-            with txl.Then():
+        with txl.if_(interior):
+            with txl.then_():
                 for it in range(4):
                     for h in range(2):
                         b = 8 * it + 4 * h
                         txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
-            with txl.Else():
+            with txl.else_():
                 for it in range(4):
                     for h in range(2):
                         b = 8 * it + 4 * h
                         for e in range(4):
                             txl.assign(w[b + e], u322(0))
-                        with txl.If((R0 + r0 + 32 * it < M) & (C0 + (k + 8 * h) * 8 < N)), txl.Then():
+                        with txl.if_((R0 + r0 + 32 * it < M) & (C0 + (k + 8 * h) * 8 < N)), txl.then_():
                             txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
         iket_end(tok_load)
         tok_stage = iket_range("shared-stage")
@@ -190,7 +183,7 @@ def build_one():
         fm = txl.local_scalar("int32", init=txl.truncdiv(fid, nbn))
         fn = fid - fm * nbn
         tq = txl.thread_id()
-        with txl.If((tq < 128) & (fm * 128 + 128 <= M) & (fn * 128 + 128 <= N)), txl.Then():
+        with txl.if_((tq < 128) & (fm * 128 + 128 <= M) & (fn * 128 + 128 <= N)), txl.then_():
             txl.ptx.cp.async_.bulk.prefetch.L2.global_(txl.address_of(x[off + i642(fm * 128 + tq) * ld + i642(fn * 128)]), u322(256))
         iket_end(tok_prefetch)
         tok_row = iket_range("row-quant")
@@ -213,17 +206,17 @@ def build_one():
                 b = 8 * it + 4 * h
                 o.append(pack16(q_bf16x2(w[b], rcp2), q_bf16x2(w[b + 1], rcp2)))
                 o.append(pack16(q_bf16x2(w[b + 2], rcp2), q_bf16x2(w[b + 3], rcp2)))
-            with txl.If(grow < M), txl.Then():
+            with txl.if_(grow < M), txl.then_():
                 qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
-                with txl.If(C0 + 128 <= N):
-                    with txl.Then():
+                with txl.if_(C0 + 128 <= N):
+                    with txl.then_():
                         txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
                         txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
-                    with txl.Else():
+                    with txl.else_():
                         for h in range(2):
-                            with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
+                            with txl.if_(C0 + k * 8 + 64 * h < N), txl.then_():
                                 txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
-            with txl.If(k == 0), txl.Then():
+            with txl.if_(k == 0), txl.then_():
                 txl.ptx.st.shared.b32(rsc.ptr_to([r0 + 32 * it]), sbits)
         iket_end(tok_row)
         tok_barrier = iket_range("cta-barrier")
@@ -231,7 +224,7 @@ def build_one():
         iket_end(tok_barrier)
         tok_row_scale = iket_range("row-scale-store")
         t = txl.thread_id()
-        with txl.If((t < 128) & (R0 + t < M)), txl.Then():
+        with txl.if_((t < 128) & (R0 + t < M)), txl.then_():
             rs = txl.local_scalar("uint32")
             txl.ptx.ld.shared.b32(rs, rsc.ptr_to([t]))
             txl.ptx.st.global_.b32(txl.address_of(xs[i642(tn) * M64 + i642(R0 + t)]), rs)
@@ -270,11 +263,11 @@ def build_one():
             lw = [pack16(lo[2 * j], lo[2 * j + 1]) for j in range(4)]
             hw = [pack16(hi[2 * j], hi[2 * j + 1]) for j in range(4)]
             col = C0 + 2 * p
-            with txl.If((col < N) & (R0 + rg * 16 < M)), txl.Then():
+            with txl.if_((col < N) & (R0 + rg * 16 < M)), txl.then_():
                 ta = txl.local_scalar("int64", init=i642(col) * M64 + i642(R0 + rg * 16))
                 txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta]), lw[0], lw[1], lw[2], lw[3])
                 txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta + M64]), hw[0], hw[1], hw[2], hw[3])
-                with txl.If(rg == 0), txl.Then():
+                with txl.if_(rg == 0), txl.then_():
                     sa = txl.local_scalar("int64", init=i642(tm) * N64 + i642(col))
                     txl.ptx.st.global_.v2.b32(txl.address_of(xts[sa]), s_lo, s_hi)
         iket_end(tok_column)
@@ -284,7 +277,7 @@ def build_one():
 
 @functools.cache
 def one_kernel():
-    return entry_function(build_one().compile())
+    return entry_function(build_one().compile(TARGET))
 
 
 @functools.cache
@@ -300,18 +293,9 @@ def build_split4(MINB=6):
     XOR-swizzled shared tile. Each tile is read twice (the second read hits L2).
     """
 
-    @txl.kernel(warps=NTHREADS // 32, arch="sm_100a", grid=lambda p: ((p["N"] + 127) // 128) * ((p["M"] + 127) // 128) * 4, min_blocks_per_sm=MINB)
-    def fp8_quant_grad_split4(
-        x: txl.gptr[txl.bf16],
-        xq: txl.gptr[txl.u8],
-        xs: txl.gptr[txl.i32],
-        xtq: txl.gptr[txl.u8],
-        xts: txl.gptr[txl.i32],
-        M: txl.i32,
-        N: txl.i32,
-        ld: txl.i64,
-        off: txl.i64,
-    ):
+    @txl.kernel()
+    def fp8_quant_grad_split4(x: txl.Tensor((txl.int64(),), txl.bf16), xq: txl.Tensor((txl.int64(),), txl.u8), xs: txl.Tensor((txl.int64(),), txl.i32), xtq: txl.Tensor((txl.int64(),), txl.u8), xts: txl.Tensor((txl.int64(),), txl.i32), M: txl.int32, N: txl.int32, ld: txl.int64, off: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=((N + 127) // 128) * ((M + 127) // 128) * 4, block=(NTHREADS // 32) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=MINB))
         cid = txl.cta_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -329,24 +313,24 @@ def build_split4(MINB=6):
         k = lane & 7
         r0 = warp * 4 + (lane >> 3)
         w = txl.alloc_local([16], "uint32")
-        with txl.If(role < 2):
-            with txl.Then():
+        with txl.if_(role < 2):
+            with txl.then_():
                 # rows R1 .. R1+63, chunks k and k+8 of each row
                 R1 = R0 + 64 * role
                 tbase = txl.local_scalar("int64", init=off + i642(R1) * ld + i642(C0))
-                with txl.If((R1 + 64 <= M) & (C0 + 128 <= N)):
-                    with txl.Then():
+                with txl.if_((R1 + 64 <= M) & (C0 + 128 <= N)):
+                    with txl.then_():
                         for it in range(2):
                             for h in range(2):
                                 b = 8 * it + 4 * h
                                 txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
-                    with txl.Else():
+                    with txl.else_():
                         for it in range(2):
                             for h in range(2):
                                 b = 8 * it + 4 * h
                                 for e in range(4):
                                     txl.assign(w[b + e], u322(0))
-                                with txl.If((R1 + r0 + 32 * it < M) & (C0 + (k + 8 * h) * 8 < N)), txl.Then():
+                                with txl.if_((R1 + r0 + 32 * it < M) & (C0 + (k + 8 * h) * 8 < N)), txl.then_():
                                     txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642((k + 8 * h) * 8)]))
                 qtile = txl.local_scalar("int64", init=i642(R1) * N64 + i642(C0))
                 for it in range(2):
@@ -367,33 +351,33 @@ def build_split4(MINB=6):
                         b = 8 * it + 4 * h
                         o.append(pack16(q_bf16x2(w[b], rcp2), q_bf16x2(w[b + 1], rcp2)))
                         o.append(pack16(q_bf16x2(w[b + 2], rcp2), q_bf16x2(w[b + 3], rcp2)))
-                    with txl.If(grow < M), txl.Then():
+                    with txl.if_(grow < M), txl.then_():
                         qa = qtile + i642(r0 + 32 * it) * N64 + i642(k * 8)
-                        with txl.If(C0 + 128 <= N):
-                            with txl.Then():
+                        with txl.if_(C0 + 128 <= N):
+                            with txl.then_():
                                 txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa]), o[0], o[1])
                                 txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64]), o[2], o[3])
-                            with txl.Else():
+                            with txl.else_():
                                 for h in range(2):
-                                    with txl.If(C0 + k * 8 + 64 * h < N), txl.Then():
+                                    with txl.if_(C0 + k * 8 + 64 * h < N), txl.then_():
                                         txl.ptx.st.global_.v2.b32(txl.address_of(xq[qa + 64 * h]), o[2 * h], o[2 * h + 1])
-                        with txl.If(k == 0), txl.Then():
+                        with txl.if_(k == 0), txl.then_():
                             txl.ptx.st.global_.b32(txl.address_of(xs[i642(tn) * M64 + i642(grow)]), sbits)
-            with txl.Else():
+            with txl.else_():
                 # columns C1 .. C1+63 of all 128 rows: lane k loads chunk k (8 columns) of rows r0 + 32 * it
                 C1 = C0 + 64 * (role - 2)
                 tbase = txl.local_scalar("int64", init=off + i642(R0) * ld + i642(C1))
-                with txl.If((R0 + 128 <= M) & (C1 + 64 <= N)):
-                    with txl.Then():
+                with txl.if_((R0 + 128 <= M) & (C1 + 64 <= N)):
+                    with txl.then_():
                         for it in range(4):
                             b = 4 * it
                             txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642(k * 8)]))
-                    with txl.Else():
+                    with txl.else_():
                         for it in range(4):
                             b = 4 * it
                             for e in range(4):
                                 txl.assign(w[b + e], u322(0))
-                            with txl.If((R0 + r0 + 32 * it < M) & (C1 + k * 8 < N)), txl.Then():
+                            with txl.if_((R0 + r0 + 32 * it < M) & (C1 + k * 8 < N)), txl.then_():
                                 txl.ptx.ld.global_.v4.b32(w[b], w[b + 1], w[b + 2], w[b + 3], txl.address_of(x[tbase + i642(r0 + 32 * it) * ld + i642(k * 8)]))
                 for it in range(4):
                     r = r0 + 32 * it
@@ -431,11 +415,11 @@ def build_split4(MINB=6):
                 lw = [pack16(lo[2 * j], lo[2 * j + 1]) for j in range(4)]
                 hw = [pack16(hi[2 * j], hi[2 * j + 1]) for j in range(4)]
                 col = C1 + 2 * p
-                with txl.If((col < N) & (R0 + rg * 16 < M)), txl.Then():
+                with txl.if_((col < N) & (R0 + rg * 16 < M)), txl.then_():
                     ta = txl.local_scalar("int64", init=i642(col) * M64 + i642(R0 + rg * 16))
                     txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta]), lw[0], lw[1], lw[2], lw[3])
                     txl.ptx.st.global_.v4.b32(txl.address_of(xtq[ta + M64]), hw[0], hw[1], hw[2], hw[3])
-                    with txl.If(rg == 0), txl.Then():
+                    with txl.if_(rg == 0), txl.then_():
                         sa = txl.local_scalar("int64", init=i642(tm) * N64 + i642(col))
                         txl.ptx.st.global_.v2.b32(txl.address_of(xts[sa]), s_lo, s_hi)
 
@@ -444,7 +428,7 @@ def build_split4(MINB=6):
 
 @functools.cache
 def split4_kernel(MINB=6):
-    return entry_function(build_split4(MINB).compile())
+    return entry_function(build_split4(MINB).compile(TARGET))
 
 
 def load_f32(x, dtype, idx):
@@ -476,19 +460,9 @@ def q_f32(val, rcp):
 def generic_kernel(dtype):
     PITCH = BLOCK + 1
 
-    @txl.kernel(warps=NTHREADS // 32, arch="sm_100a", grid=lambda p: [(p["N"] + 127) // 128, (p["M"] + 127) // 128])
-    def fp8_quant_grad_generic(
-        x: txl.gptr[dtype],
-        xq: txl.gptr[txl.u8],
-        xs: txl.gptr[txl.i32],
-        xtq: txl.gptr[txl.u8],
-        xts: txl.gptr[txl.i32],
-        M: txl.i32,
-        N: txl.i32,
-        s0: txl.i64,
-        s1: txl.i64,
-        off: txl.i64,
-    ):
+    @txl.kernel()
+    def fp8_quant_grad_generic(x: txl.Tensor((txl.int64(),), dtype), xq: txl.Tensor((txl.int64(),), txl.u8), xs: txl.Tensor((txl.int64(),), txl.i32), xtq: txl.Tensor((txl.int64(),), txl.u8), xts: txl.Tensor((txl.int64(),), txl.i32), M: txl.int32, N: txl.int32, s0: txl.int64, s1: txl.int64, off: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(N + 127) // 128, (M + 127) // 128], block=(NTHREADS // 32) * 32))
         cid = txl.cta_id()
         tn = cid[0]
         tm = cid[1]
@@ -504,8 +478,8 @@ def generic_kernel(dtype):
             rr = e >> 7
             c = e & 127
             val = txl.local_scalar("float32", init=txl.float32(0.0))
-            with txl.If(R0 + rr < M), txl.Then():
-                with txl.If(C0 + c < N), txl.Then():
+            with txl.if_(R0 + rr < M), txl.then_():
+                with txl.if_(C0 + c < N), txl.then_():
                     txl.assign(val, load_f32(x, dtype, off + i642(R0 + rr) * s0 + i642(C0 + c) * s1))
             txl.ptx.st.shared.f32(txl.address_of(tile[rr * PITCH + c]), val)
         txl.ptx.bar.sync(u322(0), u322(NTHREADS))
@@ -523,14 +497,14 @@ def generic_kernel(dtype):
         txl.ptx.max.f32(amax, amax, rc(peer, ty="float32"))
         sbits, rbits = scale_bits(amax)
         rcp = rc(rbits, ty="float32")
-        with txl.If(R0 + r < M), txl.Then():
+        with txl.if_(R0 + r < M), txl.then_():
             with txl.serial(64) as i:
                 cc = C0 + h * 64 + i
-                with txl.If(cc < N), txl.Then():
+                with txl.if_(cc < N), txl.then_():
                     txl.ptx.ld.shared.f32(tmp, txl.address_of(tile[r * PITCH + h * 64 + i]))
                     b = q_f32(tmp, rcp)
                     txl.ptx.st.global_.b8(txl.address_of(xq[i642(R0 + r) * i642(N) + i642(cc)]), txl.Cast("uint8", b))
-            with txl.If(h == 0), txl.Then():
+            with txl.if_(h == 0), txl.then_():
                 txl.ptx.st.global_.b32(txl.address_of(xs[i642(tn) * i642(M) + i642(R0 + r)]), sbits)
 
         # columnwise: thread (column c, half g) covers 64 rows
@@ -546,17 +520,17 @@ def generic_kernel(dtype):
         txl.ptx.max.f32(camax, camax, tmp)
         csb, crb = scale_bits(camax)
         crcp = rc(crb, ty="float32")
-        with txl.If(C0 + c < N), txl.Then():
+        with txl.if_(C0 + c < N), txl.then_():
             with txl.serial(64) as i:
                 rr = R0 + g * 64 + i
-                with txl.If(rr < M), txl.Then():
+                with txl.if_(rr < M), txl.then_():
                     txl.ptx.ld.shared.f32(tmp, txl.address_of(tile[(g * 64 + i) * PITCH + c]))
                     b = q_f32(tmp, crcp)
                     txl.ptx.st.global_.b8(txl.address_of(xtq[i642(C0 + c) * i642(M) + i642(rr)]), txl.Cast("uint8", b))
-            with txl.If(g == 0), txl.Then():
+            with txl.if_(g == 0), txl.then_():
                 txl.ptx.st.global_.b32(txl.address_of(xts[i642(tm) * i642(N) + i642(C0 + c)]), csb)
 
-    return entry_function(fp8_quant_grad_generic.compile())
+    return entry_function(fp8_quant_grad_generic.compile(TARGET))
 
 
 GENERIC_DTYPES = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}

@@ -6,17 +6,19 @@ Scales are exact powers of two, so x * (1/scale) is exact in bf16 and the bf16x2
 satfinite cvt rounds once, matching the fp32 reference bit for bit.
 
 Evolved with TIRx-harness: run grouped, frontier member regtile-v8-l2pf (commit 158986c, 1.758x over the
-previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+previous SM100 path in the task's benchmark). Compiled once per process by
+tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 import math
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
 
 __all__ = ["fp8_quant_grouped_sm100"]
 
@@ -53,16 +55,14 @@ def scale_bits2(packed_amax, lane_hi):
     f32 scale bits of the bf16 amax in one half of a bf16x2 word (sign garbage).
     """
     if lane_hi:
-        f = txl.reinterpret("float32", txl.bitwise_and(packed_amax, u32(0x7FFF0000)))
+        f = txl.reinterpret(txl.bitwise_and(packed_amax, u32(0x7FFF0000)), ty="float32")
     else:
-        f = txl.reinterpret(
-            "float32", txl.shift_left(txl.bitwise_and(packed_amax, u32(0x7FFF)), u32(16))
-        )
+        f = txl.reinterpret(txl.shift_left(txl.bitwise_and(packed_amax, u32(0x7FFF)), u32(16)), ty="float32")
     clamped = txl.local_scalar("float32")
     txl.ptx.max.f32(clamped, f, txl.float32(1e-4))  # max_num: an all-NaN block clamps to 1e-4
     ratio = txl.local_scalar("float32")
     txl.ptx.mul.rn.f32(ratio, clamped, txl.float32(1.0 / 448.0))
-    bits = txl.reinterpret("uint32", ratio)
+    bits = txl.reinterpret(ratio, ty="uint32")
     return txl.local_scalar(
         "uint32", init=txl.bitwise_and(bits + u32(0x7FFFFF), u32(0x7F800000))
     )
@@ -85,7 +85,7 @@ def quant_word(word, rcp2):
 
 @functools.cache
 def build(K: int):
-    return entry_function(make(K).compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})))
+    return entry_function(make(K).compile(TARGET))
 
 
 def make(K: int):
@@ -93,15 +93,9 @@ def make(K: int):
     vec = math.gcd(K, 8)  # elements per global access
     ragged = K % BLOCK != 0
 
-    @txl.kernel(warps=THREADS // 32, arch="sm_100a", grid=lambda p: p["num_rb"] * nkb)
-    def quant(
-        x: txl.gptr[txl.bf16],
-        q_row: txl.gptr[txl.u8],
-        s_row: txl.gptr[txl.f32],
-        q_col: txl.gptr[txl.u8],
-        s_col: txl.gptr[txl.f32],
-        num_rb: txl.i32,
-    ):
+    @txl.kernel()
+    def quant(x: txl.Tensor((txl.int64(),), txl.bf16), q_row: txl.Tensor((txl.int64(),), txl.u8), s_row: txl.Tensor((txl.int64(),), txl.f32), q_col: txl.Tensor((txl.int64(),), txl.u8), s_col: txl.Tensor((txl.int64(),), txl.f32), num_rb: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_rb * nkb, block=(THREADS // 32) * 32))
         bid = txl.cta_id()
         tid = txl.thread_id()
         rb = bid // nkb
@@ -131,13 +125,13 @@ def make(K: int):
                         d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3], x.ptr_to([gofs(i, 0)])
                     )
                 if ragged:
-                    with txl.If(col0 < K), txl.Then():
+                    with txl.if_(col0 < K), txl.then_():
                         ld()
                 else:
                     ld()
             else:
                 for sub in range(8 // vec):
-                    with txl.If(col0 + sub * vec < K), txl.Then():
+                    with txl.if_(col0 + sub * vec < K), txl.then_():
                         if vec == 4:
                             w = 4 * i + 2 * sub
                             txl.ptx.ld.global_.v2.b32(d[w], d[w + 1], x.ptr_to([gofs(i, sub)]))
@@ -166,7 +160,7 @@ def make(K: int):
             peer = txl.local_scalar("uint32")
             txl.ptx.shfl_sync.bfly.b32(peer, cm[j], u32(16), u32(31), u32(0xFFFFFFFF))
             txl.assign(cm[j], max_abs(cm[j], peer))
-        with txl.If(h == 0), txl.Then():
+        with txl.if_(h == 0), txl.then_():
             txl.ptx["st.shared.v4.b32"](
                 colmax.ptr_to([warp * 64 + c * 4]), cm[0], cm[1], cm[2], cm[3]
             )
@@ -184,7 +178,7 @@ def make(K: int):
             sb = scale_bits2(rm2, False)
             r16 = rcp_bf16(sb)
             txl.assign(rrcp[i], txl.bitwise_or(r16, txl.shift_left(r16, u32(16))))
-            with txl.If(c == 0), txl.Then():
+            with txl.if_(c == 0), txl.then_():
                 txl.ptx.st.global_.b32(
                     s_row.ptr_to([txl.Cast("int64", (row0 + 2 * i) * nkb + kb)]), sb
                 )
@@ -209,11 +203,11 @@ def make(K: int):
                 crcp[j],
                 txl.bitwise_or(rcp_bf16(lo), txl.shift_left(rcp_bf16(hi), u32(16))),
             )
-        with txl.If(tid < 16), txl.Then():
+        with txl.if_(tid < 16), txl.then_():
             sbase = rb * K + col0
             for e in range(8):
                 if ragged or K % 8 != 0:
-                    with txl.If(col0 + e < K), txl.Then():
+                    with txl.if_(col0 + e < K), txl.then_():
                         txl.ptx.st.global_.b32(s_col.ptr_to([txl.Cast("int64", sbase + e)]), csb[e])
                 else:
                     txl.ptx.st.global_.b32(s_col.ptr_to([txl.Cast("int64", sbase + e)]), csb[e])
@@ -230,7 +224,7 @@ def make(K: int):
                     def st():
                         txl.ptx.st.global_.v2.b32(dst.ptr_to([gofs(i, 0)]), lo, hi)
                     if ragged:
-                        with txl.If(col0 < K), txl.Then():
+                        with txl.if_(col0 < K), txl.then_():
                             st()
                     else:
                         st()
@@ -241,7 +235,7 @@ def make(K: int):
                             txl.bitwise_and(txl.shift_right(word, u32(8 * (e % 4))), u32(0xFF)),
                             "uint8",
                         )
-                        with txl.If(col0 + e < K), txl.Then():
+                        with txl.if_(col0 + e < K), txl.then_():
                             txl.ptx.st.global_.b8(
                                 dst.ptr_to([txl.Cast("int64", (row0 + 2 * i) * K + col0 + e)]), byte
                             )
@@ -263,23 +257,16 @@ T8 = W8 * 32
 
 @functools.cache
 def build_v8(K: int):
-    return entry_function(make_v8(K).compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})))
+    return entry_function(make_v8(K).compile(TARGET))
 
 
 def make_v8(K: int):
     nkb = (K + BLOCK - 1) // BLOCK
     ragged = K % BLOCK != 0
 
-    @txl.kernel(warps=W8, arch="sm_100a", grid=lambda p: p["num_rb"] * nkb)
-    def quant(
-        x: txl.gptr[txl.bf16],
-        q_row: txl.gptr[txl.u8],
-        s_row: txl.gptr[txl.f32],
-        q_col: txl.gptr[txl.u8],
-        s_col: txl.gptr[txl.f32],
-        num_rb: txl.i32,
-        pf_dist: txl.i32,
-    ):
+    @txl.kernel()
+    def quant(x: txl.Tensor((txl.int64(),), txl.bf16), q_row: txl.Tensor((txl.int64(),), txl.u8), s_row: txl.Tensor((txl.int64(),), txl.f32), q_col: txl.Tensor((txl.int64(),), txl.u8), s_col: txl.Tensor((txl.int64(),), txl.f32), num_rb: txl.int32, pf_dist: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_rb * nkb, block=(W8) * 32))
         bid = txl.cta_id()
         tid = txl.thread_id()
         rb = bid // nkb
@@ -302,7 +289,7 @@ def make_v8(K: int):
 
         def guarded(body):
             if ragged:
-                with txl.If(col0 < K), txl.Then():
+                with txl.if_(col0 < K), txl.then_():
                     body()
             else:
                 body()
@@ -316,7 +303,7 @@ def make_v8(K: int):
         # column partials: own 4 rows, then the 4 row-lanes (xor 8, 16), then per warp to smem
         # L2 prefetch of the tile a CTA about one resident wave later will load: one row per thread
         t2 = bid + pf_dist
-        with txl.If((pf_dist > 0) & (t2 < num_rb * nkb)), txl.Then():
+        with txl.if_((pf_dist > 0) & (t2 < num_rb * nkb)), txl.then_():
             rb2 = t2 // nkb
             kb2 = t2 % nkb
             if ragged:
@@ -336,7 +323,7 @@ def make_v8(K: int):
                 peer = txl.local_scalar("uint32")
                 txl.ptx.shfl_sync.bfly.b32(peer, cm[j], u32(delta), u32(31), u32(0xFFFFFFFF))
                 txl.assign(cm[j], max_abs(cm[j], peer))
-        with txl.If(h == 0), txl.Then():
+        with txl.if_(h == 0), txl.then_():
             txl.ptx["st.shared.v4.b32"](part.ptr_to([warp * 64 + c * 8]), cm[0], cm[1], cm[2], cm[3])
             txl.ptx["st.shared.v4.b32"](part.ptr_to([warp * 64 + c * 8 + 4]), cm[4], cm[5], cm[6], cm[7])
 
@@ -353,11 +340,11 @@ def make_v8(K: int):
             sb = scale_bits2(rm2, False)
             r16 = rcp_bf16(sb)
             txl.assign(rrcp[i], txl.bitwise_or(r16, txl.shift_left(r16, u32(16))))
-            with txl.If(c == 0), txl.Then():
+            with txl.if_(c == 0), txl.then_():
                 txl.ptx.st.global_.b32(s_row.ptr_to([txl.Cast("int64", (row0 + 4 * i) * nkb + kb)]), sb)
 
         txl.ptx.bar.sync(u32(0), u32(T8))
-        with txl.If(tid < 64), txl.Then():
+        with txl.if_(tid < 64), txl.then_():
             w = txl.local_scalar("uint32", init=u32(0))
             for wv in range(W8):
                 t = txl.local_scalar("uint32")
@@ -372,7 +359,7 @@ def make_v8(K: int):
             def sst():
                 txl.ptx.st.global_.v2.b32(s_col.ptr_to([txl.Cast("int64", rb * K + ccol)]), lo, hi)
             if ragged:
-                with txl.If(ccol < K), txl.Then():
+                with txl.if_(ccol < K), txl.then_():
                     sst()
             else:
                 sst()

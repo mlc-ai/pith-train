@@ -16,8 +16,8 @@ them with a second kernel.
 
 Evolved with TIRx-harness: run clamped, frontier member tma-ring-fused-dbias (commit 256df46,
 1669.9 us vs 14016.2 us, 8.394x over the previous SM100 path in the task's benchmark). Compiled
-once per process by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on torch's
-current stream.
+once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on
+torch's current stream.
 """
 
 import contextlib
@@ -25,9 +25,11 @@ import functools
 import struct
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # sm_100a SASS only, as the old -gencode nvcc build
 
 __all__ = ["clamped_swiglu_quant_fwd_sm100", "fp8_clamped_swiglu_rowwise_sm100", "fp8_clamped_swiglu_kmajor_sm100", "fp8_clamped_swiglu_bwd_sm100"]
 
@@ -66,11 +68,11 @@ def u2(op, *args):
 
 
 def lo_f32(w):
-    return txl.reinterpret("float32", txl.shift_left(w, txl.uint32(16)))
+    return txl.reinterpret(txl.shift_left(w, txl.uint32(16)), ty="float32")
 
 
 def hi_f32(w):
-    return txl.reinterpret("float32", txl.bitwise_and(w, txl.uint32(0xFFFF0000)))
+    return txl.reinterpret(txl.bitwise_and(w, txl.uint32(0xFFFF0000)), ty="float32")
 
 
 def pk(lo, hi):
@@ -199,7 +201,7 @@ def e8_pair(word):
 
 
 def scale_of(e):
-    return txl.reinterpret("float32", txl.shift_left(e, txl.uint32(23)))
+    return txl.reinterpret(txl.shift_left(e, txl.uint32(23)), ty="float32")
 
 
 def rcp_bf16(e):
@@ -293,22 +295,9 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
     n_sc = n_ct
     has_tail = C % BLOCK != 0
 
-    @txl.kernel(warps=WARPS, arch="sm_100a", grid="num_ctas")
-    def kern(
-        gu: txl.gptr[txl.bf16],
-        bias: txl.gptr[txl.bf16],
-        offs: txl.gptr[txl.i32],
-        dh: txl.gptr[txl.bf16],
-        x_fp8: txl.gptr[txl.u8],
-        x_scale: txl.gptr[txl.f32],
-        x_ch: txl.gptr[txl.u8],
-        x_ch_scale: txl.gptr[txl.f32],
-        partial: txl.gptr[txl.f32],
-        alpha: txl.f32,
-        limit: txl.f32,
-        num_groups: txl.i32,
-        num_ctas: txl.i32,
-    ):
+    @txl.kernel()
+    def kern(gu: txl.Tensor((txl.int64(),), txl.bf16), bias: txl.Tensor((txl.int64(),), txl.bf16), offs: txl.Tensor((txl.int64(),), txl.i32), dh: txl.Tensor((txl.int64(),), txl.bf16), x_fp8: txl.Tensor((txl.int64(),), txl.u8), x_scale: txl.Tensor((txl.int64(),), txl.f32), x_ch: txl.Tensor((txl.int64(),), txl.u8), x_ch_scale: txl.Tensor((txl.int64(),), txl.f32), partial: txl.Tensor((txl.int64(),), txl.f32), alpha: txl.float32, limit: txl.float32, num_groups: txl.int32, num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(WARPS) * 32))
         cta = txl.cta_id()
         tid = txl.thread_id()
         lane = txl.truncmod(tid, txl.int32(32))
@@ -332,7 +321,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
             "m12": pk(txl.float32(-1.0), txl.float32(-1.0)),
         }
         alpha2 = pk(alpha, alpha)
-        lim_b = txl.shift_right(txl.reinterpret("uint32", limit), txl.uint32(16))
+        lim_b = txl.shift_right(txl.reinterpret(limit, ty="uint32"), txl.uint32(16))
         lim2 = txl.local_scalar("uint32", init=txl.bitwise_or(lim_b, txl.shift_left(lim_b, txl.uint32(16))))
         neg2 = txl.local_scalar("uint32", init=txl.bitwise_or(txl.uint32(0x7FC0), txl.shift_left(txl.bitwise_or(lim_b, txl.uint32(0x8000)), txl.uint32(16))))
 
@@ -350,7 +339,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                 if cond is None:
                     fn()
                 else:
-                    with txl.If(cond), txl.Then():
+                    with txl.if_(cond), txl.then_():
                         fn()
 
             def zero(regs):
@@ -382,14 +371,14 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
             oi = txl.local_scalar("int32")
             base = txl.local_scalar("int32", init=txl.int32(0))
             bal = txl.local_scalar("uint32")
-            with txl.While(base < num_groups):
+            with txl.while_(base < num_groups):
                 txl.assign(oi, row0 + 1)
-                with txl.If(base + lane < num_groups), txl.Then():
+                with txl.if_(base + lane < num_groups), txl.then_():
                     txl.ptx.ld.global_.nc.b32(oi, offs.ptr_to([txl.Cast("int64", base + lane)]))
                 txl.ptx.vote_sync.ballot.b32(bal, txl.ptx.pred(oi <= row0), txl.uint32(FULL))
                 txl.assign(grp, grp + txl.Cast("int32", txl.popcount(bal)))
                 txl.assign(base, base + 32)
-            with txl.If(grp > num_groups - 1), txl.Then():
+            with txl.if_(grp > num_groups - 1), txl.then_():
                 txl.assign(grp, num_groups - 1)
 
             zero([bw[k] for k in range(8)])
@@ -422,10 +411,10 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                             w = fwd_pair(x0, x1, alpha2, limit, neg_limit, consts)
                         txl.ptx.mov.b32(ow[4 * i + k], w)
                 if tail:
-                    with txl.If(c0 >= C), txl.Then():
+                    with txl.if_(c0 >= C), txl.then_():
                         txl.ptx.mov.b32(ow[4 * i + 0], txl.uint32(0))
                         txl.ptx.mov.b32(ow[4 * i + 1], txl.uint32(0))
-                    with txl.If(c0 + 4 >= C), txl.Then():
+                    with txl.if_(c0 + 4 >= C), txl.then_():
                         txl.ptx.mov.b32(ow[4 * i + 2], txl.uint32(0))
                         txl.ptx.mov.b32(ow[4 * i + 3], txl.uint32(0))
 
@@ -438,16 +427,16 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                         txl.ptx.st.global_.b32(buf.ptr_to([off]), w0)
                         txl.ptx.st.global_.b32(buf.ptr_to([off + 4]), w1)
                 elif C % 8 == 0:
-                    with txl.If(v1):
-                        with txl.Then():
+                    with txl.if_(v1):
+                        with txl.then_():
                             txl.ptx.st.global_.v2.b32(buf.ptr_to([off]), w0, w1)
-                        with txl.Else():
-                            with txl.If(v0), txl.Then():
+                        with txl.else_():
+                            with txl.if_(v0), txl.then_():
                                 txl.ptx.st.global_.b32(buf.ptr_to([off]), w0)
                 else:
-                    with txl.If(v0), txl.Then():
+                    with txl.if_(v0), txl.then_():
                         txl.ptx.st.global_.b32(buf.ptr_to([off]), w0)
-                    with txl.If(v1), txl.Then():
+                    with txl.if_(v1), txl.then_():
                         txl.ptx.st.global_.b32(buf.ptr_to([off + 4]), w1)
 
             if write_row:
@@ -463,7 +452,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                     for half, ee in ((0, ea), (1, eb)):
                         i = 2 * p + half
                         row = row0 + rg + 16 * i
-                        with txl.If(cg == 0), txl.Then():
+                        with txl.if_(cg == 0), txl.then_():
                             txl.ptx.st.global_.f32(x_scale.ptr_to([txl.Cast("int64", row) * n_sc + txl.Cast("int64", ct)]), scale_of(ee))
                         rb16 = rcp_bf16(ee)
                         r2 = txl.bitwise_or(rb16, txl.shift_left(rb16, txl.uint32(16)))
@@ -477,7 +466,7 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                         m = amax2(m, ow[4 * i + k])
                     m = amax2(m, shfl(m, 16))
                     cm.append(m)
-                with txl.If(lane < 16), txl.Then():
+                with txl.if_(lane < 16), txl.then_():
                     txl.ptx.st.shared.v4.b32(redw.ptr_to([warp * 64 + cg * 4]), cm[0], cm[1], cm[2], cm[3])
                 txl.ptx.bar.sync(txl.uint32(0), txl.uint32(WARPS * 32))
                 cw = txl.alloc_local([4], "uint32")
@@ -495,10 +484,10 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                     eb = txl.shift_right(e, txl.uint32(8))
                     sc += [scale_of(ea), scale_of(eb)]
                     rc.append(txl.local_scalar("uint32", init=txl.bitwise_or(rcp_bf16(ea), txl.shift_left(rcp_bf16(eb), txl.uint32(16)))))
-                with txl.If(rg == 0), txl.Then():
+                with txl.if_(rg == 0), txl.then_():
                     if tail:
                         for j in range(8):
-                            with txl.If(c0 + j < C), txl.Then():
+                            with txl.if_(c0 + j < C), txl.then_():
                                 txl.ptx.st.global_.f32(x_ch_scale.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", c0 + j)]), sc[j])
                     else:
                         for j in range(0, 8, 4):
@@ -517,13 +506,13 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                         txl.ptx["add.rn.f32.bf16"](cs[2 * k], hl, cs[2 * k])
                         txl.ptx["add.rn.f32.bf16"](cs[2 * k + 1], hh, cs[2 * k + 1])
                 for j in range(8):
-                    txl.ptx.mov.b32(cs[j], f("add.rn.f32", cs[j], txl.reinterpret("float32", shfl(txl.reinterpret("uint32", cs[j]), 16))))
-                with txl.If(lane < 16), txl.Then():
+                    txl.ptx.mov.b32(cs[j], f("add.rn.f32", cs[j], txl.reinterpret(shfl(txl.reinterpret(cs[j], ty="uint32"), 16), ty="float32")))
+                with txl.if_(lane < 16), txl.then_():
                     txl.ptx.st.shared.v4.f32(red.ptr_to([warp * BLOCK + cg * 8]), cs[0], cs[1], cs[2], cs[3])
                     txl.ptx.st.shared.v4.f32(red.ptr_to([warp * BLOCK + cg * 8 + 4]), cs[4], cs[5], cs[6], cs[7])
                 txl.ptx.bar.sync(txl.uint32(0), txl.uint32(WARPS * 32))
                 tv = txl.alloc_local([8], "float32")
-                with txl.If(rg == 0), txl.Then():
+                with txl.if_(rg == 0), txl.then_():
                     for w in range(1, WARPS):
                         txl.ptx.ld.shared.v4.f32(tv[0], tv[1], tv[2], tv[3], red.ptr_to([w * BLOCK + cg * 8]))
                         txl.ptx.ld.shared.v4.f32(tv[4], tv[5], tv[6], tv[7], red.ptr_to([w * BLOCK + cg * 8 + 4]))
@@ -531,17 +520,17 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
                             txl.ptx.mov.b32(cs[j], f("add.rn.f32", cs[j], tv[j]))
                     if tail:
                         for j in range(8):
-                            with txl.If(c0 + j < C), txl.Then():
+                            with txl.if_(c0 + j < C), txl.then_():
                                 txl.ptx.st.global_.f32(partial.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", c0 + j)]), cs[j])
                     else:
                         for j in range(0, 8, 4):
                             txl.ptx.st.global_.v4.f32(partial.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", c0 + j)]), cs[j], cs[j + 1], cs[j + 2], cs[j + 3])
 
         if has_tail:
-            with txl.If(ct == n_ct - 1):
-                with txl.Then():
+            with txl.if_(ct == n_ct - 1):
+                with txl.then_():
                     body(True)
-                with txl.Else():
+                with txl.else_():
                     body(False)
         else:
             body(False)
@@ -551,14 +540,9 @@ def quant_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp
 
 @functools.cache
 def segsum_kernel(C: int):
-    @txl.kernel(warps=4, arch="sm_100a", grid="num_ctas")
-    def segsum(
-        partial: txl.gptr[txl.f32],
-        offs: txl.gptr[txl.i32],
-        out: txl.gptr[txl.bf16],
-        num_groups: txl.i32,
-        num_ctas: txl.i32,
-    ):
+    @txl.kernel()
+    def segsum(partial: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.bf16), num_groups: txl.int32, num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=128))
         cta = txl.cta_id()
         tid = txl.thread_id()
         n_cb = (C + 127) // 128
@@ -566,18 +550,18 @@ def segsum_kernel(C: int):
         c = txl.truncmod(cta, txl.int32(n_cb)) * 128 + tid
         start = txl.local_scalar("int32", init=txl.int32(0))
         end = txl.local_scalar("int32")
-        with txl.If(g > 0), txl.Then():
+        with txl.if_(g > 0), txl.then_():
             txl.ptx.ld.global_.nc.b32(start, offs.ptr_to([txl.Cast("int64", g - 1)]))
         txl.ptx.ld.global_.nc.b32(end, offs.ptr_to([txl.Cast("int64", g)]))
         acc = txl.local_scalar("float32", init=txl.float32(0.0))
         b = txl.local_scalar("int32", init=txl.truncdiv(start, txl.int32(128)))
-        with txl.If(c < C), txl.Then():
+        with txl.if_(c < C), txl.then_():
             nb = txl.truncdiv(end, txl.int32(128))
             tv = txl.alloc_local([32], "float32")
-            with txl.While(b < nb):
+            with txl.while_(b < nb):
                 for u in range(32):
                     txl.ptx.mov.b32(tv[u], txl.float32(0.0))
-                    with txl.If(b + u < nb), txl.Then():
+                    with txl.if_(b + u < nb), txl.then_():
                         txl.ptx.ld.global_.f32(tv[u], partial.ptr_to([txl.Cast("int64", b + u) * C + txl.Cast("int64", c)]))
                 for u in range(32):
                     txl.assign(acc, f("add.rn.f32", acc, tv[u]))
@@ -602,14 +586,9 @@ def segsum4_kernel(C: int):
     """
     assert C % 4 == 0
 
-    @txl.kernel(warps=8, arch="sm_100a", grid="num_ctas")
-    def segsum4(
-        partial: txl.gptr[txl.f32],
-        offs: txl.gptr[txl.i32],
-        out: txl.gptr[txl.bf16],
-        num_groups: txl.i32,
-        num_ctas: txl.i32,
-    ):
+    @txl.kernel()
+    def segsum4(partial: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.bf16), num_groups: txl.int32, num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=256))
         cta = txl.cta_id()
         tid = txl.thread_id()
         lane = txl.truncmod(tid, txl.int32(32))
@@ -621,7 +600,7 @@ def segsum4_kernel(C: int):
         red = smem.alloc([8 * 128], txl.f32, align=16)
         start = txl.local_scalar("int32", init=txl.int32(0))
         end = txl.local_scalar("int32")
-        with txl.If(g > 0), txl.Then():
+        with txl.if_(g > 0), txl.then_():
             txl.ptx.ld.global_.nc.b32(start, offs.ptr_to([txl.Cast("int64", g - 1)]))
         txl.ptx.ld.global_.nc.b32(end, offs.ptr_to([txl.Cast("int64", g)]))
         b0 = txl.truncdiv(start, txl.int32(128))
@@ -632,12 +611,12 @@ def segsum4_kernel(C: int):
         tv = txl.alloc_local([4 * SEG_U], "float32")
         for j in range(4):
             txl.ptx.mov.b32(acc[j], txl.float32(0.0))
-        with txl.If(c < C), txl.Then():
-            with txl.While(lo < hi):
+        with txl.if_(c < C), txl.then_():
+            with txl.while_(lo < hi):
                 for u in range(SEG_U):
                     for j in range(4):
                         txl.ptx.mov.b32(tv[4 * u + j], txl.float32(0.0))
-                    with txl.If(lo + u < hi), txl.Then():
+                    with txl.if_(lo + u < hi), txl.then_():
                         txl.ptx.ld.global_.nc.v4.f32(tv[4 * u], tv[4 * u + 1], tv[4 * u + 2], tv[4 * u + 3], partial.ptr_to([txl.Cast("int64", lo + u) * C + txl.Cast("int64", c)]))
                 for u in range(SEG_U):
                     for j in range(4):
@@ -645,9 +624,9 @@ def segsum4_kernel(C: int):
                 txl.assign(lo, lo + SEG_U)
         txl.ptx.st.shared.v4.f32(red.ptr_to([w * 128 + lane * 4]), acc[0], acc[1], acc[2], acc[3])
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(256))
-        with txl.If(tid < 128), txl.Then():
+        with txl.if_(tid < 128), txl.then_():
             cc = txl.truncmod(cta, txl.int32(n_cb)) * 128 + tid
-            with txl.If(cc < C), txl.Then():
+            with txl.if_(cc < C), txl.then_():
                 s_ = txl.local_scalar("float32")
                 tq = txl.local_scalar("float32")
                 txl.ptx.ld.shared.f32(s_, red.ptr_to([tid]))
@@ -669,14 +648,9 @@ def segsum1_kernel(C: int):
     """
     assert C % 4 == 0
 
-    @txl.kernel(warps=1, arch="sm_100a", grid="num_ctas")
-    def segsum1(
-        partial: txl.gptr[txl.f32],
-        offs: txl.gptr[txl.i32],
-        out: txl.gptr[txl.bf16],
-        num_groups: txl.i32,
-        num_ctas: txl.i32,
-    ):
+    @txl.kernel()
+    def segsum1(partial: txl.Tensor((txl.int64(),), txl.f32), offs: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.bf16), num_groups: txl.int32, num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=32))
         cta = txl.cta_id()
         lane = txl.thread_id()
         n_cb = (C + 127) // 128
@@ -684,7 +658,7 @@ def segsum1_kernel(C: int):
         c = txl.truncmod(cta, txl.int32(n_cb)) * 128 + lane * 4
         start = txl.local_scalar("int32", init=txl.int32(0))
         end = txl.local_scalar("int32")
-        with txl.If(g > 0), txl.Then():
+        with txl.if_(g > 0), txl.then_():
             txl.ptx.ld.global_.nc.b32(start, offs.ptr_to([txl.Cast("int64", g - 1)]))
         txl.ptx.ld.global_.nc.b32(end, offs.ptr_to([txl.Cast("int64", g)]))
         lo = txl.local_scalar("int32", init=txl.truncdiv(start, txl.int32(128)))
@@ -693,12 +667,12 @@ def segsum1_kernel(C: int):
         tv = txl.alloc_local([4 * SEG_U], "float32")
         for j in range(4):
             txl.ptx.mov.b32(acc[j], txl.float32(0.0))
-        with txl.If(c < C), txl.Then():
-            with txl.While(lo < hi):
+        with txl.if_(c < C), txl.then_():
+            with txl.while_(lo < hi):
                 for u in range(SEG_U):
                     for j in range(4):
                         txl.ptx.mov.b32(tv[4 * u + j], txl.float32(0.0))
-                    with txl.If(lo + u < hi), txl.Then():
+                    with txl.if_(lo + u < hi), txl.then_():
                         txl.ptx.ld.global_.nc.v4.f32(tv[4 * u], tv[4 * u + 1], tv[4 * u + 2], tv[4 * u + 3], partial.ptr_to([txl.Cast("int64", lo + u) * C + txl.Cast("int64", c)]))
                 for u in range(SEG_U):
                     for j in range(4):
@@ -743,12 +717,12 @@ def fold_dbias(partial, out, offs_s, red, num_groups, seg_mode, me, npart, tid, 
     def run(lo, hi, c):
         for j in range(4):
             txl.ptx.mov.b32(acc[j], txl.float32(0.0))
-        with txl.If(c < C), txl.Then():
-            with txl.While(lo < hi):
+        with txl.if_(c < C), txl.then_():
+            with txl.while_(lo < hi):
                 for u in range(SEG_U):
                     for j in range(4):
                         txl.ptx.mov.b32(tv[4 * u + j], txl.float32(0.0))
-                    with txl.If(lo + u < hi), txl.Then():
+                    with txl.if_(lo + u < hi), txl.then_():
                         txl.ptx["ld.relaxed.gpu.global.v4.f32"](tv[4 * u], tv[4 * u + 1], tv[4 * u + 2], tv[4 * u + 3], partial.ptr_to([txl.Cast("int64", lo + u) * C + txl.Cast("int64", c)]))
                 for u in range(SEG_U):
                     for j in range(4):
@@ -758,17 +732,17 @@ def fold_dbias(partial, out, offs_s, red, num_groups, seg_mode, me, npart, tid, 
     def bounds(g):
         start = txl.local_scalar("int32", init=txl.int32(0))
         end = txl.local_scalar("int32")
-        with txl.If(g > 0), txl.Then():
+        with txl.if_(g > 0), txl.then_():
             txl.ptx.ld.shared.b32(start, offs_s.ptr_to([g - 1]))
         txl.ptx.ld.shared.b32(end, offs_s.ptr_to([g]))
         b0 = txl.truncdiv(start, txl.int32(128))
         return b0, txl.truncdiv(end, txl.int32(128)) - b0
 
-    with txl.If(seg_mode == 1):
-        with txl.Then():
+    with txl.if_(seg_mode == 1):
+        with txl.then_():
             ch = txl.local_scalar("int32", init=me)
             first_chunk = txl.local_scalar("int32", init=txl.int32(1))
-            with txl.While(ch < n_ch):
+            with txl.while_(ch < n_ch):
                 g = txl.local_scalar("int32", init=txl.truncdiv(ch, txl.int32(n_cb)))
                 cb = txl.local_scalar("int32", init=ch - g * n_cb)
                 b0, nb = bounds(g)
@@ -776,13 +750,13 @@ def fold_dbias(partial, out, offs_s, red, num_groups, seg_mode, me, npart, tid, 
                 hi = txl.local_scalar("int32", init=b0 + txl.truncdiv(nb * (w + 1), txl.int32(8)))
                 run(lo, hi, cb * 128 + lane * 4)
                 # The first chunk has no previous shared payload to protect.
-                with txl.If(first_chunk == 0), txl.Then():
+                with txl.if_(first_chunk == 0), txl.then_():
                     txl.ptx.bar.sync(txl.uint32(0), txl.uint32(256))
                 txl.ptx.st.shared.v4.f32(red.ptr_to([w * 128 + lane * 4]), acc[0], acc[1], acc[2], acc[3])
                 txl.ptx.bar.sync(txl.uint32(0), txl.uint32(256))
-                with txl.If(tid < 128), txl.Then():
+                with txl.if_(tid < 128), txl.then_():
                     cc = cb * 128 + tid
-                    with txl.If(cc < C), txl.Then():
+                    with txl.if_(cc < C), txl.then_():
                         s_ = txl.local_scalar("float32")
                         tq = txl.local_scalar("float32")
                         txl.ptx.ld.shared.f32(s_, red.ptr_to([tid]))
@@ -794,16 +768,16 @@ def fold_dbias(partial, out, offs_s, red, num_groups, seg_mode, me, npart, tid, 
                         txl.ptx.st.global_.b16(out.ptr_to([txl.Cast("int64", g) * C + txl.Cast("int64", cc)]), h)
                 txl.assign(first_chunk, txl.int32(0))
                 txl.assign(ch, ch + npart)
-        with txl.Else():
+        with txl.else_():
             ch = txl.local_scalar("int32", init=me * 8 + w)
-            with txl.While(ch < n_ch):
+            with txl.while_(ch < n_ch):
                 g = txl.local_scalar("int32", init=txl.truncdiv(ch, txl.int32(n_cb)))
                 cb = txl.local_scalar("int32", init=ch - g * n_cb)
                 b0, nb = bounds(g)
                 lo = txl.local_scalar("int32", init=b0)
                 c = cb * 128 + lane * 4
                 run(lo, b0 + nb, c)
-                with txl.If(c < C), txl.Then():
+                with txl.if_(c < C), txl.then_():
                     hw = txl.alloc_local([4], "uint16")
                     for j in range(4):
                         txl.ptx.cvt.rn.bf16.f32(hw[j], acc[j])
@@ -866,29 +840,29 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             encode(dh_map, params["gu"].data, 2 * N, rows, 4 * N, GU_BOX, BLOCK)
         return gu_map, dh_map, b_map
 
-    @txl.kernel(warps=P_WARPS, arch="sm_100a", grid="num_ctas", min_blocks_per_sm=2 if bwd else 1, host_prelude=host_prelude)
+    @txl.kernel()
     def kern(
-        gu: txl.gptr[txl.bf16],
-        bias: txl.gptr[txl.bf16],
-        offs: txl.gptr[txl.i32],
-        dh: txl.gptr[txl.bf16],
-        x_fp8: txl.gptr[txl.u8],
-        x_scale: txl.gptr[txl.f32],
-        x_ch: txl.gptr[txl.u8],
-        x_ch_scale: txl.gptr[txl.f32],
-        partial: txl.gptr[txl.f32],
-        sched: txl.gptr[txl.u32],
-        dbias: txl.gptr[txl.bf16],
-        alpha: txl.f32,
-        limit: txl.f32,
-        num_groups: txl.i32,
-        num_tiles: txl.i32,
-        num_ctas: txl.i32,
-        num_rows: txl.i32,
-        seg_mode: txl.i32,
-        *,
-        host,
+        gu: txl.Tensor((txl.int64(),), txl.bf16),
+        bias: txl.Tensor((txl.int64(),), txl.bf16),
+        offs: txl.Tensor((txl.int64(),), txl.i32),
+        dh: txl.Tensor((txl.int64(),), txl.bf16),
+        x_fp8: txl.Tensor((txl.int64(),), txl.u8),
+        x_scale: txl.Tensor((txl.int64(),), txl.f32),
+        x_ch: txl.Tensor((txl.int64(),), txl.u8),
+        x_ch_scale: txl.Tensor((txl.int64(),), txl.f32),
+        partial: txl.Tensor((txl.int64(),), txl.f32),
+        sched: txl.Tensor((txl.int64(),), txl.u32),
+        dbias: txl.Tensor((txl.int64(),), txl.bf16),
+        alpha: txl.float32,
+        limit: txl.float32,
+        num_groups: txl.int32,
+        num_tiles: txl.int32,
+        num_ctas: txl.int32,
+        num_rows: txl.int32,
+        seg_mode: txl.int32,
     ):
+        host = host_prelude({"gu": gu, "bias": bias, "dh": dh, "num_groups": num_groups, "num_rows": num_rows})
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=P_WARPS * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=2 if bwd else 1))
         gu_map, dh_map, b_map = host
         cta = txl.cta_id()
         tid = txl.thread_id()
@@ -922,12 +896,12 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             tile_s = smem.alloc([stages], txl.i32, align=16)
             role_s = smem.alloc([2], txl.i32, align=8)
             # started-CTA count: a CTA may wait for the others at its exit only once all have started
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.ptx.red.global_.add.u32(sched.ptr_to([2]), txl.uint32(1))
 
         with txl.serial(txl.truncdiv(num_groups + (P_WARPS * 32 - 1), txl.int32(P_WARPS * 32))) as it:
             gi = it * (P_WARPS * 32) + tid
-            with txl.If(gi < num_groups), txl.Then():
+            with txl.if_(gi < num_groups), txl.then_():
                 ov = txl.local_scalar("int32")
                 txl.ptx.ld.global_.nc.b32(ov, offs.ptr_to([txl.Cast("int64", gi)]))
                 txl.ptx.st.shared.b32(offs_s.ptr_to([gi]), ov)
@@ -947,19 +921,19 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             go = txl.local_scalar("int32", init=txl.int32(1))
             oi = txl.local_scalar("int32")
             bal = txl.local_scalar("uint32")
-            with txl.While(go == 1):
+            with txl.while_(go == 1):
                 txl.assign(oi, row0 + 1)
-                with txl.If(base + lane < num_groups), txl.Then():
+                with txl.if_(base + lane < num_groups), txl.then_():
                     txl.ptx.ld.shared.b32(oi, offs_s.ptr_to([base + lane]))
                 txl.ptx.vote_sync.ballot.b32(bal, txl.ptx.pred(oi <= row0), txl.uint32(FULL))
                 cnt = txl.local_scalar("int32", init=txl.Cast("int32", txl.popcount(bal)))
                 txl.assign(grp, grp + cnt)
                 txl.assign(base, base + 32)
                 txl.assign(go, txl.int32(0))
-                with txl.If(txl.And(cnt == 32, base < num_groups)), txl.Then():
+                with txl.if_(txl.And(cnt == 32, base < num_groups)), txl.then_():
                     txl.assign(go, txl.int32(1))
             txl.assign(gcur, grp)
-            with txl.If(grp > num_groups - 1), txl.Then():
+            with txl.if_(grp > num_groups - 1), txl.then_():
                 txl.assign(grp, num_groups - 1)
             return grp
 
@@ -1000,16 +974,16 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                 else:
                     t = txl.local_scalar("int32")
                     txl.ptx.shfl_sync.idx.b32(t, nxt, txl.uint32(0), txl.uint32(31), txl.uint32(FULL))
-                    with txl.If(txl.And(lane == 0, t < num_tiles)), txl.Then():
+                    with txl.if_(txl.And(lane == 0, t < num_tiles)), txl.then_():
                         fetch()
-                with txl.If(t >= num_tiles), txl.Then():
-                    with txl.If(lane == 0), txl.Then():
+                with txl.if_(t >= num_tiles), txl.then_():
+                    with txl.if_(lane == 0), txl.then_():
                         stg = txl.truncmod(k, txl.int32(stages))
                         txl.ptx.st.shared.b32(tile_s.ptr_to([stg]), txl.int32(-1))
                         txl.ptx.mbarrier.arrive.shared.b64(full.buf.ptr_to([stg]), txl.uint32(1))
             else:
                 t, _ = tile_of(k)
-            with txl.If(t < num_tiles), txl.Then():
+            with txl.if_(t < num_tiles), txl.then_():
                 rb = txl.truncdiv(t, txl.int32(n_ct))
                 ct = txl.truncmod(t, txl.int32(n_ct))
                 stage = txl.truncmod(k, txl.int32(stages))
@@ -1018,7 +992,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                 row0 = rb * BLOCK
                 grp = group_of(row0)
                 gcol = ct * (BLOCK * 2 if not bwd else BLOCK)  # first gate_up column of the tile
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     bar = full.buf.ptr_to([stage])
                     if DYN:
                         txl.ptx.st.shared.b32(tile_s.ptr_to([stage]), t)
@@ -1048,16 +1022,16 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                             txl.ptx[TMA_2D_H](dh_stage.ptr_to(HB, 0), txl.address_of(dh_map), txl.Cast("int32", ct * (BLOCK // 2)), txl.Cast("int32", row0 + HB), barB, txl.uint64(POLICY_EVICT_LAST))
             if write_row and not write_col and not bwd and not (first and k < stages - 1):
                 tp, _ = tile_of(k + 1)
-                with txl.If(txl.And(lane == 0, tp < num_tiles)), txl.Then():
+                with txl.if_(txl.And(lane == 0, tp < num_tiles)), txl.then_():
                     prb = txl.truncdiv(tp, txl.int32(n_ct))
                     pct = tp - prb * n_ct
                     txl.ptx[TMA_PF_2D](txl.address_of(gu_map), txl.Cast("int32", pct * (BLOCK * 2)), txl.Cast("int32", prb * BLOCK))
 
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             for k in range(stages):
                 issue(k, first=True)
             if DYN:
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     fetch()
 
         neg_limit = f("neg.f32", limit)
@@ -1068,7 +1042,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             "m12": pk(txl.float32(-1.0), txl.float32(-1.0)),
         }
         alpha2 = pk(alpha, alpha)
-        lim_b = txl.shift_right(txl.reinterpret("uint32", limit), txl.uint32(16))
+        lim_b = txl.shift_right(txl.reinterpret(limit, ty="uint32"), txl.uint32(16))
         lim2 = txl.local_scalar("uint32", init=txl.bitwise_or(lim_b, txl.shift_left(lim_b, txl.uint32(16))))
         neg2 = txl.local_scalar("uint32", init=txl.bitwise_or(txl.uint32(0x7FC0), txl.shift_left(txl.bitwise_or(lim_b, txl.uint32(0x8000)), txl.uint32(16))))
 
@@ -1083,7 +1057,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
         if DYN:
             kkv = txl.local_scalar("int32", init=txl.int32(0))
             go = txl.local_scalar("int32", init=txl.int32(1))
-            loop_cm = txl.While(go != 0)
+            loop_cm = txl.while_(go != 0)
         else:
             loop_cm = txl.serial(n_my if bwd else txl.truncdiv(n_my - gid + 1, txl.int32(2)))
         with loop_cm as kk2_:
@@ -1120,7 +1094,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             # Groups alternate tiles, so with an odd stage count the stage's previous tile
             # belongs to the other group; until that tile was consumed the full barrier's
             # parity could alias its still-pending phase. Its release cannot alias.
-            with txl.If(k >= stages), txl.Then():
+            with txl.if_(k >= stages), txl.then_():
                 empty.wait(stage, txl.truncmod(txl.truncdiv(k, txl.int32(stages)) + 1, txl.int32(2)))
             full.wait(stage, txl.truncmod(txl.truncdiv(k, txl.int32(stages)), txl.int32(2)))
             if DYN:
@@ -1183,18 +1157,18 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                         if not SPLIT:
                             fwd_math()
                         elif write_row:
-                            with txl.If(actA if i < RPT // 2 else actB), txl.Then():
+                            with txl.if_(actA if i < RPT // 2 else actB), txl.then_():
                                 fwd_math()
                         else:
-                            with txl.If(actA), txl.Then():
+                            with txl.if_(actA), txl.then_():
                                 fwd_math(kks=(0, 1))
-                            with txl.If(actB), txl.Then():
+                            with txl.if_(actB), txl.then_():
                                 fwd_math(kks=(2, 3))
                     if has_tail:
-                        with txl.If(ca >= C), txl.Then():
+                        with txl.if_(ca >= C), txl.then_():
                             txl.ptx.mov.b32(ow[4 * i + 0], txl.uint32(0))
                             txl.ptx.mov.b32(ow[4 * i + 1], txl.uint32(0))
-                        with txl.If(cb >= C), txl.Then():
+                        with txl.if_(cb >= C), txl.then_():
                             txl.ptx.mov.b32(ow[4 * i + 2], txl.uint32(0))
                             txl.ptx.mov.b32(ow[4 * i + 3], txl.uint32(0))
                 tig = wg * 32 + lane  # thread index within the group
@@ -1217,27 +1191,27 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                             m = amax2(m, ow[4 * i + kk])
                         m = amax2(m, shfl(m, 16))
                         cm.append(m)
-                    with txl.If(lane < 16), txl.Then():
+                    with txl.if_(lane < 16), txl.then_():
                         txl.ptx.st.shared.v4.b32(redw_all.ptr_to([rw0 + wg * 64 + cg * 4]), cm[0], cm[1], cm[2], cm[3])
                 if bwd:
                     for j in range(8):
-                        txl.ptx.mov.b32(cs[j], f("add.rn.f32", cs[j], txl.reinterpret("float32", shfl(txl.reinterpret("uint32", cs[j]), 16))))
-                    with txl.If(lane < 16), txl.Then():
+                        txl.ptx.mov.b32(cs[j], f("add.rn.f32", cs[j], txl.reinterpret(shfl(txl.reinterpret(cs[j], ty="uint32"), 16), ty="float32")))
+                    with txl.if_(lane < 16), txl.then_():
                         txl.ptx.st.shared.v4.f32(red_all.ptr_to([rf0 + wg * BLOCK + cg * 8]), cs[0], cs[1], cs[2], cs[3])
                         txl.ptx.st.shared.v4.f32(red_all.ptr_to([rf0 + wg * BLOCK + cg * 8 + 4]), cs[4], cs[5], cs[6], cs[7])
                 # Backward can overlap its independent rowwise quantization with warp 0's
                 # refill.  The non-issuing warps only arrive here; a second named barrier
                 # below keeps every shared reduction read behind completion of this barrier.
                 if bwd:
-                    with txl.If(wg == 0):
-                        with txl.Then():
+                    with txl.if_(wg == 0):
+                        with txl.then_():
                             txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
-                        with txl.Else():
+                        with txl.else_():
                             txl.ptx.bar.arrive(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
                 else:
                     txl.ptx.bar.sync(txl.Cast("uint32", gbar), txl.uint32(GW * 32))
-                with txl.If(wg == 0), txl.Then():
-                    with txl.If(lane == 0), txl.Then():
+                with txl.if_(wg == 0), txl.then_():
+                    with txl.if_(lane == 0), txl.then_():
                         txl.ptx.mbarrier.arrive.shared.b64(empty.buf.ptr_to([stage]), txl.uint32(1))
                     issue(k + stages)
 
@@ -1250,16 +1224,16 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                             txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
                             txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", cb)]), w1)
                     elif bwd:
-                        with txl.If(vb):
-                            with txl.Then():
+                        with txl.if_(vb):
+                            with txl.then_():
                                 txl.ptx.st.global_.v2.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0, w1)
-                            with txl.Else():
-                                with txl.If(va), txl.Then():
+                            with txl.else_():
+                                with txl.if_(va), txl.then_():
                                     txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
                     else:
-                        with txl.If(va), txl.Then():
+                        with txl.if_(va), txl.then_():
                             txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", ca)]), w0)
-                        with txl.If(vb), txl.Then():
+                        with txl.if_(vb), txl.then_():
                             txl.ptx.st.global_.b32(buf.ptr_to([off + txl.Cast("int64", cb)]), w1)
 
                 def quantize_rows():
@@ -1275,13 +1249,13 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                             eb = txl.shift_right(e, txl.uint32(8))
                             for half, ee in ((0, ea), (1, eb)):
                                 i = 2 * p + half
-                                with txl.If(cg == 0), txl.Then():
+                                with txl.if_(cg == 0), txl.then_():
                                     txl.ptx.st.global_.f32(x_scale.ptr_to([sbase_row + 16 * i]), scale_of(ee))
                                 rb16 = rcp_bf16(ee)
                                 r2 = txl.bitwise_or(rb16, txl.shift_left(rb16, txl.uint32(16)))
                                 store(x_fp8, i, fp8x4(ow[4 * i], ow[4 * i + 1], r2, r2), fp8x4(ow[4 * i + 2], ow[4 * i + 3], r2, r2))
                         if SPLIT:
-                            with txl.If(actA if p < RPT // 4 else actB), txl.Then():
+                            with txl.if_(actA if p < RPT // 4 else actB), txl.then_():
                                 row_quant()
                         else:
                             row_quant()
@@ -1295,7 +1269,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                 if write_col:
                     # one thread per amax word: 8 warp partials -> E8M0 scales (stored) and the
                     # bf16x2 reciprocals every thread of the group needs (broadcast through smem)
-                    with txl.If(tig < 64), txl.Then():
+                    with txl.if_(tig < 64), txl.then_():
                         mw = txl.local_scalar("uint32")
                         tw = txl.local_scalar("uint32")
                         txl.ptx.ld.shared.b32(mw, redw_all.ptr_to([rw0 + tig]))
@@ -1311,11 +1285,11 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                         if SPLIT:
                             # words cg*4 + 0..1 hold the first-half channels (ca), 2..3 the second
                             cok = txl.And(cok, txl.Select(txl.truncmod(tig, txl.int32(4)) < 2, txl.Cast("int32", actA), txl.Cast("int32", actB)) == 1)
-                        with txl.If(cok), txl.Then():
+                        with txl.if_(cok), txl.then_():
                             txl.ptx.st.global_.v2.f32(x_ch_scale.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", col)]), scale_of(ea), scale_of(eb))
                 if bwd:
                     # one thread per column: the 128-row block sum over the group's 8 warp partials
-                    with txl.If(txl.And(tig >= 64, tig < 64 + BLOCK)), txl.Then():
+                    with txl.if_(txl.And(tig >= 64, tig < 64 + BLOCK)), txl.then_():
                         j = tig - 64
                         acc = txl.local_scalar("float32")
                         tv = txl.local_scalar("float32")
@@ -1323,7 +1297,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                         for w in range(1, GW):
                             txl.ptx.ld.shared.f32(tv, red_all.ptr_to([rf0 + w * BLOCK + j]))
                             txl.assign(acc, f("add.rn.f32", acc, tv))
-                        with txl.If(ct * BLOCK + j < C), txl.Then():
+                        with txl.if_(ct * BLOCK + j < C), txl.then_():
                             txl.ptx.st.global_.f32(partial.ptr_to([txl.Cast("int64", rb) * C + txl.Cast("int64", ct * BLOCK + j)]), acc)
                 if write_row and not bwd:
                     quantize_rows()
@@ -1345,7 +1319,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
             # reaches num_ctas. If no CTA registered, the last CTA out reduces everything alone.
             # The last participant to read the exit word returns all counters to zero.
             txl.ptx.bar.sync(txl.uint32(0), txl.uint32(P_WARPS * 32))
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 st_ = txl.local_scalar("uint32")
                 txl.ptx.ld.relaxed.gpu.global_.u32(st_, sched.ptr_to([2]))
                 # Register only CTAs that can own a d_bias chunk. Mode 1 assigns one
@@ -1361,31 +1335,31 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
                 pp = txl.local_scalar("int32", init=txl.int32(-1))
                 np_ = txl.local_scalar("int32", init=txl.int32(0))
                 if bwd:
-                    with txl.If(spin == txl.uint32(1)):
-                        with txl.Then():
+                    with txl.if_(spin == txl.uint32(1)):
+                        with txl.then_():
                             txl.assign(pp, txl.Cast("int32", txl.shift_right(ex, txl.uint32(16))))
                             cur = txl.local_scalar("uint32")
-                            txl.cuda.wait_until(cur, sched.ptr_to([1]), txl.bitwise_and(cur, txl.uint32(0xFFFF)) == txl.Cast("uint32", num_ctas), scope="gpu", ptx_type="b32")
+                            txl.cuda.wait_until(cur, sched.ptr_to([1]), txl.bitwise_and(cur, txl.uint32(0xFFFF)) == txl.Cast("uint32", num_ctas), scope="gpu", ptx_type="b32", ty=txl.void)  # ty: tvm-tirx b0 types the Call Missing, which drops it unemitted
                             txl.assign(np_, txl.Cast("int32", txl.shift_right(cur, txl.uint32(16))))
-                        with txl.Else():
-                            with txl.If(txl.And(txl.bitwise_and(ex, txl.uint32(0xFFFF)) == txl.Cast("uint32", num_ctas - 1), txl.shift_right(ex, txl.uint32(16)) == txl.uint32(0))), txl.Then():
+                        with txl.else_():
+                            with txl.if_(txl.And(txl.bitwise_and(ex, txl.uint32(0xFFFF)) == txl.Cast("uint32", num_ctas - 1), txl.shift_right(ex, txl.uint32(16)) == txl.uint32(0))), txl.then_():
                                 txl.assign(pp, txl.int32(0))
                                 txl.assign(np_, txl.int32(1))
-                    with txl.If(pp >= 0), txl.Then():
+                    with txl.if_(pp >= 0), txl.then_():
                         fo = txl.local_scalar("uint32")
                         txl.ptx.atom.acq_rel.gpu.global_.add.u32(fo, sched.ptr_to([3]), txl.uint32(1))
-                        with txl.If(fo == txl.Cast("uint32", np_ - 1)), txl.Then():
+                        with txl.if_(fo == txl.Cast("uint32", np_ - 1)), txl.then_():
                             txl.ptx.st.global_.v4.b32(sched.ptr_to([0]), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0))
                     txl.ptx.st.shared.v2.b32(role_s.ptr_to([0]), pp, np_)
                 else:
-                    with txl.If(ex == txl.Cast("uint32", num_ctas - 1)), txl.Then():
+                    with txl.if_(ex == txl.Cast("uint32", num_ctas - 1)), txl.then_():
                         txl.ptx.st.global_.v4.b32(sched.ptr_to([0]), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0))
             if bwd:
                 txl.ptx.bar.sync(txl.uint32(0), txl.uint32(P_WARPS * 32))
                 me = txl.local_scalar("int32")
                 npart = txl.local_scalar("int32")
                 txl.ptx.ld.shared.v2.b32(me, npart, role_s.ptr_to([0]))
-                with txl.If(me >= 0), txl.Then():
+                with txl.if_(me >= 0), txl.then_():
                     fold_dbias(partial, dbias, offs_s, red_all, num_groups, seg_mode, me, npart, tid, lane, warp, C)
 
     return compile_kernel(kern)
@@ -1399,17 +1373,17 @@ def guard(cond, go):
     if cond is None:
         yield
         return
-    with txl.If(cond):
-        with txl.Then():
+    with txl.if_(cond):
+        with txl.then_():
             yield
-        with txl.Else():
+        with txl.else_():
             txl.assign(go, txl.int32(0))
 
 
 def compile_kernel(kernel):
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+    target = TARGET
     with target:
-        return entry_function(tvm.compile(kernel.mod, target=target, tir_pipeline="tirx"))
+        return entry_function(tvm_tirx.tirx.compile(kernel.mod, target=target, pipeline="tirx"))
 
 
 SCHED = {}

@@ -18,15 +18,18 @@ and prologue overlap the first one's tail, adds each segment's chunk sums in ord
 
 Evolved with TIRx-harness: run slots, frontier member tma-gather (commit 6e1b68f, 972 us vs 10401
 us, 10.699x over the previous SM100 path in the task's benchmark). Compiled once per process by
-tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 from typing import NamedTuple, Optional
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
 
 __all__ = ["bf16_expert_group_slots_sm100", "bf16_expert_gather_sum_sm100", "bf16_expert_gather_rows_sm100", "bf16_expert_segment_sum_sm100"]
 
@@ -73,19 +76,9 @@ MAXT = 4096  # tokens per mask window in shared memory
 def group_slots_kernel(G: int, has_x: bool):
     NW = TILE // 32
 
-    @txl.kernel(warps=NW, arch="sm_100a", grid=lambda p: txl.max(1, (p["S"] + TILE - 1) // TILE))
-    def group_slots(
-        e: txl.gptr[txl.i64],
-        x: txl.gptr[txl.i64],
-        cu: txl.gptr[txl.i32],
-        a_idx: txl.gptr[txl.i32],
-        row_of: txl.gptr[txl.i32],
-        slot_of: txl.gptr[txl.i32],
-        mask: txl.gptr[txl.u64],
-        table: txl.gptr[txl.i32],
-        S: txl.i32,
-        T: txl.i32,
-    ):
+    @txl.kernel()
+    def group_slots(e: txl.Tensor((txl.int64(),), txl.i64), x: txl.Tensor((txl.int64(),), txl.i64), cu: txl.Tensor((txl.int64(),), txl.i32), a_idx: txl.Tensor((txl.int64(),), txl.i32), row_of: txl.Tensor((txl.int64(),), txl.i32), slot_of: txl.Tensor((txl.int64(),), txl.i32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), S: txl.int32, T: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.max(1, (S + TILE - 1) // TILE), block=(NW) * 32))
         b = txl.cta_id()
         tid = txl.thread_id()
         lane = tid & 31
@@ -99,7 +92,7 @@ def group_slots_kernel(G: int, has_x: bool):
         msk = smem.alloc([MAXT], txl.u64)
         lt = txl.shift_left(txl.uint32(1), u322(lane)) - txl.uint32(1)
 
-        with txl.If(tid < 64), txl.Then():
+        with txl.if_(tid < 64), txl.then_():
             txl.ptx.st.shared.s32(tot.ptr_to([tid]), txl.int32(0))
             txl.ptx.st.shared.s32(bef.ptr_to([tid]), txl.int32(0))
         with txl.serial(0, (64 * NW) // TILE) as i:
@@ -124,7 +117,7 @@ def group_slots_kernel(G: int, has_x: bool):
                 for u in range(U):
                     j = (k * U + u) * TILE + tid
                     txl.assign(ev[u], txl.int64(64))
-                    with txl.If(j < S), txl.Then():
+                    with txl.if_(j < S), txl.then_():
                         txl.ptx.ld.global_.nc.s64(ev[u], e.ptr_to([j]))
                         if has_x:
                             txl.ptx.ld.global_.nc.s64(xv[u], x.ptr_to([j]))
@@ -135,30 +128,30 @@ def group_slots_kernel(G: int, has_x: bool):
                     ei = i322(ev[u])
                     if has_x:
                         xi = i322(xv[u])
-                        with txl.If(txl.And(ei < 64, txl.And(xi >= wt0, xi < wt1))), txl.Then():
+                        with txl.if_(txl.And(ei < 64, txl.And(xi >= wt0, xi < wt1))), txl.then_():
                             txl.ptx.atom.shared.or_.b64(
                                 old, msk.ptr_to([xi - wt0]), txl.shift_left(txl.uint64(1), txl.Cast("uint64", ei))
                             )
-                    with txl.If(w_ == 0), txl.Then():
+                    with txl.if_(w_ == 0), txl.then_():
                         txl.ptx["match.any.sync.b32"](peers[u], ei, txl.uint32(FULL))
                         lead = (peers[u] & lt) == txl.uint32(0)
-                        with txl.If(txl.And(lead, ei < 64)), txl.Then():
+                        with txl.if_(txl.And(lead, ei < 64)), txl.then_():
                             cnt = i322(txl.popcount(peers[u]))
                             txl.ptx.red.shared.add.s32(tot.ptr_to([ei]), cnt)
                             # a 1024-slot step lies wholly before this CTA's tile or not at all
-                            with txl.If(j < before), txl.Then():
+                            with txl.if_(j < before), txl.then_():
                                 txl.ptx.red.shared.add.s32(bef.ptr_to([ei]), cnt)
             txl.cuda.cta_sync()
             if has_x:
                 with txl.serial(0, MAXT // TILE) as i:
                     t = wt0 + i * TILE + tid
-                    with txl.If(t < wt1), txl.Then():
+                    with txl.if_(t < wt1), txl.then_():
                         txl.ptx.ld.shared.u64(old, msk.ptr_to([i * TILE + tid]))
                         txl.ptx.st.global_.u64(mask.ptr_to([t]), old)
             txl.cuda.cta_sync()
 
         # cu: exclusive scan of the totals by warp 0 (two experts a lane)
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             a0 = txl.local_scalar(txl.i32)
             a1 = txl.local_scalar(txl.i32)
             txl.ptx.ld.shared.s32(a0, tot.ptr_to([2 * lane]))
@@ -172,20 +165,20 @@ def group_slots_kernel(G: int, has_x: bool):
             ex = incl - s
             txl.ptx.st.shared.s32(cus.ptr_to([2 * lane]), ex)
             txl.ptx.st.shared.s32(cus.ptr_to([2 * lane + 1]), ex + a0)
-            with txl.If(b == 0), txl.Then():
-                with txl.If(2 * lane <= G), txl.Then():
+            with txl.if_(b == 0), txl.then_():
+                with txl.if_(2 * lane <= G), txl.then_():
                     txl.ptx.st.global_.s32(cu.ptr_to([2 * lane]), ex)
-                with txl.If(2 * lane + 1 <= G), txl.Then():
+                with txl.if_(2 * lane + 1 <= G), txl.then_():
                     txl.ptx.st.global_.s32(cu.ptr_to([2 * lane + 1]), ex + a0)
                 if G == 64:
-                    with txl.If(lane == 31), txl.Then():
+                    with txl.if_(lane == 31), txl.then_():
                         txl.ptx.st.global_.s32(cu.ptr_to([64]), incl)
 
         # rank this CTA's tile
         j = before + tid
         e0 = txl.local_scalar(txl.i64, init=txl.int64(64))
         x0 = txl.local_scalar(txl.i64, init=txl.int64(0))
-        with txl.If(j < S), txl.Then():
+        with txl.if_(j < S), txl.then_():
             txl.ptx.ld.global_.nc.s64(e0, e.ptr_to([j]))
             if has_x:
                 txl.ptx.ld.global_.nc.s64(x0, x.ptr_to([j]))
@@ -193,7 +186,7 @@ def group_slots_kernel(G: int, has_x: bool):
         pr = txl.local_scalar(txl.u32)
         txl.ptx["match.any.sync.b32"](pr, ei, txl.uint32(FULL))
         lrank = i322(txl.popcount(pr & lt))
-        with txl.If(txl.And(lrank == 0, ei < 64)), txl.Then():
+        with txl.if_(txl.And(lrank == 0, ei < 64)), txl.then_():
             txl.ptx.st.shared.s32(wc.ptr_to([ei * NW + warp]), i322(txl.popcount(pr)))
         txl.cuda.cta_sync()
         # per-expert exclusive scan over the warps: warp w scans experts w, w + 32
@@ -208,7 +201,7 @@ def group_slots_kernel(G: int, has_x: bool):
                 txl.assign(inc, inc + txl.Select(lane >= d, o2, txl.int32(0)))
             txl.ptx.st.shared.s32(wc.ptr_to([ee * NW + lane]), inc - v)
         txl.cuda.cta_sync()
-        with txl.If(j < S), txl.Then():
+        with txl.if_(j < S), txl.then_():
             c0 = txl.local_scalar(txl.i32)
             c1 = txl.local_scalar(txl.i32)
             c2 = txl.local_scalar(txl.i32)
@@ -225,7 +218,7 @@ def group_slots_kernel(G: int, has_x: bool):
             else:
                 txl.ptx.st.global_.s32(a_idx.ptr_to([row]), j)
 
-    return entry_function(group_slots.compile())
+    return entry_function(group_slots.compile(TARGET))
 
 
 CCS = 16  # (non-portable cluster size, launches on B200) cluster group_slots: the whole call is one cluster of CCS CTAs, CTA r owns slots [r * SP, r * SP + SP)
@@ -238,20 +231,11 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
     NW = TILE // 32
     U = csp // TILE  # 1024-slot tiles per CTA, held in registers
 
-    @txl.kernel(warps=NW, arch="sm_100a", grid=CCS * NCL)
-    def group_slots_cluster(
-        e: txl.gptr[txl.i32],  # int64 ids viewed as int32 pairs: the low word at 2 * j
-        x: txl.gptr[txl.i32],
-        cu: txl.gptr[txl.i32],
-        a_idx: txl.gptr[txl.i32],
-        row_of: txl.gptr[txl.i32],
-        slot_of: txl.gptr[txl.i32],
-        mask: txl.gptr[txl.u64],
-        table: txl.gptr[txl.i32],
-        S: txl.i32,
-        T: txl.i32,
-    ):
-        r = txl.cta_id_in_cluster([CCS])
+    @txl.kernel()
+    def group_slots_cluster(e: txl.Tensor((txl.int64(),), txl.i32), # int64 ids viewed as int32 pairs: the low word at 2 * j
+        x: txl.Tensor((txl.int64(),), txl.i32), cu: txl.Tensor((txl.int64(),), txl.i32), a_idx: txl.Tensor((txl.int64(),), txl.i32), row_of: txl.Tensor((txl.int64(),), txl.i32), slot_of: txl.Tensor((txl.int64(),), txl.i32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), S: txl.int32, T: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=CCS * NCL, block=(NW) * 32, cluster=CCS))
+        r = txl.cuda.cluster_cta_id("x")
         # peers' shared memory may be written only once every CTA of the cluster has started: arrive now,
         # wait just before the first remote store (by then the wait is free)
         txl.ptx.barrier.cluster.arrive.relaxed()
@@ -281,7 +265,7 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
         def iket_range(name):
             token = txl.alloc_local([1], "uint32")
             txl.assign(token[0], txl.cuda.iket.sentinel_token(name))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.assign(token[0], txl.cuda.iket.range_start(name))
             return token
 
@@ -292,34 +276,34 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
         for u in range(U):
             jl = u * TILE + tid
             txl.assign(ev[u], txl.int32(64))
-            with txl.If(jl < n), txl.Then():
+            with txl.if_(jl < n), txl.then_():
                 txl.ptx.ld.global_.nc.s32(ev[u], e.ptr_to([2 * (s0 + jl)]))
                 if has_x:
                     txl.ptx.ld.global_.nc.s32(xv[u], x.ptr_to([2 * (s0 + jl)]))
-        with txl.If(tid < 64), txl.Then():
+        with txl.if_(tid < 64), txl.then_():
             txl.ptx.st.shared.s32(hist.ptr_to([tid]), txl.int32(0))
         for u in range(U):
-            with txl.If(u * TILE < n), txl.Then():
+            with txl.if_(u * TILE < n), txl.then_():
                 for i in range((64 * NW) // TILE):
                     txl.ptx.st.shared.s32(wc.ptr_to([u * 64 * NW + i * TILE + tid]), txl.int32(0))
         if has_x:
             with txl.serial(0, (TPC + TILE - 1) // TILE) as i:
                 o = r * TPC + i * TILE + tid  # owned-token ordinal
                 t = ((o >> 5) * NCL + cl) * 32 + (o & 31)
-                with txl.If(txl.And(t < T, i * TILE + tid < TPC)), txl.Then():
+                with txl.if_(txl.And(t < T, i * TILE + tid < TPC)), txl.then_():
                     txl.ptx.st.global_.u64(mask.ptr_to([t]), txl.uint64(0))
         txl.cuda.cta_sync()
         for u in range(U):
-            with txl.If(u * TILE < n), txl.Then():
+            with txl.if_(u * TILE < n), txl.then_():
                 txl.ptx["match.any.sync.b32"](prs[u], ev[u], txl.uint32(FULL))
-                with txl.If(txl.And((prs[u] & lt) == txl.uint32(0), ev[u] < 64)), txl.Then():
+                with txl.if_(txl.And((prs[u] & lt) == txl.uint32(0), ev[u] < 64)), txl.then_():
                     cnt = i322(txl.popcount(prs[u]))
                     txl.ptx.red.shared.add.s32(hist.ptr_to([ev[u]]), cnt)
                     txl.ptx.st.shared.s32(wc.ptr_to([(u * 64 + ev[u]) * NW + warp]), cnt)
         txl.cuda.cta_sync()
         # the slice histogram is complete: push it to every peer now, under the scan below
         txl.ptx.barrier.cluster.wait()
-        with txl.If(tid < 64), txl.Then():
+        with txl.if_(tid < 64), txl.then_():
             hv = txl.local_scalar(txl.i32)
             txl.ptx.ld.shared.s32(hv, hist.ptr_to([tid]))
             for q in range(CCS):
@@ -335,7 +319,7 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
             ee = warp + 32 * half
             txl.assign(carry, txl.int32(0))
             for u in range(U):
-                with txl.If(u * TILE < n), txl.Then():
+                with txl.if_(u * TILE < n), txl.then_():
                     txl.ptx.ld.shared.s32(v, wc.ptr_to([(u * 64 + ee) * NW + lane]))
                     txl.assign(inc, v)
                     for d in (1, 2, 4, 8, 16):
@@ -351,10 +335,10 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
         tk3 = iket_range("mask-dsmem")
         if has_x:
             for u in range(U):
-                with txl.If(txl.And(u * TILE + tid < n, ((xv[u] >> 5) % NCL) == cl)), txl.Then():
+                with txl.if_(txl.And(u * TILE + tid < n, ((xv[u] >> 5) % NCL) == cl)), txl.then_():
                     txl.ptx.red.global_.or_.b64(mask.ptr_to([xv[u]]), txl.shift_left(txl.uint64(1), txl.Cast("uint64", ev[u])))
         # warp 0: totals and this slice's offsets for experts 2 * lane and 2 * lane + 1, then the cu scan
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             h0 = txl.alloc_local([CCS], txl.i32)
             h1 = txl.alloc_local([CCS], txl.i32)
             for q in range(CCS):
@@ -377,13 +361,13 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
             ex = txl.local_scalar(txl.i32, init=incl - s)
             txl.ptx.st.shared.s32(base.ptr_to([2 * lane]), ex + b0)
             txl.ptx.st.shared.s32(base.ptr_to([2 * lane + 1]), ex + a0 + b1)
-            with txl.If(txl.And(r == 0, cl == 0)), txl.Then():
-                with txl.If(2 * lane <= G), txl.Then():
+            with txl.if_(txl.And(r == 0, cl == 0)), txl.then_():
+                with txl.if_(2 * lane <= G), txl.then_():
                     txl.ptx.st.global_.s32(cu.ptr_to([2 * lane]), ex)
-                with txl.If(2 * lane + 1 <= G), txl.Then():
+                with txl.if_(2 * lane + 1 <= G), txl.then_():
                     txl.ptx.st.global_.s32(cu.ptr_to([2 * lane + 1]), ex + a0)
                 if G == 64:
-                    with txl.If(lane == 31), txl.Then():
+                    with txl.if_(lane == 31), txl.then_():
                         txl.ptx.st.global_.s32(cu.ptr_to([64]), incl)
         txl.cuda.cta_sync()
         txl.cuda.iket.range_end(tk3[0])
@@ -392,7 +376,7 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
         c2 = txl.local_scalar(txl.i32)
         for u in range(U):
             jl = u * TILE + tid
-            with txl.If(txl.And(jl < n, (u * NW + warp) % NCL == cl)), txl.Then():
+            with txl.if_(txl.And(jl < n, (u * NW + warp) % NCL == cl)), txl.then_():
                 j = s0 + jl
                 txl.ptx.ld.shared.s32(c0, base.ptr_to([ev[u]]))
                 txl.ptx.ld.shared.s32(c2, wc.ptr_to([(u * 64 + ev[u]) * NW + warp]))
@@ -406,7 +390,7 @@ def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
                     txl.ptx.st.global_.s32(a_idx.ptr_to([row]), j)
         txl.cuda.iket.range_end(tk5[0])
 
-    return entry_function(group_slots_cluster.compile())
+    return entry_function(group_slots_cluster.compile(TARGET))
 
 
 def bf16_expert_group_slots_sm100(expert_idxs, expand_idx, num_groups, num_tokens):
@@ -454,14 +438,9 @@ def gather_sum_kernel(G: int, H: int):
     KB = min(GS_BATCH, G)
     GRID = NUM_SMS * GS_CTAS_PER_SM.get(H, 4)
 
-    @txl.kernel(warps=NW, arch="sm_100a", grid=lambda p: txl.min(p["T"], GRID))
-    def gather_sum(
-        grad: txl.gptr[txl.u32],
-        mask: txl.gptr[txl.u64],
-        table: txl.gptr[txl.i32],
-        out: txl.gptr[txl.u32],
-        T: txl.i32,
-    ):
+    @txl.kernel()
+    def gather_sum(grad: txl.Tensor((txl.int64(),), txl.u32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), T: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW) * 32))
         tid = txl.thread_id()
         grid = txl.min(T, GRID)
         active = tid < V
@@ -486,35 +465,35 @@ def gather_sum_kernel(G: int, H: int):
                 txl.assign(m, m ^ low)
             for k in range(KB):
                 txl.assign(rows[k], txl.int32(-1))
-                with txl.If(ee[k] >= 0), txl.Then():
+                with txl.if_(ee[k] >= 0), txl.then_():
                     txl.ptx.ld.global_.nc.s32(rows[k], table.ptr_to([ee[k] * T + tt]))
 
         def add_rows(rows):
             for k in range(KB):
-                with txl.If(txl.And(rows[k] >= 0, active)), txl.Then():
+                with txl.if_(txl.And(rows[k] >= 0, active)), txl.then_():
                     txl.ptx.ld.global_.nc.v4.b32(w[4 * k], w[4 * k + 1], w[4 * k + 2], w[4 * k + 3],
                                                  grad.ptr_to([txl.Cast("int64", rows[k]) * (H // 2) + tid * 4]))
 
         def accumulate(rows):
             for k in range(KB):
-                with txl.If(rows[k] >= 0), txl.Then():
+                with txl.if_(rows[k] >= 0), txl.then_():
                     for p in range(4):
-                        lo = txl.reinterpret("float32", txl.shift_left(w[4 * k + p], txl.uint32(16)))
-                        hi = txl.reinterpret("float32", w[4 * k + p] & txl.uint32(0xFFFF0000))
+                        lo = txl.reinterpret(txl.shift_left(w[4 * k + p], txl.uint32(16)), ty="float32")
+                        hi = txl.reinterpret(w[4 * k + p] & txl.uint32(0xFFFF0000), ty="float32")
                         txl.assign(acc[2 * p], acc[2 * p] + lo)
                         txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
 
         # prologue: rows of the first token, mask of the second
         txl.assign(rem_c, txl.uint64(0))
-        with txl.If(t < T), txl.Then():
+        with txl.if_(t < T), txl.then_():
             txl.ptx.ld.global_.nc.u64(rem_c, mask.ptr_to([t]))
         take_batch(rem_c, t, rc)
-        with txl.If(t + grid < T), txl.Then():
+        with txl.if_(t + grid < T), txl.then_():
             txl.ptx.ld.global_.nc.u64(m_n, mask.ptr_to([t + grid]))
-        with txl.While(t < T):
+        with txl.while_(t < T):
             add_rows(rc)
             txl.assign(m_n2, txl.uint64(0))
-            with txl.If(t + 2 * grid < T), txl.Then():
+            with txl.if_(t + 2 * grid < T), txl.then_():
                 txl.ptx.ld.global_.nc.u64(m_n2, mask.ptr_to([t + 2 * grid]))
             txl.assign(rem_n, m_n)
             take_batch(rem_n, t + grid, rn)
@@ -522,19 +501,19 @@ def gather_sum_kernel(G: int, H: int):
                 txl.assign(acc[i], txl.float32(0))
             accumulate(rc)
             # experts past the first KB (rare): one at a time, still ascending
-            with txl.While(rem_c != txl.uint64(0)):
+            with txl.while_(rem_c != txl.uint64(0)):
                 txl.assign(low, rem_c & (txl.uint64(0) - rem_c))
                 txl.assign(rem_c, rem_c ^ low)
                 txl.ptx.ld.global_.nc.s32(row, table.ptr_to([i322(txl.popcount(low - txl.uint64(1))) * T + t]))
-                with txl.If(active), txl.Then():
+                with txl.if_(active), txl.then_():
                     txl.ptx.ld.global_.nc.v4.b32(w[0], w[1], w[2], w[3],
                                                  grad.ptr_to([txl.Cast("int64", row) * (H // 2) + tid * 4]))
                     for p in range(4):
-                        lo = txl.reinterpret("float32", txl.shift_left(w[p], txl.uint32(16)))
-                        hi = txl.reinterpret("float32", w[p] & txl.uint32(0xFFFF0000))
+                        lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
+                        hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
                         txl.assign(acc[2 * p], acc[2 * p] + lo)
                         txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
-            with txl.If(active), txl.Then():
+            with txl.if_(active), txl.then_():
                 for p in range(4):
                     txl.ptx["cvt.rn.bf16x2.f32"](w[p], acc[2 * p + 1], acc[2 * p])
                 txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", t) * (H // 2) + tid * 4]), w[0], w[1], w[2], w[3])
@@ -544,7 +523,7 @@ def gather_sum_kernel(G: int, H: int):
             txl.assign(m_n, m_n2)
             txl.assign(t, t + grid)
 
-    return entry_function(gather_sum.compile())
+    return entry_function(gather_sum.compile(TARGET))
 
 
 GS_TMA = True
@@ -569,14 +548,9 @@ def gather_sum_tma_kernel(G: int, H: int):
     RB = H * 2  # bytes per row
     assert RB % 16 == 0 and KB <= 32
 
-    @txl.kernel(warps=NW, arch="sm_100a", grid=lambda p: txl.min(p["T"], GRID))
-    def gather_sum_tma(
-        grad: txl.gptr[txl.u32],
-        mask: txl.gptr[txl.u64],
-        table: txl.gptr[txl.i32],
-        out: txl.gptr[txl.u32],
-        T: txl.i32,
-    ):
+    @txl.kernel()
+    def gather_sum_tma(grad: txl.Tensor((txl.int64(),), txl.u32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), T: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW) * 32))
         tid = txl.thread_id()
         lane = tid & 31
         warp = tid >> 5
@@ -586,7 +560,7 @@ def gather_sum_tma_kernel(G: int, H: int):
         stage = smem.alloc([ST * KB * RW], txl.u32, align=128)
         bars = smem.alloc([ST], txl.u64, align=8)
         meta = smem.alloc([2 * ST], txl.i32)  # per slot: token, rows | last << 8 (-1: no more units)
-        with txl.If(tid < ST), txl.Then():
+        with txl.if_(tid < ST), txl.then_():
             txl.ptx.mbarrier.init.shared.b64(bars.ptr_to([tid]), txl.uint32(1))
         txl.ptx.fence.mbarrier_init.release.cluster()
         txl.cuda.cta_sync()
@@ -600,15 +574,15 @@ def gather_sum_tma_kernel(G: int, H: int):
         em = txl.local_scalar(txl.i32)
         nv = txl.local_scalar(txl.i32)
         rr = txl.local_scalar(txl.i32)
-        with txl.If(warp == 0), txl.Then():
-            with txl.If(tp < T), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
+            with txl.if_(tp < T), txl.then_():
                 txl.ptx.ld.global_.nc.u64(mp, mask.ptr_to([tp]))
-            with txl.If(tp + grid < T), txl.Then():
+            with txl.if_(tp + grid < T), txl.then_():
                 txl.ptx.ld.global_.nc.u64(mn, mask.ptr_to([tp + grid]))
 
         def produce(slot):
-            with txl.If(tp < T):
-                with txl.Then():
+            with txl.if_(tp < T):
+                with txl.then_():
                     txl.assign(nv, txl.int32(0))
                     txl.assign(em, txl.int32(-1))
                     for k in range(KB):
@@ -618,12 +592,12 @@ def gather_sum_tma_kernel(G: int, H: int):
                         txl.assign(nv, nv + txl.Select(ee[k] >= 0, txl.int32(1), txl.int32(0)))
                         txl.assign(em, txl.Select(lane == k, ee[k], em))
                     last = txl.Select(mp == txl.uint64(0), txl.int32(1), txl.int32(0))
-                    with txl.If(lane == 0), txl.Then():
+                    with txl.if_(lane == 0), txl.then_():
                         txl.ptx.st.shared.s32(meta.ptr_to([2 * slot]), tp)
                         txl.ptx.st.shared.s32(meta.ptr_to([2 * slot + 1]), nv + last * 256)
                         txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bars.ptr_to([slot]), u322(nv * RB))
                     txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-                    with txl.If(em >= 0), txl.Then():
+                    with txl.if_(em >= 0), txl.then_():
                         txl.ptx.ld.global_.nc.s32(rr, table.ptr_to([em * T + tp]))
                         txl.ptx[BULK_G2S](
                             stage.ptr_to([(slot * KB + lane) * RW]),
@@ -631,18 +605,18 @@ def gather_sum_tma_kernel(G: int, H: int):
                             txl.uint32(RB),
                             bars.ptr_to([slot]),
                         )
-                    with txl.If(mp == txl.uint64(0)), txl.Then():
+                    with txl.if_(mp == txl.uint64(0)), txl.then_():
                         txl.assign(tp, tp + grid)
                         txl.assign(mp, mn)
                         txl.assign(mn, txl.uint64(0))
-                        with txl.If(tp + grid < T), txl.Then():
+                        with txl.if_(tp + grid < T), txl.then_():
                             txl.ptx.ld.global_.nc.u64(mn, mask.ptr_to([tp + grid]))
-                with txl.Else():
-                    with txl.If(lane == 0), txl.Then():
+                with txl.else_():
+                    with txl.if_(lane == 0), txl.then_():
                         txl.ptx.st.shared.s32(meta.ptr_to([2 * slot + 1]), txl.int32(-1))
                         txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bars.ptr_to([slot]), txl.uint32(0))
 
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             for q in range(ST):
                 produce(q)
 
@@ -655,37 +629,37 @@ def gather_sum_tma_kernel(G: int, H: int):
         sl = txl.local_scalar(txl.i32)
         for p in range(8):
             txl.assign(acc[p], txl.float32(0))
-        with txl.While(go > 0):
+        with txl.while_(go > 0):
             txl.assign(sl, i % ST)
             txl.cuda.mbarrier_wait(bars.ptr_to([sl]), u322((i // ST) & 1))
             txl.ptx.ld.shared.s32(tt, meta.ptr_to([2 * sl]))
             txl.ptx.ld.shared.s32(info, meta.ptr_to([2 * sl + 1]))
-            with txl.If(info < 0):
-                with txl.Then():
+            with txl.if_(info < 0):
+                with txl.then_():
                     txl.assign(go, txl.int32(0))
-                with txl.Else():
-                    with txl.If(active), txl.Then():
+                with txl.else_():
+                    with txl.if_(active), txl.then_():
                         for k in range(KB):
-                            with txl.If(k < (info & 255)), txl.Then():
+                            with txl.if_(k < (info & 255)), txl.then_():
                                 txl.ptx.ld.shared.v4.b32(w[0], w[1], w[2], w[3], stage.ptr_to([(sl * KB + k) * RW + tid * 4]))
                                 for p in range(4):
-                                    lo = txl.reinterpret("float32", txl.shift_left(w[p], txl.uint32(16)))
-                                    hi = txl.reinterpret("float32", w[p] & txl.uint32(0xFFFF0000))
+                                    lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
+                                    hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
                                     txl.assign(acc[2 * p], acc[2 * p] + lo)
                                     txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
-                    with txl.If(info >= 256), txl.Then():
-                        with txl.If(active), txl.Then():
+                    with txl.if_(info >= 256), txl.then_():
+                        with txl.if_(active), txl.then_():
                             for p in range(4):
                                 txl.ptx["cvt.rn.bf16x2.f32"](w[p], acc[2 * p + 1], acc[2 * p])
                             txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", tt) * RW + tid * 4]), w[0], w[1], w[2], w[3])
                         for p in range(8):
                             txl.assign(acc[p], txl.float32(0))
             txl.cuda.cta_sync()  # every thread is done with slot sl
-            with txl.If(txl.And(go > 0, warp == 0)), txl.Then():
+            with txl.if_(txl.And(go > 0, warp == 0)), txl.then_():
                 produce(sl)
             txl.assign(i, i + 1)
 
-    return entry_function(gather_sum_tma.compile())
+    return entry_function(gather_sum_tma.compile(TARGET))
 
 
 GS_PRODUCER_WARP = True  # tma3: a dedicated producer warp and per-slot empty barriers (no CTA barrier per unit)
@@ -715,14 +689,9 @@ def gather_sum_tma3_kernel(G: int, H: int):
 
     PW = NW if GS_PRODUCER_WARP else 0  # the producer warp (a dedicated extra warp, or consumer warp 0)
 
-    @txl.kernel(warps=NW + (1 if GS_PRODUCER_WARP else 0), arch="sm_100a", grid=lambda p: txl.min(p["T"], GRID))
-    def gather_sum_tma3(
-        grad: txl.gptr[txl.u32],
-        mask: txl.gptr[txl.u64],
-        table: txl.gptr[txl.i32],
-        out: txl.gptr[txl.u32],
-        T: txl.i32,
-    ):
+    @txl.kernel()
+    def gather_sum_tma3(grad: txl.Tensor((txl.int64(),), txl.u32), mask: txl.Tensor((txl.int64(),), txl.u64), table: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), T: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW + (1 if GS_PRODUCER_WARP else 0)) * 32))
         tid = txl.thread_id()
         lane = tid & 31
         warp = tid >> 5
@@ -735,7 +704,7 @@ def gather_sum_tma3_kernel(G: int, H: int):
         meta_n = smem.alloc([ST], txl.i32)  # entries in the unit (-1: no more units)
         meta_e = smem.alloc([ST * KB], txl.i32)  # token | LAST_BIT | NOROW_BIT
         empt = smem.alloc([ST], txl.u64, align=8)  # slot consumed: one arrival per consumer thread
-        with txl.If(tid < ST), txl.Then():
+        with txl.if_(tid < ST), txl.then_():
             txl.ptx.mbarrier.init.shared.b64(bars.ptr_to([tid]), txl.uint32(1))
             txl.ptx.mbarrier.init.shared.b64(empt.ptr_to([tid]), txl.uint32(NW * 32))
         txl.ptx.fence.mbarrier_init.release.cluster()
@@ -764,7 +733,7 @@ def gather_sum_tma3_kernel(G: int, H: int):
         def load_window(dst, base):
             t_ = cta + (base + lane) * grid
             txl.assign(dst, txl.uint64(0))
-            with txl.If(t_ < T), txl.Then():
+            with txl.if_(t_ < T), txl.then_():
                 txl.ptx.ld.global_.nc.u64(dst, mask.ptr_to([t_]))
 
         def fetch_mask():  # mp = mask of window entry cur (all lanes)
@@ -774,7 +743,7 @@ def gather_sum_tma3_kernel(G: int, H: int):
             txl.ptx.shfl_sync.idx.b32(hi32, hw, u322(cur), txl.uint32(31), txl.uint32(FULL))
             txl.assign(mp, (txl.Cast("uint64", hi32) << txl.uint64(32)) | txl.Cast("uint64", lo32))
 
-        with txl.If(warp == PW), txl.Then():
+        with txl.if_(warp == PW), txl.then_():
             load_window(win, txl.int32(0))
             load_window(winn, txl.int32(32))
             fetch_mask()
@@ -784,33 +753,33 @@ def gather_sum_tma3_kernel(G: int, H: int):
             txl.assign(nr, txl.int32(0))
             txl.assign(em, txl.int32(-1))
             for k in range(KB):
-                with txl.If(tp < T), txl.Then():
+                with txl.if_(tp < T), txl.then_():
                     txl.assign(low, mp & (txl.uint64(0) - mp))
                     txl.assign(ek, txl.Select(low != txl.uint64(0), i322(txl.popcount(low - txl.uint64(1))), txl.int32(-1)))
                     txl.assign(mp, mp ^ low)
                     word = tp + txl.Select(mp == txl.uint64(0), txl.int32(LAST_BIT), txl.int32(0)) + txl.Select(ek < 0, txl.int32(NOROW_BIT), txl.int32(0))
-                    with txl.If(lane == k), txl.Then():
+                    with txl.if_(lane == k), txl.then_():
                         txl.assign(em, ek)
                         txl.assign(tk, word)
                     txl.assign(nv, nv + 1)
                     txl.assign(nr, nr + txl.Select(ek >= 0, txl.int32(1), txl.int32(0)))
-                    with txl.If(mp == txl.uint64(0)), txl.Then():  # token done: next token of this CTA
+                    with txl.if_(mp == txl.uint64(0)), txl.then_():  # token done: next token of this CTA
                         txl.assign(cur, cur + 1)
-                        with txl.If(cur == 32), txl.Then():
+                        with txl.if_(cur == 32), txl.then_():
                             txl.assign(win, winn)
                             txl.assign(wbase, wbase + 32)
                             txl.assign(cur, txl.int32(0))
                             load_window(winn, wbase + 32)
                         txl.assign(tp, cta + (wbase + cur) * grid)
                         fetch_mask()
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.st.shared.s32(meta_n.ptr_to([slot]), txl.Select(nv > 0, nv, txl.int32(-1)))
-            with txl.If(lane < nv), txl.Then():
+            with txl.if_(lane < nv), txl.then_():
                 txl.ptx.st.shared.s32(meta_e.ptr_to([slot * KB + lane]), tk)
             txl.ptx["bar.warp.sync"](txl.uint32(FULL))  # every lane's meta store before the (releasing) arrive
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bars.ptr_to([slot]), u322(nr * RB))
-            with txl.If(txl.And(lane < nv, em >= 0)), txl.Then():
+            with txl.if_(txl.And(lane < nv, em >= 0)), txl.then_():
                 txl.ptx.ld.global_.nc.s32(rr, table.ptr_to([em * T + (tk & txl.int32(NOROW_BIT - 1))]))
                 if EVF["gs"]:
                     txl.ptx[BULK_G2S + ".L2::cache_hint"](
@@ -830,17 +799,17 @@ def gather_sum_tma3_kernel(G: int, H: int):
 
         def spin(bar, parity):
             rdy = txl.local_scalar(txl.u32, init=txl.uint32(0))
-            with txl.While(rdy == txl.uint32(0)):
+            with txl.while_(rdy == txl.uint32(0)):
                 txl.ptx.mbarrier.try_wait.parity.shared.b64(rdy, bar, parity)
 
-        with txl.If(warp == PW), txl.Then():
+        with txl.if_(warp == PW), txl.then_():
             for q in range(ST):
                 produce(q)
             if GS_PRODUCER_WARP:  # refill each slot once its consumers release it, until the end marker
                 pi = txl.local_scalar(txl.i32, init=txl.int32(ST))
                 fin = txl.local_scalar(txl.i32, init=txl.Select(nv == 0, txl.int32(1), txl.int32(0)))
                 ps = txl.local_scalar(txl.i32)
-                with txl.While(fin == 0):
+                with txl.while_(fin == 0):
                     txl.assign(ps, pi % ST)
                     spin(empt.ptr_to([ps]), u322((pi // ST - 1) & 1))
                     produce(ps)
@@ -857,31 +826,31 @@ def gather_sum_tma3_kernel(G: int, H: int):
         for p in range(8):
             txl.assign(acc[p], txl.float32(0))
         txl.assign(go, txl.Select(warp < NW, txl.int32(1), txl.int32(0)))
-        with txl.While(go > 0):
+        with txl.while_(go > 0):
             txl.assign(sl, i % ST)
             if GS_SPIN:  # try_wait without a suspend-time hint, in a spin loop
                 rdy = txl.local_scalar(txl.u32, init=txl.uint32(0))
-                with txl.While(rdy == txl.uint32(0)):
+                with txl.while_(rdy == txl.uint32(0)):
                     txl.ptx.mbarrier.try_wait.parity.shared.b64(rdy, bars.ptr_to([sl]), u322((i // ST) & 1))
             else:
                 txl.cuda.mbarrier_wait(bars.ptr_to([sl]), u322((i // ST) & 1))
             txl.ptx.ld.shared.s32(nn, meta_n.ptr_to([sl]))
-            with txl.If(nn < 0):
-                with txl.Then():
+            with txl.if_(nn < 0):
+                with txl.then_():
                     txl.assign(go, txl.int32(0))
-                with txl.Else():
-                    with txl.If(active), txl.Then():
+                with txl.else_():
+                    with txl.if_(active), txl.then_():
                         for k in range(KB):
-                            with txl.If(k < nn), txl.Then():
+                            with txl.if_(k < nn), txl.then_():
                                 txl.ptx.ld.shared.s32(wd, meta_e.ptr_to([sl * KB + k]))
-                                with txl.If((wd & txl.int32(NOROW_BIT)) == 0), txl.Then():
+                                with txl.if_((wd & txl.int32(NOROW_BIT)) == 0), txl.then_():
                                     txl.ptx.ld.shared.v4.b32(w[0], w[1], w[2], w[3], stage.ptr_to([(sl * KB + k) * RW + tid * 4]))
                                     for p in range(4):
-                                        lo = txl.reinterpret("float32", txl.shift_left(w[p], txl.uint32(16)))
-                                        hi = txl.reinterpret("float32", w[p] & txl.uint32(0xFFFF0000))
+                                        lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
+                                        hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
                                         txl.assign(acc[2 * p], acc[2 * p] + lo)
                                         txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
-                                with txl.If((wd & txl.int32(LAST_BIT)) != 0), txl.Then():
+                                with txl.if_((wd & txl.int32(LAST_BIT)) != 0), txl.then_():
                                     for p in range(4):
                                         txl.ptx["cvt.rn.bf16x2.f32"](w[p], acc[2 * p + 1], acc[2 * p])
                                     tt = wd & txl.int32(NOROW_BIT - 1)
@@ -889,15 +858,15 @@ def gather_sum_tma3_kernel(G: int, H: int):
                                     for p in range(8):
                                         txl.assign(acc[p], txl.float32(0))
             if GS_PRODUCER_WARP:
-                with txl.If(go > 0), txl.Then():  # each consumer thread releases the slot after its own reads
+                with txl.if_(go > 0), txl.then_():  # each consumer thread releases the slot after its own reads
                     txl.ptx.mbarrier.arrive.shared.b64(empt.ptr_to([sl]))
             else:
                 txl.cuda.cta_sync()  # every thread is done with slot sl
-                with txl.If(txl.And(go > 0, warp == 0)), txl.Then():
+                with txl.if_(txl.And(go > 0, warp == 0)), txl.then_():
                     produce(sl)
             txl.assign(i, i + 1)
 
-    return entry_function(gather_sum_tma3.compile())
+    return entry_function(gather_sum_tma3.compile(TARGET))
 
 
 def bf16_expert_gather_sum_sm100(grad, maps, num_groups, max_slots):
@@ -919,8 +888,9 @@ def gather_rows_kernel(N: int):
     V = N // 8
     NW = 8
 
-    @txl.kernel(warps=NW, arch="sm_100a", grid=lambda p: (p["R"] + ROWS_PER_CTA - 1) // ROWS_PER_CTA)
-    def gather_rows(x: txl.gptr[txl.u32], idx: txl.gptr[txl.i32], out: txl.gptr[txl.u32], R: txl.i32):
+    @txl.kernel()
+    def gather_rows(x: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.u32), R: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(R + ROWS_PER_CTA - 1) // ROWS_PER_CTA, block=(NW) * 32))
         b = txl.cta_id()
         tid = txl.thread_id()
         NI = (V * ROWS_PER_CTA + NW * 32 - 1) // (NW * 32)
@@ -931,12 +901,12 @@ def gather_rows_kernel(N: int):
         for i in range(NI):
             f = i * NW * 32 + tid
             r = b * ROWS_PER_CTA + f // V
-            with txl.If(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.Then():
+            with txl.if_(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.then_():
                 txl.ptx.ld.global_.nc.s32(src[i], idx.ptr_to([r]))
         for i in range(NI):
             f = i * NW * 32 + tid
             r = b * ROWS_PER_CTA + f // V
-            with txl.If(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.Then():
+            with txl.if_(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.then_():
                 if EVF["rows"]:
                     txl.ptx["ld.global.nc.L1::no_allocate.L2::cache_hint.v4.b32"](
                         w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3],
@@ -947,11 +917,11 @@ def gather_rows_kernel(N: int):
         for i in range(NI):
             f = i * NW * 32 + tid
             r = b * ROWS_PER_CTA + f // V
-            with txl.If(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.Then():
+            with txl.if_(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.then_():
                 txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", r) * (N // 2) + (f % V) * 4]),
                                           w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3])
 
-    return entry_function(gather_rows.compile())
+    return entry_function(gather_rows.compile(TARGET))
 
 
 def bf16_expert_gather_rows_sm100(x, idx):
@@ -980,14 +950,9 @@ def segment_sum_kernel(N: int, has_idx: bool):
     NT = W * 32
     assert 256 % D == 0
 
-    @txl.kernel(warps=W, arch="sm_100a", grid=lambda p: p["G"] * NCB)
-    def segment_sum(
-        x: txl.gptr[txl.u32],
-        idx: txl.gptr[txl.i32],
-        cu: txl.gptr[txl.i32],
-        out: txl.gptr[txl.f32],
-        G: txl.i32,
-    ):
+    @txl.kernel()
+    def segment_sum(x: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), cu: txl.Tensor((txl.int64(),), txl.i32), out: txl.Tensor((txl.int64(),), txl.f32), G: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(W) * 32))
         b = txl.cta_id()
         g = b // NCB
         cb = b % NCB
@@ -1042,8 +1007,8 @@ def segment_sum_kernel(N: int, has_idx: bool):
             else:
                 txl.ptx.ld.shared.v2.b32(w[0], w[1], ring.ptr_to([(slot * NT + tid) * VW]))
             for p in range(VW):
-                lo = txl.reinterpret("float32", txl.shift_left(w[p], txl.uint32(16)))
-                hi = txl.reinterpret("float32", w[p] & txl.uint32(0xFFFF0000))
+                lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
+                hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
                 if SEG_F32X2:
                     txl.ptx["add.rn.f32x2"](acc2[p], acc2[p], txl.cuda.make_float2(lo, hi))
                 else:
@@ -1058,12 +1023,12 @@ def segment_sum_kernel(N: int, has_idx: bool):
                 txl.assign(acc[i], txl.float32(0))
             for p in range(VW):
                 txl.assign(acc2[p], txl.uint64(0))
-            with txl.If(c < nch), txl.Then():
+            with txl.if_(c < nch), txl.then_():
                 if has_idx:
                     for q in range(8):
                         r = cs + q * 32 + lane
                         iv = txl.local_scalar(txl.i32, init=txl.int32(0))
-                        with txl.If(r < ce), txl.Then():
+                        with txl.if_(r < ce), txl.then_():
                             txl.ptx.ld.global_.nc.s32(iv, idx.ptr_to([r]))
                         txl.ptx.st.shared.s32(rows_s.ptr_to([warp * 256 + q * 32 + lane]), iv)
                     txl.ptx["bar.warp.sync"](txl.uint32(FULL))
@@ -1092,18 +1057,18 @@ def segment_sum_kernel(N: int, has_idx: bool):
                 txl.ptx.st.shared.f32(part.ptr_to([warp * COLS + lane * VE + i]), acc[i])
             txl.cuda.cta_sync()
             # thread tid < COLS owns column cb * COLS + tid: add this round's chunk sums in order
-            with txl.If(tid < COLS), txl.Then():
+            with txl.if_(tid < COLS), txl.then_():
                 for q in range(W):
                     pv = txl.local_scalar(txl.f32)
                     txl.ptx.ld.shared.f32(pv, part.ptr_to([q * COLS + tid]))
-                    with txl.If(rnd * W + q < nch), txl.Then():
+                    with txl.if_(rnd * W + q < nch), txl.then_():
                         txl.assign(tot, tot + pv)
             txl.cuda.cta_sync()
         oc = cb * COLS + tid
-        with txl.If(txl.And(tid < COLS, oc < N)), txl.Then():
+        with txl.if_(txl.And(tid < COLS, oc < N)), txl.then_():
             txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + oc]), tot)
 
-    return entry_function(segment_sum.compile())
+    return entry_function(segment_sum.compile(TARGET))
 
 
 # two-launch split for these has_idx values: (warps per CTA, bytes per lane per row, rows in flight)
@@ -1126,7 +1091,7 @@ def chunk_of(cu, G, c, cs, ce, lane):
         gg = rd * 32 + lane
         txl.assign(n_, txl.int32(0))
         txl.assign(s_, txl.int32(0))
-        with txl.If(gg < G), txl.Then():
+        with txl.if_(gg < G), txl.then_():
             txl.ptx.ld.global_.nc.s32(s_, cu.ptr_to([gg]))
             txl.ptx.ld.global_.nc.s32(e_, cu.ptr_to([gg + 1]))
             txl.assign(n_, (e_ - s_ + 255) // 256)
@@ -1137,7 +1102,7 @@ def chunk_of(cu, G, c, cs, ce, lane):
         first = base + inc - n_  # this lane's segment's first chunk
         mine = txl.And(c >= first, c < base + inc)
         txl.ptx.vote_sync.ballot.b32(hit, txl.ptx.pred(mine), txl.uint32(FULL))
-        with txl.If(hit != txl.uint32(0)), txl.Then():
+        with txl.if_(hit != txl.uint32(0)), txl.then_():
             src = i322(txl.popcount((hit & (txl.uint32(0) - hit)) - txl.uint32(1)))
             fs = txl.local_scalar(txl.i32)
             ss = txl.local_scalar(txl.i32)
@@ -1165,15 +1130,9 @@ def segment_chunks_kernel(N: int, has_idx: bool):
     NT = W * 32
     assert 256 % D == 0
 
-    @txl.kernel(warps=W, arch="sm_100a", grid=lambda p: p["NC"] * NCB)
-    def segment_chunks(
-        x: txl.gptr[txl.u32],
-        idx: txl.gptr[txl.i32],
-        cu: txl.gptr[txl.i32],
-        part: txl.gptr[txl.f32],
-        G: txl.i32,
-        NC: txl.i32,
-    ):
+    @txl.kernel()
+    def segment_chunks(x: txl.Tensor((txl.int64(),), txl.u32), idx: txl.Tensor((txl.int64(),), txl.i32), cu: txl.Tensor((txl.int64(),), txl.i32), part: txl.Tensor((txl.int64(),), txl.f32), G: txl.int32, NC: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NC * NCB, block=(W) * 32))
         if SEG_PDL:
             txl.ptx.griddepcontrol.launch_dependents()  # the combine may launch now; it waits for our writes
         b = txl.cta_id()
@@ -1192,9 +1151,9 @@ def segment_chunks_kernel(N: int, has_idx: bool):
             with txl.serial(0, (256 + NT - 1) // NT) as q:
                 k_ = q * NT + tid
                 iv = txl.local_scalar(txl.i32, init=txl.int32(0))
-                with txl.If(txl.And(k_ < 256, cs + k_ < ce)), txl.Then():
+                with txl.if_(txl.And(k_ < 256, cs + k_ < ce)), txl.then_():
                     txl.ptx.ld.global_.nc.s32(iv, idx.ptr_to([cs + k_]))
-                with txl.If(k_ < 256), txl.Then():
+                with txl.if_(k_ < 256), txl.then_():
                     txl.ptx.st.shared.s32(rows_s.ptr_to([k_]), iv)
             txl.cuda.cta_sync()
         col = (cb * W + warp) * COLS + lane * VE
@@ -1244,14 +1203,14 @@ def segment_chunks_kernel(N: int, has_idx: bool):
             else:
                 txl.ptx.ld.shared.b32(w[0], ring.ptr_to([slot * NT + tid]))
             for p in range(VW):
-                lo = txl.reinterpret("float32", txl.shift_left(w[p], txl.uint32(16)))
-                hi = txl.reinterpret("float32", w[p] & txl.uint32(0xFFFF0000))
+                lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
+                hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
                 txl.assign(acc[2 * p], acc[2 * p] + lo)
                 txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
 
         for i in range(VE):
             txl.assign(acc[i], txl.float32(0))
-        with txl.If((cb * W + warp) * COLS < N), txl.Then():
+        with txl.if_((cb * W + warp) * COLS < N), txl.then_():
             if has_idx:
                 load_idx(0)
             for j in range(D):
@@ -1268,11 +1227,11 @@ def segment_chunks_kernel(N: int, has_idx: bool):
             txl.ptx["cp.async.wait_group"](0)
             for j in range(D):
                 consume(j)
-            with txl.If(colok), txl.Then():
+            with txl.if_(colok), txl.then_():
                 for i in range(VE):
                     txl.ptx.st.global_.f32(part.ptr_to([txl.Cast("int64", c) * N + col + i]), acc[i])
 
-    return entry_function(segment_chunks.compile())
+    return entry_function(segment_chunks.compile(TARGET))
 
 
 SEG_PDL = True  # combine launched with programmatic dependent launch: its launch and cu prologue overlap the chunk tail
@@ -1285,13 +1244,9 @@ def segment_combine_kernel(N: int, pdl: bool):
     """
     NCB = (N + 255) // 256
 
-    @txl.kernel(warps=8, arch="sm_100a", grid=lambda p: p["G"] * NCB)
-    def segment_combine(
-        cu: txl.gptr[txl.i32],
-        part: txl.gptr[txl.f32],
-        out: txl.gptr[txl.f32],
-        G: txl.i32,
-    ):
+    @txl.kernel()
+    def segment_combine(cu: txl.Tensor((txl.int64(),), txl.i32), part: txl.Tensor((txl.int64(),), txl.f32), out: txl.Tensor((txl.int64(),), txl.f32), G: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=256, programmatic_stream_serialization=True if pdl else None))
         b = txl.cta_id()
         g = b // NCB
         col = (b % NCB) * 256 + txl.thread_id()
@@ -1309,19 +1264,17 @@ def segment_combine_kernel(N: int, pdl: bool):
         tot = txl.local_scalar(txl.f32, init=txl.float32(0))
         pv = txl.alloc_local([8], txl.f32)
         nc_ = (e_ - s_ + 255) // 256
-        with txl.If(col < N), txl.Then():
+        with txl.if_(col < N), txl.then_():
             with txl.serial(0, (nc_ + 7) // 8) as k8:
                 for q in range(8):
-                    with txl.If(k8 * 8 + q < nc_), txl.Then():
+                    with txl.if_(k8 * 8 + q < nc_), txl.then_():
                         txl.ptx.ld.global_.f32(pv[q], part.ptr_to([txl.Cast("int64", base + k8 * 8 + q) * N + col]))
                 for q in range(8):
-                    with txl.If(k8 * 8 + q < nc_), txl.Then():
+                    with txl.if_(k8 * 8 + q < nc_), txl.then_():
                         txl.assign(tot, tot + pv[q])
             txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + col]), tot)
 
-    if pdl:
-        segment_combine.func = segment_combine.func.with_attr("tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_programtic_dependent_launch"])
-    return entry_function(segment_combine.compile())
+    return entry_function(segment_combine.compile(TARGET))
 
 
 def bf16_expert_segment_sum_sm100(x, cu_host, cu, idx=None):

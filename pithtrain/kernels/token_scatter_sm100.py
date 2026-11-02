@@ -39,10 +39,10 @@ Rows are raw bytes: kernels are keyed on (row bytes, vector width) only, shared 
 
 Evolved with TIRx-harness: run token_scatter, frontier member host-plan-tma-ring (commit 00207e06,
 179.456 us vs 561.641 us summed over the task's 3 rows, 3.13x over the previous SM100 path in the
-task's benchmark). Compiled once per process (tirx_kernels.runner.compile_kernel) and launched
-through tvm-ffi on torch's current stream. The fallback launch is cooperative: every CTA must be
-resident at once, so it runs only when the whole grid fits beside whatever other streams are
-running.
+task's benchmark). Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and
+launched through tvm-ffi on torch's current stream. The fallback launch is cooperative: every CTA
+must be resident at once, so it runs only when the whole grid fits beside whatever other streams
+are running.
 """
 
 import functools
@@ -52,8 +52,11 @@ import os
 from typing import Optional
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
 
 __all__ = ["scatter_by_expert_sm100"]
 
@@ -142,7 +145,7 @@ def st_vec(vec, regs, ptr, pol=0):
 
 
 def reg_dtype(vec):
-    return {32: txl.u32, 16: txl.u32, 8: txl.u32, 4: txl.u32, 2: txl.u16, 1: "uint8"}[vec]
+    return {32: "uint32", 16: "uint32", 8: "uint32", 4: "uint32", 2: "uint16", 1: "uint8"}[vec]
 
 
 def nregs(vec):
@@ -166,14 +169,13 @@ def bulk_cfg(row_bytes, vec, contiguous):
 
 @functools.cache
 def init_kernel():
-    @txl.kernel(warps=4, arch="sm_100a", grid=1)
-    def token_scatter_state_init(state: txl.gptr[txl.i32]):
+    @txl.kernel()
+    def token_scatter_state_init(state: txl.Tensor((txl.int64(),), txl.i32)):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=128))
         with txl.serial(txl.thread_id(), STATE_WORDS, step=128) as i:
             txl.ptx["st.global.s32"](state.ptr_to([txl.cast(i, "int64")]), txl.int32(0))
 
-    from tirx_kernels.runner import compile_kernel
-
-    return entry_function(compile_kernel(token_scatter_state_init.func, arch="sm_100a"))
+    return entry_function(token_scatter_state_init.compile(TARGET))
 
 
 hstate: dict = {}
@@ -222,23 +224,9 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
     else:
         R = TASK_ROWS
 
-    @txl.kernel(warps=WARPS, arch="sm_100a", min_blocks_per_sm=1, grid="num_ctas")
-    def token_scatter(
-        x: txl.gptr[txl.u8],
-        eidx: txl.gptr[txl.i64],
-        out: txl.gptr[txl.u8],
-        rev: txl.gptr[txl.i64],
-        offs: txl.gptr[txl.i32],
-        ks_t: txl.gptr[txl.i32],
-        state: txl.gptr[txl.i32],
-        dbg: txl.gptr[txl.u64],
-        m: txl.i32,
-        G: txl.i32,
-        align: txl.i32,
-        src_stride: txl.i64,
-        tpc: txl.i32,
-        num_ctas: txl.i32,
-    ):
+    @txl.kernel()
+    def token_scatter(x: txl.Tensor((txl.int64(),), txl.u8), eidx: txl.Tensor((txl.int64(),), txl.i64), out: txl.Tensor((txl.int64(),), txl.u8), rev: txl.Tensor((txl.int64(),), txl.i64), offs: txl.Tensor((txl.int64(),), txl.i32), ks_t: txl.Tensor((txl.int64(),), txl.i32), state: txl.Tensor((txl.int64(),), txl.i32), dbg: txl.Tensor((txl.int64(),), txl.u64), m: txl.int32, G: txl.int32, align: txl.int32, src_stride: txl.int64, tpc: txl.int32, num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(WARPS) * 32, cooperative=True), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         c = txl.cta_id()
         tid = txl.thread_id()
         lane = tid & 31
@@ -260,9 +248,9 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
 
         def stamp():
             if instr:
-                with txl.If(tid == 0), txl.Then():
+                with txl.if_(tid == 0), txl.then_():
                     ts = txl.local_scalar("uint64")
-                    txl.ptx["mov.u64"](ts, txl.reinterpret("uint64", txl.cuda.mov_sreg(64, "globaltimer")))
+                    txl.ptx["mov.u64"](ts, txl.reinterpret(txl.cuda.mov_sreg(64, "globaltimer"), ty="uint64"))
                     txl.ptx["st.global.u64"](dbg.ptr_to([txl.cast(c, "int64") * 8 + stamp_n[0]]), ts)
             stamp_n[0] += 1
 
@@ -295,7 +283,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
 
         def grab():
             v = txl.local_scalar("int32", init=txl.int32(0))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.atom.global_.add.s32(v, state.ptr_to([QHEAD]), txl.int32(1))
                 txl.assign(v, v + n_static)
             return v
@@ -311,7 +299,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
         k_e64 = []
         for k in range(KREG):
             e64 = txl.local_scalar("int64", init=txl.int64(0))
-            with txl.If(t0 + tid + k * NT < t1), txl.Then():
+            with txl.if_(t0 + tid + k * NT < t1), txl.then_():
                 txl.ptx["ld.global.nc.s64"](e64, eidx.ptr_to([txl.cast(t0 + tid + k * NT, "int64")]))
             k_e64.append(e64)
         with txl.serial(tid, GMAX, step=NT) as g:
@@ -336,7 +324,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
 
             def issue_load(b):
                 t = cur[b] * R
-                with txl.If(txl.And(is_loader, txl.And(cur[b] < n_copy, t < m))), txl.Then():
+                with txl.if_(txl.And(is_loader, txl.And(cur[b] < n_copy, t < m))), txl.then_():
                     rows = txl.min(txl.int32(R), m - t)
                     copy_bytes = rows * row_bytes
                     mb = s_mbar.ptr_to([slot(b)])
@@ -351,14 +339,14 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
 
             def issue_rev(b):
                 t = cur[b] * R + lane
-                with txl.If(txl.And(is_pipe, txl.And(cur[b] < n_copy, t < m))), txl.Then():
+                with txl.if_(txl.And(is_pipe, txl.And(cur[b] < n_copy, t < m))), txl.then_():
                     txl.ptx["ld.global.cg.s64"](pk[b], rev.ptr_to([txl.cast(t, "int64")]))
 
-            with txl.If(is_loader), txl.Then():
+            with txl.if_(is_loader), txl.then_():
                 for b in range(D):
                     txl.ptx.mbarrier.init.shared.b64(s_mbar.ptr_to([slot(b)]), txl.uint32(1))
                 txl.ptx.fence.mbarrier_init.release.cluster()
-            with txl.If(warp < P), txl.Then():
+            with txl.if_(warp < P), txl.then_():
                 for b in range(D - 1):
                     txl.assign(cur[b], (c * P + warp) * (D - 1) + b)
                 if BULK_EARLY:
@@ -371,7 +359,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
         k_r = []
         for k in range(KREG):
             r = txl.local_scalar("int32", init=txl.int32(0))
-            with txl.If(t0 + tid + k * NT < t1), txl.Then():
+            with txl.if_(t0 + tid + k * NT < t1), txl.then_():
                 txl.ptx.atom.shared.add.s32(r, s_cnt.ptr_to([k_e[k]]), txl.int32(1))
             k_r.append(r)
         with txl.serial(t0 + tid + KREG * NT, t1, step=NT) as t:
@@ -385,14 +373,14 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
         bar()
         with txl.serial(tid, G, step=NT) as g:
             cnt = lds(s_cnt, g)
-            with txl.If(cnt > 0), txl.Then():
+            with txl.if_(cnt > 0), txl.then_():
                 base = txl.local_scalar("int32")
                 txl.ptx.atom.global_.add.s32(base, state.ptr_to([txl.cast(g, "int64")]), cnt)
                 sts(s_tot, g, base)
         bar()
         for k in range(KREG):
             t = t0 + tid + k * NT
-            with txl.If(t < t1), txl.Then():
+            with txl.if_(t < t1), txl.then_():
                 packed = txl.bitwise_or(
                     txl.shift_left(txl.cast(k_e[k], "int64"), txl.int64(32)),
                     txl.cast(k_r[k] + lds(s_tot, k_e[k]), "int64"),
@@ -416,7 +404,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
         for j in range(IPT):
             g = tid * IPT + j
             cnt = txl.local_scalar("int32", init=txl.int32(0))
-            with txl.If(g < G), txl.Then():
+            with txl.if_(g < G), txl.then_():
                 txl.ptx["ld.global.cg.s32"](cnt, state.ptr_to([txl.cast(g, "int64")]))
             ks = txl.local_scalar("int32", init=(cnt + align - 1) // align * align)
             ks_l.append(ks)
@@ -433,7 +421,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
         b_s = txl.local_scalar("int32", init=b_)
         ia = warp_incl(a_s)
         ib = warp_incl(b_s)
-        with txl.If(lane == 31), txl.Then():
+        with txl.if_(lane == 31), txl.then_():
             sts(s_wa, warp, ia)
             sts(s_wb, warp, ib)
         bar()
@@ -452,7 +440,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
             g = tid * IPT + j
             sts(s_start, g, ea)
             sts(s_zp, g, eb)
-            with txl.If(txl.And(c == 0, g < G)), txl.Then():
+            with txl.if_(txl.And(c == 0, g < G)), txl.then_():
                 txl.ptx["st.global.s32"](offs.ptr_to([txl.cast(g, "int64")]), ea + ks_l[j])
                 txl.ptx["st.global.s32"](ks_t.ptr_to([txl.cast(g, "int64")]), ks_l[j])
             txl.assign(ea, ea + ks_l[j])
@@ -466,20 +454,20 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
 
         def zero_row(z):
             zrow = txl.local_scalar("int32")
-            with txl.If(z < ZP):
-                with txl.Then():
+            with txl.if_(z < ZP):
+                with txl.then_():
                     lo = txl.local_scalar("int32", init=txl.int32(0))
                     hi = txl.local_scalar("int32", init=G)
                     # largest g with zp[g] <= z
-                    with txl.While(hi - lo > 1):
+                    with txl.while_(hi - lo > 1):
                         mid = (lo + hi) >> 1
-                        with txl.If(lds(s_zp, mid) <= z):
-                            with txl.Then():
+                        with txl.if_(lds(s_zp, mid) <= z):
+                            with txl.then_():
                                 txl.assign(lo, mid)
-                            with txl.Else():
+                            with txl.else_():
                                 txl.assign(hi, mid)
                     txl.assign(zrow, lds(s_start, lo) + lds(s_tot, lo) + (z - lds(s_zp, lo)))
-                with txl.Else():
+                with txl.else_():
                     txl.assign(zrow, M + (z - ZP))
             return zrow
 
@@ -492,11 +480,11 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
             # ---- phase 4 (bulk): D-deep ring of row slots per lane, tasks from the queue ------
             def process(b):
                 task = cur[b]
-                with txl.If(is_pipe), txl.Then():
-                    with txl.If(task < n_copy):
-                        with txl.Then():
+                with txl.if_(is_pipe), txl.then_():
+                    with txl.if_(task < n_copy):
+                        with txl.then_():
                             t = task * R + lane
-                            with txl.If(t < m), txl.Then():
+                            with txl.if_(t < m), txl.then_():
                                 dest = dest_of(pk[b])
                                 txl.ptx["st.global.s64"](rev.ptr_to([txl.cast(t, "int64")]), dest)
                                 txl.cuda.mbarrier_wait(s_mbar.ptr_to([slot(b)]), ph[b])
@@ -506,9 +494,9 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                                     s_ring.ptr_to([(slot(b) * R + lane) * row_bytes]),
                                     txl.uint32(row_bytes),
                                 )
-                        with txl.Else():
+                        with txl.else_():
                             z = (task - n_copy) * R + lane
-                            with txl.If(z < Z), txl.Then():
+                            with txl.if_(z < Z), txl.then_():
                                 dst = txl.local_scalar(
                                     "int64", init=txl.cast(zero_row(z), "int64") * txl.int64(row_bytes)
                                 )
@@ -520,23 +508,23 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                                     )
                     txl.ptx.cp.async_.bulk.commit_group()
 
-            with txl.If(warp < P), txl.Then():
+            with txl.if_(warp < P), txl.then_():
                 if not BULK_EARLY:
                     for b in range(D - 1):
                         issue_load(b)
                 for b in range(D - 1):
                     issue_rev(b)
-                with txl.While(cur[0] < n_task):
+                with txl.while_(cur[0] < n_task):
                     for b in range(D):
                         nxt = grab()
                         process(b)
                         nb = (b + D - 1) % D
                         txl.assign(cur[nb], shfl0(nxt))
-                        with txl.If(is_pipe), txl.Then():
+                        with txl.if_(is_pipe), txl.then_():
                             txl.ptx.cp.async_.bulk.wait_group.read(1)
                         issue_load(nb)
                         issue_rev(nb)
-                with txl.If(is_pipe), txl.Then():
+                with txl.if_(is_pipe), txl.then_():
                     txl.ptx.cp.async_.bulk.wait_group(0)
         else:
             # ---- phase 4 (registers): warp per row, loads before stores --------------------
@@ -555,7 +543,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                         if full or (k + 1) * 32 <= nchunks:
                             ld_vec(vec, r, x.ptr_to([src_base + off]), LD_POL)
                         else:
-                            with txl.If(k * 32 + lane < nchunks), txl.Then():
+                            with txl.if_(k * 32 + lane < nchunks), txl.then_():
                                 ld_vec(vec, r, x.ptr_to([src_base + off]), LD_POL)
                     for j in range(nb):
                         k = b0 + j
@@ -564,7 +552,7 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                         if full or (k + 1) * 32 <= nchunks:
                             st_vec(vec, r, out.ptr_to([dst_base + off]), ST_POL)
                         else:
-                            with txl.If(k * 32 + lane < nchunks), txl.Then():
+                            with txl.if_(k * 32 + lane < nchunks), txl.then_():
                                 st_vec(vec, r, out.ptr_to([dst_base + off]), ST_POL)
 
             rpb = max(1, min(TASK_ROWS, CHUNK_BATCH // lane_iters))  # rows per register batch
@@ -575,24 +563,24 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                 """
                 n = len(srcs)
                 for i in range(n):
-                    with txl.If(valids[i]), txl.Then():
+                    with txl.if_(valids[i]), txl.then_():
                         for k in range(lane_iters):
                             off = txl.cast((k * 32 + lane) * vec, "int64")
                             r = [regs[(i * lane_iters + k) * nreg + q] for q in range(nreg)]
                             if full or (k + 1) * 32 <= nchunks:
                                 ld_vec(vec, r, x.ptr_to([srcs[i] + off]), LD_POL)
                             else:
-                                with txl.If(k * 32 + lane < nchunks), txl.Then():
+                                with txl.if_(k * 32 + lane < nchunks), txl.then_():
                                     ld_vec(vec, r, x.ptr_to([srcs[i] + off]), LD_POL)
                 for i in range(n):
-                    with txl.If(valids[i]), txl.Then():
+                    with txl.if_(valids[i]), txl.then_():
                         for k in range(lane_iters):
                             off = txl.cast((k * 32 + lane) * vec, "int64")
                             r = [regs[(i * lane_iters + k) * nreg + q] for q in range(nreg)]
                             if full or (k + 1) * 32 <= nchunks:
                                 st_vec(vec, r, out.ptr_to([dsts[i] + off]), ST_POL)
                             else:
-                                with txl.If(k * 32 + lane < nchunks), txl.Then():
+                                with txl.if_(k * 32 + lane < nchunks), txl.then_():
                                     st_vec(vec, r, out.ptr_to([dsts[i] + off]), ST_POL)
 
             def zero_store(dst_base):
@@ -601,15 +589,15 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                     if full or (k + 1) * 32 <= nchunks:
                         st_vec(vec, zregs, out.ptr_to([dst_base + off]), ST_POL)
                     else:
-                        with txl.If(k * 32 + lane < nchunks), txl.Then():
+                        with txl.if_(k * 32 + lane < nchunks), txl.then_():
                             st_vec(vec, zregs, out.ptr_to([dst_base + off]), ST_POL)
 
             n_rtask = txl.local_scalar("int32", init=n_copy + (Z + ZERO_ROWS - 1) // ZERO_ROWS)
             task = txl.local_scalar("int32", init=shfl0(grab()))
-            with txl.While(task < n_rtask):
+            with txl.while_(task < n_rtask):
                 nxt = grab()
-                with txl.If(task < n_copy):
-                    with txl.Then():
+                with txl.if_(task < n_copy):
+                    with txl.then_():
                         rows = [txl.local_scalar("int32", init=task * TASK_ROWS + j) for j in range(TASK_ROWS)]
                         dests = []
                         for j in range(TASK_ROWS):
@@ -622,11 +610,11 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                         # every lane read rev[rows] before lane 0 overwrites it
                         txl.ptx.bar.warp.sync(txl.uint32(0xFFFFFFFF))
                         for j in range(TASK_ROWS):
-                            with txl.If(txl.And(rows[j] < m, lane == 0)), txl.Then():
+                            with txl.if_(txl.And(rows[j] < m, lane == 0)), txl.then_():
                                 txl.ptx["st.global.s64"](rev.ptr_to([txl.cast(rows[j], "int64")]), dests[j])
                         if rpb == 1:
                             for j in range(TASK_ROWS):
-                                with txl.If(rows[j] < m), txl.Then():
+                                with txl.if_(rows[j] < m), txl.then_():
                                     copy_row(
                                         txl.cast(rows[j], "int64") * src_stride, dests[j] * txl.int64(row_bytes)
                                     )
@@ -638,38 +626,32 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                                     [dests[j] * txl.int64(row_bytes) for j in js],
                                     [rows[j] < m for j in js],
                                 )
-                    with txl.Else():
+                    with txl.else_():
                         zt = task - n_copy
                         for j in range(ZERO_ROWS):
                             z = txl.local_scalar("int32", init=zt * ZERO_ROWS + j)
-                            with txl.If(z < Z), txl.Then():
+                            with txl.if_(z < Z), txl.then_():
                                 zero_store(txl.cast(zero_row(z), "int64") * txl.int64(row_bytes))
                 txl.assign(task, shfl0(nxt))
         bar()
         stamp()
 
         # ---- phase 5: the last CTA out resets the persistent counters ---------------------
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             old = txl.local_scalar("int32")
             txl.ptx.atom.acq_rel.gpu.global_.add.s32(
                 old, state.ptr_to([DONE]), txl.int32(1)
             )
             sts(s_wa, 0, old)
         bar()
-        with txl.If(lds(s_wa, 0) == num_ctas - 1), txl.Then():
+        with txl.if_(lds(s_wa, 0) == num_ctas - 1), txl.then_():
             with txl.serial(tid, G, step=NT) as g:
                 txl.ptx["st.global.s32"](state.ptr_to([txl.cast(g, "int64")]), txl.int32(0))
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.ptx["st.global.s32"](state.ptr_to([QHEAD]), txl.int32(0))
                 txl.ptx["st.global.s32"](state.ptr_to([DONE]), txl.int32(0))
 
-    func = token_scatter.func.with_attr(
-        "tirx.kernel_launch_params",
-        ["blockIdx.x", "threadIdx.x", "tirx.use_cooperative_launch", "tirx.use_dyn_shared_memory"],
-    )
-    from tirx_kernels.runner import compile_kernel
-
-    return entry_function(compile_kernel(func, arch="sm_100a"))
+    return entry_function(token_scatter.compile(TARGET))
 
 
 HOST_PARAMS = 128  # fast host-count path: 256 experts packed two per int64 parameter
@@ -736,7 +718,7 @@ def build_host(row_bytes: int, cfg):
         nxt = txl.local_scalar("int32", init=txl.int32(0))  # raw queue head, consumed one refill later
 
         def grab_into(v):
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.atom.global_.add.s32(v, state.ptr_to([QHEAD]), txl.int32(1))
 
         n_copy = txl.local_scalar("int32", init=(m + R - 1) // R)
@@ -775,7 +757,7 @@ def build_host(row_bytes: int, cfg):
 
         def issue_load(b):
             t = cur[b] * R
-            with txl.If(txl.And(is_loader, txl.And(cur[b] < n_copy, t < m))), txl.Then():
+            with txl.if_(txl.And(is_loader, txl.And(cur[b] < n_copy, t < m))), txl.then_():
                 rows = txl.min(txl.int32(R), m - t)
                 copy_bytes = rows * row_bytes
                 mb = s_mbar.ptr_to([slot(b)])
@@ -789,7 +771,7 @@ def build_host(row_bytes: int, cfg):
                 )
 
         def issue_eidx(b):
-            with txl.If(copy_lane(b)), txl.Then():
+            with txl.if_(copy_lane(b)), txl.then_():
                 txl.ptx["ld.global.nc.u32"](pe[b], eidx.ptr_to([txl.cast(cur[b] * R + lane, "int64")]))
 
         def issue_atom(b):
@@ -811,7 +793,7 @@ def build_host(row_bytes: int, cfg):
             lane_mask = txl.shift_left(txl.uint32(1), txl.cast(lane, "uint32")) - txl.uint32(1)
             txl.ptx.popc.b32(bef[b], txl.bitwise_and(peers, lane_mask))
             txl.assign(mst[b], master)
-            with txl.If(txl.And(valid, lane == txl.cast(master, "int32"))), txl.Then():
+            with txl.if_(txl.And(valid, lane == txl.cast(master, "int32"))), txl.then_():
                 txl.ptx.atom.global_.add.s32(
                     lb[b], state.ptr_to([key]), txl.cast(count, "int32")
                 )
@@ -850,7 +832,7 @@ def build_host(row_bytes: int, cfg):
             before = txl.local_scalar("uint32")
             txl.ptx.popc.b32(before, txl.bitwise_and(peers, lane_mask))
             pair_lb = txl.local_scalar("int32", init=txl.int32(0))
-            with txl.If(txl.And(txl.Or(valid0, valid1), lane == txl.cast(master, "int32"))), txl.Then():
+            with txl.if_(txl.And(txl.Or(valid0, valid1), lane == txl.cast(master, "int32"))), txl.then_():
                 txl.ptx.atom.global_.add.s32(
                     pair_lb, state.ptr_to([key]), txl.cast(count, "int32")
                 )
@@ -882,11 +864,11 @@ def build_host(row_bytes: int, cfg):
             txl.assign(pr[b], txl.Select(copy_lane(b), base + txl.cast(bef[b], "int32"), txl.int32(0)))
 
         # ---- phase 0: first loads and expert ids, then the host counts into shared memory --------
-        with txl.If(is_loader), txl.Then():
+        with txl.if_(is_loader), txl.then_():
             for b in range(D):
                 txl.ptx.mbarrier.init.shared.b64(s_mbar.ptr_to([slot(b)]), txl.uint32(1))
             txl.ptx.fence.mbarrier_init.release.cluster()
-        with txl.If(warp < P), txl.Then():
+        with txl.if_(warp < P), txl.then_():
             for b in range(D):
                 txl.assign(cur[b], remap((c * P + warp) * D + b))
             for b in range(D):
@@ -901,16 +883,16 @@ def build_host(row_bytes: int, cfg):
         txl.ptx.fence.proxy.async_.shared__cta()
         # The next call uses the other counter bank: clear it now (the previous call that used it has
         # completed in stream order, and nothing in this call touches it), so no CTA resets at exit.
-        with txl.If(c == num_ctas - 1), txl.Then():
+        with txl.if_(c == num_ctas - 1), txl.then_():
             with txl.serial(tid, HOST_GMAX, step=NT) as g:
                 txl.ptx["st.global.s32"](state_nx.ptr_to([txl.cast(g, "int64")]), txl.int32(0))
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.ptx["st.global.s32"](state_nx.ptr_to([QHEAD]), txl.int32(0))
         for i, w in enumerate(store_warps):
-            with txl.If(txl.And(warp == w, lane == 0)), txl.Then():
+            with txl.if_(txl.And(warp == w, lane == 0)), txl.then_():
                 for p in range(i, HOST_PARAMS, len(store_warps)):
                     txl.ptx["st.shared.s64"](s_hc.ptr_to([p]), hc[p])
-        with txl.If(warp < P), txl.Then():
+        with txl.if_(warp < P), txl.then_():
             issue_static_pair_atom()  # rank claims of both static slots overlap the scan
         bar()
 
@@ -936,7 +918,7 @@ def build_host(row_bytes: int, cfg):
         b_s = txl.local_scalar("int32", init=b_)
         ia = warp_incl(a_s)
         ib = warp_incl(b_s)
-        with txl.If(lane == 31), txl.Then():
+        with txl.if_(lane == 31), txl.then_():
             sts(s_wa, warp, ia)
             sts(s_wb, warp, ib)
         bar()
@@ -955,7 +937,7 @@ def build_host(row_bytes: int, cfg):
             g = tid * IPH + j
             sts(s_start, g, ea)
             sts(s_zp, g, eb)
-            with txl.If(txl.And(c == 0, g < G)), txl.Then():
+            with txl.if_(txl.And(c == 0, g < G)), txl.then_():
                 txl.ptx["st.global.s32"](offs.ptr_to([txl.cast(g, "int64")]), ea + ks_l[j])
                 txl.ptx["st.global.s32"](ks_t.ptr_to([txl.cast(g, "int64")]), ks_l[j])
             txl.assign(ea, ea + ks_l[j])
@@ -968,30 +950,30 @@ def build_host(row_bytes: int, cfg):
 
         def zero_row(z):
             zrow = txl.local_scalar("int32")
-            with txl.If(z < ZP):
-                with txl.Then():
+            with txl.if_(z < ZP):
+                with txl.then_():
                     lo = txl.local_scalar("int32", init=txl.int32(0))
                     hi = txl.local_scalar("int32", init=G)
-                    with txl.While(hi - lo > 1):
+                    with txl.while_(hi - lo > 1):
                         mid = (lo + hi) >> 1
-                        with txl.If(lds(s_zp, mid) <= z):
-                            with txl.Then():
+                        with txl.if_(lds(s_zp, mid) <= z):
+                            with txl.then_():
                                 txl.assign(lo, mid)
-                            with txl.Else():
+                            with txl.else_():
                                 txl.assign(hi, mid)
                     txl.assign(zrow, lds(s_start, lo) + lds(s_tot, lo) + (z - lds(s_zp, lo)))
-                with txl.Else():
+                with txl.else_():
                     txl.assign(zrow, M + (z - ZP))
             return zrow
 
         # ---- phase 2: D-deep ring of row slots per lane, tasks from the queue ----------------
         def process(b):
             task = cur[b]
-            with txl.If(is_pipe), txl.Then():
-                with txl.If(task < n_copy):
-                    with txl.Then():
+            with txl.if_(is_pipe), txl.then_():
+                with txl.if_(task < n_copy):
+                    with txl.then_():
                         t = task * R + lane
-                        with txl.If(t < m), txl.Then():
+                        with txl.if_(t < m), txl.then_():
                             e = pe[b]
                             dest = txl.local_scalar("int64", init=txl.cast(lds(s_start, e) + pr[b], "int64"))
                             txl.ptx["st.global.s64"](rev.ptr_to([txl.cast(t, "int64")]), dest)
@@ -1005,9 +987,9 @@ def build_host(row_bytes: int, cfg):
                             # Copy groups are committed individually because the
                             # following wait.read protects reuse of this ring slot.
                             txl.ptx.cp.async_.bulk.commit_group()
-                    with txl.Else():
+                    with txl.else_():
                         z = (task - n_copy) * R + lane
-                        with txl.If(z < Z), txl.Then():
+                        with txl.if_(z < Z), txl.then_():
                             dst = txl.local_scalar(
                                 "int64", init=txl.cast(zero_row(z), "int64") * txl.int64(row_bytes)
                             )
@@ -1020,28 +1002,28 @@ def build_host(row_bytes: int, cfg):
                         # s_zero is immutable, so all terminal zero stores can remain
                         # uncommitted and share one group drained at warp exit.
 
-        with txl.If(warp < P), txl.Then():
+        with txl.if_(warp < P), txl.then_():
             first = txl.local_scalar("int32", init=txl.int32(1))
-            with txl.While(cur[0] < n_task):
+            with txl.while_(cur[0] < n_task):
                 for b in range(D):
-                    with txl.If(cur[b] < n_copy), txl.Then():
+                    with txl.if_(cur[b] < n_copy), txl.then_():
                         finish_atom(b)
                     process(b)
                     nb = (b + D - 1) % D  # the slot processed one step ago
-                    with txl.If(first == 0), txl.Then():
+                    with txl.if_(first == 0), txl.then_():
                         txl.assign(cur[nb], remap(shfl0(nxt) + n_static))
                         grab_into(nxt)
                         # Zero refills neither reuse the ring nor need expert/rank
                         # metadata.  Avoid the otherwise unconditional match.any,
                         # bfind, popc, and rank shuffle on the terminal suffix.
-                        with txl.If(cur[nb] < n_copy), txl.Then():
-                            with txl.If(is_pipe), txl.Then():
+                        with txl.if_(cur[nb] < n_copy), txl.then_():
+                            with txl.if_(is_pipe), txl.then_():
                                 txl.ptx.cp.async_.bulk.wait_group.read(1)
                             issue_load(nb)
                             issue_eidx(nb)
                             issue_atom(nb)
                     txl.assign(first, txl.int32(0))
-            with txl.If(is_pipe), txl.Then():
+            with txl.if_(is_pipe), txl.then_():
                 txl.ptx.cp.async_.bulk.commit_group()
                 txl.ptx.cp.async_.bulk.wait_group(0)
         # No CTA barrier is needed at exit: every issuing lane has drained its
@@ -1049,31 +1031,28 @@ def build_host(row_bytes: int, cfg):
 
 
     def token_scatter_host(*args):
+        num_ctas = args[11]
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=WARPS * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         return body(*args)
 
     K = inspect.Parameter.POSITIONAL_OR_KEYWORD
     params = [
-        inspect.Parameter("x", K, annotation=txl.gptr[txl.u8]),
-        inspect.Parameter("eidx", K, annotation=txl.gptr[txl.i64]),
-        inspect.Parameter("out", K, annotation=txl.gptr[txl.u8]),
-        inspect.Parameter("rev", K, annotation=txl.gptr[txl.i64]),
-        inspect.Parameter("offs", K, annotation=txl.gptr[txl.i32]),
-        inspect.Parameter("ks_t", K, annotation=txl.gptr[txl.i32]),
-        inspect.Parameter("state", K, annotation=txl.gptr[txl.i32]),
-        inspect.Parameter("state_nx", K, annotation=txl.gptr[txl.i32]),
+        inspect.Parameter("x", K, annotation=txl.Tensor((txl.int64(),), txl.u8)),
+        inspect.Parameter("eidx", K, annotation=txl.Tensor((txl.int64(),), txl.i64)),
+        inspect.Parameter("out", K, annotation=txl.Tensor((txl.int64(),), txl.u8)),
+        inspect.Parameter("rev", K, annotation=txl.Tensor((txl.int64(),), txl.i64)),
+        inspect.Parameter("offs", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
+        inspect.Parameter("ks_t", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
+        inspect.Parameter("state", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
+        inspect.Parameter("state_nx", K, annotation=txl.Tensor((txl.int64(),), txl.i32)),
         inspect.Parameter("m", K, annotation=txl.i32),
         inspect.Parameter("G", K, annotation=txl.i32),
         inspect.Parameter("align", K, annotation=txl.i32),
         inspect.Parameter("num_ctas", K, annotation=txl.i32),
     ] + [inspect.Parameter(f"hc{p}", K, annotation=txl.i64) for p in range(HOST_PARAMS)]
     token_scatter_host.__signature__ = inspect.Signature(params)
-    kern = txl.kernel(warps=WARPS, arch="sm_100a", min_blocks_per_sm=1, grid="num_ctas")(token_scatter_host)
-    func = kern.func.with_attr(
-        "tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory"]
-    )
-    from tirx_kernels.runner import compile_kernel
-
-    return entry_function(compile_kernel(func, arch="sm_100a"))
+    kern = txl.kernel()(token_scatter_host)
+    return entry_function(kern.compile(TARGET))
 
 
 @functools.cache

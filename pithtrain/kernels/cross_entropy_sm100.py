@@ -22,19 +22,43 @@ TransformerEngine, in the task's benchmark). Changed since: for 16-bit logits th
 the logits in shared memory and recomputes exp(x - max) in fp32 in the gradient pass, where the
 member stored an f16 exp(x - chunk max) that zeroed terms more than ~16.6 below it; through KCoral
 on the same task that costs 11471 us vs 10883 us for the member in the same session (1.696x over
-the Triton kernel). Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched
-through tvm-ffi on torch's current stream.
+the Triton kernel). Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and
+launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
 import torch.nn.functional as F
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+
 __all__ = ["cross_entropy_fwd_bwd_sm100"]
+
+def old_max(a, b):
+    """
+    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN operand
+    (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
+    """
+    return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_f32(a, b) else txl.max(a, b)
+
+
+def old_min(a, b):
+    """
+    txl.min as apache-tvm 0.27 emitted it: CUDA fminf for float32 operands, txl.min otherwise.
+    """
+    return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_f32(a, b) else txl.min(a, b)
+
+
+def is_f32(*xs):
+    """
+    Whether any operand is a float32 expression (the other may be a Python float).
+    """
+    return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
+
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
@@ -54,8 +78,8 @@ LN2 = 0.6931471805599453
 FULL = 0xFFFFFFFF
 NEG_BIG = -3.0e38
 
-TDT = {torch.int64: txl.i64, torch.int32: txl.i32}
-LDT = {torch.bfloat16: txl.bf16, torch.float16: txl.f16, torch.float32: txl.f32}
+TDT = {torch.int64: "int64", torch.int32: "int32"}
+LDT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 ESZ = {torch.bfloat16: 2, torch.float16: 2, torch.float32: 4}
 
 CLUSTER_WARPS = 8
@@ -69,7 +93,7 @@ def blocks_per_sm(cap_bytes):
 
 
 def ld_target(t, target, row, tstride, tdt):
-    if tdt == txl.i64:
+    if tdt == "int64":
         txl.ptx.ld.global_.s64(t, target.ptr_to([txl.Cast("int64", row) * tstride]))
     else:
         t32 = txl.local_scalar("int32")
@@ -91,21 +115,21 @@ def lg2(x):
 
 def shfl_bfly_f32(v, delta):
     peer = txl.local_scalar("uint32")
-    txl.ptx.shfl_sync.bfly.b32(peer, txl.reinterpret("uint32", v), txl.uint32(delta), txl.uint32(31), txl.uint32(FULL))
-    return txl.reinterpret("float32", peer)
+    txl.ptx.shfl_sync.bfly.b32(peer, txl.reinterpret(v, ty="uint32"), txl.uint32(delta), txl.uint32(31), txl.uint32(FULL))
+    return txl.reinterpret(peer, ty="float32")
 
 
 def shfl_idx_f32(v, lane):
     peer = txl.local_scalar("uint32")
-    txl.ptx.shfl_sync.idx.b32(peer, txl.reinterpret("uint32", v), txl.uint32(lane), txl.uint32(31), txl.uint32(FULL))
-    return txl.reinterpret("float32", peer)
+    txl.ptx.shfl_sync.idx.b32(peer, txl.reinterpret(v, ty="uint32"), txl.uint32(lane), txl.uint32(31), txl.uint32(FULL))
+    return txl.reinterpret(peer, ty="float32")
 
 
 def merge(m, s, m2, s2):
     """
     (m, s) <- (m, s) (+) (m2, s2) for running (max, sum exp(x - max)).
     """
-    mn = txl.local_scalar("float32", init=txl.max(m, m2))
+    mn = txl.local_scalar("float32", init=old_max(m, m2))
     txl.assign(s, s * exp2((m - mn) * LOG2E) + s2 * exp2((m2 - mn) * LOG2E))
     txl.assign(m, mn)
 
@@ -128,15 +152,15 @@ def block_merge(m, s, red, warps, lane, warp):
     warp_merge(m, s)
     if warps == 1:
         return
-    with txl.If(lane == 0), txl.Then():
+    with txl.if_(lane == 0), txl.then_():
         txl.ptx.st.shared.f32(red.ptr_to([2 * warp]), m)
         txl.ptx.st.shared.f32(red.ptr_to([2 * warp + 1]), s)
     txl.cuda.cta_sync()
-    with txl.If(lane < warps):
-        with txl.Then():
+    with txl.if_(lane < warps):
+        with txl.then_():
             txl.ptx.ld.shared.f32(m, red.ptr_to([2 * lane]))
             txl.ptx.ld.shared.f32(s, red.ptr_to([2 * lane + 1]))
-        with txl.Else():
+        with txl.else_():
             txl.assign(m, txl.float32(NEG_BIG))
             txl.assign(s, txl.float32(0.0))
     warp_merge(m, s)
@@ -146,24 +170,24 @@ def to_f32(dst, words, nwords, ldt):
     """
     Unpack nwords 32-bit words of ldt logits into dst[0 : elems].
     """
-    if ldt == txl.f32:
+    if ldt == "float32":
         for k in range(nwords):
-            txl.assign(dst[k], txl.reinterpret("float32", words[k]))
-    elif ldt == txl.bf16:
+            txl.assign(dst[k], txl.reinterpret(words[k], ty="float32"))
+    elif ldt == "bfloat16":
         for k in range(nwords):
-            txl.assign(dst[2 * k], txl.reinterpret("float32", words[k] << txl.uint32(16)))
-            txl.assign(dst[2 * k + 1], txl.reinterpret("float32", words[k] & txl.uint32(0xFFFF0000)))
+            txl.assign(dst[2 * k], txl.reinterpret(words[k] << txl.uint32(16), ty="float32"))
+            txl.assign(dst[2 * k + 1], txl.reinterpret(words[k] & txl.uint32(0xFFFF0000), ty="float32"))
     else:
         for k in range(nwords):
             txl.idioms.cast_f16x2_to_f32x2(dst, k, words[k])
 
 
 def from_f32(words, src, nwords, ldt):
-    if ldt == txl.f32:
+    if ldt == "float32":
         for k in range(nwords):
-            txl.assign(words[k], txl.reinterpret("uint32", src[k]))
+            txl.assign(words[k], txl.reinterpret(src[k], ty="uint32"))
     else:
-        cvt = "cvt.rn.bf16x2.f32" if ldt == txl.bf16 else "cvt.rn.f16x2.f32"
+        cvt = "cvt.rn.bf16x2.f32" if ldt == "bfloat16" else "cvt.rn.f16x2.f32"
         for k in range(nwords):
             txl.ptx[cvt](words[k], src[2 * k + 1], src[2 * k])
 
@@ -172,8 +196,9 @@ def from_f32(words, src, nwords, ldt):
 def count_kernel(tdt):
     U = 4  # target loads in flight per thread
 
-    @txl.kernel(warps=32, grid=1)
-    def ce_count(target: txl.gptr[tdt], tstride: txl.i64, N: txl.i32, ii: txl.i64, stats: txl.gptr[txl.f32], done: txl.gptr[txl.i32], loss: txl.gptr[txl.f32]):
+    @txl.kernel()
+    def ce_count(target: txl.Tensor((txl.int64(),), tdt), tstride: txl.int64, N: txl.int32, ii: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32), done: txl.Tensor((txl.int64(),), txl.i32), loss: txl.Tensor((txl.int64(),), txl.f32)):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=1024))
         tid = txl.thread_id()
         lane = txl.lane_id()
         warp = txl.warp_id()
@@ -184,35 +209,36 @@ def count_kernel(tdt):
         with txl.serial((N + 1024 * U - 1) // (1024 * U)) as it:
             for u in range(U):
                 r = (it * U + u) * 1024 + tid
-                with txl.If(r < N), txl.Then():
+                with txl.if_(r < N), txl.then_():
                     ld_target(ts[u], target, r, tstride, tdt)
             for u in range(U):
-                with txl.If(ts[u] != ii), txl.Then():
+                with txl.if_(ts[u] != ii), txl.then_():
                     txl.assign(cnt, cnt + 1)
                 txl.assign(ts[u], txl.Cast("int64", ii))
         w = txl.local_scalar("uint32")
-        txl.ptx.redux_sync.add.u32(w, txl.reinterpret("uint32", cnt), txl.uint32(FULL))
-        with txl.If(lane == 0), txl.Then():
-            txl.ptx.st.shared.s32(red.ptr_to([warp]), txl.reinterpret("int32", w))
+        txl.ptx.redux_sync.add.u32(w, txl.reinterpret(cnt, ty="uint32"), txl.uint32(FULL))
+        with txl.if_(lane == 0), txl.then_():
+            txl.ptx.st.shared.s32(red.ptr_to([warp]), txl.reinterpret(w, ty="int32"))
         txl.cuda.cta_sync()
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             v = txl.local_scalar("int32")
             txl.ptx.ld.shared.s32(v, red.ptr_to([lane]))
-            txl.ptx.redux_sync.add.u32(w, txl.reinterpret("uint32", v), txl.uint32(FULL))
-            with txl.If(lane == 0), txl.Then():
-                nf = txl.Cast("float32", txl.max(txl.reinterpret("int32", w), txl.int32(1)))
+            txl.ptx.redux_sync.add.u32(w, txl.reinterpret(v, ty="uint32"), txl.uint32(FULL))
+            with txl.if_(lane == 0), txl.then_():
+                nf = txl.Cast("float32", old_max(txl.reinterpret(w, ty="int32"), txl.int32(1)))
                 txl.ptx.st.global_.f32(stats.ptr_to([0]), txl.float32(1.0) / nf)
                 # The main kernel's last row to finish sums the row losses into loss (0 if N == 0).
                 txl.ptx.st.global_.s32(done.ptr_to([0]), txl.int32(0))
                 txl.ptx.st.global_.f32(loss.ptr_to([0]), txl.float32(0.0))
 
-    return entry_function(ce_count.compile())
+    return entry_function(ce_count.compile(TARGET))
 
 
 @functools.cache
 def final_kernel():
-    @txl.kernel(warps=32, grid=1)
-    def ce_final(row_loss: txl.gptr[txl.f32], stats: txl.gptr[txl.f32], loss: txl.gptr[txl.f32], N: txl.i32):
+    @txl.kernel()
+    def ce_final(row_loss: txl.Tensor((txl.int64(),), txl.f32), stats: txl.Tensor((txl.int64(),), txl.f32), loss: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=1024))
         tid = txl.thread_id()
         lane = txl.lane_id()
         warp = txl.warp_id()
@@ -221,23 +247,23 @@ def final_kernel():
         acc, v = txl.local_scalar("float32", init=txl.float32(0.0)), txl.local_scalar("float32")
         with txl.serial((N + 1023) // 1024) as it:
             r = it * 1024 + tid
-            with txl.If(r < N), txl.Then():
+            with txl.if_(r < N), txl.then_():
                 txl.ptx.ld.global_.f32(v, row_loss.ptr_to([r]))
                 txl.assign(acc, acc + v)
         for delta in (16, 8, 4, 2, 1):
             txl.assign(acc, acc + shfl_bfly_f32(acc, delta))
-        with txl.If(lane == 0), txl.Then():
+        with txl.if_(lane == 0), txl.then_():
             txl.ptx.st.shared.f32(red.ptr_to([warp]), acc)
         txl.cuda.cta_sync()
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             txl.ptx.ld.shared.f32(acc, red.ptr_to([lane]))
             for delta in (16, 8, 4, 2, 1):
                 txl.assign(acc, acc + shfl_bfly_f32(acc, delta))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.ld.global_.f32(v, stats.ptr_to([0]))
                 txl.ptx.st.global_.f32(loss.ptr_to([0]), acc * v)
 
-    return entry_function(ce_final.compile())
+    return entry_function(ce_final.compile(TARGET))
 
 
 @functools.cache
@@ -247,7 +273,7 @@ def stream_kernel(ldt, tdt):
     """
     warps = 16
     nt = warps * 32
-    BITS = {txl.bf16: 16, txl.f16: 16, txl.f32: 32}[ldt]
+    BITS = {"bfloat16": 16, "float16": 16, "float32": 32}[ldt]
 
     def load_f32(inp, idx):
         if BITS == 32:
@@ -256,18 +282,19 @@ def stream_kernel(ldt, tdt):
             return x
         u = txl.local_scalar("uint16")
         txl.ptx.ld.global_.b16(u, inp.ptr_to([idx]))
-        if ldt == txl.bf16:
-            return txl.reinterpret("float32", txl.Cast("uint32", u) << txl.uint32(16))
-        return txl.Cast("float32", txl.reinterpret("float16", u))
+        if ldt == "bfloat16":
+            return txl.reinterpret(txl.Cast("uint32", u) << txl.uint32(16), ty="float32")
+        return txl.Cast("float32", txl.reinterpret(u, ty="float16"))
 
     def store(inp, idx, g):
         if BITS == 32:
             txl.ptx.st.global_.f32(inp.ptr_to([idx]), g)
         else:
-            txl.ptx.st.global_.b16(inp.ptr_to([idx]), txl.reinterpret("uint16", txl.Cast(ldt, g)))
+            txl.ptx.st.global_.b16(inp.ptr_to([idx]), txl.reinterpret(txl.Cast(ldt, g), ty="uint16"))
 
-    @txl.kernel(warps=warps, grid="N")
-    def ce_stream(inp: txl.gptr[ldt], target: txl.gptr[tdt], tstride: txl.i64, stats: txl.gptr[txl.f32], row_loss: txl.gptr[txl.f32], N: txl.i32, V: txl.i32, ii: txl.i64):
+    @txl.kernel()
+    def ce_stream(inp: txl.Tensor((txl.int64(),), ldt), target: txl.Tensor((txl.int64(),), tdt), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32), row_loss: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, V: txl.int32, ii: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=N, block=(warps) * 32))
         row = txl.cta_id()
         tid = txl.thread_id()
         lane = txl.lane_id()
@@ -278,19 +305,19 @@ def stream_kernel(ldt, tdt):
         ld_target(t, target, row, tstride, tdt)
         base = txl.Cast("int64", row) * txl.Cast("int64", V)
         niter = (V + nt - 1) // nt
-        with txl.If(t == ii):
-            with txl.Then():
+        with txl.if_(t == ii):
+            with txl.then_():
                 with txl.serial(niter) as it:
                     c = it * nt + tid
-                    with txl.If(c < V), txl.Then():
+                    with txl.if_(c < V), txl.then_():
                         store(inp, base + txl.Cast("int64", c), txl.float32(0.0))
-                with txl.If(tid == 0), txl.Then():
+                with txl.if_(tid == 0), txl.then_():
                     txl.ptx.st.global_.f32(row_loss.ptr_to([row]), txl.float32(0.0))
-            with txl.Else():
+            with txl.else_():
                 m, s = txl.local_scalar("float32", init=txl.float32(NEG_BIG)), txl.local_scalar("float32", init=txl.float32(0.0))
                 with txl.serial(niter) as it:
                     c = it * nt + tid
-                    with txl.If(c < V), txl.Then():
+                    with txl.if_(c < V), txl.then_():
                         x = txl.local_scalar("float32", init=load_f32(inp, base + txl.Cast("int64", c)))
                         merge(m, s, x, txl.float32(1.0))
                 block_merge(m, s, red, warps, lane, warp)
@@ -299,16 +326,16 @@ def stream_kernel(ldt, tdt):
                 scale = txl.local_scalar("float32", init=inv_n / s)
                 with txl.serial(niter) as it:
                     c = it * nt + tid
-                    with txl.If(c < V), txl.Then():
+                    with txl.if_(c < V), txl.then_():
                         x = txl.local_scalar("float32", init=load_f32(inp, base + txl.Cast("int64", c)))
                         g = txl.local_scalar("float32", init=exp2((x - m) * LOG2E) * scale)
-                        with txl.If(txl.Cast("int64", c) == t), txl.Then():
+                        with txl.if_(txl.Cast("int64", c) == t), txl.then_():
                             txl.assign(g, g - inv_n)
                             lg = lg2(s)
                             txl.ptx.st.global_.f32(row_loss.ptr_to([row]), m + lg * LN2 - x)
                         store(inp, base + txl.Cast("int64", c), g)
 
-    return entry_function(ce_stream.compile())
+    return entry_function(ce_stream.compile(TARGET))
 
 
 def f2(op, a, b):
@@ -324,10 +351,10 @@ def pairs(words, ldt):
     """
     The float2 pairs of one 4-word vector: 4 pairs for 16-bit logits, 2 for fp32.
     """
-    if ldt == txl.f32:
-        return [txl.cuda.make_float2(txl.reinterpret("float32", words[2 * k]), txl.reinterpret("float32", words[2 * k + 1])) for k in range(2)]
-    if ldt == txl.bf16:
-        return [txl.cuda.make_float2(txl.reinterpret("float32", words[k] << txl.uint32(16)), txl.reinterpret("float32", words[k] & txl.uint32(0xFFFF0000))) for k in range(4)]
+    if ldt == "float32":
+        return [txl.cuda.make_float2(txl.reinterpret(words[2 * k], ty="float32"), txl.reinterpret(words[2 * k + 1], ty="float32")) for k in range(2)]
+    if ldt == "bfloat16":
+        return [txl.cuda.make_float2(txl.reinterpret(words[k] << txl.uint32(16), ty="float32"), txl.reinterpret(words[k] & txl.uint32(0xFFFF0000), ty="float32")) for k in range(4)]
     out = []
     for k in range(4):
         tmp = txl.alloc_local([2], "float32")
@@ -340,25 +367,25 @@ def vec_max(words, nw, ldt):
     """
     Exact max over nw words of packed logits, as f32.
     """
-    if ldt == txl.f32:
-        acc = txl.local_scalar("float32", init=txl.reinterpret("float32", words[0]))
+    if ldt == "float32":
+        acc = txl.local_scalar("float32", init=txl.reinterpret(words[0], ty="float32"))
         for k in range(1, nw):
-            txl.assign(acc, txl.max(acc, txl.reinterpret("float32", words[k])))
+            txl.assign(acc, old_max(acc, txl.reinterpret(words[k], ty="float32")))
         return acc
-    op = "max.bf16x2" if ldt == txl.bf16 else "max.f16x2"
+    op = "max.bf16x2" if ldt == "bfloat16" else "max.f16x2"
     acc = txl.local_scalar("uint32", init=words[0])
     for k in range(1, nw):
         txl.ptx[op](acc, acc, words[k])
     tmp = txl.alloc_local([2], "float32")
-    if ldt == txl.bf16:
-        txl.assign(tmp[0], txl.reinterpret("float32", acc << txl.uint32(16)))
-        txl.assign(tmp[1], txl.reinterpret("float32", acc & txl.uint32(0xFFFF0000)))
+    if ldt == "bfloat16":
+        txl.assign(tmp[0], txl.reinterpret(acc << txl.uint32(16), ty="float32"))
+        txl.assign(tmp[1], txl.reinterpret(acc & txl.uint32(0xFFFF0000), ty="float32"))
     else:
         txl.idioms.cast_f16x2_to_f32x2(tmp, 0, acc)
-    return txl.max(tmp[0], tmp[1])
+    return old_max(tmp[0], tmp[1])
 
 
-PAD = {txl.bf16: 0xFF80FF80, txl.f16: 0xFC00FC00, txl.f32: 0xFF800000}  # -inf lanes
+PAD = {"bfloat16": 0xFF80FF80, "float16": 0xFC00FC00, "float32": 0xFF800000}  # -inf lanes
 
 
 def ld_logit(inp, idx, ldt):
@@ -366,13 +393,13 @@ def ld_logit(inp, idx, ldt):
     One logit from global memory as f32.
     """
     x = txl.local_scalar("float32")
-    if ldt == txl.f32:
+    if ldt == "float32":
         txl.ptx.ld.global_.f32(x, inp.ptr_to([idx]))
         return x
     u = txl.local_scalar("uint16")
     txl.ptx.ld.global_.b16(u, inp.ptr_to([idx]))
-    if ldt == txl.bf16:
-        txl.assign(x, txl.reinterpret("float32", txl.Cast("uint32", u) << txl.uint32(16)))
+    if ldt == "bfloat16":
+        txl.assign(x, txl.reinterpret(txl.Cast("uint32", u) << txl.uint32(16), ty="float32"))
     else:
         txl.ptx.cvt.f32.f16(x, u)
     return x
@@ -383,7 +410,7 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
     C CTAs per row; each holds up to CAP bytes of the row in shared memory, loaded in chunks.
     """
     nt = warps * 32
-    esz = 4 if ldt == txl.f32 else 2
+    esz = 4 if ldt == "float32" else 2
     cap = CAP_BYTES // esz  # elements per CTA
     epv = 16 // esz  # elements per 16-byte vector
     VPT = 2  # vectors per thread per chunk
@@ -395,10 +422,11 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
     viters = nchunk * VPT
     L2 = txl.cuda.make_float2(txl.float32(LOG2E), txl.float32(LOG2E))
 
-    @txl.kernel(warps=warps, grid=lambda p: p["N"] * C, min_blocks_per_sm=blocks_per_sm(CAP_BYTES))
-    def ce_cluster(inp: txl.gptr[ldt], target: txl.gptr[tdt], tstride: txl.i64, stats: txl.gptr[txl.f32], row_loss: txl.gptr[txl.f32], N: txl.i32, V: txl.i32, ii: txl.i64, done: txl.gptr[txl.i32], loss: txl.gptr[txl.f32]):
+    @txl.kernel()
+    def ce_cluster(inp: txl.Tensor((txl.int64(),), ldt), target: txl.Tensor((txl.int64(),), tdt), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32), row_loss: txl.Tensor((txl.int64(),), txl.f32), N: txl.int32, V: txl.int32, ii: txl.int64, done: txl.Tensor((txl.int64(),), txl.i32), loss: txl.Tensor((txl.int64(),), txl.f32)):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=N * C, block=(warps) * 32, cluster=(C,) if C > 1 else None), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=blocks_per_sm(CAP_BYTES)))
         cta = txl.cta_id()
-        rank = txl.cta_id_in_cluster([C]) if C > 1 else txl.int32(0)
+        rank = txl.cuda.mov_sreg(32, "cluster_ctarank") if C > 1 else txl.int32(0)  # %cluster_ctarank, as before: %cluster_ctaid.x costs a division by the cluster size
         # Rows run last-to-first: the restore copy (or producer) wrote the tail last, so it is
         # the part most likely still resident in L2.
         row = N - 1 - cta // C
@@ -410,10 +438,10 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
         bar, sbar = txl.MBarrier(smem, nchunk), txl.MBarrier(smem, 1)
         bar.init(1)
         sbar.init(1)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.st.shared.s32(last.ptr_to([0]), txl.int32(0))
         if C > 1:
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.ptx.mbarrier.arrive.expect_tx.shared.b64(sbar.ptr_to([0]), txl.uint32(8 * C))
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.fence.proxy.async_.shared__cta()
@@ -424,7 +452,7 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
 
         per = txl.local_scalar("int32", init=((V + C * 8 - 1) // (C * 8)) * 8)
         lo = txl.local_scalar("int32", init=rank * per)
-        cnt = txl.local_scalar("int32", init=txl.max(txl.min(V - lo, per), txl.int32(0)))
+        cnt = txl.local_scalar("int32", init=old_max(old_min(V - lo, per), txl.int32(0)))
         nvec = cnt // epv
         base = txl.local_scalar("int64", init=txl.Cast("int64", row) * txl.Cast("int64", V) + txl.Cast("int64", lo))
         t = txl.local_scalar("int64")
@@ -433,27 +461,27 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
 
         words = txl.alloc_local([4 * VPT], "uint32")
 
-        with txl.If(t == ii):
-            with txl.Then():
+        with txl.if_(t == ii):
+            with txl.then_():
                 for k in range(4):
                     txl.assign(words[k], txl.uint32(0))
                 with txl.serial(viters) as it:
                     v = it * nt + tid
-                    with txl.If(v < nvec), txl.Then():
+                    with txl.if_(v < nvec), txl.then_():
                         txl.ptx["st.global.v4.b32"](inp.ptr_to([base + txl.Cast("int64", v * epv)]), words[0], words[1], words[2], words[3])
-                with txl.If(txl.And(tid == 0, rank == 0)), txl.Then():
+                with txl.if_(txl.And(tid == 0, rank == 0)), txl.then_():
                     txl.ptx.st.global_.f32(row_loss.ptr_to([row]), txl.float32(0.0))
                     old = txl.local_scalar("int32")
                     txl.ptx.atom.acq_rel.gpu.global_.add.s32(old, done.ptr_to([0]), txl.int32(1))
                     txl.ptx.st.shared.s32(last.ptr_to([0]), txl.Select(old == N - 1, txl.int32(1), txl.int32(0)))
                 if C > 1:
                     txl.ptx.barrier.cluster.wait()
-            with txl.Else():
-                with txl.If(tid == 0), txl.Then():
+            with txl.else_():
+                with txl.if_(tid == 0), txl.then_():
                     with txl.serial(nchunk) as k:
                         rem = cnt * esz - k * chunk_bytes
-                        with txl.If(rem > 0), txl.Then():
-                            sz = txl.Cast("uint32", txl.min(rem, txl.int32(chunk_bytes)))
+                        with txl.if_(rem > 0), txl.then_():
+                            sz = txl.Cast("uint32", old_min(rem, txl.int32(chunk_bytes)))
                             txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bar.ptr_to([k]), sz)
                             txl.ptx["cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"](buf.ptr_to([k * chunk_el]), inp.ptr_to([base + txl.Cast("int64", k * chunk_el)]), sz, bar.ptr_to([k]))
 
@@ -465,42 +493,42 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                 # from ~9.7 below, in f16 denormals), where the contract is fp32 until the final round.
                 m, s, xt = txl.local_scalar("float32", init=txl.float32(NEG_BIG)), txl.local_scalar("float32", init=txl.float32(0.0)), txl.local_scalar("float32", init=txl.float32(0.0))
                 owner = txl.And(tl >= 0, tl < cnt)
-                with txl.If(txl.And(tid == 0, owner)), txl.Then():
+                with txl.if_(txl.And(tid == 0, owner)), txl.then_():
                     txl.assign(xt, ld_logit(inp, base + txl.Cast("int64", tl), ldt))
                 ow = txl.alloc_local([4], "uint32")
                 mref = []
                 for k in range(nchunk):
                     mk = txl.local_scalar("float32", init=txl.float32(NEG_BIG))
                     mref.append(mk)
-                    with txl.If(k * chunk_el < cnt), txl.Then():
+                    with txl.if_(k * chunk_el < cnt), txl.then_():
                         bar.wait(k, 0)
                         for j in range(VPT):
                             v = k * chunk_vec + j * nt + tid
-                            with txl.If(v < nvec):
-                                with txl.Then():
+                            with txl.if_(v < nvec):
+                                with txl.then_():
                                     txl.ptx["ld.shared.v4.b32"](words[4 * j], words[4 * j + 1], words[4 * j + 2], words[4 * j + 3], buf.ptr_to([v * epv]))
-                                with txl.Else():
+                                with txl.else_():
                                     for q in range(4):
                                         txl.assign(words[4 * j + q], txl.uint32(PAD[ldt]))
                         cm = vec_max(words, 4 * VPT, ldt)
-                        mn = txl.local_scalar("float32", init=txl.max(m, cm))
+                        mn = txl.local_scalar("float32", init=old_max(m, cm))
                         txl.assign(s, s * exp2((m - mn) * LOG2E))
                         txl.assign(m, mn)
                         txl.assign(mk, mn)
                         mm = txl.cuda.make_float2(mn, mn)
-                        acc = txl.local_scalar("uint64", init=txl.reinterpret("uint64", txl.uint64(0)))
+                        acc = txl.local_scalar("uint64", init=txl.reinterpret(txl.uint64(0), ty="uint64"))
                         for j in range(VPT):
                             prs = pairs([words[4 * j + q] for q in range(4)], ldt)
                             for q, pr in enumerate(prs):
                                 d = f2("mul", f2("sub", pr, mm), L2)
                                 ex, ey = txl.local_scalar("float32", init=exp2(txl.cuda.float2_x(d))), txl.local_scalar("float32", init=exp2(txl.cuda.float2_y(d)))
                                 txl.ptx["add.rn.ftz.f32x2"](acc, acc, txl.cuda.make_float2(ex, ey))
-                                if ldt == txl.f32:
-                                    txl.assign(ow[2 * q], txl.reinterpret("uint32", ex))
-                                    txl.assign(ow[2 * q + 1], txl.reinterpret("uint32", ey))
-                            if ldt == txl.f32:
+                                if ldt == "float32":
+                                    txl.assign(ow[2 * q], txl.reinterpret(ex, ty="uint32"))
+                                    txl.assign(ow[2 * q + 1], txl.reinterpret(ey, ty="uint32"))
+                            if ldt == "float32":
                                 v = k * chunk_vec + j * nt + tid
-                                with txl.If(v < nvec), txl.Then():
+                                with txl.if_(v < nvec), txl.then_():
                                     txl.ptx["st.shared.v4.b32"](buf.ptr_to([v * epv]), ow[0], ow[1], ow[2], ow[3])
                         txl.assign(s, s + txl.cuda.float2_x(acc) + txl.cuda.float2_y(acc))
                 block_merge(m, s, red, warps, lane, warp)
@@ -508,7 +536,7 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                 if C > 1:
                     txl.ptx.barrier.cluster.wait()
                     # Lane r of warp 0 pushes this CTA's pair into slot [rank] of peer r.
-                    with txl.If(txl.And(warp == 0, lane < C)), txl.Then():
+                    with txl.if_(txl.And(warp == 0, lane < C)), txl.then_():
                         ra, rb = txl.local_scalar("uint32"), txl.local_scalar("uint32")
                         txl.ptx.mapa.shared__cluster.u32(ra, txl.cuda.cvta_generic_to_shared(slots.ptr_to([2 * rank])), txl.Cast("uint32", lane))
                         txl.ptx.mapa.shared__cluster.u32(rb, txl.cuda.cvta_generic_to_shared(sbar.ptr_to([0])), txl.Cast("uint32", lane))
@@ -526,7 +554,7 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                 inv_n = txl.local_scalar("float32")
                 txl.ptx.ld.global_.f32(inv_n, stats.ptr_to([0]))
                 scale = txl.local_scalar("float32", init=inv_n / s)
-                with txl.If(txl.And(tid == 0, owner)), txl.Then():
+                with txl.if_(txl.And(tid == 0, owner)), txl.then_():
                     txl.ptx.st.global_.f32(row_loss.ptr_to([row]), m + lg2(s) * LN2 - xt)
                     old = txl.local_scalar("int32")
                     txl.ptx.atom.acq_rel.gpu.global_.add.s32(old, done.ptr_to([0]), txl.int32(1))
@@ -535,16 +563,16 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                 g = txl.alloc_local([epv], "float32")
                 mm, ss = txl.cuda.make_float2(m, m), txl.cuda.make_float2(scale, scale)
                 for k in range(nchunk):
-                    with txl.If(k * chunk_el < cnt), txl.Then():
-                        if ldt == txl.f32:
+                    with txl.if_(k * chunk_el < cnt), txl.then_():
+                        if ldt == "float32":
                             f = txl.local_scalar("float32", init=exp2((mref[k] - m) * LOG2E) * scale)
                             ff = txl.cuda.make_float2(f, f)
                         for j in range(VPT):
                             v = k * chunk_vec + j * nt + tid
-                            with txl.If(v < nvec), txl.Then():
+                            with txl.if_(v < nvec), txl.then_():
                                 txl.ptx["ld.shared.v4.b32"](words[0], words[1], words[2], words[3], buf.ptr_to([v * epv]))
                                 for q, pr in enumerate(pairs(words, ldt)):
-                                    if ldt == txl.f32:
+                                    if ldt == "float32":
                                         r2 = f2("mul", pr, ff)
                                         txl.assign(g[2 * q], txl.cuda.float2_x(r2))
                                         txl.assign(g[2 * q + 1], txl.cuda.float2_y(r2))
@@ -555,10 +583,10 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
                                         r2 = f2("mul", txl.cuda.make_float2(ex, ey), ss)
                                         txl.assign(g[2 * q], txl.cuda.float2_x(r2))
                                         txl.assign(g[2 * q + 1], txl.cuda.float2_y(r2))
-                                with txl.If(v == vt), txl.Then():
+                                with txl.if_(v == vt), txl.then_():
                                     rel = tl - v * epv
                                     for q in range(epv):
-                                        with txl.If(rel == q), txl.Then():
+                                        with txl.if_(rel == q), txl.then_():
                                             txl.assign(g[q], g[q] - inv_n)
                                 from_f32(words, g, 4, ldt)
                                 txl.ptx["st.global.v4.b32"](inp.ptr_to([base + txl.Cast("int64", v * epv)]), words[0], words[1], words[2], words[3])
@@ -566,43 +594,39 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
         txl.cuda.cta_sync()
         flag = txl.local_scalar("int32")
         txl.ptx.ld.shared.s32(flag, last.ptr_to([0]))
-        with txl.If(flag != 0), txl.Then():
+        with txl.if_(flag != 0), txl.then_():
             txl.ptx.fence.acq_rel.gpu()
             acc, lv = txl.local_scalar("float32", init=txl.float32(0.0)), txl.local_scalar("float32")
             with txl.serial((N + nt - 1) // nt) as it:
                 r = it * nt + tid
-                with txl.If(r < N), txl.Then():
+                with txl.if_(r < N), txl.then_():
                     txl.ptx.ld.relaxed.gpu.global_.f32(lv, row_loss.ptr_to([r]))
                     txl.assign(acc, acc + lv)
             for delta in (16, 8, 4, 2, 1):
                 txl.assign(acc, acc + shfl_bfly_f32(acc, delta))
-            with txl.If(lane == 0), txl.Then():
+            with txl.if_(lane == 0), txl.then_():
                 txl.ptx.st.shared.f32(red.ptr_to([warp]), acc)
             txl.cuda.cta_sync()
-            with txl.If(warp == 0), txl.Then():
-                with txl.If(lane < warps):
-                    with txl.Then():
+            with txl.if_(warp == 0), txl.then_():
+                with txl.if_(lane < warps):
+                    with txl.then_():
                         txl.ptx.ld.shared.f32(acc, red.ptr_to([lane]))
-                    with txl.Else():
+                    with txl.else_():
                         txl.assign(acc, txl.float32(0.0))
                 for delta in (16, 8, 4, 2, 1):
                     txl.assign(acc, acc + shfl_bfly_f32(acc, delta))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     sc = txl.local_scalar("float32")
                     txl.ptx.ld.global_.f32(sc, stats.ptr_to([0]))
                     txl.ptx.st.global_.f32(loss.ptr_to([0]), acc * sc)
 
-    func = ce_cluster.func
-    if C > 1:
-        func = func.with_attr("tirx.launch_tags", ["blockIdx.x", "clusterCtaIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory"])
-    return func
+    return ce_cluster.func
 
 
 @functools.cache
 def cluster_kernel(ldt, tdt, C, cap, warps=CLUSTER_WARPS):
     func = cluster_func(ldt, tdt, C, cap, warps)
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
-    return entry_function(tvm.compile(tvm.IRModule({"main": func}), target=target, tir_pipeline="tirx"))
+    return entry_function(tvm_tirx.tirx.compile(tvm_tirx.IRModule({"main": func}), target=TARGET, pipeline="tirx"))
 
 
 def pick_cluster(V, esz):

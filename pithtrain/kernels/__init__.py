@@ -4,7 +4,7 @@ from pithtrain.kernels, never a submodule. Each name's docstring is its contract
 PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100 implementation
 itself; callers that need to know whether a fused path exists use the capability queries
 fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported and
-gated_delta_rule_cp_supported. Importing the package never loads cutlass, QuACK or tvm.
+gated_delta_rule_cp_supported. Importing the package never loads cutlass, QuACK or tvm_tirx.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad

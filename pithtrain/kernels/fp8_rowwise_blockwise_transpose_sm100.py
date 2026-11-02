@@ -8,15 +8,18 @@ own next row part after reading the current one. Each tile uses packed bf16x2 qu
 for both FP8 layouts, and column-major row scales. Everything else runs a generic scalar kernel.
 
 Evolved with TIRx-harness: run act, frontier member selfprod-persistent (commit 1ef3160, 226.061 us vs 289.362 us, 1.28x over the
-previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+previous SM100 path in the task's benchmark). Compiled once per process by
+tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
 
 __all__ = ["fp8_quant_act_sm100"]
 
@@ -46,13 +49,13 @@ def e8m0(amax):
     ratio = txl.local_scalar("float32")
     txl.ptx.max.f32(ratio, amax, txl.float32(1e-4))
     txl.ptx.mul.f32(ratio, ratio, txl.float32(RCP_448))
-    bits = txl.reinterpret("uint32", ratio)
+    bits = txl.reinterpret(ratio, ty="uint32")
     sbits = txl.local_scalar("uint32", init=txl.bitwise_and(bits, txl.uint32(0x7F800000)))
-    with txl.If(txl.bitwise_and(bits, txl.uint32(0x007FFFFF)) != txl.uint32(0)), txl.Then():
+    with txl.if_(txl.bitwise_and(bits, txl.uint32(0x007FFFFF)) != txl.uint32(0)), txl.then_():
         txl.assign(sbits, sbits + txl.uint32(0x00800000))
     txl.assign(sbits, txl.min(sbits, txl.uint32(254 << 23)))
-    scale = txl.reinterpret("float32", sbits)
-    rcp = txl.reinterpret("float32", txl.uint32(254 << 23) - sbits)
+    scale = txl.reinterpret(sbits, ty="float32")
+    rcp = txl.reinterpret(txl.uint32(254 << 23) - sbits, ty="float32")
     return scale, rcp
 
 
@@ -67,8 +70,8 @@ def half_to_f32(h16, dtype):
     f32 of the 16-bit value in the low half of a u32.
     """
     if dtype == "bfloat16":
-        return txl.reinterpret("float32", txl.shift_left(h16, txl.uint32(16)))
-    return txl.cast(txl.reinterpret("float16", txl.cast(h16, "uint16")), "float32")
+        return txl.reinterpret(txl.shift_left(h16, txl.uint32(16)), ty="float32")
+    return txl.cast(txl.reinterpret(txl.cast(h16, "uint16"), ty="float16"), "float32")
 
 
 def lo(word, dtype):
@@ -77,26 +80,15 @@ def lo(word, dtype):
 
 def hi(word, dtype):
     if dtype == "bfloat16":
-        return txl.reinterpret("float32", txl.bitwise_and(word, txl.uint32(0xFFFF0000)))
+        return txl.reinterpret(txl.bitwise_and(word, txl.uint32(0xFFFF0000)), ty="float32")
     return half_to_f32(txl.shift_right(word, txl.uint32(16)), dtype)
 
 
 @functools.cache
 def generic_kernel(dtype: str):
-    @txl.kernel(warps=4, arch="sm_100a", grid=lambda p: p["nmb"] * p["nkb"])
-    def fp8_quant_act_generic(
-        x: txl.gptr[dtype],
-        q: txl.gptr[txl.u8],
-        s: txl.gptr[txl.f32],
-        qt: txl.gptr[txl.u8],
-        st: txl.gptr[txl.f32],
-        M: txl.i32,
-        K: txl.i32,
-        nmb: txl.i32,
-        nkb: txl.i32,
-        sr: txl.i64,
-        sc: txl.i64,
-    ):
+    @txl.kernel()
+    def fp8_quant_act_generic(x: txl.Tensor((txl.int64(),), dtype), q: txl.Tensor((txl.int64(),), txl.u8), s: txl.Tensor((txl.int64(),), txl.f32), qt: txl.Tensor((txl.int64(),), txl.u8), st: txl.Tensor((txl.int64(),), txl.f32), M: txl.int32, K: txl.int32, nmb: txl.int32, nkb: txl.int32, sr: txl.int64, sc: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=nmb * nkb, block=128))
         b = txl.cta_id()
         t = txl.thread_id()
         smem = txl.smem_pool()
@@ -112,7 +104,7 @@ def generic_kernel(dtype: str):
         def load(c):
             col = tk * BLOCK + c
             txl.assign(v, txl.float32(0.0))
-            with txl.If(rvalid & (col < K)), txl.Then():
+            with txl.if_(rvalid & (col < K)), txl.then_():
                 addr = x.ptr_to([txl.cast(r, "int64") * sr + txl.cast(col, "int64") * sc])
                 if dtype == "float32":
                     txl.ptx["ld.global.nc.f32"](v, addr)
@@ -127,18 +119,18 @@ def generic_kernel(dtype: str):
         scale, rcp = e8m0(amax)
         rscale = txl.local_scalar("float32", init=scale)
         rrcp = txl.local_scalar("float32", init=rcp)
-        with txl.If(rvalid), txl.Then():
+        with txl.if_(rvalid), txl.then_():
             txl.ptx.st.global_.f32(s.ptr_to([txl.cast(r, "int64") * nkb + tk]), rscale)
         with txl.serial(BLOCK) as c:
             col = load(c)
-            with txl.If(rvalid & (col < K)), txl.Then():
+            with txl.if_(rvalid & (col < K)), txl.then_():
                 txl.ptx.st.global_.b8(q.ptr_to([txl.cast(r, "int64") * K + col]), fp8_byte(v * rrcp))
 
         peer = txl.local_scalar("uint32")
         for d in (16, 8, 4, 2, 1):
-            txl.ptx.shfl_sync.bfly.b32(peer, txl.reinterpret("uint32", amax), txl.uint32(d), txl.uint32(31), txl.uint32(FULL))
-            txl.ptx.max.f32(amax, amax, txl.reinterpret("float32", peer))
-        with txl.If(txl.bitwise_and(t, 31) == 0), txl.Then():
+            txl.ptx.shfl_sync.bfly.b32(peer, txl.reinterpret(amax, ty="uint32"), txl.uint32(d), txl.uint32(31), txl.uint32(FULL))
+            txl.ptx.max.f32(amax, amax, txl.reinterpret(peer, ty="float32"))
+        with txl.if_(txl.bitwise_and(t, 31) == 0), txl.then_():
             txl.ptx.st.shared.f32(red.ptr_to([t >> 5]), amax)
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(128))
         bmax = txl.local_scalar("float32")
@@ -149,14 +141,14 @@ def generic_kernel(dtype: str):
             txl.ptx.max.f32(bmax, bmax, tmp)
         bscale, brcp = e8m0(bmax)
         bb = txl.local_scalar("float32", init=brcp)
-        with txl.If(t == 0), txl.Then():
+        with txl.if_(t == 0), txl.then_():
             txl.ptx.st.global_.f32(st.ptr_to([tk * nmb + tm]), bscale)
         with txl.serial(BLOCK) as c:
             col = load(c)
-            with txl.If(rvalid & (col < K)), txl.Then():
+            with txl.if_(rvalid & (col < K)), txl.then_():
                 txl.ptx.st.global_.b8(qt.ptr_to([txl.cast(col, "int64") * M + r]), fp8_byte(v * bb))
 
-    return entry_function(fp8_quant_act_generic.compile())
+    return entry_function(fp8_quant_act_generic.compile(TARGET))
 
 
 # ----------------------------------------------------------------------------- fast path
@@ -192,7 +184,7 @@ def bf16x2_of(f32):
     """
     Both halves = the bf16 of an f32 power of two (exact).
     """
-    u = txl.reinterpret("uint32", f32)
+    u = txl.reinterpret(f32, ty="uint32")
     return txl.bitwise_or(txl.shift_right(u, txl.uint32(16)), txl.bitwise_and(u, txl.uint32(0xFFFF0000)))
 
 
@@ -201,7 +193,7 @@ ONESHOT_CTAS_PER_SM = 3
 
 @functools.cache
 def oneshot_kernel(ctas_per_sm: int, persistent: bool, direct: bool = False):
-    return entry_function(oneshot_func(ctas_per_sm, persistent, direct).compile())
+    return entry_function(oneshot_func(ctas_per_sm, persistent, direct).compile(TARGET))
 
 
 class Zero:
@@ -232,22 +224,23 @@ def oneshot_func(ctas_per_sm: int, persistent: bool = True, direct: bool = False
         )  # fmt: skip
         return (q_map, qt_map) if direct else (x_map, q_map, qt_map)
 
-    @txl.kernel(warps=8, arch="sm_100a", min_blocks_per_sm=ctas_per_sm, grid="grid_n", host_prelude=host_prelude)
+    @txl.kernel()
     def fp8_quant_act_self(
-        x: txl.gptr[txl.bf16],
-        q: txl.gptr[txl.u8],
-        s: txl.gptr[txl.f32],
-        qt: txl.gptr[txl.u8],
-        st: txl.gptr[txl.f32],
-        M: txl.i32,
-        K: txl.i32,
-        nmb: txl.i32,
-        nkb: txl.i32,
-        sr: txl.i64,
-        grid_n: txl.i32,
-        *,
-        host,
+        x: txl.Tensor((txl.int64(),), txl.bf16),
+        q: txl.Tensor((txl.int64(),), txl.u8),
+        s: txl.Tensor((txl.int64(),), txl.f32),
+        qt: txl.Tensor((txl.int64(),), txl.u8),
+        st: txl.Tensor((txl.int64(),), txl.f32),
+        M: txl.int32,
+        K: txl.int32,
+        nmb: txl.int32,
+        nkb: txl.int32,
+        sr: txl.int64,
+        grid_n: txl.int32,
     ):
+        host = host_prelude({"x": x, "q": q, "qt": qt, "M": M, "K": K, "sr": sr})
+        launch = txl.cuda.LaunchConfig(grid=grid_n, block=8 * 32)
+        txl.device_entry(launch=launch, kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=ctas_per_sm))
         if direct:
             q_map, qt_map = host
         else:
@@ -266,7 +259,7 @@ def oneshot_func(ctas_per_sm: int, persistent: bool = True, direct: bool = False
             full = smem.alloc([8], "uint64", align=8)
             tm = txl.truncdiv(b, nkb)
             tk = txl.truncmod(b, nkb)
-            with txl.If(t == 0), txl.Then():
+            with txl.if_(t == 0), txl.then_():
                 for pp in range(8):
                     txl.ptx.mbarrier.init.shared.b64(full.ptr_to([pp]), txl.uint32(1))
                 txl.ptx.fence.mbarrier_init.release.cluster()
@@ -291,7 +284,7 @@ def oneshot_func(ctas_per_sm: int, persistent: bool = True, direct: bool = False
         def reload():
             # this warp's 16 rows of its next tile go into the part it has just read
             nt = tid + grid_n
-            with txl.If(nt < nmb * nkb), txl.Then():
+            with txl.if_(nt < nmb * nkb), txl.then_():
                 txl.ptx.mbarrier.arrive.expect_tx.shared.b64(full.ptr_to([warp]), txl.uint32(TILE_BYTES // 8))
                 txl.ptx[TMA_G2S](
                     xs.ptr_to([warp * 16 * 64]),
@@ -331,10 +324,10 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
     rot = txl.alloc_local([8], "uint32")
     bmax = txl.local_scalar("float32")
     ftmp = txl.local_scalar("float32")
-    loop = txl.If(tid < ntiles) if oneshot else txl.While(tid < ntiles)
+    loop = txl.if_(tid < ntiles) if oneshot else txl.while_(tid < ntiles)
     with loop:
         if oneshot:
-            then = txl.Then()
+            then = txl.then_()
             then.__enter__()
         txl.assign(tm, txl.truncdiv(tid, nkb))
         txl.assign(tk, txl.truncmod(tid, nkb))
@@ -351,7 +344,7 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
                         txl.assign(data[base + u], txl.uint32(0))
                     col = tk * BLOCK + h * 64 + cc * 8
                     row = m0 + g * 4 + r
-                    with txl.If((row < M) & (col < K)), txl.Then():
+                    with txl.if_((row < M) & (col < K)), txl.then_():
                         txl.ptx["ld.global.nc.L1::no_allocate.v4.b32"](
                             data[base], data[base + 1], data[base + 2], data[base + 3],
                             x.ptr_to([txl.cast(row, "int64") * sr + txl.cast(col, "int64")]),
@@ -370,13 +363,13 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
             if reload is not None:
                 txl.ptx.fence.proxy.async_.shared__cta()
                 txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     reload()
             elif not oneshot:
                 # order this thread's generic-proxy reads before the producer's next TMA write
                 txl.ptx.fence.proxy.async_.shared__cta()
                 txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-                with txl.If(lane == 0), txl.Then():
+                with txl.if_(lane == 0), txl.then_():
                     txl.ptx.mbarrier.arrive.shared.b64(empty.ptr_to([stage]), txl.uint32(1))
 
         for r in range(4):
@@ -405,7 +398,7 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
             ml = g * 4 + r
             scale, rcp = e8m0(ramax[r])
             txl.assign(r2, bf16x2_of(rcp))
-            with txl.If((cc == 0) & (m0 + ml < M)), txl.Then():
+            with txl.if_((cc == 0) & (m0 + ml < M)), txl.then_():
                 txl.ptx.st.global_.f32(s.ptr_to([sbase + txl.cast(ml, "int64")]), scale)
             for h in range(2):
                 base = h * 16 + r * 4
@@ -420,17 +413,17 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
         for jj in range(1, 4):
             txl.ptx.max.f32(bmax, bmax, ramax[jj])
         for d in (8, 16):
-            txl.ptx.shfl_sync.bfly.b32(peer, txl.reinterpret("uint32", bmax), txl.uint32(d), txl.uint32(31), txl.uint32(FULL))
-            txl.ptx.max.f32(bmax, bmax, txl.reinterpret("float32", peer))
-        with txl.If(lane == 0), txl.Then():
+            txl.ptx.shfl_sync.bfly.b32(peer, txl.reinterpret(bmax, ty="uint32"), txl.uint32(d), txl.uint32(31), txl.uint32(FULL))
+            txl.ptx.max.f32(bmax, bmax, txl.reinterpret(peer, ty="float32"))
+        with txl.if_(lane == 0), txl.then_():
             txl.ptx.st.shared.f32(red.ptr_to([warp]), bmax)
         if not oneshot:
             # the previous tile's TMA stores must have read qs / tile before they are rewritten
-            with txl.If(t == 0), txl.Then():
+            with txl.if_(t == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group.read(0)
         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NC))
         # every warp's rowwise FP8 is in qs now: store it while the transposed half is built
-        with txl.If(t == 0), txl.Then():
+        with txl.if_(t == 0), txl.then_():
             txl.ptx.fence.proxy.async_.shared__cta()
             txl.ptx[TMA_S2G](txl.address_of(q_map), txl.Cast("int32", tk * BLOCK), txl.Cast("int32", m0), qs.ptr_to([qb]))
             txl.ptx.cp.async_.bulk.commit_group()
@@ -440,7 +433,7 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
             txl.ptx.max.f32(bmax, bmax, ftmp)
         bscale, brcp = e8m0(bmax)
         txl.assign(r2, bf16x2_of(brcp))
-        with txl.If(t == 0), txl.Then():
+        with txl.if_(t == 0), txl.then_():
             txl.ptx.st.global_.f32(st.ptr_to([tk * nmb + tm]), bscale)
         end(tk2)
 
@@ -475,10 +468,10 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
                 txl.ptx["st.shared.b32"](tile.ptr_to([k * 32 + txl.bitwise_xor(warp, jc) * 4 + rg]), tw[step])
         if reload is not None:
             # single qs buffer: the rowwise store must have read it before the next tile rewrites it
-            with txl.If((t == 0) & has_next()), txl.Then():
+            with txl.if_((t == 0) & has_next()), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group.read(0)
         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NC))
-        with txl.If(t == 0), txl.Then():
+        with txl.if_(t == 0), txl.then_():
             txl.ptx.fence.proxy.async_.shared__cta()
             txl.ptx[TMA_S2G](txl.address_of(qt_map), txl.Cast("int32", m0), txl.Cast("int32", tk * BLOCK), tile.ptr_to([0]))
             txl.ptx.cp.async_.bulk.commit_group()
@@ -487,7 +480,7 @@ def consume(x, sr, xs, qs, tile, red, full, empty, stage, phase, tid, it_n, adva
             then.__exit__(None, None, None)
         else:
             advance()
-    with txl.If(t == 0), txl.Then():
+    with txl.if_(t == 0), txl.then_():
         txl.ptx.cp.async_.bulk.wait_group.read(0)
 
 

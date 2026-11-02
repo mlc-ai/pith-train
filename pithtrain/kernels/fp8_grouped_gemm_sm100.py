@@ -19,20 +19,24 @@ kernel's tail; every global access follows griddepcontrol.wait).
 
 Evolved with TIRx-harness: run fp8gemm, frontier member pair2cta-hybrid (commit db8dbbc, 8021 us
 vs 11612 us, 1.448x over the previous SM100 path in the task's benchmark). Compiled once per process
-by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current
+stream.
 """
 
 import contextlib
 import functools
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
-from tvm.backend.cuda.cpp.descriptors import (
+
+from tvm_tirx.backend.cuda.cpp.descriptors import (
     encode_instr_descriptor_block_scaled_uint32,
     encode_smem_descriptor_base_uint64,
 )
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
 
 __all__ = ["fp8_grouped_gemm_sm100", "k_grouped_fp8_gemm_sm100"]
 
@@ -107,10 +111,10 @@ def pack4(vals, base):
     hi = txl.local_scalar("uint16")
     out = txl.local_scalar("uint32")
     txl.ptx.cvt.rz.satfinite.ue8m0x2.f32(
-        lo, txl.reinterpret("float32", vals[base + 1]), txl.reinterpret("float32", vals[base])
+        lo, txl.reinterpret(vals[base + 1], ty="float32"), txl.reinterpret(vals[base], ty="float32")
     )
     txl.ptx.cvt.rz.satfinite.ue8m0x2.f32(
-        hi, txl.reinterpret("float32", vals[base + 3]), txl.reinterpret("float32", vals[base + 2])
+        hi, txl.reinterpret(vals[base + 3], ty="float32"), txl.reinterpret(vals[base + 2], ty="float32")
     )
     txl.ptx.mov.b32(out, lo, hi)
     return out
@@ -136,7 +140,7 @@ def ktail(ki, cond):
     if ki == 0:
         yield
     else:
-        with txl.If(cond), txl.Then():
+        with txl.if_(cond), txl.then_():
             yield
 
 
@@ -229,23 +233,23 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
         )
         return a_map, b_map, bh_map, d_map
 
-    @txl.kernel(warps=4 + EPI_WARPS, arch="sm_100a", min_blocks_per_sm=1, grid=NUM_SMS, host_prelude=prelude)
+    @txl.kernel()
     def mgrouped(
-        a: txl.gptr[FP8, 2],
-        sfa: txl.gptr[txl.f32, 2],
-        b: txl.gptr[FP8, 3],
-        sfb: txl.gptr[txl.f32, 3],
-        d: txl.gptr[txl.bf16, 2],
-        offs: txl.gptr[txl.i32, 1],
-        M: txl.i32,
-        N: txl.i32,
-        K: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
+        offs: txl.Tensor((txl.int64(),), txl.i32),
+        M: txl.int32,
+        N: txl.int32,
+        K: txl.int32,
+        G: txl.int32,
     ):
+        host = prelude(locals())
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_SMS, block=(4 + EPI_WARPS) * 32, cluster=[2]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         a_map, b_map, bh_map, d_map = host
-        rank = txl.cta_id_in_cluster([2])
+        rank = txl.cuda.cluster_cta_id("x")
         cluster = txl.cta_id() // 2
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -283,7 +287,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
         t_empty.init(2 * 32 * EPI_WARPS)
         tail_free = txl.MBarrier(smem, 2)
         tail_free.init(2 * 32 * 4)  # warpgroup 1 (columns 128-255) of both CTAs
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.bar.sync(txl.uint32(0))  # CTA-wide order for barrier init (also what compute-sanitizer models)
         with r_idle:
@@ -317,20 +321,20 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
 
         with txl.serial((G + 31) // 32) as wc:
             gi = txl.local_scalar("int32", init=wc * 32 + lane)
-            with txl.If(wc == 0):
-                with txl.Then():
+            with txl.if_(wc == 0):
+                with txl.then_():
                     txl.assign(cur, cur0)
                     txl.assign(prev, prev0)
-                with txl.Else():
+                with txl.else_():
                     txl.ptx.ld.global_.s32(cur, offs.ptr_to([txl.min(gi, G - 1)]))
                     txl.ptx.ld.global_.s32(prev, offs.ptr_to([txl.max(txl.min(gi, G - 1) - 1, 0)]))
-            with txl.If(gi == 0), txl.Then():
+            with txl.if_(gi == 0), txl.then_():
                 txl.assign(prev, 0)
             cnt = txl.local_scalar("uint32", init=txl.if_then_else(gi < G, u322(udiv(cur - prev + 255, 256)), txl.uint32(0)))
             incl = txl.local_scalar("uint32", init=cnt)
             for x in (1, 2, 4, 8, 16):
                 txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(x), txl.uint32(0), txl.uint32(0xFFFFFFFF))
-                with txl.If(lane >= x), txl.Then():
+                with txl.if_(lane >= x), txl.then_():
                     txl.assign(incl, incl + peer)
             pe = txl.local_scalar("int32", init=txl.cast(carry + incl, "int32"))
             pb = txl.local_scalar("int32", init=pe - txl.cast(cnt, "int32"))
@@ -363,7 +367,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
             tail = umod(n_tiles, NUM_SMS // 2) if SPLIT else 0
             tail = txl.if_then_else(2 * tail <= NUM_SMS // 2, tail, 0)
             full_end = n_tiles - tail  # tiles [full_end, n_tiles) run as two column halves each
-            with txl.While(t < full_end + 2 * tail):
+            with txl.while_(t < full_end + 2 * tail):
                 hf = txl.local_scalar("int32", init=txl.if_then_else(t >= full_end, 1, 0))
                 tile = txl.local_scalar(
                     "int32", init=txl.if_then_else(hf == 1, full_end + udiv(t - full_end, 2), t)
@@ -375,13 +379,13 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                 )
                 # The walk's precomputed start assumes the first tile id is `cluster`; a final-wave split
                 # covering the whole problem (< one wave of tiles) starts earlier: restart from group 0.
-                with txl.If(pp < pbeg), txl.Then():
+                with txl.if_(pp < pbeg), txl.then_():
                     txl.assign(g, -1)
                     txl.assign(gbeg, 0)
                     txl.assign(gend, 0)
                     txl.assign(pbeg, 0)
                     txl.assign(pend, 0)
-                with txl.While(pp >= pend):
+                with txl.while_(pp >= pend):
                     txl.assign(g, g + 1)
                     txl.assign(gbeg, gend)
                     txl.ptx.ld.global_.s32(gend, offs.ptr_to([g]))
@@ -392,7 +396,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                 txl.assign(t, t + NUM_SMS // 2)
 
         with r_tma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 txl.ptx.prefetch.tensormap(txl.address_of(a_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(b_map))
                 st = txl.PipelineState(STAGES, 1)
@@ -401,7 +405,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                     with txl.serial(nk) as k:
                         twait("tma-wait-empty", empty, st.stage, st.phase)
                         bar = txl.cuda.cvta_generic_to_shared(full0.ptr_to([st.stage]))
-                        with txl.If(rank == 0), txl.Then():
+                        with txl.if_(rank == 0), txl.then_():
                             full0.arrive(
                                 st.stage, txl.if_then_else(hf == 1, 2 * (A_BYTES + B_HALF // 2), 2 * (A_BYTES + B_HALF))
                             )
@@ -412,8 +416,8 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                             m0,
                             bar,
                         )
-                        with txl.If(hf == 0):
-                            with txl.Then():
+                        with txl.if_(hf == 0):
+                            with txl.then_():
                                 txl.ptx[LD3](
                                     s_b.ptr_to([st.stage * B_HALF]),
                                     txl.address_of(b_map),
@@ -422,7 +426,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                                     g,
                                     bar,
                                 )
-                            with txl.Else():
+                            with txl.else_():
                                 txl.ptx[LD3](
                                     s_b.ptr_to([st.stage * B_HALF]),
                                     txl.address_of(bh_map),
@@ -463,16 +467,16 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                         kk = txl.min(kb + j, kb_sf - 1)
                         for i in range(4):
                             txl.ptx.ld.global_.nc.f32(fv, sfa.ptr_to([txl.min(m0 + lane + 32 * i, M - 1), kk]))
-                            txl.assign(ra[i * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(ra[i * 4 + j], txl.reinterpret(fv, ty="uint32"))
                         for c in range(NBLK):
                             nsf = txl.min(udiv(col0, 128) + c, n_sfb - 1)
                             txl.ptx.ld.global_.nc.f32(fv, sfb.ptr_to([g, nsf, kk]))
-                            txl.assign(rb[c * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(rb[c * 4 + j], txl.reinterpret(fv, ty="uint32"))
 
             def body(m0, col0, g, valid, hf):
                 load_group(m0, col0, g, 0)
                 with txl.serial(nk) as k:
-                    with txl.If(umod(k, 4) == 0), txl.Then():
+                    with txl.if_(umod(k, 4) == 0), txl.then_():
                         # Scale slots advance only when scales change. Reuse is protected by the data
                         # stage at k: after STAGES scale groups, k advanced 4*STAGES and is back on the
                         # same data stage, whose empty barrier includes the prior tcgen05.cp.
@@ -493,7 +497,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                             txl.ptx.st.shared.v4.u32(
                                 s_sfb.ptr_to([(ss.stage * N_SF_CHUNKS + c) * 128 + lane * 4]), *ws
                             )
-                        with txl.If(k + 4 < nk), txl.Then():
+                        with txl.if_(k + 4 < nk), txl.then_():
                             load_group(m0, col0, g, k + 4)
                         txl.ptx.fence.proxy.async_.shared__cta()
                         sf_full0.arrive(ss.stage)
@@ -503,8 +507,8 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
             tiles(body)
 
         with r_mma:
-            with txl.If(rank == 0), txl.Then():
-                with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(rank == 0), txl.then_():
+                with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                     st = txl.PipelineState(STAGES, 0)
                     ss = txl.PipelineState(STAGES, 0)
                     acc = txl.PipelineState(ACC_STAGES, 0)
@@ -522,7 +526,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                         twait("mma-wait-acc", t_empty, acc.stage, acc.phase ^ 1)
                         if SFT:
                             sfa_col = txl.local_scalar("uint32", init=u322((1 - acc.stage) * 256 + 240))
-                            with txl.If(q > 0), txl.Then():
+                            with txl.if_(q > 0), txl.then_():
                                 # the previous tile (other accumulator) has had its tail chunk read
                                 twait("mma-wait-tail", tail_free, 1 - acc.stage, u322(umod(udiv(q - 1, 2), 2)))
                         else:
@@ -541,10 +545,10 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                             sd0 = txl.local_scalar("uint64", init=smem_desc(SF_DESC_BASE, sfa_base + u322(ss.stage * 512)))
                             sd1 = txl.local_scalar("uint64", init=smem_desc(SF_DESC_BASE, sfb_base + u322(ss.stage * N_SF_CHUNKS * 512)))
                             twait("mma-wait-tma", full, st.stage, st.phase)
-                            with txl.If(umod(k, 4) == 0), txl.Then():
+                            with txl.if_(umod(k, 4) == 0), txl.then_():
                                 twait("mma-wait-sf", sf_full, ss.stage, ss.phase)
                             txl.ptx.tcgen05.fence__after_thread_sync()
-                            with txl.If(umod(k, 4) == 0), txl.Then():
+                            with txl.if_(umod(k, 4) == 0), txl.then_():
                                 txl.ptx[UTCCP2](
                                     sfa_col,
                                     sd0,
@@ -600,14 +604,14 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                     txl.ptx["tcgen05.ld.sync.aligned.32x32b.x32.b32"](*[vals[j] for j in range(32)], taddr)
                     txl.ptx.tcgen05.wait__ld.sync.aligned()
                     if SFT and i == 0:
-                        with txl.If(wg == 1), txl.Then():
+                        with txl.if_(wg == 1), txl.then_():
                             txl.ptx.tcgen05.fence__before_thread_sync()
                             tail_free.arrive(acc.stage, remote=0)
                     for p in range(16):
                         txl.ptx.cvt.rn.bf16x2.f32(
                             packed[c * 16 + p],
-                            txl.reinterpret("float32", vals[2 * p + 1]),
-                            txl.reinterpret("float32", vals[2 * p]),
+                            txl.reinterpret(vals[2 * p + 1], ty="float32"),
+                            txl.reinterpret(vals[2 * p], ty="float32"),
                         )
                 txl.ptx.tcgen05.fence__before_thread_sync()
                 t_empty.arrive(acc.stage, remote=0)
@@ -615,7 +619,7 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                 st_tok = rng("epi-store")
                 for c in range(COLS_PER_WG // 32):
                     buf = (wg * CDB + c % CDB) * (BM * 16)
-                    with txl.If(wtid == 0), txl.Then():
+                    with txl.if_(wtid == 0), txl.then_():
                         txl.ptx.cp.async_.bulk.wait_group.read(CDB - 1)
                     txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                     for q in range(4):
@@ -627,20 +631,20 @@ def build_mgrouped(STAGES, BN, CDB=1, SFT=False, VSF=False):
                     txl.ptx.fence.proxy.async_.shared__cta()
                     txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                     # A half tile's 128 columns all belong to warpgroup 0.
-                    with txl.If(txl.And(txl.And(wtid == 0, valid), txl.Or(hf == 0, wg == 0))), txl.Then():
+                    with txl.if_(txl.And(txl.And(wtid == 0, valid), txl.Or(hf == 0, wg == 0))), txl.then_():
                         txl.ptx[STORE2D](
                             txl.address_of(d_map),
                             col0 + wg * COLS_PER_WG + c * 32,
                             m0,
                             s_cd.ptr_to([buf]),
                         )
-                    with txl.If(wtid == 0), txl.Then():
+                    with txl.if_(wtid == 0), txl.then_():
                         txl.ptx.cp.async_.bulk.commit_group()
                 end(st_tok)
                 acc.advance()
 
             tiles(body)
-            with txl.If(wtid == 0), txl.Then():
+            with txl.if_(wtid == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group(0)
 
         txl.ptx.barrier.cluster.arrive.relaxed.aligned()
@@ -711,23 +715,23 @@ def build_mgrouped_w320(STAGES, VSF=False):
         )
         return a_map, b_map, bh_map, d_map
 
-    @txl.kernel(warps=4 + EPI_WARPS, arch="sm_100a", min_blocks_per_sm=1, grid=NUM_SMS, host_prelude=prelude)
+    @txl.kernel()
     def mgrouped_w320(
-        a: txl.gptr[FP8, 2],
-        sfa: txl.gptr[txl.f32, 2],
-        b: txl.gptr[FP8, 3],
-        sfb: txl.gptr[txl.f32, 3],
-        d: txl.gptr[txl.bf16, 2],
-        offs: txl.gptr[txl.i32, 1],
-        M: txl.i32,
-        N: txl.i32,
-        K: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
+        offs: txl.Tensor((txl.int64(),), txl.i32),
+        M: txl.int32,
+        N: txl.int32,
+        K: txl.int32,
+        G: txl.int32,
     ):
+        host = prelude(locals())
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_SMS, block=(4 + EPI_WARPS) * 32, cluster=[2]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         a_map, b_map, bh_map, d_map = host
-        rank = txl.cta_id_in_cluster([2])
+        rank = txl.cuda.cluster_cta_id("x")
         cluster = txl.cta_id() // 2
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -765,7 +769,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
         t_empty.init(2 * 32 * EPI_WARPS)
         tail_free = txl.MBarrier(smem, 2)
         tail_free.init(2 * 32 * 4)  # warpgroup 1 (columns 128-255) of both CTAs
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.bar.sync(txl.uint32(0))  # CTA-wide order for barrier init (also what compute-sanitizer models)
         with r_idle:
@@ -799,20 +803,20 @@ def build_mgrouped_w320(STAGES, VSF=False):
 
         with txl.serial((G + 31) // 32) as wc:
             gi = txl.local_scalar("int32", init=wc * 32 + lane)
-            with txl.If(wc == 0):
-                with txl.Then():
+            with txl.if_(wc == 0):
+                with txl.then_():
                     txl.assign(cur, cur0)
                     txl.assign(prev, prev0)
-                with txl.Else():
+                with txl.else_():
                     txl.ptx.ld.global_.s32(cur, offs.ptr_to([txl.min(gi, G - 1)]))
                     txl.ptx.ld.global_.s32(prev, offs.ptr_to([txl.max(txl.min(gi, G - 1) - 1, 0)]))
-            with txl.If(gi == 0), txl.Then():
+            with txl.if_(gi == 0), txl.then_():
                 txl.assign(prev, 0)
             cnt = txl.local_scalar("uint32", init=txl.if_then_else(gi < G, u322(udiv(cur - prev + 255, 256)), txl.uint32(0)))
             incl = txl.local_scalar("uint32", init=cnt)
             for x in (1, 2, 4, 8, 16):
                 txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(x), txl.uint32(0), txl.uint32(0xFFFFFFFF))
-                with txl.If(lane >= x), txl.Then():
+                with txl.if_(lane >= x), txl.then_():
                     txl.assign(incl, incl + peer)
             pe = txl.local_scalar("int32", init=txl.cast(carry + incl, "int32"))
             pb = txl.local_scalar("int32", init=pe - txl.cast(cnt, "int32"))
@@ -845,7 +849,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
             tail = umod(n_tiles, NUM_SMS // 2) if SPLIT else 0
             tail = txl.if_then_else(2 * tail <= NUM_SMS // 2, tail, 0)
             full_end = n_tiles - tail  # tiles [full_end, n_tiles) run as two column halves each
-            with txl.While(t < full_end + 2 * tail):
+            with txl.while_(t < full_end + 2 * tail):
                 hf = txl.local_scalar("int32", init=txl.if_then_else(t >= full_end, 1, 0))
                 tile = txl.local_scalar(
                     "int32", init=txl.if_then_else(hf == 1, full_end + udiv(t - full_end, 2), t)
@@ -857,13 +861,13 @@ def build_mgrouped_w320(STAGES, VSF=False):
                 )
                 # The walk's precomputed start assumes the first tile id is `cluster`; a final-wave split
                 # covering the whole problem (< one wave of tiles) starts earlier: restart from group 0.
-                with txl.If(pp < pbeg), txl.Then():
+                with txl.if_(pp < pbeg), txl.then_():
                     txl.assign(g, -1)
                     txl.assign(gbeg, 0)
                     txl.assign(gend, 0)
                     txl.assign(pbeg, 0)
                     txl.assign(pend, 0)
-                with txl.While(pp >= pend):
+                with txl.while_(pp >= pend):
                     txl.assign(g, g + 1)
                     txl.assign(gbeg, gend)
                     txl.ptx.ld.global_.s32(gend, offs.ptr_to([g]))
@@ -874,7 +878,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
                 txl.assign(t, t + NUM_SMS // 2)
 
         with r_tma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 txl.ptx.prefetch.tensormap(txl.address_of(a_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(b_map))
                 st = txl.PipelineState(STAGES, 1)
@@ -883,7 +887,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
                     with txl.serial(nk) as k:
                         twait("tma-wait-empty", empty, st.stage, st.phase)
                         bar = txl.cuda.cvta_generic_to_shared(full0.ptr_to([st.stage]))
-                        with txl.If(rank == 0), txl.Then():
+                        with txl.if_(rank == 0), txl.then_():
                             full0.arrive(
                                 st.stage, txl.if_then_else(hf == 1, 2 * (A_BYTES + B_HALF // 2), 2 * (A_BYTES + B_HALF))
                             )
@@ -935,16 +939,16 @@ def build_mgrouped_w320(STAGES, VSF=False):
                         kk = txl.min(kb + j, kb_sf - 1)
                         for i in range(4):
                             txl.ptx.ld.global_.nc.f32(fv, sfa.ptr_to([txl.min(m0 + lane + 32 * i, M - 1), kk]))
-                            txl.assign(ra[i * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(ra[i * 4 + j], txl.reinterpret(fv, ty="uint32"))
                         for c in range(NBLK):
                             nsf = txl.min(udiv(col0, 128) + c, n_sfb - 1)
                             txl.ptx.ld.global_.nc.f32(fv, sfb.ptr_to([g, nsf, kk]))
-                            txl.assign(rb[c * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(rb[c * 4 + j], txl.reinterpret(fv, ty="uint32"))
 
             def body(m0, col0, g, valid, hf):
                 load_group(m0, col0, g, 0)
                 with txl.serial(nk) as k:
-                    with txl.If(umod(k, 4) == 0), txl.Then():
+                    with txl.if_(umod(k, 4) == 0), txl.then_():
                         # Scale slots advance only when scales change. Reuse is protected by the data
                         # stage at k: after STAGES scale groups, k advanced 4*STAGES and is back on the
                         # same data stage, whose empty barrier includes the prior tcgen05.cp.
@@ -965,7 +969,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
                             txl.ptx.st.shared.v4.u32(
                                 s_sfb.ptr_to([(ss.stage * N_SF_CHUNKS + c) * 128 + lane * 4]), *ws
                             )
-                        with txl.If(k + 4 < nk), txl.Then():
+                        with txl.if_(k + 4 < nk), txl.then_():
                             load_group(m0, col0, g, k + 4)
                         txl.ptx.fence.proxy.async_.shared__cta()
                         sf_full0.arrive(ss.stage)
@@ -975,8 +979,8 @@ def build_mgrouped_w320(STAGES, VSF=False):
             tiles(body)
 
         with r_mma:
-            with txl.If(rank == 0), txl.Then():
-                with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(rank == 0), txl.then_():
+                with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                     st = txl.PipelineState(STAGES, 0)
                     ss = txl.PipelineState(STAGES, 0)
                     acc = txl.PipelineState(ACC_STAGES, 0)
@@ -994,7 +998,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
                         twait("mma-wait-acc", t_empty, acc.stage, acc.phase ^ 1)
                         if SFT:
                             sfa_col = txl.local_scalar("uint32", init=u322((1 - acc.stage) * 256 + 240))
-                            with txl.If(q > 0), txl.Then():
+                            with txl.if_(q > 0), txl.then_():
                                 # the previous tile (other accumulator) has had its tail chunk read
                                 twait("mma-wait-tail", tail_free, 1 - acc.stage, u322(umod(udiv(q - 1, 2), 2)))
                         else:
@@ -1013,10 +1017,10 @@ def build_mgrouped_w320(STAGES, VSF=False):
                             sd0 = txl.local_scalar("uint64", init=smem_desc(SF_DESC_BASE, sfa_base + u322(ss.stage * 512)))
                             sd1 = txl.local_scalar("uint64", init=smem_desc(SF_DESC_BASE, sfb_base + u322(ss.stage * N_SF_CHUNKS * 512)))
                             twait("mma-wait-tma", full, st.stage, st.phase)
-                            with txl.If(umod(k, 4) == 0), txl.Then():
+                            with txl.if_(umod(k, 4) == 0), txl.then_():
                                 twait("mma-wait-sf", sf_full, ss.stage, ss.phase)
                             txl.ptx.tcgen05.fence__after_thread_sync()
-                            with txl.If(umod(k, 4) == 0), txl.Then():
+                            with txl.if_(umod(k, 4) == 0), txl.then_():
                                 txl.ptx[UTCCP2](
                                     sfa_col,
                                     sd0,
@@ -1073,14 +1077,14 @@ def build_mgrouped_w320(STAGES, VSF=False):
                     txl.ptx["tcgen05.ld.sync.aligned.32x32b.x32.b32"](*[vals[j] for j in range(32)], taddr)
                     txl.ptx.tcgen05.wait__ld.sync.aligned()
                     if SFT and i == 0:
-                        with txl.If(wg == 1), txl.Then():
+                        with txl.if_(wg == 1), txl.then_():
                             txl.ptx.tcgen05.fence__before_thread_sync()
                             tail_free.arrive(acc.stage, remote=0)
                     for p in range(16):
                         txl.ptx.cvt.rn.bf16x2.f32(
                             packed[c * 16 + p],
-                            txl.reinterpret("float32", vals[2 * p + 1]),
-                            txl.reinterpret("float32", vals[2 * p]),
+                            txl.reinterpret(vals[2 * p + 1], ty="float32"),
+                            txl.reinterpret(vals[2 * p], ty="float32"),
                         )
                 txl.ptx.tcgen05.fence__before_thread_sync()
                 t_empty.arrive(acc.stage, remote=0)
@@ -1088,7 +1092,7 @@ def build_mgrouped_w320(STAGES, VSF=False):
                 st_tok = rng("epi-store")
                 for c in range(COLS_PER_WG // 32):
                     buf = (wg * CDB + c % CDB) * (BM * 16)
-                    with txl.If(wtid == 0), txl.Then():
+                    with txl.if_(wtid == 0), txl.then_():
                         txl.ptx.cp.async_.bulk.wait_group.read(CDB - 1)
                     txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                     for q in range(4):
@@ -1100,20 +1104,20 @@ def build_mgrouped_w320(STAGES, VSF=False):
                     txl.ptx.fence.proxy.async_.shared__cta()
                     txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                     # A half tile's 128 columns all belong to warpgroup 0.
-                    with txl.If(txl.And(txl.And(wtid == 0, valid), txl.Or(hf == 0, wg == 0))), txl.Then():
+                    with txl.if_(txl.And(txl.And(wtid == 0, valid), txl.Or(hf == 0, wg == 0))), txl.then_():
                         txl.ptx[STORE2D](
                             txl.address_of(d_map),
                             col0 + wg * COLS_PER_WG + c * 32,
                             m0,
                             s_cd.ptr_to([buf]),
                         )
-                    with txl.If(wtid == 0), txl.Then():
+                    with txl.if_(wtid == 0), txl.then_():
                         txl.ptx.cp.async_.bulk.commit_group()
                 end(st_tok)
                 acc.advance()
 
             tiles(body)
-            with txl.If(wtid == 0), txl.Then():
+            with txl.if_(wtid == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group(0)
 
         txl.ptx.barrier.cluster.arrive.relaxed.aligned()
@@ -1184,23 +1188,23 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
         )
         return a_map, b_map, bh_map, d_map
 
-    @txl.kernel(warps=4 + EPI_WARPS, arch="sm_100a", min_blocks_per_sm=1, grid=NUM_SMS, host_prelude=prelude)
+    @txl.kernel()
     def mgrouped_w320r(
-        a: txl.gptr[FP8, 2],
-        sfa: txl.gptr[txl.f32, 2],
-        b: txl.gptr[FP8, 3],
-        sfb: txl.gptr[txl.f32, 3],
-        d: txl.gptr[txl.bf16, 2],
-        offs: txl.gptr[txl.i32, 1],
-        M: txl.i32,
-        N: txl.i32,
-        K: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
+        offs: txl.Tensor((txl.int64(),), txl.i32),
+        M: txl.int32,
+        N: txl.int32,
+        K: txl.int32,
+        G: txl.int32,
     ):
+        host = prelude(locals())
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_SMS, block=(4 + EPI_WARPS) * 32, cluster=[2]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         a_map, b_map, bh_map, d_map = host
-        rank = txl.cta_id_in_cluster([2])
+        rank = txl.cuda.cluster_cta_id("x")
         cluster = txl.cta_id() // 2
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -1238,7 +1242,7 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
         slot_free.init(2 * 128)  # one epilogue warpgroup of each CTA drains a slot
         tail_free = txl.MBarrier(smem, 2)
         tail_free.init(2 * 32 * 4)  # warpgroup 1 (columns 128-255) of both CTAs
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.bar.sync(txl.uint32(0))  # CTA-wide order for barrier init (also what compute-sanitizer models)
         with r_idle:
@@ -1272,20 +1276,20 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
 
         with txl.serial((G + 31) // 32) as wc:
             gi = txl.local_scalar("int32", init=wc * 32 + lane)
-            with txl.If(wc == 0):
-                with txl.Then():
+            with txl.if_(wc == 0):
+                with txl.then_():
                     txl.assign(cur, cur0)
                     txl.assign(prev, prev0)
-                with txl.Else():
+                with txl.else_():
                     txl.ptx.ld.global_.s32(cur, offs.ptr_to([txl.min(gi, G - 1)]))
                     txl.ptx.ld.global_.s32(prev, offs.ptr_to([txl.max(txl.min(gi, G - 1) - 1, 0)]))
-            with txl.If(gi == 0), txl.Then():
+            with txl.if_(gi == 0), txl.then_():
                 txl.assign(prev, 0)
             cnt = txl.local_scalar("uint32", init=txl.if_then_else(gi < G, u322(udiv(cur - prev + 255, 256)), txl.uint32(0)))
             incl = txl.local_scalar("uint32", init=cnt)
             for x in (1, 2, 4, 8, 16):
                 txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(x), txl.uint32(0), txl.uint32(0xFFFFFFFF))
-                with txl.If(lane >= x), txl.Then():
+                with txl.if_(lane >= x), txl.then_():
                     txl.assign(incl, incl + peer)
             pe = txl.local_scalar("int32", init=txl.cast(carry + incl, "int32"))
             pb = txl.local_scalar("int32", init=pe - txl.cast(cnt, "int32"))
@@ -1318,7 +1322,7 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
             tail = umod(n_tiles, NUM_SMS // 2) if SPLIT else 0
             tail = txl.if_then_else(2 * tail <= NUM_SMS // 2, tail, 0)
             full_end = n_tiles - tail  # tiles [full_end, n_tiles) run as two column halves each
-            with txl.While(t < full_end + 2 * tail):
+            with txl.while_(t < full_end + 2 * tail):
                 hf = txl.local_scalar("int32", init=txl.if_then_else(t >= full_end, 1, 0))
                 tile = txl.local_scalar(
                     "int32", init=txl.if_then_else(hf == 1, full_end + udiv(t - full_end, 2), t)
@@ -1330,13 +1334,13 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                 )
                 # The walk's precomputed start assumes the first tile id is `cluster`; a final-wave split
                 # covering the whole problem (< one wave of tiles) starts earlier: restart from group 0.
-                with txl.If(pp < pbeg), txl.Then():
+                with txl.if_(pp < pbeg), txl.then_():
                     txl.assign(g, -1)
                     txl.assign(gbeg, 0)
                     txl.assign(gend, 0)
                     txl.assign(pbeg, 0)
                     txl.assign(pend, 0)
-                with txl.While(pp >= pend):
+                with txl.while_(pp >= pend):
                     txl.assign(g, g + 1)
                     txl.assign(gbeg, gend)
                     txl.ptx.ld.global_.s32(gend, offs.ptr_to([g]))
@@ -1347,7 +1351,7 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                 txl.assign(t, t + NUM_SMS // 2)
 
         with r_tma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 txl.ptx.prefetch.tensormap(txl.address_of(a_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(b_map))
                 st = txl.PipelineState(STAGES, 1)
@@ -1356,7 +1360,7 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                     with txl.serial(nk) as k:
                         twait("tma-wait-empty", empty, st.stage, st.phase)
                         bar = txl.cuda.cvta_generic_to_shared(full0.ptr_to([st.stage]))
-                        with txl.If(rank == 0), txl.Then():
+                        with txl.if_(rank == 0), txl.then_():
                             full0.arrive(
                                 st.stage, txl.if_then_else(hf == 1, 2 * (A_BYTES + B_HALF // 2), 2 * (A_BYTES + B_HALF))
                             )
@@ -1408,16 +1412,16 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                         kk = txl.min(kb + j, kb_sf - 1)
                         for i in range(4):
                             txl.ptx.ld.global_.nc.f32(fv, sfa.ptr_to([txl.min(m0 + lane + 32 * i, M - 1), kk]))
-                            txl.assign(ra[i * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(ra[i * 4 + j], txl.reinterpret(fv, ty="uint32"))
                         for c in range(NBLK):
                             nsf = txl.min(udiv(col0, 128) + c, n_sfb - 1)
                             txl.ptx.ld.global_.nc.f32(fv, sfb.ptr_to([g, nsf, kk]))
-                            txl.assign(rb[c * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(rb[c * 4 + j], txl.reinterpret(fv, ty="uint32"))
 
             def body(m0, col0, g, valid, hf, last=None):
                 load_group(m0, col0, g, 0)
                 with txl.serial(nk) as k:
-                    with txl.If(umod(k, 4) == 0), txl.Then():
+                    with txl.if_(umod(k, 4) == 0), txl.then_():
                         # Scale slots advance only when scales change. Reuse is protected by the data
                         # stage at k: after STAGES scale groups, k advanced 4*STAGES and is back on the
                         # same data stage, whose empty barrier includes the prior tcgen05.cp.
@@ -1438,7 +1442,7 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                             txl.ptx.st.shared.v4.u32(
                                 s_sfb.ptr_to([(ss.stage * N_SF_CHUNKS + c) * 128 + lane * 4]), *ws
                             )
-                        with txl.If(k + 4 < nk), txl.Then():
+                        with txl.if_(k + 4 < nk), txl.then_():
                             load_group(m0, col0, g, k + 4)
                         txl.ptx.fence.proxy.async_.shared__cta()
                         sf_full0.arrive(ss.stage)
@@ -1448,8 +1452,8 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
             tiles(body)
 
         with r_mma:
-            with txl.If(rank == 0), txl.Then():
-                with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(rank == 0), txl.then_():
+                with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                     st = txl.PipelineState(STAGES, 0)
                     ss = txl.PipelineState(STAGES, 0)
                     acc = txl.PipelineState(2, 0)
@@ -1495,10 +1499,10 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                         sd0 = txl.local_scalar("uint64", init=smem_desc(SF_DESC_BASE, sfa_base + u322(ss.stage * 512)))
                         sd1 = txl.local_scalar("uint64", init=smem_desc(SF_DESC_BASE, sfb_base + u322(ss.stage * N_SF_CHUNKS * 512)))
                         twait("mma-wait-tma", full, st.stage, st.phase)
-                        with txl.If(umod(k, 4) == 0), txl.Then():
+                        with txl.if_(umod(k, 4) == 0), txl.then_():
                             twait("mma-wait-sf", sf_full, ss.stage, ss.phase)
                         txl.ptx.tcgen05.fence__after_thread_sync()
-                        with txl.If(umod(k, 4) == 0), txl.Then():
+                        with txl.if_(umod(k, 4) == 0), txl.then_():
                             txl.ptx[UTCCP2](sfa_col, sd0)
                             for c in range(N_SF_CHUNKS):
                                 txl.ptx[UTCCP2](sfa_col + txl.uint32(4 + 4 * c), dadd(sd1, c * 512))
@@ -1574,14 +1578,14 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                     txl.ptx["tcgen05.ld.sync.aligned.32x32b.x32.b32"](*[vals[j] for j in range(32)], taddr)
                     txl.ptx.tcgen05.wait__ld.sync.aligned()
                     if SFT and i == 0:
-                        with txl.If(wg == 1), txl.Then():
+                        with txl.if_(wg == 1), txl.then_():
                             txl.ptx.tcgen05.fence__before_thread_sync()
                             tail_free.arrive(acc.stage, remote=0)
                     for p in range(16):
                         txl.ptx.cvt.rn.bf16x2.f32(
                             packed[c * 16 + p],
-                            txl.reinterpret("float32", vals[2 * p + 1]),
-                            txl.reinterpret("float32", vals[2 * p]),
+                            txl.reinterpret(vals[2 * p + 1], ty="float32"),
+                            txl.reinterpret(vals[2 * p], ty="float32"),
                         )
                 txl.ptx.tcgen05.fence__before_thread_sync()
                 slot_free.arrive(myslot, remote=0)
@@ -1595,15 +1599,15 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                         # this CTA's last tile: no next tile's loads to compete with, so alternate two
                         # buffers (chunk c -> (c + 1) % 2: the previous tile's final store used buffer 0)
                         buf = (wg * 2 + txl.if_then_else(last, (c + 1) % 2, 0)) * (BM * 16)
-                        with txl.If(wtid == 0), txl.Then():
-                            with txl.If(last):
-                                with txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
+                            with txl.if_(last):
+                                with txl.then_():
                                     txl.ptx.cp.async_.bulk.wait_group.read(1)
-                                with txl.Else():
+                                with txl.else_():
                                     txl.ptx.cp.async_.bulk.wait_group.read(0)
                     else:
                         buf = (wg * CDB + (umod(cc + c, CDB) if CDB > 1 else 0)) * (BM * 16)
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             txl.ptx.cp.async_.bulk.wait_group.read(CDB - 1)
                     txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                     for q in range(4):
@@ -1615,21 +1619,21 @@ def build_mgrouped_w320r(STAGES, VSF=False, DEFER=2, SW=160, CDB=1, LASTCD=False
                     txl.ptx.fence.proxy.async_.shared__cta()
                     txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                     # A half tile's 128 columns all belong to warpgroup 0.
-                    with txl.If(txl.And(txl.And(wtid == 0, valid), txl.Or(hf == 0, wg == 0))), txl.Then():
+                    with txl.if_(txl.And(txl.And(wtid == 0, valid), txl.Or(hf == 0, wg == 0))), txl.then_():
                         txl.ptx[STORE2D](
                             txl.address_of(d_map),
                             col0 + wg * COLS_PER_WG + c * 32,
                             m0,
                             s_cd.ptr_to([buf]),
                         )
-                    with txl.If(wtid == 0), txl.Then():
+                    with txl.if_(wtid == 0), txl.then_():
                         txl.ptx.cp.async_.bulk.commit_group()
                 end(st_tok)
                 txl.assign(cc, cc + COLS_PER_WG // 32)
                 acc.advance()
 
             tiles(body)
-            with txl.If(wtid == 0), txl.Then():
+            with txl.if_(wtid == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group(0)
 
         txl.ptx.barrier.cluster.arrive.relaxed.aligned()
@@ -1679,21 +1683,21 @@ def build_mgrouped_1cta(STAGES, VSF=False):
         )
         return a_map, b_map, d_map
 
-    @txl.kernel(warps=12, arch="sm_100a", min_blocks_per_sm=1, grid=NUM_SMS, host_prelude=prelude)
+    @txl.kernel()
     def mgrouped_1cta(
-        a: txl.gptr[FP8, 2],
-        sfa: txl.gptr[txl.f32, 2],
-        b: txl.gptr[FP8, 3],
-        sfb: txl.gptr[txl.f32, 3],
-        d: txl.gptr[txl.bf16, 2],
-        offs: txl.gptr[txl.i32, 1],
-        M: txl.i32,
-        N: txl.i32,
-        K: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
+        offs: txl.Tensor((txl.int64(),), txl.i32),
+        M: txl.int32,
+        N: txl.int32,
+        K: txl.int32,
+        G: txl.int32,
     ):
+        host = prelude(locals())
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_SMS, block=384), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         a_map, b_map, d_map = host
         cta = txl.cta_id()
         warp = txl.warp_id()
@@ -1724,7 +1728,7 @@ def build_mgrouped_1cta(STAGES, VSF=False):
         sf_full.init(32)
         t_full.init(1)
         t_empty.init(256)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.bar.sync(txl.uint32(0))
         with r_idle:
@@ -1751,7 +1755,7 @@ def build_mgrouped_1cta(STAGES, VSF=False):
             tail = umod(total, NUM_SMS)
             tail = txl.if_then_else(2 * tail <= NUM_SMS, tail, 0)
             full_end = total - tail  # tiles [full_end, total) run as two column halves each
-            with txl.While(t < full_end + 2 * tail):
+            with txl.while_(t < full_end + 2 * tail):
                 hf = txl.local_scalar("int32", init=txl.if_then_else(t >= full_end, 1, 0))
                 tile = txl.local_scalar("int32", init=txl.if_then_else(hf == 1, full_end + udiv(t - full_end, 2), t))
                 m0 = txl.local_scalar("int32", init=udiv(tile, n_nb) * BM)
@@ -1759,11 +1763,11 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                     "int32", init=umod(tile, n_nb) * BN + txl.if_then_else(hf == 1, umod(t - full_end, 2) * (BN // 2), 0)
                 )
                 # half-tile ids can map below this CTA's previous tile (problem under one wave): restart the walk
-                with txl.If(m0 < gstart), txl.Then():
+                with txl.if_(m0 < gstart), txl.then_():
                     txl.assign(g, 0)
                     txl.assign(gstart, 0)
                     txl.ptx.ld.global_.s32(gend, offs.ptr_to([0]))
-                with txl.While(m0 >= gend):
+                with txl.while_(m0 >= gend):
                     txl.assign(g, g + 1)
                     txl.assign(gstart, gend)
                     txl.ptx.ld.global_.s32(gend, offs.ptr_to([g]))
@@ -1778,13 +1782,13 @@ def build_mgrouped_1cta(STAGES, VSF=False):
             tail = umod(total, NUM_SMS)
             tail = txl.if_then_else(2 * tail <= NUM_SMS, tail, 0)
             full_end = total - tail
-            with txl.While(t < full_end + 2 * tail):
+            with txl.while_(t < full_end + 2 * tail):
                 hf = txl.local_scalar("int32", init=txl.if_then_else(t >= full_end, 1, 0))
                 body(0, 0, 0, hf)
                 txl.assign(t, t + NUM_SMS)
 
         with r_tma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 txl.ptx.prefetch.tensormap(txl.address_of(a_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(b_map))
                 st = txl.PipelineState(STAGES, 1)
@@ -1829,11 +1833,11 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                         kk = txl.min(kb + j, kb_sf - 1)
                         for i in range(4):
                             txl.ptx.ld.global_.nc.f32(fv, sfa.ptr_to([m0 + lane + 32 * i, kk]))
-                            txl.assign(ra[i * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(ra[i * 4 + j], txl.reinterpret(fv, ty="uint32"))
                         for c in range(N_SF_CHUNKS):
                             nsf = txl.min(udiv(col0, 128) + c, n_sfb - 1)
                             txl.ptx.ld.global_.nc.f32(fv, sfb.ptr_to([g, nsf, kk]))
-                            txl.assign(rb[c * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(rb[c * 4 + j], txl.reinterpret(fv, ty="uint32"))
 
             def body(m0, col0, g, hf):
                 load_group(m0, col0, g, 0)
@@ -1841,7 +1845,7 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                     twait("sf-wait-empty", empty, st.stage, st.phase)
                     # the previous tcgen05.cp of this stage (async proxy) completed: order our writes after it
                     txl.ptx.fence.proxy.async_.shared__cta()
-                    with txl.If(umod(k, 4) == 0), txl.Then():
+                    with txl.if_(umod(k, 4) == 0), txl.then_():
                         txl.ptx.st.shared.v4.u32(
                             s_sfa.ptr_to([st.stage * 128 + lane * 4]),
                             pack4(ra, 0), pack4(ra, 4), pack4(ra, 8), pack4(ra, 12),
@@ -1849,7 +1853,7 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                         for c in range(N_SF_CHUNKS):
                             wb = txl.local_scalar("uint32", init=pack4(rb, c * 4))
                             txl.ptx.st.shared.v4.u32(s_sfb.ptr_to([st.stage * BN + c * 128 + lane * 4]), wb, wb, wb, wb)
-                        with txl.If(k + 4 < nk), txl.Then():
+                        with txl.if_(k + 4 < nk), txl.then_():
                             load_group(m0, col0, g, k + 4)
                     txl.ptx.fence.proxy.async_.shared__cta()
                     sf_full.arrive(st.stage)
@@ -1858,7 +1862,7 @@ def build_mgrouped_1cta(STAGES, VSF=False):
             tiles(body)
 
         with r_mma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 st = txl.PipelineState(STAGES, 0)
                 acc = txl.PipelineState(1, 0)
                 a_base = txl.local_scalar("uint32", init=txl.cuda.cvta_generic_to_shared(s_a.ptr_to([0])))
@@ -1882,7 +1886,7 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                         twait("mma-wait-tma", full, st.stage, st.phase)
                         twait("mma-wait-sf", sf_full, st.stage, st.phase)
                         txl.ptx.tcgen05.fence__after_thread_sync()
-                        with txl.If(umod(k, 4) == 0), txl.Then():
+                        with txl.if_(umod(k, 4) == 0), txl.then_():
                             txl.ptx[UTCCP_CHAIN](
                                 txl.uint32(SFA_COL), sd0
                             )
@@ -1923,21 +1927,21 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                 live = txl.Or(hf == 0, wg == 0)  # a half tile's 128 columns belong to warpgroup 0
                 twait("epi-wait-acc", t_full, acc.stage, acc.phase)
                 txl.ptx.tcgen05.fence__after_thread_sync()
-                with txl.If(live), txl.Then():
+                with txl.if_(live), txl.then_():
                     for c in range(4):
                         taddr = txl.bitwise_or(txl.shift_left(u322(quad * 32), txl.uint32(16)), u322(wg * 128 + c * 32))
                         txl.ptx["tcgen05.ld.sync.aligned.32x32b.x32.b32"](*[vals[c * 32 + j] for j in range(32)], taddr)
                     txl.ptx.tcgen05.wait__ld.sync.aligned()
                 txl.ptx.tcgen05.fence__before_thread_sync()
                 t_empty.arrive(acc.stage)
-                with txl.If(live), txl.Then():
+                with txl.if_(live), txl.then_():
                     for p in range(64):
                         txl.ptx.cvt.rn.bf16x2.f32(
-                            packed[p], txl.reinterpret("float32", vals[2 * p + 1]), txl.reinterpret("float32", vals[2 * p])
+                            packed[p], txl.reinterpret(vals[2 * p + 1], ty="float32"), txl.reinterpret(vals[2 * p], ty="float32")
                         )
                     buf = wg * (BM * 16)
                     for c in range(4):
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             txl.ptx.cp.async_.bulk.wait_group.read(0)
                         txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                         for q in range(4):
@@ -1948,13 +1952,13 @@ def build_mgrouped_1cta(STAGES, VSF=False):
                             )  # fmt: skip
                         txl.ptx.fence.proxy.async_.shared__cta()
                         txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             txl.ptx[STORE2D](txl.address_of(d_map), col0 + wg * 128 + c * 32, m0, s_cd.ptr_to([buf]))
                             txl.ptx.cp.async_.bulk.commit_group()
                 acc.advance()
 
             tiles(body)
-            with txl.If(wtid == 0), txl.Then():
+            with txl.if_(wtid == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group(0)
 
         txl.ptx.bar.sync(txl.uint32(0))
@@ -2008,23 +2012,23 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
         )
         return a_map, a64_map, b_map, d_map
 
-    @txl.kernel(warps=4 + EPI_WARPS, arch="sm_100a", min_blocks_per_sm=1, grid=NUM_SMS, host_prelude=prelude)
+    @txl.kernel()
     def mgrouped_swap(
-        a: txl.gptr[FP8, 2],
-        sfa: txl.gptr[txl.f32, 2],
-        b: txl.gptr[FP8, 3],
-        sfb: txl.gptr[txl.f32, 3],
-        d: txl.gptr[txl.bf16, 2],
-        offs: txl.gptr[txl.i32, 1],
-        M: txl.i32,
-        N: txl.i32,
-        K: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        b: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), FP8),
+        sfb: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
+        d: txl.Tensor((txl.int64(), txl.int64()), txl.bf16),
+        offs: txl.Tensor((txl.int64(),), txl.i32),
+        M: txl.int32,
+        N: txl.int32,
+        K: txl.int32,
+        G: txl.int32,
     ):
+        host = prelude(locals())
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_SMS, block=(4 + EPI_WARPS) * 32, cluster=[2]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         a_map, a64_map, b_map, d_map = host
-        rank = txl.cta_id_in_cluster([2])
+        rank = txl.cuda.cluster_cta_id("x")
         cluster = txl.cta_id() // 2
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -2059,7 +2063,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
         sf_full.init(64)
         t_full.init(1)
         t_empty.init(2 * 32 * EPI_WARPS)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.bar.sync(txl.uint32(0))  # CTA-wide order for barrier init (also what compute-sanitizer models)
         with r_idle:
@@ -2092,20 +2096,20 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
 
         with txl.serial((G + 31) // 32) as wc:
             gi = txl.local_scalar("int32", init=wc * 32 + lane)
-            with txl.If(wc == 0):
-                with txl.Then():
+            with txl.if_(wc == 0):
+                with txl.then_():
                     txl.assign(cur, cur0)
                     txl.assign(prev, prev0)
-                with txl.Else():
+                with txl.else_():
                     txl.ptx.ld.global_.s32(cur, offs.ptr_to([txl.min(gi, G - 1)]))
                     txl.ptx.ld.global_.s32(prev, offs.ptr_to([txl.max(txl.min(gi, G - 1) - 1, 0)]))
-            with txl.If(gi == 0), txl.Then():
+            with txl.if_(gi == 0), txl.then_():
                 txl.assign(prev, 0)
             cnt = txl.local_scalar("uint32", init=txl.if_then_else(gi < G, u322(udiv(cur - prev + 255, 256)), txl.uint32(0)))
             incl = txl.local_scalar("uint32", init=cnt)
             for x in (1, 2, 4, 8, 16):
                 txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(x), txl.uint32(0), txl.uint32(0xFFFFFFFF))
-                with txl.If(lane >= x), txl.Then():
+                with txl.if_(lane >= x), txl.then_():
                     txl.assign(incl, incl + peer)
             pe = txl.local_scalar("int32", init=txl.cast(carry + incl, "int32"))
             pb = txl.local_scalar("int32", init=pe - txl.cast(cnt, "int32"))
@@ -2134,10 +2138,10 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
             gend = txl.local_scalar("int32", init=txl.cast(init[3], "int32"))
             pbeg = txl.local_scalar("int32", init=txl.cast(init[4], "int32"))
             pend = txl.local_scalar("int32", init=txl.cast(init[5], "int32"))
-            with txl.While(t < total * n_nb):
+            with txl.while_(t < total * n_nb):
                 pp = txl.local_scalar("int32", init=udiv(t, n_nb))
                 nb = txl.local_scalar("int32", init=umod(t, n_nb))
-                with txl.While(pp >= pend):
+                with txl.while_(pp >= pend):
                     txl.assign(g, g + 1)
                     txl.assign(gbeg, gend)
                     txl.ptx.ld.global_.s32(gend, offs.ptr_to([g]))
@@ -2148,7 +2152,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                 txl.assign(t, t + NUM_SMS // 2)
 
         with r_tma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 txl.ptx.prefetch.tensormap(txl.address_of(a_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(a64_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(b_map))
@@ -2161,7 +2165,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                     with txl.serial(nk) as k:
                         twait("tma-wait-empty", empty, st.stage, st.phase)
                         bar = txl.cuda.cvta_generic_to_shared(full0.ptr_to([st.stage]))
-                        with txl.If(rank == 0), txl.Then():
+                        with txl.if_(rank == 0), txl.then_():
                             full0.arrive(st.stage, tx)
                         txl.ptx[LD3](
                             s_w.ptr_to([st.stage * W_BYTES]),
@@ -2171,8 +2175,8 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                             g,
                             bar,
                         )
-                        with txl.If(fullt):
-                            with txl.Then():
+                        with txl.if_(fullt):
+                            with txl.then_():
                                 txl.ptx[LD2](
                                     s_t.ptr_to([st.stage * T_BYTES]),
                                     txl.address_of(a_map),
@@ -2180,7 +2184,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                                     m0 + rank * 128,
                                     bar,
                                 )
-                            with txl.Else():
+                            with txl.else_():
                                 txl.ptx[LD2](
                                     s_t.ptr_to([st.stage * T_BYTES]),
                                     txl.address_of(a64_map),
@@ -2214,13 +2218,13 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                     for j in range(4):
                         kk = txl.min(kb + j, kb_sf - 1)
                         txl.ptx.ld.global_.nc.f32(fv, sfb.ptr_to([g, nsf, kk]))
-                        txl.assign(ra[j], txl.reinterpret("uint32", fv))
+                        txl.assign(ra[j], txl.reinterpret(fv, ty="uint32"))
                         for c in range(2):
                             for i in range(4):
                                 txl.ptx.ld.global_.nc.f32(
                                     fv, sfa.ptr_to([txl.min(m0 + c * 128 + lane + 32 * i, M - 1), kk])
                                 )
-                                txl.assign(rb[c * 16 + i * 4 + j], txl.reinterpret("uint32", fv))
+                                txl.assign(rb[c * 16 + i * 4 + j], txl.reinterpret(fv, ty="uint32"))
 
             def body(m0, nb, g, fullt):
                 load_group(m0, nb, g, 0)
@@ -2228,7 +2232,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                     twait("sf-wait-empty", empty, st.stage, st.phase)
                     # The previous tcgen05.cp of this stage (async proxy) completed; order it before our writes.
                     txl.ptx.fence.proxy.async_.shared__cta()
-                    with txl.If(umod(k, 4) == 0), txl.Then():
+                    with txl.if_(umod(k, 4) == 0), txl.then_():
                         wa = txl.local_scalar("uint32", init=pack4(ra, 0))
                         txl.ptx.st.shared.v4.u32(s_sfa.ptr_to([st.stage * 128 + lane * 4]), wa, wa, wa, wa)
                         for c in range(2):
@@ -2237,7 +2241,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                                 pack4(rb, c * 16), pack4(rb, c * 16 + 4),
                                 pack4(rb, c * 16 + 8), pack4(rb, c * 16 + 12),
                             )  # fmt: skip
-                        with txl.If(k + 4 < nk), txl.Then():
+                        with txl.if_(k + 4 < nk), txl.then_():
                             load_group(m0, nb, g, k + 4)
                     txl.ptx.fence.proxy.async_.shared__cta()
                     sf_full0.arrive(st.stage)
@@ -2246,8 +2250,8 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
             tiles(body)
 
         with r_mma:
-            with txl.If(rank == 0), txl.Then():
-                with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(rank == 0), txl.then_():
+                with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                     st = txl.PipelineState(STAGES, 0)
                     acc = txl.PipelineState(1, 0)
                     w_base = txl.local_scalar("uint32", init=txl.cuda.cvta_generic_to_shared(s_w.ptr_to([0])))
@@ -2275,7 +2279,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                             twait("mma-wait-tma", full, st.stage, st.phase)
                             twait("mma-wait-sf", sf_full, st.stage, st.phase)
                             txl.ptx.tcgen05.fence__after_thread_sync()
-                            with txl.If(umod(k, 4) == 0), txl.Then():
+                            with txl.if_(umod(k, 4) == 0), txl.then_():
                                 txl.ptx[UTCCP2](
                                     txl.uint32(SFA_COL),
                                     sd0,
@@ -2329,7 +2333,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                 live = txl.Or(fullt, wg == 0)
                 twait("epi-wait-acc", t_full, acc.stage, acc.phase)
                 txl.ptx.tcgen05.fence__after_thread_sync()
-                with txl.If(live), txl.Then():
+                with txl.if_(live), txl.then_():
                     for c in range(4):
                         taddr = txl.bitwise_or(
                             txl.shift_left(u322(quad * 32), txl.uint32(16)), u322(wg * 128 + c * 32)
@@ -2342,7 +2346,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                 txl.ptx.tcgen05.fence__before_thread_sync()
                 t_empty.arrive(acc.stage, remote=0)
                 for c in range(4):
-                    with txl.If(live), txl.Then():
+                    with txl.if_(live), txl.then_():
                         # Lane pairs swap halves so each lane owns two adjacent columns of one token.
                         for p in range(16):
                             txl.ptx.shfl_sync.bfly.b32(
@@ -2355,16 +2359,16 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                             lo = txl.if_then_else(par == 0, vals[c * 32 + 2 * p], peer)
                             hi = txl.if_then_else(par == 0, peer, vals[c * 32 + 2 * p + 1])
                             txl.ptx.cvt.rn.bf16x2.f32(
-                                packed[p], txl.reinterpret("float32", hi), txl.reinterpret("float32", lo)
+                                packed[p], txl.reinterpret(hi, ty="float32"), txl.reinterpret(lo, ty="float32")
                             )
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             txl.ptx.cp.async_.bulk.wait_group.read(0)
                         txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                         for p in range(16):
                             txl.ptx.st.shared.u32(s_cd.ptr_to([buf + (2 * p + par) * 64 + col // 2]), packed[p])
                         txl.ptx.fence.proxy.async_.shared__cta()
                         txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             txl.ptx[STORE2D](
                                 txl.address_of(d_map), nb * 256 + rank * 128, m0 + wg * 128 + c * 32, s_cd.ptr_to([buf])
                             )
@@ -2372,7 +2376,7 @@ def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):
                 acc.advance()
 
             tiles(body)
-            with txl.If(wtid == 0), txl.Then():
+            with txl.if_(wtid == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group(0)
 
         txl.ptx.barrier.cluster.arrive.relaxed.aligned()
@@ -2438,24 +2442,26 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
         )  # fmt: skip
         return a_map, b_map, d_map
 
-    @txl.kernel(warps=12, arch="sm_100a", min_blocks_per_sm=1, grid=NUM_SMS, host_prelude=prelude)
+    @txl.kernel()
     def kgrouped(
-        a: txl.gptr[FP8, 2],
-        sfa: txl.gptr[txl.f32, 2],
-        b: txl.gptr[FP8, 2],
-        sfb: txl.gptr[txl.f32, 2],
-        d: txl.gptr[txl.f32, 3],
-        ks: txl.gptr[txl.i32, 1],
-        ctr: txl.gptr[txl.i32, 1],
-        M: txl.i32,
-        N: txl.i32,
-        K: txl.i32,
-        G: txl.i32,
-        *,
-        host,
+        a: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfa: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        b: txl.Tensor((txl.int64(), txl.int64()), FP8),
+        sfb: txl.Tensor((txl.int64(), txl.int64()), txl.f32),
+        d: txl.Tensor((txl.int64(), txl.int64(), txl.int64()), txl.f32),
+        ks: txl.Tensor((txl.int64(),), txl.i32),
+        ctr: txl.Tensor((txl.int64(),), txl.i32),
+        M: txl.int32,
+        N: txl.int32,
+        K: txl.int32,
+        G: txl.int32,
     ):
+        host = prelude(locals())
+        # Programmatic dependent launch: the prologue (barrier init, TMEM allocation, cluster sync)
+        # overlaps the tail of the preceding kernel; all global accesses follow griddepcontrol.wait.
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_SMS, block=384, cluster=[2], programmatic_stream_serialization=True), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1))
         a_map, b_map, d_map = host
-        rank = txl.cta_id_in_cluster([2])
+        rank = txl.cuda.cluster_cta_id("x")
         warp = txl.warp_id()
         lane = txl.lane_id()
         tid = txl.thread_id()
@@ -2489,7 +2495,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
         q_empty = txl.MBarrier(smem, SCHED_DEPTH)
         q_full.init(1)
         q_empty.init(SCHED_CONSUMERS)
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx.fence.mbarrier_init.release.cluster()
         txl.ptx.bar.sync(txl.uint32(0))  # CTA-wide order for barrier init (also what compute-sanitizer models)
         with r_idle:
@@ -2526,7 +2532,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                 txl.ptx.ld.shared.s32(t, s_tile.ptr_to([qs.stage]))
                 if not one_lane:
                     txl.ptx.bar.warp.sync(txl.uint32(0xFFFFFFFF))
-                with txl.If(txl.Or(txl.bool(one_lane), lane == 0)), txl.Then():
+                with txl.if_(txl.Or(txl.bool(one_lane), lane == 0)), txl.then_():
                     q_empty0.arrive(qs.stage)
                 qs.advance()
 
@@ -2542,29 +2548,29 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                 g = txl.local_scalar("int32", init=0)
                 row0 = txl.local_scalar("int32", init=0)
                 txl.ptx.ld.global_.s32(kg, ks.ptr_to([0]))
-            with txl.While(t >= 0):
+            with txl.while_(t >= 0):
                 if REV:
                     tg = txl.local_scalar("int32", init=G - 1 - udiv(t, per_group))
-                    with txl.While(g > tg):
+                    with txl.while_(g > tg):
                         txl.assign(g, g - 1)
                         txl.ptx.ld.global_.s32(kg, ks.ptr_to([g]))
                         txl.assign(row0, row0 - kg)
                     r = txl.local_scalar("int32", init=per_group - 1 - (t - (G - 1 - tg) * per_group))
                 else:
                     tg = txl.local_scalar("int32", init=udiv(t, per_group))
-                    with txl.While(g < tg):
+                    with txl.while_(g < tg):
                         txl.assign(row0, row0 + kg)
                         txl.assign(g, g + 1)
                         txl.ptx.ld.global_.s32(kg, ks.ptr_to([g]))
                     r = txl.local_scalar("int32", init=t - tg * per_group)
                 m0 = txl.local_scalar("int32", init=udiv(r, n_nt) * 256 + rank * BM)
                 n0 = txl.local_scalar("int32", init=umod(r, n_nt) * BN)
-                with txl.If(kg > 0), txl.Then():
+                with txl.if_(kg > 0), txl.then_():
                     body(m0, n0, g, row0, udiv(kg, BK))
                 next_tile()
 
         with r_tma:
-            with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                 txl.ptx.prefetch.tensormap(txl.address_of(a_map))
                 txl.ptx.prefetch.tensormap(txl.address_of(b_map))
                 st = txl.PipelineState(STAGES, 1)
@@ -2580,7 +2586,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                     with txl.serial(nk) as k:
                         twait("tma-wait-empty", empty, st.stage, st.phase)
                         bar = txl.cuda.cvta_generic_to_shared(full0.ptr_to([st.stage]))
-                        with txl.If(rank == 0), txl.Then():
+                        with txl.if_(rank == 0), txl.then_():
                             full0.arrive(st.stage, 2 * (A_BYTES + B_HALF))
                         krow = row0 + txl.cast(k * BK, "int32")
                         txl.ptx[LD2](s_a.ptr_to([st.stage * A_BYTES]), txl.address_of(a_map), m0, krow, bar)
@@ -2602,12 +2608,12 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                     kk = udiv(row0, BK) + txl.min(kb + j, nk - 1)
                     for i in range(4):
                         txl.ptx.ld.global_.nc.f32(fv, sfa.ptr_to([kk, txl.min(m0 + lane + 32 * i, N - 1)]))
-                        txl.assign(ra[i * 4 + j], txl.reinterpret("uint32", fv))
+                        txl.assign(ra[i * 4 + j], txl.reinterpret(fv, ty="uint32"))
                         for c in range(N_SF_CHUNKS):
                             txl.ptx.ld.global_.nc.f32(
                                 fv, sfb.ptr_to([kk, txl.min(n0 + c * 128 + lane + 32 * i, K - 1)])
                             )
-                            txl.assign(rb[c * 16 + i * 4 + j], txl.reinterpret("uint32", fv))
+                            txl.assign(rb[c * 16 + i * 4 + j], txl.reinterpret(fv, ty="uint32"))
 
             def body(m0, n0, g, row0, nk):
                 load_group(m0, n0, row0, nk, 0)
@@ -2615,7 +2621,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                     twait("sf-wait-empty", empty, st.stage, st.phase)
                     # The previous tcgen05.cp of this stage (async proxy) completed; order it before our writes.
                     txl.ptx.fence.proxy.async_.shared__cta()
-                    with txl.If(umod(k, 4) == 0), txl.Then():
+                    with txl.if_(umod(k, 4) == 0), txl.then_():
                         txl.ptx.st.shared.v4.u32(
                             s_sfa.ptr_to([st.stage * 128 + lane * 4]),
                             pack4(ra, 0), pack4(ra, 4), pack4(ra, 8), pack4(ra, 12),
@@ -2626,7 +2632,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                                 pack4(rb, c * 16), pack4(rb, c * 16 + 4),
                                 pack4(rb, c * 16 + 8), pack4(rb, c * 16 + 12),
                             )  # fmt: skip
-                        with txl.If(k + 4 < nk), txl.Then():
+                        with txl.if_(k + 4 < nk), txl.then_():
                             load_group(m0, n0, row0, nk, k + 4)
                     txl.ptx.fence.proxy.async_.shared__cta()
                     sf_full0.arrive(st.stage)
@@ -2635,16 +2641,16 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
             tiles(body, one_lane=False)
 
         with r_idle:
-            with txl.If(rank == 0), txl.Then():
-                with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(rank == 0), txl.then_():
+                with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                     qs = txl.PipelineState(SCHED_DEPTH, 1)
                     nt = txl.local_scalar("int32", init=0)
                     peer_tile = txl.local_scalar("uint32")
                     peer_full = txl.local_scalar("uint32")
-                    with txl.While(nt >= 0):
+                    with txl.while_(nt >= 0):
                         txl.cuda.mbarrier_wait(q_empty.ptr_to([qs.stage]), qs.phase)
                         txl.ptx.atom.global_.add.s32(nt, ctr.ptr_to([0]), txl.int32(1))
-                        with txl.If(nt >= total), txl.Then():
+                        with txl.if_(nt >= total), txl.then_():
                             txl.assign(nt, -1)
                         txl.ptx.st.shared.s32(s_tile.ptr_to([qs.stage]), nt)
                         txl.ptx["mapa.shared::cluster.u32"](
@@ -2664,13 +2670,13 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                     # acq_rel: each pair releases its last ticket fetch; the last pair acquires them all
                     # before resetting the counter.
                     txl.ptx["atom.acq_rel.gpu.global.add.s32"](done, ctr.ptr_to([1]), txl.int32(1))
-                    with txl.If(done == NUM_SMS // 2 - 1), txl.Then():
+                    with txl.if_(done == NUM_SMS // 2 - 1), txl.then_():
                         txl.ptx.st.global_.s32(ctr.ptr_to([0]), txl.int32(0))
                         txl.ptx.st.global_.s32(ctr.ptr_to([1]), txl.int32(0))
 
         with r_mma:
-            with txl.If(rank == 0), txl.Then():
-                with txl.If(txl.cuda.elect_sync() != txl.uint32(0)), txl.Then():
+            with txl.if_(rank == 0), txl.then_():
+                with txl.if_(txl.cuda.elect_sync() != txl.uint32(0)), txl.then_():
                     st = txl.PipelineState(STAGES, 0)
                     acc = txl.PipelineState(ACC_STAGES, 0)
                     a_base = txl.local_scalar("uint32", init=txl.cuda.cvta_generic_to_shared(s_a.ptr_to([0])))
@@ -2691,7 +2697,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                             twait("mma-wait-tma", full, st.stage, st.phase)
                             twait("mma-wait-sf", sf_full, st.stage, st.phase)
                             txl.ptx.tcgen05.fence__after_thread_sync()
-                            with txl.If(umod(k, 4) == 0), txl.Then():
+                            with txl.if_(umod(k, 4) == 0), txl.then_():
                                 txl.ptx[UTCCP2](
                                     txl.uint32(SFA_COL), sd0
                                 )
@@ -2730,7 +2736,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
             def body(m0, n0, g, row0, nk):
                 if EPF:
                     # Long tiles: prefetch this warpgroup's d slice while the MMA accumulates it.
-                    with txl.If(wtid == 0), txl.Then():
+                    with txl.if_(wtid == 0), txl.then_():
                         for c in range(COLS // RC):
                             txl.ptx[PREFETCH3D](
                                 txl.address_of(d_map), n0 + wg * COLS + c * RC, m0, g, u64c(EVICT_LAST)
@@ -2753,9 +2759,9 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                     # final common barrier of a tile protects the first write of the next one, so only
                     # two cross-WG barriers are needed per tile (versus one per reduce in r170).
                     for owner in range(2):
-                        with txl.If(wg == owner), txl.Then():
+                        with txl.if_(wg == owner), txl.then_():
                             for c in range(COLS // RC):
-                                with txl.If(wtid == 0), txl.Then():
+                                with txl.if_(wtid == 0), txl.then_():
                                     txl.ptx.cp.async_.bulk.wait_group.read(0)
                                 txl.ptx.bar.sync(u322(EPI_BAR + owner), txl.uint32(128))
                                 for q in range(RC // 4):
@@ -2767,7 +2773,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                                     )  # fmt: skip
                                 txl.ptx.fence.proxy.async_.shared__cta()
                                 txl.ptx.bar.sync(u322(EPI_BAR + owner), txl.uint32(128))
-                                with txl.If(wtid == 0), txl.Then():
+                                with txl.if_(wtid == 0), txl.then_():
                                     txl.ptx[REDUCE3D + ".L2::cache_hint"](
                                         txl.address_of(d_map), n0 + owner * COLS + c * RC, m0, g,
                                         s_cd.ptr_to([0]), u64c(EVICT_LAST),
@@ -2778,7 +2784,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                 else:
                     for c in range(COLS // RC):
                         buf = (wg * CDB + c % CDB) * (BM * RC)
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             txl.ptx.cp.async_.bulk.wait_group.read(CDB - 1)
                         txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
                         for q in range(RC // 4):
@@ -2790,7 +2796,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                             )  # fmt: skip
                         txl.ptx.fence.proxy.async_.shared__cta()
                         txl.ptx.bar.sync(u322(EPI_BAR + wg), txl.uint32(128))
-                        with txl.If(wtid == 0), txl.Then():
+                        with txl.if_(wtid == 0), txl.then_():
                             # evict_last keeps the reduced d lines resident in L2 while the stream runs
                             txl.ptx[REDUCE3D + ".L2::cache_hint"](
                                 txl.address_of(d_map), n0 + wg * COLS + c * RC, m0, g, s_cd.ptr_to([buf]), u64c(EVICT_LAST)
@@ -2800,7 +2806,7 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
                 acc.advance()
 
             tiles(body, one_lane=False)
-            with txl.If(wtid == 0), txl.Then():
+            with txl.if_(wtid == 0), txl.then_():
                 txl.ptx.cp.async_.bulk.wait_group(0)
 
         txl.ptx.barrier.cluster.arrive.relaxed.aligned()
@@ -2811,12 +2817,8 @@ def build_kgrouped(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32,
     return kgrouped
 
 
-def compile_v(kernel, pdl=False):
-    mod = kernel.mod
-    if pdl:
-        mod = tvm.IRModule({"main": kernel.func.with_attr("tirx.kernel_launch_params", PDL_LAUNCH_TAGS)})
-    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
-    return entry_function(tvm.compile(mod, target=target, tir_pipeline="tirx"))
+def compile_v(kernel):
+    return entry_function(kernel.compile(TARGET))
 
 
 @functools.cache
@@ -2902,20 +2904,15 @@ def fp8_grouped_gemm_sm100(a, b, n, grouped_mm_offs):
     return out
 
 
-# Programmatic dependent launch: the k-grouped kernel's prologue (barrier init, TMEM allocation,
-# cluster sync) overlaps the tail of the preceding kernel; all global accesses follow
-# griddepcontrol.wait.
-PDL_LAUNCH_TAGS = ["clusterCtaIdx.x", "blockIdx.x", "threadIdx.x", "tirx.use_programtic_dependent_launch", "tirx.use_dyn_shared_memory"]
-
-
 @functools.cache
 def kgrouped_exec(STAGES, CDB=1, REV=False, BN=256, PF=False, EPF=False, RC=32, SHARECD=False):
-    return compile_v(build_kgrouped(STAGES, CDB, REV, BN, PF, EPF, RC, SHARECD), pdl=True)
+    return compile_v(build_kgrouped(STAGES, CDB, REV, BN, PF, EPF, RC, SHARECD))
 
 
-@txl.kernel(warps=1, arch="sm_100a", grid=1)
-def zero2(ctr: txl.gptr[txl.i32, 1]):
-    with txl.If(txl.thread_id() < 2), txl.Then():
+@txl.kernel()
+def zero2(ctr: txl.Tensor((txl.int64(),), txl.i32)):
+    txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=32))
+    with txl.if_(txl.thread_id() < 2), txl.then_():
         txl.ptx.st.global_.s32(ctr.ptr_to([txl.thread_id()]), txl.int32(0))
 
 

@@ -17,16 +17,19 @@ chunk has < 2^30 elements). Plans are cached per (dtype, index dtype, H, pointer
 
 Evolved with TIRx-harness: run group_bias_add, frontier member rowtile-packed-direct-retire (commit
 4a1608d3, 587.085 us vs 671.33 us, 1.1435x over the previous SM100 path in the task's benchmark).
-Compiled once per process by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on
-torch's current stream.
+Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") for sm_100a with nvcc and
+launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 import math
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
 
 __all__ = ["group_bias_add_sm100"]
 
@@ -52,7 +55,7 @@ RT_MAXCH = 2
 RT_TAIL = 48 << 20
 ESIZE = {torch.bfloat16: 2, torch.float16: 2, torch.float32: 4}
 DNAME = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
-INAME = {torch.int32: "int32", torch.int64: "int64"}
+INAME = {torch.int32: txl.int32, torch.int64: "int64"}
 VSUF = {1: ".b32", 2: ".v2.b32", 4: ".v4.b32", 8: ".v8.b32"}
 
 
@@ -63,8 +66,8 @@ def add_words(dtype, out, yw, bw, n):
     if dtype == "float32":
         for i in range(n):
             f = txl.local_scalar("float32")
-            txl.ptx["add.rn.f32"](f, txl.reinterpret("float32", yw[i]), txl.reinterpret("float32", bw[i]))
-            txl.assign(out[i], txl.reinterpret("uint32", f))
+            txl.ptx["add.rn.f32"](f, txl.reinterpret(yw[i], ty="float32"), txl.reinterpret(bw[i], ty="float32"))
+            txl.assign(out[i], txl.reinterpret(f, ty="uint32"))
         return
     op = "add.rn.bf16x2" if dtype == "bfloat16" else "add.rn.f16x2"
     for i in range(n):
@@ -98,8 +101,11 @@ def kernel_flat(dtype: str, itype: str, H: int, W: int):
     ldi = "ld.global.nc.s64" if itype == "int64" else "ld.global.nc.s32"
     per_cta = BLOCK * UNROLL
 
-    @txl.kernel(warps=BLOCK // 32, arch="sm_100a", grid=lambda p: txl.ceildiv(p["M"] * vpr, per_cta))
-    def group_bias_add(y: txl.gptr(dtype, shape=lambda p: (p["M"], H)), bias: txl.gptr(dtype, shape=lambda p: (p["G"], H)), gidx: txl.gptr(itype, shape=lambda p: (p["M"],)), M: txl.i32, G: txl.i32, tail: txl.i32):
+    var_M, var_G = txl.Var("M", "int32"), txl.Var("G", "int32")
+
+    @txl.kernel()
+    def group_bias_add(y: txl.Tensor((var_M, H), dtype), bias: txl.Tensor((var_G, H), dtype), gidx: txl.Tensor((var_M,), itype), M: var_M, G: var_G, tail: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.ceildiv(M * vpr, per_cta), block=(BLOCK // 32) * 32))
         nvec = M * vpr
         tid = txl.thread_id()
         nb = (nvec + per_cta - 1) // per_cta
@@ -111,7 +117,7 @@ def kernel_flat(dtype: str, itype: str, H: int, W: int):
         g = txl.alloc_local([UNROLL], "int32")
         for u in range(UNROLL):
             v = base + u * BLOCK
-            with txl.If(v < nvec), txl.Then():
+            with txl.if_(v < nvec), txl.then_():
                 row = v // vpr
                 gl = txl.local_scalar(itype)
                 txl.ptx[ldi](gl, gidx.ptr_to([row]))
@@ -119,18 +125,18 @@ def kernel_flat(dtype: str, itype: str, H: int, W: int):
                 txl.ptx[ld](*[yw[u * W + k] for k in range(W)], y.ptr_to([row, (v - row * vpr) * epv]))
         for u in range(UNROLL):
             v = base + u * BLOCK
-            with txl.If(v < nvec), txl.Then():
+            with txl.if_(v < nvec), txl.then_():
                 row = v // vpr
                 col = v - row * vpr
                 txl.ptx[ldb](*[bw[u * W + k] for k in range(W)], bias.ptr_to([g[u], col * epv]))
         for u in range(UNROLL):
             v = base + u * BLOCK
-            with txl.If(v < nvec), txl.Then():
+            with txl.if_(v < nvec), txl.then_():
                 row = v // vpr
                 add_words(dtype, Slice(yw, u * W), Slice(yw, u * W), Slice(bw, u * W), W)
                 txl.ptx[st](y.ptr_to([row, (v - row * vpr) * epv]), *[yw[u * W + k] for k in range(W)])
 
-    return entry_function(group_bias_add.compile())
+    return entry_function(group_bias_add.compile(TARGET))
 
 
 @functools.cache
@@ -141,10 +147,13 @@ def kernel_h(dtype: str, itype: str, H: int):
     cvt = "cvt.rn.bf16.f32" if dtype == "bfloat16" else "cvt.rn.f16.f32"
     ldi = "ld.global.nc.s64" if itype == "int64" else "ld.global.nc.s32"
 
-    @txl.kernel(warps=BLOCK // 32, arch="sm_100a", grid=lambda p: txl.ceildiv(p["M"] * H, BLOCK))
-    def group_bias_add_h(y: txl.gptr(dtype, shape=lambda p: (p["M"], H)), bias: txl.gptr(dtype, shape=lambda p: (p["G"], H)), gidx: txl.gptr(itype, shape=lambda p: (p["M"],)), M: txl.i32, G: txl.i32):
+    var_M, var_G = txl.Var("M", "int32"), txl.Var("G", "int32")
+
+    @txl.kernel()
+    def group_bias_add_h(y: txl.Tensor((var_M, H), dtype), bias: txl.Tensor((var_G, H), dtype), gidx: txl.Tensor((var_M,), itype), M: var_M, G: var_G):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.ceildiv(M * H, BLOCK), block=(BLOCK // 32) * 32))
         v = txl.cta_id() * BLOCK + txl.thread_id()
-        with txl.If(v < M * H), txl.Then():
+        with txl.if_(v < M * H), txl.then_():
             row = v // H
             col = v - row * H
             g = txl.local_scalar(itype)
@@ -154,8 +163,8 @@ def kernel_h(dtype: str, itype: str, H: int):
             txl.ptx["ld.global.nc.b16"](bh, bias.ptr_to([txl.cast(g, "int32"), col]))
             yf, bf = txl.local_scalar("float32"), txl.local_scalar("float32")
             if dtype == "bfloat16":
-                txl.assign(yf, txl.reinterpret("float32", txl.cast(yh, "uint32") << txl.uint32(16)))
-                txl.assign(bf, txl.reinterpret("float32", txl.cast(bh, "uint32") << txl.uint32(16)))
+                txl.assign(yf, txl.reinterpret(txl.cast(yh, "uint32") << txl.uint32(16), ty="float32"))
+                txl.assign(bf, txl.reinterpret(txl.cast(bh, "uint32") << txl.uint32(16), ty="float32"))
             else:
                 txl.ptx["cvt.f32.f16"](yf, yh)
                 txl.ptx["cvt.f32.f16"](bf, bh)
@@ -165,7 +174,7 @@ def kernel_h(dtype: str, itype: str, H: int):
             txl.ptx[cvt](out, s)
             txl.ptx["st.global.b16"](y.ptr_to([row, col]), out)
 
-    return entry_function(group_bias_add_h.compile())
+    return entry_function(group_bias_add_h.compile(TARGET))
 
 
 def rt_shape(H, W, esize):
@@ -189,8 +198,11 @@ def kernel_rt(dtype: str, itype: str, H: int, W: int):
     ld, ldb, st = "ld.global" + VSUF[W], "ld.global.nc" + VSUF[W], "st.global" + VSUF[W]
     ldi = "ld.global.nc.s64" if itype == "int64" else "ld.global.nc.s32"
 
-    @txl.kernel(warps=block // 32, arch="sm_100a", grid=lambda p: p["M"] // R, min_blocks_per_sm=5)
-    def group_bias_add_rt(y: txl.gptr(dtype, shape=lambda p: (p["M"], H)), bias: txl.gptr(dtype, shape=lambda p: (p["G"], H)), gidx: txl.gptr(itype, shape=lambda p: (p["M"],)), M: txl.i32, G: txl.i32, tail: txl.i32):
+    var_M, var_G = txl.Var("M", "int32"), txl.Var("G", "int32")
+
+    @txl.kernel()
+    def group_bias_add_rt(y: txl.Tensor((var_M, H), dtype), bias: txl.Tensor((var_G, H), dtype), gidx: txl.Tensor((var_M,), itype), M: var_M, G: var_G, tail: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=M // R, block=(block // 32) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=5))
         c0 = txl.cta_id()
         nt = M // R
         row0 = txl.Select(c0 < tail, nt - 1 - c0, c0 - tail) * R
@@ -204,7 +216,7 @@ def kernel_rt(dtype: str, itype: str, H: int, W: int):
         bw = txl.alloc_local([R * W], "uint32")
         for ch in range(nch):
             c = tid + ch * block
-            with txl.If(c < vpr), txl.Then():
+            with txl.if_(c < vpr), txl.then_():
                 for r in range(R):
                     o = ((ch * R) + r) * W
                     txl.ptx[ld](*[yw[o + k] for k in range(W)], y.ptr_to([row0 + r, c * epv]))
@@ -213,22 +225,22 @@ def kernel_rt(dtype: str, itype: str, H: int, W: int):
             same = same & (g[0] == g[r])
         for ch in range(nch):
             c = tid + ch * block
-            with txl.If(c < vpr), txl.Then():
-                with txl.If(same):
-                    with txl.Then():
+            with txl.if_(c < vpr), txl.then_():
+                with txl.if_(same):
+                    with txl.then_():
                         txl.ptx[ldb](*[bw[k] for k in range(W)], bias.ptr_to([g[0], c * epv]))
                         for r in range(R):
                             o = ((ch * R) + r) * W
                             add_words(dtype, Slice(yw, o), Slice(yw, o), bw, W)
                             txl.ptx[st](y.ptr_to([row0 + r, c * epv]), *[yw[o + k] for k in range(W)])
-                    with txl.Else():
+                    with txl.else_():
                         for r in range(R):
                             o = ((ch * R) + r) * W
                             txl.ptx[ldb](*[bw[k] for k in range(W)], bias.ptr_to([g[r], c * epv]))
                             add_words(dtype, Slice(yw, o), Slice(yw, o), bw, W)
                             txl.ptx[st](y.ptr_to([row0 + r, c * epv]), *[yw[o + k] for k in range(W)])
 
-    return entry_function(group_bias_add_rt.compile())
+    return entry_function(group_bias_add_rt.compile(TARGET))
 
 
 MAX_ELEMS = 1 << 30  # per launch: element offsets (and G * H) stay well inside int32

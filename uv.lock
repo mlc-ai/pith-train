@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
@@ -45,37 +45,54 @@ wheels = [
 ]
 
 [[package]]
-name = "apache-tvm"
-version = "0.27.0.post1"
+name = "apache-tvm-ffi"
+version = "0.1.15.post2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "apache-tvm-ffi" },
-    { name = "ml-dtypes" },
-    { name = "numpy" },
     { name = "typing-extensions" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/a8/8f/2fcd88ce2f43dd2c1945c6613356a9bc1f5fdbe6e37080d34d2b980ad9f6/apache_tvm_ffi-0.1.15.post2.tar.gz", hash = "sha256:909be9ef5af07726aa9afd38a3111abc4d86cfd5927ebedfa9166232ce7d287b", size = 3363431, upload-time = "2026-10-29T21:13:25.144Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/8f/b3440c6b7b2fe0bc214d3686a388a661a197eb729c3f362d1b66cbf18b4b/apache_tvm-0.27.0.post1-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4acfdb7653e4e1ba7a707bdf2833db72eb8fda7d04d99141f2a4e1da43171fb7", size = 94643021, upload-time = "2026-09-29T21:06:17.821Z" },
-    { url = "https://files.pythonhosted.org/packages/2c/17/f5f4dd5e309dc938911a7b83c8d06a3111232d11c4b6a2c88c485e030338/apache_tvm-0.27.0.post1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f503fc903b6e16fda5daacac6698ecb8bc38937f57da7aa29f6c7ab169d08657", size = 100544100, upload-time = "2026-09-29T21:06:25.705Z" },
+    { url = "https://files.pythonhosted.org/packages/60/e3/bd80e7c07573ea1423df4c7f527198bac7801bd8e0f962fc1c9530c95690/apache_tvm_ffi-0.1.15.post2-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5c807217f134272d6e08ffdeeb9f1b2c1f366e096712b4e47b88ee9103f80113", size = 3101802, upload-time = "2026-10-29T21:12:16.747Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/26/5f33831621f3bb493556ad508ee419ba26e134356ecfdb2ca5415f9bbe5c/apache_tvm_ffi-0.1.15.post2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:059eed9bfc94bcd41650fb8eefde74040a1bc7e7b1a6f0a8ff897b02b118875b", size = 3312304, upload-time = "2026-10-29T21:12:19.574Z" },
+    { url = "https://files.pythonhosted.org/packages/83/c9/6256df9b64db1bd7e605ff7612690629a2adc8ebbf15a6c65f15e076a47b/apache_tvm_ffi-0.1.15.post2-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:de48c255b2753fae02b06b6ca0a30742593e46c6828938a29eafb5e2ccff430f", size = 3101697, upload-time = "2026-10-29T21:12:27.905Z" },
+    { url = "https://files.pythonhosted.org/packages/41/fb/70cc7fc2ab86b805089ff165e306a3ff550baa3672271a9d9a23f14ce6b6/apache_tvm_ffi-0.1.15.post2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:eae72eb5bcbbddbc68d54eb6c16af860c628ca2f2b02cc4af2693e01a8186f73", size = 3310288, upload-time = "2026-10-29T21:12:29.641Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/e9/cdd5f99c645c4fad5351a9ae595120ae301f084bbe513d60ff963e499a3b/apache_tvm_ffi-0.1.15.post2-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cdf3f10bcc698e2cf19b408fa82e708a4364648eaa6dcf8b2643da804d6fdf6a", size = 3110653, upload-time = "2026-10-29T21:12:37.122Z" },
+    { url = "https://files.pythonhosted.org/packages/17/c0/481430a69db58099073281ec86c1fa21d8e171373e98db232ff185fec98b/apache_tvm_ffi-0.1.15.post2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:950682d8e5f088e2d4925cb03b6690a2a554e08c28b28ea721e9ca7727ff19d5", size = 3315480, upload-time = "2026-10-29T21:12:39.222Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/d2/943805f4e51c6788e6cbbf70f7b0d60503c49add412c4dd33970544bcffd/apache_tvm_ffi-0.1.15.post2-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0b9e748f149e50341db2193a4be2ef859af691f05762650392ddf6c8e5b40102", size = 3103452, upload-time = "2026-10-29T21:12:47.066Z" },
+    { url = "https://files.pythonhosted.org/packages/15/21/aa180ee749a8b5c12e91c7aea1d1046366edca9f994a44d250aa2ed0c57f/apache_tvm_ffi-0.1.15.post2-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7d401542b9d99e605dc60f251226f557dc6778d3ea3f003c602832b2ec6ae240", size = 3308505, upload-time = "2026-10-29T21:12:49.133Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/53/ad7c152f89c17a3d43762c93e95687ced763766510847355d82d2aa87630/apache_tvm_ffi-0.1.15.post2-cp315-cp315-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:910254ce28828b6de50725485d903fe637c38940983781939f9f690fb9199e41", size = 3109054, upload-time = "2026-10-29T21:12:57.021Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/0e/c1b1e9576ca3a03ee81b7c65b128d8f61e2fd0a786edbf135ba871a6c8d5/apache_tvm_ffi-0.1.15.post2-cp315-cp315-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a3d06da7aea75a59e85e3f1cd2e3de7ebbf645a28fb314216ea30dad7092d46b", size = 3314596, upload-time = "2026-10-29T21:12:58.882Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/d3/99203196be50daf19b6aef682b41ddac58fa005aadbc8444fbc0161288ac/apache_tvm_ffi-0.1.15.post2-cp315-cp315t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cc2a237f57265880b37316c8a1c73d1cf872111641e4f46be336f86978a83766", size = 3103977, upload-time = "2026-10-29T21:13:07.133Z" },
+    { url = "https://files.pythonhosted.org/packages/53/35/8c8c0bf606e23505306d0fb605d6f12aab0b0806ce233291577078f2a882/apache_tvm_ffi-0.1.15.post2-cp315-cp315t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4ceb2aa4161156080a44d113f8030bccf5197d8491b507565537b50086da3ffc", size = 3308616, upload-time = "2026-10-29T21:13:08.948Z" },
 ]
 
 [[package]]
-name = "apache-tvm-ffi"
-version = "0.1.14.post0"
+name = "apache-tvm-ffi-orcjit"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions" },
+    { name = "apache-tvm-ffi" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/12/68/94f5f874812c23d972ea2d62f3d2754ddb3a38dd010434653db3cfe77ae8/apache_tvm_ffi-0.1.14.post0.tar.gz", hash = "sha256:53cb68ac05ca84fd32042211c13fcee372729dcbff537f8689289b7f2f7d765d", size = 3193250, upload-time = "2026-09-16T08:07:06.389Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b4/11/3791b1c9967c2863313221b37889e0cd1181d56dc815a2f6e7e6d1bf342d/apache_tvm_ffi-0.1.14.post0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8efb2234473980271c665eea40bfdfbb154c46e0dda195e1c3a36963318aa029", size = 3035872, upload-time = "2026-09-16T08:06:31.632Z" },
-    { url = "https://files.pythonhosted.org/packages/4d/57/fef5632a5f84e3c8faec314a4b750e82c22b38ffcfa96cc3c4e7f1de91c3/apache_tvm_ffi-0.1.14.post0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fbff37582722fa382b04cdb15654a6bf78172d86ea7afb95b91110e3f04a934b", size = 3233474, upload-time = "2026-09-16T08:06:33.347Z" },
-    { url = "https://files.pythonhosted.org/packages/a6/83/6c58771a08e854bed800bc804b2bf97c5f776ab2f4dfa002a162c3a52605/apache_tvm_ffi-0.1.14.post0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9003b2bec3f4aa8debaadd18ce9dae9112172009a8344ed10279645b4674a073", size = 3037146, upload-time = "2026-09-16T08:06:38.601Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/4c/928a7631d55b7ad5c422896e9ab7d573f17e71c76f7105b076975d66b82a/apache_tvm_ffi-0.1.14.post0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:70a2cd855fcd3a9dda94d0d328d6356d7337de5268b7d79a0172a89e9c4ca8a7", size = 3233395, upload-time = "2026-09-16T08:06:40.594Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/c1/ff827363627efa8c355203c93459445a1e9c6e18f687564c7ee7aa2d2dfb/apache_tvm_ffi-0.1.14.post0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:67e8fc285bda5f019173a6e2b10a66f7e6b23cb7ce103419e578b775517165e1", size = 3045387, upload-time = "2026-09-16T08:06:46.002Z" },
-    { url = "https://files.pythonhosted.org/packages/99/fd/efe5c4823397464e2d0d04ecfd134d6870676bb5b0ddb923d5f0609b7be2/apache_tvm_ffi-0.1.14.post0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1c1f8ed242d2c1603a138b43cb3977c462b90fc8d21d91fddf02d6b0eee4591a", size = 3236656, upload-time = "2026-09-16T08:06:47.767Z" },
-    { url = "https://files.pythonhosted.org/packages/7a/a2/d724ecce2e25a592123fc3679d870106f5086cfd7b9423749c295b263b09/apache_tvm_ffi-0.1.14.post0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:235ac180db4399e2ce1617065545fc2c23c0f314962c920b34e4f820cca99cff", size = 3037856, upload-time = "2026-09-16T08:06:53.296Z" },
-    { url = "https://files.pythonhosted.org/packages/2e/ce/e0185f3ca18eb8400f6b108d1016e2b68043d7c7c2b1fa63da5509b9666f/apache_tvm_ffi-0.1.14.post0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:aeb45c1eeccf889ea5c327c19cd8d5a8c1d5f03b67177fd1c5281bbfeb2f2fd8", size = 3231991, upload-time = "2026-09-16T08:06:55.055Z" },
+    { url = "https://files.pythonhosted.org/packages/65/95/757f5ea8c53e8d982f137dba66ba295f5f2085d306130a9e256520bb2b02/apache_tvm_ffi_orcjit-0.1.3-py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c134044db04e39f01ef904b68b03cbf2596cbee108aebe037454efc709f8f89b", size = 14886734, upload-time = "2026-10-26T17:56:17.476Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/a6/514d719264fd723a47fa9c3ddc01ab66e2f626b87d569e396752138537e9/apache_tvm_ffi_orcjit-0.1.3-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:04f0ea19f4ae7c89564202067c34b697ce7afc3bb1158ecbdf7c0d1f4951f156", size = 15966993, upload-time = "2026-10-26T17:56:20.123Z" },
+]
+
+[[package]]
+name = "apache-tvm-tirx"
+version = "0.1.0a6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi" },
+    { name = "apache-tvm-ffi-orcjit" },
+    { name = "ml-dtypes" },
+    { name = "numpy" },
+    { name = "packaging" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/c2/4e7ef83eda7a0a817e845a563303039fd35e2d555d8f69e0ac2667aaf796/apache_tvm_tirx-0.1.0a6-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aca939f7759cf364a0d34daa9ebef870baee87352aed5a396984d9a47c44da7d", size = 42026276, upload-time = "2026-10-30T15:59:03.859Z" },
+    { url = "https://files.pythonhosted.org/packages/95/56/57408edd0dc88339063b2017c871d5e635e93be9fb77c38968be29432d30/apache_tvm_tirx-0.1.0a6-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:38f854cc576ee7e567bcb2b64387d4d41f729499727c2caaa723b69940dc2b59", size = 45789726, upload-time = "2026-10-30T15:59:07.914Z" },
 ]
 
 [[package]]
@@ -1116,8 +1133,8 @@ name = "pithtrain"
 version = "0.1.3"
 source = { editable = "." }
 dependencies = [
-    { name = "apache-tvm" },
     { name = "apache-tvm-ffi" },
+    { name = "apache-tvm-tirx" },
     { name = "deep-gemm" },
     { name = "flash-attn-4", extra = ["cu13"] },
     { name = "flash-linear-attention" },
@@ -1138,13 +1155,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apache-tvm", specifier = "==0.27.0.post1" },
-    { name = "apache-tvm-ffi", specifier = "==0.1.14.post0" },
+    { name = "apache-tvm-ffi", specifier = "==0.1.15.post2" },
+    { name = "apache-tvm-tirx", specifier = "==0.1.0a6" },
     { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM?rev=559d79fb6994a58b8a15b4b93bf13ccc16edf247" },
     { name = "flash-attn-4", extras = ["cu13"], specifier = "==4.0.0b28" },
     { name = "flash-linear-attention", specifier = "==0.5.2" },
     { name = "quack-kernels", specifier = "==0.6.5" },
-    { name = "tirx-kernels", specifier = "==0.1.2.post1" },
+    { name = "tirx-kernels", git = "https://github.com/mlc-ai/TIRx-kernels?rev=716d8a3cfc8cb5810f79f2515a39d400c1264340" },
     { name = "torch", specifier = ">=2.13.0,<2.14", index = "https://download.pytorch.org/whl/cu130" },
     { name = "transformers" },
     { name = "wandb" },
@@ -1549,16 +1566,12 @@ wheels = [
 
 [[package]]
 name = "tirx-kernels"
-version = "0.1.2.post1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.2.post2.dev11+g716d8a3cf"
+source = { git = "https://github.com/mlc-ai/TIRx-kernels?rev=716d8a3cfc8cb5810f79f2515a39d400c1264340#716d8a3cfc8cb5810f79f2515a39d400c1264340" }
 dependencies = [
     { name = "kcoral" },
     { name = "packaging" },
     { name = "pyyaml" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/66/6e/cdd8c626e89cb7a93112e642840a2b144452c2d023b237006ad9a4c39bc4/tirx_kernels-0.1.2.post1.tar.gz", hash = "sha256:6966c975b93db82f3a630bf0c17385e8c18e0eb130648379ca5041ec1e3cd127", size = 2365994, upload-time = "2026-09-30T22:06:29.728Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/8a/ea2f2963b66c9c32819773f73dea6322ea0b1cd419baae14ec0087b0722b/tirx_kernels-0.1.2.post1-py3-none-any.whl", hash = "sha256:619d9aee9e96d86e2504cba07b3e5b44289b362883ca6708ad2d743fdfe6bd01", size = 2536018, upload-time = "2026-09-30T22:06:27.588Z" },
 ]
 
 [[package]]

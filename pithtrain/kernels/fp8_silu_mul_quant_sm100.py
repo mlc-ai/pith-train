@@ -27,19 +27,43 @@ du of the previous window in thread-private shared memory and recomputes it (hal
 N not a multiple of 8 falls back to a non-persistent kernel with narrower predicated loads.
 
 Evolved with TIRx-harness: run silu, frontier member persistent-cpasync (commit 23cc854, 2126.9 us vs 8709.9 us, 4.095x over the
-previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+previous SM100 path in the task's benchmark). Compiled once per process by
+tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 import math
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # sm_100a SASS only, as the old -gencode nvcc build
+
 __all__ = ["fp8_silu_mul_fwd_sm100", "fp8_silu_mul_bwd_sm100", "fp8_silu_mul_gu_fwd_sm100", "fp8_silu_mul_gu_bwd_sm100"]
+
+def old_max(a, b):
+    """
+    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN operand
+    (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
+    """
+    return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_f32(a, b) else txl.max(a, b)
+
+
+def old_min(a, b):
+    """
+    txl.min as apache-tvm 0.27 emitted it: CUDA fminf for float32 operands, txl.min otherwise.
+    """
+    return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_f32(a, b) else txl.min(a, b)
+
+
+def is_f32(*xs):
+    """
+    Whether any operand is a float32 expression (the other may be a Python float).
+    """
+    return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
+
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
@@ -76,11 +100,11 @@ def cdiv(a, b):
 
 
 def lo_f32(w):
-    return txl.reinterpret("float32", txl.shift_left(w, txl.uint32(16)))
+    return txl.reinterpret(txl.shift_left(w, txl.uint32(16)), ty="float32")
 
 
 def hi_f32(w):
-    return txl.reinterpret("float32", txl.bitwise_and(w, txl.uint32(0xFFFF0000)))
+    return txl.reinterpret(txl.bitwise_and(w, txl.uint32(0xFFFF0000)), ty="float32")
 
 
 def f2(a, b):
@@ -155,12 +179,12 @@ def scale_rcp(amax):
     """
     s16 = txl.local_scalar("uint16")
     arg = txl.local_scalar("float32")
-    txl.ptx.mul.rn.f32(arg, txl.max(amax, txl.float32(1e-4)), txl.float32(FP8_MAX_RCP))
+    txl.ptx.mul.rn.f32(arg, old_max(amax, txl.float32(1e-4)), txl.float32(FP8_MAX_RCP))
     txl.ptx.cvt.rp.satfinite.ue8m0x2.f32(s16, txl.float32(0.0), arg)
     e = txl.bitwise_and(txl.cast(s16, "uint32"), txl.uint32(0xFF))
     sb = txl.local_scalar("uint32")
     txl.assign(sb, txl.Select(e == txl.uint32(0), txl.uint32(1 << 23), txl.shift_left(e, txl.uint32(23))))
-    return txl.reinterpret("float32", sb), txl.reinterpret("float32", txl.uint32(254 << 23) - sb)
+    return txl.reinterpret(sb, ty="float32"), txl.reinterpret(txl.uint32(254 << 23) - sb, ty="float32")
 
 
 def quant2(dst16, xw, rcp2):
@@ -283,7 +307,7 @@ def build(mode, N):
             for k in range(4):
                 txl.ptx.shfl_sync.bfly.b32(peer, cmax[k], txl.uint32(16), txl.uint32(31), txl.uint32(FULL))
                 txl.ptx.max.bf16x2(cmax[k], cmax[k], peer)
-            with txl.If(lane < 16), txl.Then():
+            with txl.if_(lane < 16), txl.then_():
                 txl.ptx.st.shared.v4.b32(part_sm.ptr_to([buf, oi, warp, cg * 4]), cmax[0], cmax[1], cmax[2], cmax[3])
             # row maxima: fold the two column parities, two rows per bf16x2 word
             rpk = txl.alloc_local([RPT // 2], "uint32")
@@ -303,7 +327,7 @@ def build(mode, N):
             txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NTHREADS))
 
             # 64 reducer threads: one bf16x2 column pair each
-            with txl.If(tid < BLOCK // 2), txl.Then():
+            with txl.if_(tid < BLOCK // 2), txl.then_():
                 acc = txl.local_scalar("uint32")
                 tmpw = txl.alloc_local([NWARP], "uint32")
                 for w_ in range(NWARP):
@@ -319,12 +343,12 @@ def build(mode, N):
                 txl.assign(sc1, s1)
                 txl.ptx.st.shared.v2.f32(rcp_sm.ptr_to([buf, oi, 2 * tid]), rc0, rc1)
                 if olim % 2 == 0:
-                    with txl.If(ccol < olim), txl.Then():
+                    with txl.if_(ccol < olim), txl.then_():
                         txl.ptx.st.global_.v2.f32(cs_t.ptr_to([rb, ccol]), sc0, sc1)
                 else:
-                    with txl.If(ccol < olim), txl.Then():
+                    with txl.if_(ccol < olim), txl.then_():
                         txl.ptx.st.global_.f32(cs_t.ptr_to([rb, ccol]), sc0)
-                    with txl.If(ccol + 1 < olim), txl.Then():
+                    with txl.if_(ccol + 1 < olim), txl.then_():
                         txl.ptx.st.global_.f32(cs_t.ptr_to([rb, ccol + 1]), sc1)
 
             def pack(q, a, b):
@@ -335,20 +359,20 @@ def build(mode, N):
                     if ofull:
                         txl.ptx.st.global_.v2.b32(dst_t.ptr_to([row, ocol]), pack(q, 0, 1), pack(q, 2, 3))
                     else:
-                        with txl.If(ocol < olim), txl.Then():
+                        with txl.if_(ocol < olim), txl.then_():
                             txl.ptx.st.global_.v2.b32(dst_t.ptr_to([row, ocol]), pack(q, 0, 1), pack(q, 2, 3))
                 elif vec == 4:
                     for sv in range(2):
-                        with txl.If(ocol + 4 * sv < olim), txl.Then():
+                        with txl.if_(ocol + 4 * sv < olim), txl.then_():
                             txl.ptx.st.global_.b32(dst_t.ptr_to([row, ocol + 4 * sv]), pack(q, 2 * sv, 2 * sv + 1))
                 elif vec == 2:
                     for sv in range(4):
-                        with txl.If(ocol + 2 * sv < olim), txl.Then():
+                        with txl.if_(ocol + 2 * sv < olim), txl.then_():
                             txl.ptx.st.global_.b16(dst_t.ptr_to([row, ocol + 2 * sv]), q[sv])
                 else:
                     for sv in range(8):
                         byte = txl.bitwise_and(txl.shift_right(txl.cast(q[sv // 2], "uint32"), txl.uint32(8 * (sv % 2))), txl.uint32(0xFF))
-                        with txl.If(ocol + sv < olim), txl.Then():
+                        with txl.if_(ocol + sv < olim), txl.then_():
                             txl.ptx.st.global_.b8(dst_t.ptr_to([row, ocol + sv]), txl.cast(byte, "uint8"))
 
             # row blocks, while the reducers finish the column scales
@@ -357,8 +381,8 @@ def build(mode, N):
                 w = rpk[i // 2]
                 rs, rr = scale_rcp(lo_f32(w) if i % 2 == 0 else hi_f32(w))
                 rr2 = txl.local_scalar("uint32")
-                txl.ptx["prmt.b32"](rr2, txl.reinterpret("uint32", rr), txl.reinterpret("uint32", rr), txl.uint32(0x7632))
-                with txl.If(cg == slane if sguard is None else txl.And(cg == slane, sguard)), txl.Then():
+                txl.ptx["prmt.b32"](rr2, txl.reinterpret(rr, ty="uint32"), txl.reinterpret(rr, ty="uint32"), txl.uint32(0x7632))
+                with txl.if_(cg == slane if sguard is None else txl.And(cg == slane, sguard)), txl.then_():
                     txl.ptx.st.global_.f32(s_t.ptr_to([row, sblk]), rs)
                 qr = txl.alloc_local([4], "uint16")
                 for k in range(4):
@@ -426,7 +450,7 @@ def build(mode, N):
             t = cta + (uu // HP) * G
             hh = uu % HP
             slot = uu % HU
-            with txl.If(t < ntiles), txl.Then():
+            with txl.if_(t < ntiles), txl.then_():
                 rb, cb, ocol, row_base = tile_coords(t, cg, r0)
                 inside = None if full else ocol < LIM
                 icol = txl.Select(ocol < N, ocol, ocol - N) if sel else ocol
@@ -447,7 +471,7 @@ def build(mode, N):
         def issue(j):
             t = cta + j * G
             slot = j % STAGES
-            with txl.If(t < ntiles), txl.Then():
+            with txl.if_(t < ntiles), txl.then_():
                 rb, cb, ocol, row_base = tile_coords(t, cg, r0)
                 inside = None if full else ocol < LIM
                 icol = txl.Select(ocol < N, ocol, ocol - N) if sel else ocol
@@ -474,7 +498,7 @@ def build(mode, N):
         wu = txl.alloc_local([W], "uint32")
         wd = txl.alloc_local([W], "uint32") if bwd else None
         regs = [wg, wu] + ([wd] if bwd else [])
-        with txl.While(cta + j * G < ntiles):
+        with txl.while_(cta + j * G < ntiles):
             t = cta + j * G
             if HU:
                 for hh in range(HP):
@@ -587,11 +611,11 @@ def build(mode, N):
         # CTAs); otherwise flat contiguous ranges of ceil(total / G) windows. No range starts at window
         # HQ (it would need both a halo and the window-0 aux load).
         PP = lv(G // MB)
-        PL = lv((NT + PP - 1) // txl.max(PP, 1))
+        PL = lv((NT + PP - 1) // old_max(PP, 1))
         per = lv((total + G - 1) // G)
 
         def cut(part):
-            c = txl.min(part * PL, NT)
+            c = old_min(part * PL, NT)
             if HQ > 0:
                 c = c + txl.Select(c == HQ, 1, 0)
             return c
@@ -600,11 +624,11 @@ def build(mode, N):
             f = c * per
             if HQ > 0:
                 f = f + txl.Select(f % NT == HQ, 1, 0)
-            return txl.min(f, total)
+            return old_min(f, total)
 
         aligned = PP >= 1
-        rbc = cta // txl.max(PP, 1)
-        pc = cta % txl.max(PP, 1)
+        rbc = cta // old_max(PP, 1)
+        pc = cta % old_max(PP, 1)
         f0 = lv(txl.Select(aligned, rbc * NT + cut(pc), start(cta)))
         f1 = lv(txl.Select(aligned, rbc * NT + cut(pc + 1), start(cta + 1)))
 
@@ -613,7 +637,7 @@ def build(mode, N):
             return lv(txl.cast(fu // txl.uint32(NT), "int32")), lv(txl.cast(fu % txl.uint32(NT), "int32"))
 
         def issue_main(f, ok_q):
-            with txl.If(ok_q), txl.Then():
+            with txl.if_(ok_q), txl.then_():
                 rb, k = win(f)
                 row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
                 ocol = k * BLOCK + c8
@@ -636,14 +660,14 @@ def build(mode, N):
             return txl.Select(ok, col, 0), ok, txl.Or(halo_, last)
 
         def issue_aux(f, ok_q):
-            with txl.If(ok_q), txl.Then():
+            with txl.if_(ok_q), txl.then_():
                 rb, k = win(f)
                 row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
                 col, ok, need = aux_of(f, k)
                 col = lv(col)
                 okv = lv(txl.Select(ok, 1, 0))
                 ok = okv == 1
-                with txl.If(need), txl.Then():
+                with txl.if_(need), txl.then_():
                     for i in range(RPT):
                         rl = r0 + RSTRIDE * i
                         row = row_base + RSTRIDE * i
@@ -694,7 +718,7 @@ def build(mode, N):
         wd = txl.alloc_local([W], "uint32")
         par = txl.local_scalar("int32")
         txl.assign(par, 0)
-        with txl.While(fc < f1):
+        with txl.while_(fc < f1):
             rb, k = win(fc)
             row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
             nf = lv(fc + 1)
@@ -714,7 +738,7 @@ def build(mode, N):
             issue_aux(nf, nf < f1)
             last = k == HQ
             halo_ = txl.And(fc == f0, k > 0)
-            with txl.If(need), txl.Then():
+            with txl.if_(need), txl.then_():
                 # halo: du_{k-1} for lanes >= HS; last window: du of window 0 (columns < HS) for the dg|du block
                 for t_ in range(W):
                     dw = du_only(t_, wg, wd)
@@ -728,7 +752,7 @@ def build(mode, N):
                         geo=[(hw[0], out, g_lin(k)), (wu, out, gd)])
             if HR > 64:
                 # window HQ: du columns >= HS (valid < HR) form the partial last block 2HQ + 1
-                with txl.If(last), txl.Then():
+                with txl.if_(last), txl.then_():
                     prev_ld(wg)
                     for t_ in range(W):
                         txl.assign(wg[t_], txl.Select(isL, txl.uint32(0), wg[t_]))
@@ -766,7 +790,7 @@ def build(mode, N):
             return v
 
         def cut(p):
-            c = txl.min(p * RUN_L, NT)
+            c = old_min(p * RUN_L, NT)
             if HQ > 0:
                 c = c + txl.Select(c == HQ, 1, 0)
             return c
@@ -778,7 +802,7 @@ def build(mode, N):
             return rb, p
 
         def issue_main(rb, k, ok_q):
-            with txl.If(ok_q), txl.Then():
+            with txl.if_(ok_q), txl.then_():
                 row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
                 ocol = k * BLOCK + c8
                 ok = ocol < N
@@ -800,13 +824,13 @@ def build(mode, N):
             return txl.Select(ok, col, 0), ok, txl.Or(halo_, last)
 
         def issue_aux(rb, k, first, ok_q):
-            with txl.If(ok_q), txl.Then():
+            with txl.if_(ok_q), txl.then_():
                 row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
                 col, ok, need = aux_of(first, k)
                 col = lv(col)
                 okv = lv(txl.Select(ok, 1, 0))
                 ok = okv == 1
-                with txl.If(need), txl.Then():
+                with txl.if_(need), txl.then_():
                     for i in range(RPT):
                         rl = r0 + RSTRIDE * i
                         row = row_base + RSTRIDE * i
@@ -864,7 +888,7 @@ def build(mode, N):
         wg = txl.alloc_local([W], "uint32")
         wu = txl.alloc_local([W], "uint32")
         wd = txl.alloc_local([W], "uint32")
-        with txl.While(q < Q):
+        with txl.while_(q < Q):
             rb = rbv
             row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
             # next window of this CTA's walk
@@ -889,7 +913,7 @@ def build(mode, N):
             issue_aux(nrb, nk, nfirst, nq < Q)
             last = k == HQ
             halo_ = txl.And(first == 1, k > 0)
-            with txl.If(need), txl.Then():
+            with txl.if_(need), txl.then_():
                 for t_ in range(W):
                     dw = du_only(t_, wg, wd)
                     txl.assign(wu[t_], txl.Select(txl.And(halo_, txl.Not(isL)), dw, wu[t_]))
@@ -900,7 +924,7 @@ def build(mode, N):
             quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 0,
                         geo=[(hw[0], out, g_lin(k)), (wu, out, gd)])
             if HR > 64:
-                with txl.If(last), txl.Then():
+                with txl.if_(last), txl.then_():
                     prev_ld(wg)
                     for t_ in range(W):
                         txl.assign(wg[t_], txl.Select(isL, txl.uint32(0), wg[t_]))
@@ -920,37 +944,40 @@ def build(mode, N):
         assert all(cuts[i] == min(i * RUN_L, NT) + (1 if HQ > 0 and min(i * RUN_L, NT) == HQ else 0) for i in range(RUN_R + 1))
     body = ((body_runL if RUN_L else body_run) if run else body_persistent) if persistent else body_simple
 
-    def T(dt, f):
-        return txl.gptr(dt, shape=f)
+    def T(dt, shape):
+        return txl.Tensor(shape, dt)
 
-    QT = lambda p: (p["M"], K)
-    ST = lambda p: (p["M"], KB)
-    CST = lambda p: (p["MB"], K)
-    kdec = txl.kernel(warps=NWARP, arch="sm_100a", grid=lambda p: p["G"], min_blocks_per_sm=OCC if persistent else None)
+    var_M = txl.Var("M", "int32")
+    var_MB = txl.Var("MB", "int32")
+    QT = (var_M, K)
+    ST = (var_M, KB)
+    CST = (var_MB, K)
+    kattrs = txl.cuda.KernelAttributes(min_blocks_per_sm=OCC) if persistent else None
 
     if mode in ("fwd", "gu_fwd"):
 
-        @kdec
+        @txl.kernel()
         def kern(
-            g: T("bfloat16", lambda p: (p["M"], IN_W)),
-            u: T("bfloat16", lambda p: (p["M"], IN_W)),
+            g: T("bfloat16", (var_M, IN_W)),
+            u: T("bfloat16", (var_M, IN_W)),
             q0: T("float8_e4m3fn", QT),
             s0: T("float32", ST),
             c0: T("float8_e4m3fn", QT),
             cs0: T("float32", CST),
-            M: txl.i32,
-            MB: txl.i32,
-            G: txl.i32,
+            M: var_M,
+            MB: var_MB,
+            G: txl.int32,
         ):
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=NWARP * 32), kernel_attrs=kattrs)
             body(None, g, u, [(q0, s0, c0, cs0)], MB, G)
 
     elif mode == "bwd":
 
-        @kdec
+        @txl.kernel()
         def kern(
-            dh: T("bfloat16", lambda p: (p["M"], N)),
-            g: T("bfloat16", lambda p: (p["M"], N)),
-            u: T("bfloat16", lambda p: (p["M"], N)),
+            dh: T("bfloat16", (var_M, N)),
+            g: T("bfloat16", (var_M, N)),
+            u: T("bfloat16", (var_M, N)),
             q0: T("float8_e4m3fn", QT),
             s0: T("float32", ST),
             c0: T("float8_e4m3fn", QT),
@@ -959,31 +986,33 @@ def build(mode, N):
             s1: T("float32", ST),
             c1: T("float8_e4m3fn", QT),
             cs1: T("float32", CST),
-            M: txl.i32,
-            MB: txl.i32,
-            G: txl.i32,
+            M: var_M,
+            MB: var_MB,
+            G: txl.int32,
         ):
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=NWARP * 32), kernel_attrs=kattrs)
             body(dh, g, u, [(q0, s0, c0, cs0), (q1, s1, c1, cs1)], MB, G)
 
     else:
 
-        @kdec
+        @txl.kernel()
         def kern(
-            dh: T("bfloat16", lambda p: (p["M"], N)),
-            g: T("bfloat16", lambda p: (p["M"], 2 * N)),
-            u: T("bfloat16", lambda p: (p["M"], 2 * N)),
+            dh: T("bfloat16", (var_M, N)),
+            g: T("bfloat16", (var_M, 2 * N)),
+            u: T("bfloat16", (var_M, 2 * N)),
             q0: T("float8_e4m3fn", QT),
             s0: T("float32", ST),
             c0: T("float8_e4m3fn", QT),
             cs0: T("float32", CST),
-            M: txl.i32,
-            MB: txl.i32,
-            G: txl.i32,
+            M: var_M,
+            MB: var_MB,
+            G: txl.int32,
         ):
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=NWARP * 32), kernel_attrs=kattrs)
             o = (q0, s0, c0, cs0)
             body(dh, g, u, [o, o] if pair else [o], MB, G)
 
-    ex = entry_function(kern.compile(tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})))
+    ex = entry_function(kern.compile(TARGET))
     return ex, persistent, NT, OCC, (RUN_R if run and RUN_L else 0)
 
 

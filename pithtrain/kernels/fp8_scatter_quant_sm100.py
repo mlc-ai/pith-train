@@ -19,18 +19,43 @@ Without host counts, a small counting kernel and the one allowed device-to-host 
 
 Evolved with TIRx-harness: run scatter, frontier member coop-route-colorder (commit 81a96a7, 992 us
 vs 6252 us, 6.3x over the previous SM100 path in the task's benchmark). Compiled once per process
-by tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current
+stream.
 """
 
 import functools
 import inspect
 
 import torch
-import tvm
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # sm_100a SASS only, as the old -gencode nvcc build
+
 __all__ = ["scatter_quant_sm100"]
+
+def old_max(a, b):
+    """
+    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN operand
+    (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
+    """
+    return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_f32(a, b) else txl.max(a, b)
+
+
+def old_min(a, b):
+    """
+    txl.min as apache-tvm 0.27 emitted it: CUDA fminf for float32 operands, txl.min otherwise.
+    """
+    return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_f32(a, b) else txl.min(a, b)
+
+
+def is_f32(*xs):
+    """
+    Whether any operand is a float32 expression (the other may be a Python float).
+    """
+    return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
+
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
@@ -76,15 +101,9 @@ def count_kernel(gb):
     nthreads = COUNT_WARPS * 32
     gpl = gb // 32
 
-    @txl.kernel(warps=COUNT_WARPS, grid=1)
-    def count(
-        expert_idxs: txl.gptr[txl.i32],
-        counts: txl.gptr[txl.i32],
-        offs: txl.gptr[txl.i32],
-        ks_t: txl.gptr[txl.i32],
-        m: txl.i32,
-        num_groups: txl.i32,
-    ):
+    @txl.kernel()
+    def count(expert_idxs: txl.Tensor((txl.int64(),), txl.i32), counts: txl.Tensor((txl.int64(),), txl.i32), offs: txl.Tensor((txl.int64(),), txl.i32), ks_t: txl.Tensor((txl.int64(),), txl.i32), m: txl.int32, num_groups: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=(COUNT_WARPS) * 32))
         tid = txl.thread_id()
         lane = tid & 31
         warp = tid >> 5
@@ -92,7 +111,7 @@ def count_kernel(gb):
         cnt = smem.alloc([gb], txl.u32)
         for k in range((gb + nthreads - 1) // nthreads):
             g = k * nthreads + tid
-            with txl.If(g < gb), txl.Then():
+            with txl.if_(g < gb), txl.then_():
                 txl.ptx.st.shared.u32(cnt.ptr_to([g]), txl.uint32(0))
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(nthreads))
         e = txl.local_scalar("uint32")
@@ -101,19 +120,19 @@ def count_kernel(gb):
         leader = txl.local_scalar("uint32")
         old = txl.local_scalar("uint32")
         i = txl.local_scalar("int32", init=tid)
-        with txl.While(i - lane < m):
+        with txl.while_(i - lane < m):
             valid = i < m
             txl.assign(e, txl.uint32(FULL))
-            with txl.If(valid), txl.Then():
+            with txl.if_(valid), txl.then_():
                 txl.ptx.ld.global_.nc.b32(e, expert_idxs.ptr_to([i * 2]))
             txl.ptx["match.any.sync.b32"](mask, e, txl.uint32(FULL))
             txl.ptx.popc.b32(total, mask)
             txl.ptx.bfind.u32(leader, mask)
-            with txl.If(txl.And(valid, txl.Cast("uint32", lane) == leader)), txl.Then():
+            with txl.if_(txl.And(valid, txl.Cast("uint32", lane) == leader)), txl.then_():
                 txl.ptx.atom.shared.add.u32(old, cnt.ptr_to([e]), total)
             txl.assign(i, i + nthreads)
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(nthreads))
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             run = txl.local_scalar("int32", init=0)
             c = txl.local_scalar("uint32")
             for k in range(gpl):
@@ -123,27 +142,25 @@ def count_kernel(gb):
             peer = txl.local_scalar("int32")
             for d in (1, 2, 4, 8, 16):
                 txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-                with txl.If(lane >= d), txl.Then():
+                with txl.if_(lane >= d), txl.then_():
                     txl.assign(incl, incl + peer)
             acc = txl.local_scalar("int32", init=incl - run)
             for k in range(gpl):
                 g = lane * gpl + k
                 txl.ptx.ld.shared.u32(c, cnt.ptr_to([g]))
-                with txl.If(g < num_groups), txl.Then():
+                with txl.if_(g < num_groups), txl.then_():
                     txl.ptx.st.global_.s32(counts.ptr_to([g]), txl.Cast("int32", c))
                     txl.ptx.st.global_.s32(offs.ptr_to([g]), acc + pad(c))
                     txl.ptx.st.global_.s32(ks_t.ptr_to([g]), pad(c))
                 txl.assign(acc, acc + pad(c))
 
-    return entry_function(count.compile())
+    return entry_function(count.compile(TARGET))
 
 
 @functools.cache
 def fused_kernel(n, gb, wide, big=False):
-    func = fused_traced(n, gb, wide, big).func.with_attr(
-        "tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_cooperative_launch", "tirx.use_dyn_shared_memory"]
-    )
-    return entry_function(tvm.compile(tvm.IRModule({"main": func}), target=tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}), tir_pipeline="tirx"))
+    func = fused_traced(n, gb, wide, big).func  # cooperative launch: LaunchConfig(cooperative=True)
+    return entry_function(tvm_tirx.tirx.compile(tvm_tirx.IRModule({"main": func}), target=TARGET, pipeline="tirx"))
 
 
 def cfg(n, wide):
@@ -239,12 +256,12 @@ def fused_traced(n, gb, wide, big=False):
         def iket_range(name):
             token = txl.alloc_local([1], "uint32")
             txl.assign(token[0], txl.cuda.iket.sentinel_token(name))
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.assign(token[0], txl.cuda.iket.range_start(name))
             return token
 
         def mark(name):
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.cuda.iket.mark(name)
 
         # workspace (persistent, zero between launches): tot[g] (atomic group totals), queue counter at [gb]
@@ -281,29 +298,29 @@ def fused_traced(n, gb, wide, big=False):
                 i = slot(t0 + u)
                 txl.assign(ev[u], -1)
                 txl.assign(sv[u], i)
-                with txl.If(in_range(t0 + u)), txl.Then():
+                with txl.if_(in_range(t0 + u)), txl.then_():
                     txl.ptx.ld.global_.nc.b32(ev[u], experts.ptr_to([i * 2]))
-                    with txl.If(identity == 0), txl.Then():
+                    with txl.if_(identity == 0), txl.then_():
                         txl.ptx.ld.global_.nc.b32(sv[u], expand.ptr_to([i * 2]))
 
         load_steps(0)
         # warm L2 with this CTA's share of `gathered` while the sort keeps DRAM idle
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             pchunk = txl.local_scalar("int32", init=(gunits + num_ctas - 1) // num_ctas)
-            pend = txl.local_scalar("int32", init=txl.min(cid * pchunk + pchunk, gunits))
+            pend = txl.local_scalar("int32", init=old_min(cid * pchunk + pchunk, gunits))
             pu = txl.local_scalar("int32", init=cid * pchunk + lane * PF_UNITS)
-            with txl.While(pu < pend):
+            with txl.while_(pu < pend):
                 txl.ptx["cp.async.bulk.prefetch.L2.global"](
                     gathered.ptr_to([txl.Cast("int64", pu) * 4]),
-                    txl.Cast("uint32", txl.min(pend - pu, PF_UNITS) * 16),
+                    txl.Cast("uint32", old_min(pend - pu, PF_UNITS) * 16),
                 )
                 txl.assign(pu, pu + 32 * PF_UNITS)
         txl.assign(c, tid)
-        with txl.While(c < WARPS * gb):
+        with txl.while_(c < WARPS * gb):
             txl.ptx.st.shared.s32(hist.ptr_to([c]), txl.int32(0))
             txl.assign(c, c + NTHREADS)
         # host group counts (kernel parameters, zero past num_groups) -> tcnt
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for gi in range(gb):
                 txl.ptx.st.shared.s32(tcnt.ptr_to([gi]), hc[gi])
         cta_sync()
@@ -311,7 +328,7 @@ def fused_traced(n, gb, wide, big=False):
         peer = txl.local_scalar("int32")
         g = txl.local_scalar("int32")
         # scan of the padded host sizes (warp 0, off the count's critical path; tstart is read after the next sync)
-        with txl.If(warp == 0), txl.Then():
+        with txl.if_(warp == 0), txl.then_():
             run0 = txl.local_scalar("int32", init=0)
             for k in range(gpl):
                 txl.ptx.ld.shared.s32(cval, tcnt.ptr_to([lane * gpl + k]))
@@ -319,29 +336,29 @@ def fused_traced(n, gb, wide, big=False):
             txl.assign(incl, run0)
             for d in (1, 2, 4, 8, 16):
                 txl.ptx.shfl_sync.up.b32(peer, incl, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-                with txl.If(lane >= d), txl.Then():
+                with txl.if_(lane >= d), txl.then_():
                     txl.assign(incl, incl + peer)
             acc = txl.local_scalar("int32", init=incl - run0)
             for k in range(gpl):
                 gg = lane * gpl + k
                 txl.ptx.st.shared.s32(tstart.ptr_to([gg]), acc)
                 txl.ptx.ld.shared.s32(cval, tcnt.ptr_to([gg]))
-                with txl.If(txl.And(gg < num_groups, cid == 0)), txl.Then():
+                with txl.if_(txl.And(gg < num_groups, cid == 0)), txl.then_():
                     txl.ptx.st.global_.s32(offs.ptr_to([gg]), acc + pad(cval))
                     txl.ptx.st.global_.s32(ks_t.ptr_to([gg]), pad(cval))
                 txl.assign(acc, acc + pad(cval))
         t = txl.local_scalar("int32", init=0)
-        with txl.While(t < nsteps):
-            with txl.If(t > 0), txl.Then():
+        with txl.while_(t < nsteps):
+            with txl.if_(t > 0), txl.then_():
                 load_steps(t)
             for u in range(UNROLL):
                 txl.ptx["match.any.sync.b32"](pmask, ev[u], txl.uint32(FULL))
                 txl.assign(pm[u], pmask)
                 txl.ptx.popc.b32(total, pmask)
                 txl.ptx.bfind.u32(leader, pmask)
-                with txl.If(txl.And(ev[u] >= 0, txl.Cast("uint32", lane) == leader)), txl.Then():
+                with txl.if_(txl.And(ev[u] >= 0, txl.Cast("uint32", lane) == leader)), txl.then_():
                     txl.ptx.red.shared.add.u32(hist.ptr_to([warp * gb + ev[u]]), total)
-                with txl.If(t + u < CACHE_STEPS), txl.Then():
+                with txl.if_(t + u < CACHE_STEPS), txl.then_():
                     txl.ptx.st.shared.s32(cache.ptr_to([cidx(t + u, 0)]), ev[u])
                     txl.ptx.st.shared.s32(cache.ptr_to([cidx(t + u, 1)]), sv[u])
                     txl.ptx.st.shared.u32(cache.ptr_to([cidx(t + u, 2)]), pm[u])
@@ -349,20 +366,20 @@ def fused_traced(n, gb, wide, big=False):
         cta_sync()
         # padding rows of the owned groups -> -1
         txl.assign(g, cid)
-        with txl.While(g < num_groups):
+        with txl.while_(g < num_groups):
             txl.ptx.ld.shared.s32(cval, tcnt.ptr_to([g]))
             txl.ptx.ld.shared.s32(v, tstart.ptr_to([g]))
-            with txl.If(tid < pad(cval) - cval), txl.Then():
+            with txl.if_(tid < pad(cval) - cval), txl.then_():
                 txl.ptx.st.global_.s32(src_of_row.ptr_to([v + cval + tid]), txl.int32(-1))
             txl.assign(g, g + num_ctas)
         txl.assign(c, tid)
-        with txl.While(c < gb):
+        with txl.while_(c < gb):
             txl.assign(v, 0)
             for wi in range(WARPS):
                 txl.ptx.ld.shared.s32(before, hist.ptr_to([wi * gb + c]))
                 txl.assign(v, v + txl.Cast("int32", before))
             txl.assign(cval, 0)
-            with txl.If(v > 0), txl.Then():
+            with txl.if_(v > 0), txl.then_():
                 txl.ptx.atom.global_.add.s32(cval, ws_tot(c), v)
             txl.ptx.st.shared.s32(wsum.ptr_to([c]), cval)
             txl.assign(c, c + NTHREADS)
@@ -370,9 +387,9 @@ def fused_traced(n, gb, wide, big=False):
         cta_sync()
         # run[w][g] = start(g) + earlier CTAs + earlier warps
         txl.assign(c, tid)
-        with txl.While(c < gb):
+        with txl.while_(c < gb):
             txl.ptx.ld.shared.s32(v, tstart.ptr_to([c]))
-            with txl.If(c < num_groups), txl.Then():
+            with txl.if_(c < num_groups), txl.then_():
                 txl.ptx.ld.shared.s32(cval, wsum.ptr_to([c]))
                 txl.assign(v, v + cval)
             for wi in range(WARPS):
@@ -387,30 +404,30 @@ def fused_traced(n, gb, wide, big=False):
         row = txl.local_scalar("int32")
         row64 = txl.local_scalar("int64")
         txl.assign(t, 0)
-        with txl.While(t < nsteps):
-            with txl.If(t < CACHE_STEPS):
-                with txl.Then():
+        with txl.while_(t < nsteps):
+            with txl.if_(t < CACHE_STEPS):
+                with txl.then_():
                     txl.ptx.ld.shared.s32(e1, cache.ptr_to([cidx(t, 0)]))
                     txl.ptx.ld.shared.s32(s1, cache.ptr_to([cidx(t, 1)]))
                     txl.ptx.ld.shared.u32(pmask, cache.ptr_to([cidx(t, 2)]))
-                with txl.Else():
+                with txl.else_():
                     i = slot(t)
                     txl.assign(e1, -1)
                     txl.assign(s1, i)
-                    with txl.If(in_range(t)), txl.Then():
+                    with txl.if_(in_range(t)), txl.then_():
                         txl.ptx.ld.global_.nc.b32(e1, experts.ptr_to([i * 2]))
-                        with txl.If(identity == 0), txl.Then():
+                        with txl.if_(identity == 0), txl.then_():
                             txl.ptx.ld.global_.nc.b32(s1, expand.ptr_to([i * 2]))
                     txl.ptx["match.any.sync.b32"](pmask, e1, txl.uint32(FULL))
             txl.ptx.popc.b32(total, pmask)
             txl.ptx.bfind.u32(leader, pmask)
             txl.ptx.popc.b32(before, txl.bitwise_and(pmask, lt))
-            with txl.If(e1 >= 0), txl.Then():
+            with txl.if_(e1 >= 0), txl.then_():
                 txl.ptx.ld.shared.s32(run, hist.ptr_to([warp * gb + e1]))
             txl.ptx.bar.warp.sync(txl.uint32(FULL))
-            with txl.If(e1 >= 0), txl.Then():
+            with txl.if_(e1 >= 0), txl.then_():
                 txl.assign(row, run + txl.Cast("int32", before))
-                with txl.If(txl.Cast("uint32", lane) == leader), txl.Then():
+                with txl.if_(txl.Cast("uint32", lane) == leader), txl.then_():
                     txl.ptx.st.shared.s32(hist.ptr_to([warp * gb + e1]), run + txl.Cast("int32", total))
                 txl.assign(row64, txl.Cast("int64", row))
                 txl.ptx.st.global_.s64(reverse.ptr_to([slot(t)]), row64)
@@ -418,22 +435,22 @@ def fused_traced(n, gb, wide, big=False):
             txl.ptx.bar.warp.sync(txl.uint32(FULL))
             txl.assign(t, t + 1)
         # the dynamic tile queue's counter, published by the grid sync
-        with txl.If(txl.And(cid == 0, tid == 0)), txl.Then():
+        with txl.if_(txl.And(cid == 0, tid == 0)), txl.then_():
             txl.ptx.st.global_.s32(ws.ptr_to([gb]), txl.int32(0))
             txl.ptx.st.global_.s32(ws.ptr_to([gb + 1]), txl.int32(0))
         mark("rank-done")
         txl.cuda.grid_sync()
         mark("sync3")
         # every tot[] read precedes sync3: re-zero for the next launch
-        with txl.If(cid == 0), txl.Then():
+        with txl.if_(cid == 0), txl.then_():
             txl.assign(c, tid)
-            with txl.While(c < gb):
+            with txl.while_(c < gb):
                 txl.ptx.st.global_.s32(ws_tot(c), txl.int32(0))
                 txl.assign(c, c + NTHREADS)
         # this CTA's static slot lists
         for q in range(KMAX * BLOCK // NTHREADS):
             e = q * NTHREADS + tid
-            with txl.If(txl.And(tend > tbeg, rbf + (e >> 7) <= rbl)), txl.Then():
+            with txl.if_(txl.And(tend > tbeg, rbf + (e >> 7) <= rbl)), txl.then_():
                 txl.ptx.ld.global_.b32(cval, src_of_row.ptr_to([(rbf + (e >> 7)) * BLOCK + (e & 127)]))
                 txl.ptx.st.shared.s32(sl.ptr_to([e]), cval)
         # dynamic tiles: q -> column ncs + q // num_rb, row block q % num_rb (column-major: the whole GPU sweeps
@@ -454,22 +471,22 @@ def fused_traced(n, gb, wide, big=False):
 
         def load_slots(slot):  # 128 threads
             # the last four warps: never fold warps, so the synchronous slot-list load stays off the column-scale chain
-            with txl.If(tid >= NTHREADS - BLOCK), txl.Then():
+            with txl.if_(tid >= NTHREADS - BLOCK), txl.then_():
                 txl.ptx.ld.shared.s32(v, qbuf.ptr_to([slot]))
-                with txl.If(v >= 0), txl.Then():
+                with txl.if_(v >= 0), txl.then_():
                     txl.ptx.ld.global_.b32(cval, src_of_row.ptr_to([(v & 0xFFFFF) * BLOCK + tid - (NTHREADS - BLOCK)]))
                     txl.ptx.st.shared.s32(dsl.ptr_to([slot * BLOCK + tid - (NTHREADS - BLOCK)]), cval)
 
         # dynamic ordinals the in-loop pipeline cannot reach in time (short static ranges) are claimed up front
-        npre = txl.local_scalar("int32", init=txl.max(DIST - nst, 0))
-        with txl.If(tid == NTHREADS - 1), txl.Then():
+        npre = txl.local_scalar("int32", init=old_max(DIST - nst, 0))
+        with txl.if_(tid == NTHREADS - 1), txl.then_():
             for k in range(DIST):
-                with txl.If(k < npre), txl.Then():
+                with txl.if_(k < npre), txl.then_():
                     claim_issue()
                     claim_store(k)
         cta_sync()
         for k in range(DIST):
-            with txl.If(k < npre), txl.Then():
+            with txl.if_(k < npre), txl.then_():
                 load_slots(k)
         cta_sync()
         txl.cuda.iket.range_end(tk_so[0])
@@ -520,13 +537,13 @@ def fused_traced(n, gb, wide, big=False):
         def it_init(b_, c_):
             txl.assign(c_, 0)
             txl.assign(b_, bmin(0))
-            with txl.While(txl.And(b_ > bmax(c_), c_ < ncs - 1)):
+            with txl.while_(txl.And(b_ > bmax(c_), c_ < ncs - 1)):
                 txl.assign(c_, c_ + 1)
                 txl.assign(b_, bmin(c_))
 
         def it_next(b_, c_):
             txl.assign(b_, b_ + 1)
-            with txl.While(txl.And(b_ > bmax(c_), c_ < ncs - 1)):
+            with txl.while_(txl.And(b_ > bmax(c_), c_ < ncs - 1)):
                 txl.assign(c_, c_ + 1)
                 txl.assign(b_, bmin(c_))
 
@@ -550,17 +567,17 @@ def fused_traced(n, gb, wide, big=False):
             """
             def dyn():
                 txl.ptx.ld.shared.s32(dq, qbuf.ptr_to([(x - nst) & (RING - 1)]))
-                with txl.If(dq >= 0), txl.Then():
+                with txl.if_(dq >= 0), txl.then_():
                     issue(dsl, ((x - nst) & (RING - 1)) * BLOCK, dq >> 20, s)
 
             if ncs == 0:
                 dyn()
                 return
-            with txl.If(x < nst):
-                with txl.Then():
+            with txl.if_(x < nst):
+                with txl.then_():
                     issue(sl, (ib - rbf) * BLOCK, ic, s)
                     it_next(ib, ic)
-                with txl.Else():
+                with txl.else_():
                     dyn()
 
         for s in range(STAGES - 1):
@@ -569,7 +586,7 @@ def fused_traced(n, gb, wide, big=False):
 
         def proc_valid(x):  # 1 if the CTA's x-th tile exists (dynamic ones: claimed id >= 0)
             txl.assign(pq, 1)
-            with txl.If(x >= nst), txl.Then():
+            with txl.if_(x >= nst), txl.then_():
                 txl.ptx.ld.shared.s32(pq, qbuf.ptr_to([(x - nst) & (RING - 1)]))
 
         proc_valid(txl.int32(0))
@@ -587,15 +604,15 @@ def fused_traced(n, gb, wide, big=False):
         o = txl.alloc_local([max(wpl // 2, 1)], "uint32")
 
         def e8m0_pair(dst16, hi_amax, lo_amax):
-            hs = txl.max(hi_amax, txl.float32(1e-4)) * txl.float32(1.0 / 448.0)
-            ls = txl.max(lo_amax, txl.float32(1e-4)) * txl.float32(1.0 / 448.0)
+            hs = old_max(hi_amax, txl.float32(1e-4)) * txl.float32(1.0 / 448.0)
+            ls = old_max(lo_amax, txl.float32(1e-4)) * txl.float32(1.0 / 448.0)
             txl.ptx.cvt.rp.satfinite.ue8m0x2.f32(dst16, hs, ls)
 
         def bf_lo(word):
-            return txl.reinterpret("float32", txl.shift_left(word, txl.uint32(16)))
+            return txl.reinterpret(txl.shift_left(word, txl.uint32(16)), ty="float32")
 
         def bf_hi(word):
-            return txl.reinterpret("float32", txl.bitwise_and(word, txl.uint32(0xFFFF0000)))
+            return txl.reinterpret(txl.bitwise_and(word, txl.uint32(0xFFFF0000)), ty="float32")
 
         sendv = txl.local_scalar("uint32")
         leaf = txl.alloc_local([WARPS], "uint32")
@@ -603,16 +620,16 @@ def fused_traced(n, gb, wide, big=False):
         rexp = txl.local_scalar("uint32")
         obase = txl.local_scalar("int64")
         kk = txl.local_scalar("int32", init=0)
-        with txl.While(pq >= 0):
+        with txl.while_(pq >= 0):
             rb = txl.local_scalar("int32")
             ct = txl.local_scalar("int32")
             if ncs > 0:
-                with txl.If(kk < nst):
-                    with txl.Then():
+                with txl.if_(kk < nst):
+                    with txl.then_():
                         txl.assign(rb, pb)
                         txl.assign(ct, pc)
                         it_next(pb, pc)
-                    with txl.Else():
+                    with txl.else_():
                         txl.assign(rb, pq & 0xFFFFF)
                         txl.assign(ct, pq >> 20)
             else:
@@ -622,21 +639,21 @@ def fused_traced(n, gb, wide, big=False):
             # split slot-list load: the global load issues here, its shared store waits until just before this warp's
             # bar 1 arrival (after the maxima), so the L2 round trip hides behind the tile's data wait
             txl.assign(sslot, -1)
-            with txl.If(lslot >= 0), txl.Then():
-                with txl.If(tid >= NTHREADS - BLOCK), txl.Then():
+            with txl.if_(lslot >= 0), txl.then_():
+                with txl.if_(tid >= NTHREADS - BLOCK), txl.then_():
                     txl.ptx.ld.shared.s32(v, qbuf.ptr_to([lslot]))
-                    with txl.If(v >= 0), txl.Then():
+                    with txl.if_(v >= 0), txl.then_():
                         txl.ptx.ld.global_.b32(slv, src_of_row.ptr_to([(v & 0xFFFFF) * BLOCK + tid - (NTHREADS - BLOCK)]))
                         txl.assign(sslot, lslot)
                 txl.assign(lslot, -1)
-            with txl.If(pslot >= 0), txl.Then():
-                with txl.If(tid == NTHREADS - 1), txl.Then():
+            with txl.if_(pslot >= 0), txl.then_():
+                with txl.if_(tid == NTHREADS - 1), txl.then_():
                     claim_store(pslot)
                 txl.assign(lslot, pslot)
                 txl.assign(pslot, -1)
-            with txl.If(kk + DIST - nst >= npre), txl.Then():
+            with txl.if_(kk + DIST - nst >= npre), txl.then_():
                 txl.assign(pslot, (kk + DIST - nst) & (RING - 1))
-                with txl.If(tid == NTHREADS - 1), txl.Then():
+                with txl.if_(tid == NTHREADS - 1), txl.then_():
                     claim_issue()
             row0 = rb * BLOCK
             issue_seq(kk + STAGES - 1, (kk + STAGES - 1) % STAGES)
@@ -690,28 +707,28 @@ def fused_traced(n, gb, wide, big=False):
                 rsel = rsel + txl.Select((lane & xb) != 0, span, 0)
                 xb //= 2
             amaxw = txl.bitwise_and(rmax[0], txl.uint32(0x7FFF7FFF))
-            amax = txl.max(bf_lo(amaxw), bf_hi(amaxw))
+            amax = old_max(bf_lo(amaxw), bf_hi(amaxw))
             e8m0_pair(e16, txl.float32(0.0), amax)
             txl.assign(rexp, txl.bitwise_and(txl.Cast("uint32", e16), txl.uint32(0xFF)))
             rowbase = row0 + warp * rows_per_warp + rsub
-            with txl.If(txl.And((lane & (lpr // iters - 1)) == 0, bt < nct)), txl.Then():
+            with txl.if_(txl.And((lane & (lpr // iters - 1)) == 0, bt < nct)), txl.then_():
                 txl.ptx.st.global_.f32(
                     x_scale.ptr_to([bt * (num_rb * BLOCK) + rowbase + rsel * rpi]),
-                    txl.reinterpret("float32", txl.shift_left(rexp, txl.uint32(23))),
+                    txl.reinterpret(txl.shift_left(rexp, txl.uint32(23)), ty="float32"),
                 )
             if rpi == 2:
                 for k in range(wpl):
                     txl.ptx.shfl_sync.bfly.b32(upeer, cmax[k], txl.uint32(16), txl.uint32(31), txl.uint32(FULL))
                     txl.ptx[MAXABS](cmax[k], cmax[k], upeer)
             cmb = (kk & 1) * (WARPS * tw // 2)
-            with txl.If(rsub == 0), txl.Then():
+            with txl.if_(rsub == 0), txl.then_():
                 for k in range(wpl):
                     txl.ptx.st.shared.u32(cm.ptr_to([cmb + warp * (tw // 2) + csub * (BLOCK // 2) + cq * wpl + k]), cmax[k])
             # named barriers: warps 2.. hand their column partials to warps 0-1 (bar 1) and wait only for
             # their column scales (bar 2); every warp quantizes the row-scaled x_fp8 in between
-            with txl.If(sslot >= 0), txl.Then():
+            with txl.if_(sslot >= 0), txl.then_():
                 txl.ptx.st.shared.s32(dsl.ptr_to([sslot * BLOCK + tid - (NTHREADS - BLOCK)]), slv)
-            with txl.If(warp >= nfw), txl.Then():
+            with txl.if_(warp >= nfw), txl.then_():
                 txl.ptx.bar.arrive(txl.uint32(1), txl.uint32(NTHREADS))
             txl.assign(obase, txl.Cast("int64", rowbase) * (n // 4) + txl.Cast("int64", col // 4))
 
@@ -721,10 +738,10 @@ def fused_traced(n, gb, wide, big=False):
                 if n % tw == 0:
                     quant_pass(dst, rcp_of, False)
                 else:
-                    with txl.If(ct < nwt - 1):
-                        with txl.Then():
+                    with txl.if_(ct < nwt - 1):
+                        with txl.then_():
                             quant_pass(dst, rcp_of, False)
-                        with txl.Else():
+                        with txl.else_():
                             quant_pass(dst, rcp_of, True)
 
             def quant_pass(dst, rcp_of, checked):
@@ -751,16 +768,16 @@ def fused_traced(n, gb, wide, big=False):
                     if not checked:
                         row_out()
                     else:
-                        with txl.If(col_ok), txl.Then():
+                        with txl.if_(col_ok), txl.then_():
                             row_out()
 
             if hpi > 1:
                 # wide (one CTA per SM, no sibling CTA to hide the fold): the fold warps fold first and publish the
                 # column scales with bar.arrive(2), then quantize their x_fp8 rows; bar 3 orders the scales among them
-                with txl.If(warp >= nfw), txl.Then():
+                with txl.if_(warp >= nfw), txl.then_():
                     quant(x_fp8, lambda k: rr)
-                with txl.If(warp < nfw):
-                    with txl.Then():
+                with txl.if_(warp < nfw):
+                    with txl.then_():
                         txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NTHREADS))
                         # one thread per column word folds the warps' partial maxima (balanced tree over the leaves)
                         for wi in range(WARPS):
@@ -782,20 +799,20 @@ def fused_traced(n, gb, wide, big=False):
                             txl.shift_left(txl.uint32(254) - cexp[0], txl.uint32(7))
                             | txl.shift_left(txl.uint32(254) - cexp[1], txl.uint32(23)),
                         )
-                        with txl.If(ct * tw + tid * 2 < n), txl.Then():
+                        with txl.if_(ct * tw + tid * 2 < n), txl.then_():
                             txl.ptx.st.global_.v2.f32(
                                 x_ch_scale.ptr_to([rb * n + ct * tw + tid * 2]),
-                                txl.reinterpret("float32", txl.shift_left(cexp[0], txl.uint32(23))),
-                                txl.reinterpret("float32", txl.shift_left(cexp[1], txl.uint32(23))),
+                                txl.reinterpret(txl.shift_left(cexp[0], txl.uint32(23)), ty="float32"),
+                                txl.reinterpret(txl.shift_left(cexp[1], txl.uint32(23)), ty="float32"),
                             )
                         txl.ptx.bar.arrive(txl.uint32(2), txl.uint32(NTHREADS))
                         quant(x_fp8, lambda k: rr)
                         txl.ptx.bar.sync(txl.uint32(3), txl.uint32(nfw * 32))
-                    with txl.Else():
+                    with txl.else_():
                         txl.ptx.bar.sync(txl.uint32(2), txl.uint32(NTHREADS))
             else:
                 quant(x_fp8, lambda k: rr)
-                with txl.If(warp < nfw), txl.Then():
+                with txl.if_(warp < nfw), txl.then_():
                     txl.ptx.bar.sync(txl.uint32(1), txl.uint32(NTHREADS))
                     # one thread per column word folds the warps' partial maxima (balanced tree over the leaves)
                     for wi in range(WARPS):
@@ -817,11 +834,11 @@ def fused_traced(n, gb, wide, big=False):
                         txl.shift_left(txl.uint32(254) - cexp[0], txl.uint32(7))
                         | txl.shift_left(txl.uint32(254) - cexp[1], txl.uint32(23)),
                     )
-                    with txl.If(ct * tw + tid * 2 < n), txl.Then():
+                    with txl.if_(ct * tw + tid * 2 < n), txl.then_():
                         txl.ptx.st.global_.v2.f32(
                             x_ch_scale.ptr_to([rb * n + ct * tw + tid * 2]),
-                            txl.reinterpret("float32", txl.shift_left(cexp[0], txl.uint32(23))),
-                            txl.reinterpret("float32", txl.shift_left(cexp[1], txl.uint32(23))),
+                            txl.reinterpret(txl.shift_left(cexp[0], txl.uint32(23)), ty="float32"),
+                            txl.reinterpret(txl.shift_left(cexp[1], txl.uint32(23)), ty="float32"),
                         )
                 txl.ptx.bar.sync(txl.uint32(2), txl.uint32(NTHREADS))
             if wpl == 4:
@@ -843,15 +860,15 @@ def fused_traced(n, gb, wide, big=False):
             cta_sync()  # every warp's last qbuf read (proc_valid) precedes the tail id's store into qbuf[0]
             tail_tasks = (num_rb + 3) // 4
             tail_id = txl.local_scalar("int32")
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 txl.ptx.atom.global_.add.s32(tail_id, ws.ptr_to([gb + 1]), txl.int32(1))
                 txl.ptx.st.shared.s32(qbuf.ptr_to([0]), tail_id)
             cta_sync()
             txl.ptx.ld.shared.s32(tail_id, qbuf.ptr_to([0]))
             tk_tail = txl.alloc_local([1], "uint32")
             txl.assign(tk_tail[0], txl.cuda.iket.sentinel_token("tail64"))
-            with txl.If(tail_id < tail_tasks), txl.Then():
-                with txl.If(tid == 0), txl.Then():
+            with txl.if_(tail_id < tail_tasks), txl.then_():
+                with txl.if_(tid == 0), txl.then_():
                     txl.assign(tk_tail[0], txl.cuda.iket.range_start("tail64"))
                 trb0 = tail_id * 4
                 trbl = warp >> 2
@@ -866,7 +883,7 @@ def fused_traced(n, gb, wide, big=False):
                 for j in range(8):
                     trow = (trb0 + trbl) * BLOCK + twin * 32 + j * 4 + trsub
                     txl.assign(tsrc, -1)
-                    with txl.If(trb0 + trbl < num_rb), txl.Then():
+                    with txl.if_(trb0 + trbl < num_rb), txl.then_():
                         txl.ptx.ld.global_.s32(tsrc, src_of_row.ptr_to([trow]))
                     toff = txl.Cast("int64", tsrc) * (nw // ofs) + (tail_col // 2) + tq * 4
                     txl.ptx[cp_insn](
@@ -895,17 +912,17 @@ def fused_traced(n, gb, wide, big=False):
                         )
                         txl.ptx[MAXABS](rmax[0], rmax[0], upeer)
                     amaxw = txl.bitwise_and(rmax[0], txl.uint32(0x7FFF7FFF))
-                    amax = txl.max(bf_lo(amaxw), bf_hi(amaxw))
+                    amax = old_max(bf_lo(amaxw), bf_hi(amaxw))
                     e8m0_pair(e16, txl.float32(0.0), amax)
                     txl.assign(rexp, txl.bitwise_and(txl.Cast("uint32", e16), txl.uint32(0xFF)))
                     rh = txl.shift_left(txl.uint32(254) - rexp, txl.uint32(7))
                     txl.assign(rr, rh | txl.shift_left(rh, txl.uint32(16)))
                     trow = (trb0 + trbl) * BLOCK + twin * 32 + j * 4 + trsub
-                    with txl.If(trb0 + trbl < num_rb), txl.Then():
-                        with txl.If(tq == 0), txl.Then():
+                    with txl.if_(trb0 + trbl < num_rb), txl.then_():
+                        with txl.if_(tq == 0), txl.then_():
                             txl.ptx.st.global_.f32(
                                 x_scale.ptr_to([(nct - 1) * (num_rb * BLOCK) + trow]),
-                                txl.reinterpret("float32", txl.shift_left(rexp, txl.uint32(23))),
+                                txl.reinterpret(txl.shift_left(rexp, txl.uint32(23)), ty="float32"),
                             )
                         for k in range(4):
                             txl.ptx.mul.rn.bf16x2(y, w[j * 4 + k], rr)
@@ -928,14 +945,14 @@ def fused_traced(n, gb, wide, big=False):
                             upeer, cmax[k], txl.uint32(d), txl.uint32(31), txl.uint32(FULL)
                         )
                         txl.ptx[MAXABS](cmax[k], cmax[k], upeer)
-                with txl.If(trsub == 0), txl.Then():
+                with txl.if_(trsub == 0), txl.then_():
                     for k in range(4):
                         txl.ptx.st.shared.u32(cm.ptr_to([warp * 32 + tq * 4 + k]), cmax[k])
                 cta_sync()
 
                 # One warp per row block folds its four warp partials and
                 # publishes 32 packed column reciprocals/scales.
-                with txl.If(twin == 0), txl.Then():
+                with txl.if_(twin == 0), txl.then_():
                     for wi in range(4):
                         txl.ptx.ld.shared.u32(leaf[wi], cm.ptr_to([(trbl * 4 + wi) * 32 + lane]))
                     txl.ptx[MAXABS](leaf[0], leaf[0], leaf[2])
@@ -951,11 +968,11 @@ def fused_traced(n, gb, wide, big=False):
                         txl.shift_left(txl.uint32(254) - cexp[0], txl.uint32(7))
                         | txl.shift_left(txl.uint32(254) - cexp[1], txl.uint32(23)),
                     )
-                    with txl.If(trb0 + trbl < num_rb), txl.Then():
+                    with txl.if_(trb0 + trbl < num_rb), txl.then_():
                         txl.ptx.st.global_.v2.f32(
                             x_ch_scale.ptr_to([(trb0 + trbl) * n + tail_col + lane * 2]),
-                            txl.reinterpret("float32", txl.shift_left(cexp[0], txl.uint32(23))),
-                            txl.reinterpret("float32", txl.shift_left(cexp[1], txl.uint32(23))),
+                            txl.reinterpret(txl.shift_left(cexp[0], txl.uint32(23)), ty="float32"),
+                            txl.reinterpret(txl.shift_left(cexp[1], txl.uint32(23)), ty="float32"),
                         )
                 cta_sync()
                 txl.ptx.ld.shared.v4.b32(
@@ -964,7 +981,7 @@ def fused_traced(n, gb, wide, big=False):
 
                 for j in range(8):
                     trow = (trb0 + trbl) * BLOCK + twin * 32 + j * 4 + trsub
-                    with txl.If(trb0 + trbl < num_rb), txl.Then():
+                    with txl.if_(trb0 + trbl < num_rb), txl.then_():
                         for k in range(4):
                             txl.ptx.mul.rn.bf16x2(y, w[j * 4 + k], crcp[k])
                             txl.ptx.cvt.rn.satfinite.e4m3x2.bf16x2(q16[k], y)
@@ -978,23 +995,27 @@ def fused_traced(n, gb, wide, big=False):
         txl.cuda.iket.range_end(tk_st[0])
 
     params = [
-        ("gathered", txl.gptr[txl.i32]), ("experts", txl.gptr[txl.i32]), ("expand", txl.gptr[txl.i32]),
-        ("offs", txl.gptr[txl.i32]), ("ks_t", txl.gptr[txl.i32]),
-        ("reverse", txl.gptr[txl.i64]), ("x_fp8", txl.gptr[txl.i32]), ("x_scale", txl.gptr[txl.f32]),
-        ("x_ch", txl.gptr[txl.i32]), ("x_ch_scale", txl.gptr[txl.f32]), ("ws", txl.gptr[txl.i32]),
-        ("src_of_row", txl.gptr[txl.i32]),
+        ("gathered", txl.Tensor((txl.int64(),), txl.i32)), ("experts", txl.Tensor((txl.int64(),), txl.i32)), ("expand", txl.Tensor((txl.int64(),), txl.i32)),
+        ("offs", txl.Tensor((txl.int64(),), txl.i32)), ("ks_t", txl.Tensor((txl.int64(),), txl.i32)),
+        ("reverse", txl.Tensor((txl.int64(),), txl.i64)), ("x_fp8", txl.Tensor((txl.int64(),), txl.i32)), ("x_scale", txl.Tensor((txl.int64(),), txl.f32)),
+        ("x_ch", txl.Tensor((txl.int64(),), txl.i32)), ("x_ch_scale", txl.Tensor((txl.int64(),), txl.f32)), ("ws", txl.Tensor((txl.int64(),), txl.i32)),
+        ("src_of_row", txl.Tensor((txl.int64(),), txl.i32)),
         ("m", txl.i32), ("num_groups", txl.i32), ("ntiles", txl.i32), ("identity", txl.i32), ("num_ctas", txl.i32),
         ("gunits", txl.i32),
     ] + [(f"hc{gi}", txl.i32) for gi in range(gb)]
 
+    names = [name for name, _ in params]
+
     def fused(*args):
+        launch = txl.cuda.LaunchConfig(grid=args[names.index("num_ctas")], block=WARPS * 32, cooperative=True)
+        txl.device_entry(launch=launch, kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=ctas_per_sm))
         body(*args)
 
     fused.__signature__ = inspect.Signature(
         [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=ann) for name, ann in params]
     )
     fused.__name__ = "fused"
-    return txl.kernel(warps=WARPS, grid="num_ctas", min_blocks_per_sm=ctas_per_sm)(fused)
+    return txl.kernel()(fused)
 
 
 WS = {}

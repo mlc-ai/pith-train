@@ -25,15 +25,18 @@ or w) are converted first: w to fp32 (as the Triton path reads it), dw rounded b
 
 Evolved with TIRx-harness: run causal_conv1d, frontier member tma-ring-cluster-dw (commit f48a3abe,
 305.2 us vs 793.6 us, 2.6x over the previous SM100 path, the Triton kernels now in
-causal_conv1d_sm90, in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+causal_conv1d_sm90, in the task's benchmark). Compiled once per process by
+tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
+
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
 
 __all__ = ["causal_conv1d_bwd_sm100", "causal_conv1d_fwd_sm100"]
 
@@ -97,7 +100,7 @@ def load_w_f32(dst, w, idx, wdt, valid):
     dst = float32(w[idx]) if valid else 0.
     """
     txl.assign(dst, txl.float32(0.0))
-    with txl.If(valid), txl.Then():
+    with txl.if_(valid), txl.then_():
         if wdt == "float32":
             txl.ptx.ld.global_.f32(dst, w.ptr_to([idx]))
         else:
@@ -111,7 +114,7 @@ def load_w_f32(dst, w, idx, wdt, valid):
 
 def load_w_bf16(dst, w, idx, valid):
     txl.assign(dst, txl.uint16(0))
-    with txl.If(valid), txl.Then():
+    with txl.if_(valid), txl.then_():
         txl.ptx.ld.global_.b16(dst, w.ptr_to([idx]))
 
 
@@ -126,7 +129,7 @@ def cvta(ptr):
 
 
 def tmap_ptr(m):
-    return txl.reinterpret(txl.handle().ty, txl.address_of(m))
+    return txl.reinterpret(txl.address_of(m), ty=txl.handle().ty)
 
 
 def load_policy():
@@ -205,8 +208,8 @@ def partial_dw_mixed(pw, gv, xv, K, i0=0, n=TG):
 
 
 def bf16x2_to_f32x2(word):
-    lo = txl.reinterpret("float32", word << txl.uint32(16))
-    hi = txl.reinterpret("float32", word & txl.uint32(0xFFFF0000))
+    lo = txl.reinterpret(word << txl.uint32(16), ty='float32')
+    hi = txl.reinterpret(word & txl.uint32(0xFFFF0000), ty='float32')
     return txl.cuda.make_float2(lo, hi)
 
 
@@ -237,7 +240,7 @@ def release(empty, stage, lane):
     """
     if WARP_ARRIVE:
         txl.cuda.warp_sync()
-        with txl.If(lane == 0), txl.Then():
+        with txl.if_(lane == 0), txl.then_():
             txl.ptx["mbarrier.arrive.shared.b64"](cvta(empty.ptr_to([stage])), txl.uint32(1))
     else:
         txl.ptx["mbarrier.arrive.shared.b64"](cvta(empty.ptr_to([stage])), txl.uint32(1))
@@ -301,18 +304,18 @@ def fwd_tma(C, K, wdt, shuffle_store):
         )
         return (xmh, xmt, ym)
 
-    @txl.kernel(warps=NCW + 1, grid=G, min_blocks_per_sm=CTAS_PER_SM, host_prelude=host_prelude)
+    @txl.kernel()
     def conv_fwd_tma(
-        x: txl.gptr[txl.bf16],
-        w: txl.gptr[wdt],
-        y: txl.gptr[txl.bf16],
-        L: txl.i32,
-        S: txl.i32,
-        offset: txl.i32,
-        B: txl.i32,
-        *,
-        host,
+        x: txl.Tensor((txl.int64(),), txl.bf16),
+        w: txl.Tensor((txl.int64(),), wdt),
+        y: txl.Tensor((txl.int64(),), txl.bf16),
+        L: txl.int32,
+        S: txl.int32,
+        offset: txl.int32,
+        B: txl.int32,
     ):
+        host = host_prelude(dict(x=x, y=y, L=L, S=S, B=B))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=(NCW + 1) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=CTAS_PER_SM))
         xmh, xmt, ym = host
         cta = txl.cta_id()
         tid = txl.thread_id()
@@ -327,7 +330,7 @@ def fwd_tma(C, K, wdt, shuffle_store):
         full = smem.alloc([NS], "uint64", align=8)
         empty = smem.alloc([NS], "uint64", align=8)
 
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for s in range(NS):
                 txl.ptx["mbarrier.init.shared.b64"](cvta(full.ptr_to([s])), txl.uint32(1))
                 txl.ptx["mbarrier.init.shared.b64"](cvta(empty.ptr_to([s])), txl.uint32(EMPTY_COUNT))
@@ -341,7 +344,7 @@ def fwd_tma(C, K, wdt, shuffle_store):
 
         def advance():
             txl.assign(stage, stage + 1)
-            with txl.If(stage == NS), txl.Then():
+            with txl.if_(stage == NS), txl.then_():
                 txl.assign(stage, txl.int32(0))
                 txl.assign(phase, phase ^ 1)
             txl.assign(tile, tile + G)
@@ -353,14 +356,14 @@ def fwd_tma(C, K, wdt, shuffle_store):
             rest = tl // nbt
             return rest % NCB, bt, rest // NCB
 
-        with txl.If(warp == NCW):
-            with txl.Then():
-                with txl.If(lane == 0), txl.Then():
+        with txl.if_(warp == NCW):
+            with txl.then_():
+                with txl.if_(lane == 0), txl.then_():
                     txl.ptx.prefetch.tensormap(txl.address_of(xmh))
                     txl.ptx.prefetch.tensormap(txl.address_of(xmt))
                     txl.ptx.prefetch.tensormap(txl.address_of(ym))
                     lpol = load_policy()
-                    with txl.While(tile < ntiles):
+                    with txl.while_(tile < ntiles):
                         cb, bt, bb = decode(tile)
                         txl.cuda.mbarrier_wait(empty.ptr_to([stage]), phase ^ 1)
                         # order the compute warps' generic reads of this stage before the TMA rewrite
@@ -375,7 +378,7 @@ def fwd_tma(C, K, wdt, shuffle_store):
                         tma_load(cvta(xs.ptr_to([stage * (R * CB) + FT * CB])), tmap_ptr(xmt),
                                   cb * CB, xrow + FT, bb, fb, lpol)
                         advance()
-            with txl.Else():
+            with txl.else_():
                 # lane = channel pair (2 * lane, 2 * lane + 1), warp = token group of TG2 tokens
                 c2 = 2 * lane
                 tg = warp
@@ -403,7 +406,7 @@ def fwd_tma(C, K, wdt, shuffle_store):
                     oa = txl.local_scalar("float32")
                     ob = txl.local_scalar("float32")
                 it = txl.local_scalar("int32", init=txl.int32(0))
-                with txl.While(tile < ntiles):
+                with txl.while_(tile < ntiles):
                     cb, bt, bb = decode(tile)
                     if fwm:
                         for e in range(2):
@@ -435,7 +438,7 @@ def fwd_tma(C, K, wdt, shuffle_store):
                             taps2(out, wk, xv, K, False)
                         b = it % 2
                         h = tg // 4
-                        with txl.If(tid == 0), txl.Then():
+                        with txl.if_(tid == 0), txl.then_():
                             txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(1))
                         if FWO:
                             # convert (and shuffle) while thread 0 waits for the old bulk store to drain
@@ -512,7 +515,7 @@ def fwd_tma(C, K, wdt, shuffle_store):
                                         txl.ptx["st.shared.v4.b32"](ys.ptr_to([off]), pk[0], pk[1], pk[2], pk[3])
                         txl.ptx["fence.proxy.async.shared::cta"]()
                         bar_named(1, NC)
-                        with txl.If(tid == 0), txl.Then():
+                        with txl.if_(tid == 0), txl.then_():
                             for hh in range(2):
                                 tma_store(
                                     tmap_ptr(ym), bt * FT + ft * T + hh * 64, cb * CB, bb,
@@ -521,10 +524,10 @@ def fwd_tma(C, K, wdt, shuffle_store):
                             txl.ptx["cp.async.bulk.commit_group"]()
                         txl.assign(it, it + 1)
                     advance()
-                with txl.If(tid == 0), txl.Then():
+                with txl.if_(tid == 0), txl.then_():
                     txl.ptx["cp.async.bulk.wait_group"](txl.int32(0))
 
-    return entry_function(conv_fwd_tma.compile())
+    return entry_function(conv_fwd_tma.compile(TARGET))
 
 
 # ------------------------------------------------------------------------------------------
@@ -628,23 +631,23 @@ def bwd_tma(C, K, wdt, cf):
             maps += [gm, xm, dm]
         return tuple(maps)
 
-    @txl.kernel(warps=NCW + 1, grid=False, min_blocks_per_sm=CTAS_PER_SM, host_prelude=host_prelude)
+    @txl.kernel()
     def conv_bwd_tma(
-        g: txl.gptr[txl.bf16],
-        x: txl.gptr[txl.bf16],
-        w: txl.gptr[wdt],
-        dx: txl.gptr[txl.bf16],
-        dw: txl.gptr[wdt],
-        L: txl.i32,
-        S: txl.i32,
-        offset: txl.i32,
-        B: txl.i32,
-        *,
-        host,
+        g: txl.Tensor((txl.int64(),), txl.bf16),
+        x: txl.Tensor((txl.int64(),), txl.bf16),
+        w: txl.Tensor((txl.int64(),), wdt),
+        dx: txl.Tensor((txl.int64(),), txl.bf16),
+        dw: txl.Tensor((txl.int64(),), wdt),
+        L: txl.int32,
+        S: txl.int32,
+        offset: txl.int32,
+        B: txl.int32,
     ):
+        host = host_prelude(dict(g=g, x=x, dx=dx, L=L, S=S, B=B))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=(NCW + 1) * 32, cluster=(KF,), preferred_cluster=[KF]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=CTAS_PER_SM))
         maps = [host[3 * i:3 * i + 3] for i in range(len(WS))]
-        cta = txl.cta_id([G])
-        rank = txl.Cast("int32", txl.cta_id_in_cluster([KF], preferred=[KF]))
+        cta = txl.cta_id()
+        rank = txl.Cast("int32", txl.cuda.mov_sreg(32, "cluster_ctarank"))
         tid = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
@@ -662,10 +665,10 @@ def bwd_tma(C, K, wdt, cf):
             fn(W, maps of width W) under the slice-width branch of this CTA.
             """
             if extra:
-                with txl.If(wide):
-                    with txl.Then():
+                with txl.if_(wide):
+                    with txl.then_():
                         fn(WA, maps[0])
-                    with txl.Else():
+                    with txl.else_():
                         fn(WB, maps[1])
             else:
                 fn(WB, maps[0])
@@ -685,7 +688,7 @@ def bwd_tma(C, K, wdt, cf):
         full = smem.alloc([NS], "uint64", align=8)
         empty = smem.alloc([NS], "uint64", align=8)
 
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             for s in range(NS):
                 txl.ptx["mbarrier.init.shared.b64"](cvta(full.ptr_to([s])), txl.uint32(1))
                 txl.ptx["mbarrier.init.shared.b64"](cvta(empty.ptr_to([s])), txl.uint32(EMPTY_COUNT))
@@ -699,19 +702,19 @@ def bwd_tma(C, K, wdt, cf):
 
         def advance():
             txl.assign(stage, stage + 1)
-            with txl.If(stage == NS), txl.Then():
+            with txl.if_(stage == NS), txl.then_():
                 txl.assign(stage, txl.int32(0))
                 txl.assign(phase, phase ^ 1)
             txl.assign(u, u + KF)
 
-        with txl.If(warp == NCW):
-            with txl.Then():
-                with txl.If(lane == 0), txl.Then():
+        with txl.if_(warp == NCW):
+            with txl.then_():
+                with txl.if_(lane == 0), txl.then_():
                     for mp in maps:
                         for m in mp:
                             txl.ptx.prefetch.tensormap(txl.address_of(m))
                     lpol = load_policy()
-                    with txl.While(u < nrt):
+                    with txl.while_(u < nrt):
                         bs = u % nbs
                         bb = u // nbs
                         txl.cuda.mbarrier_wait(empty.ptr_to([stage]), phase ^ 1)
@@ -733,10 +736,10 @@ def bwd_tma(C, K, wdt, cf):
 
                         by_width(issue)
                         advance()
-            with txl.Else():
+            with txl.else_():
 
                 def store_dx(b, bs, bb):
-                    with txl.If(tid == 0), txl.Then():
+                    with txl.if_(tid == 0), txl.then_():
                         by_width(lambda W, mp: tma_store(
                             tmap_ptr(mp[2]), c0, bs * T, bb, cvta(dxs.ptr_to([b * T * WMAX]))))
                         txl.ptx["cp.async.bulk.commit_group"]()
@@ -752,17 +755,17 @@ def bwd_tma(C, K, wdt, cf):
                 rv = txl.local_scalar("float32")
                 for i in range(cdiv(K * CB, NC)):
                     idx = i * NC + tid
-                    with txl.If(idx < K * CB), txl.Then():
+                    with txl.if_(idx < K * CB), txl.then_():
                         txl.assign(r, txl.float32(0.0))
                         for q in range(NTG):
                             txl.ptx["ld.shared.f32"](rv, red.ptr_to([q * K * CB + idx]))
                             txl.assign(r, r + rv)
                         txl.ptx["st.shared.f32"](red2.ptr_to([idx]), r)
-                with txl.If(tid == 0), txl.Then():
+                with txl.if_(tid == 0), txl.then_():
                     txl.ptx["cp.async.bulk.wait_group"](txl.int32(0))
         # the cluster's ranks in order, by rank 0
         cluster_sync()
-        with txl.If((rank == 0) & (tid < NC)), txl.Then():
+        with txl.if_((rank == 0) & (tid < NC)), txl.then_():
             r = txl.local_scalar("float32")
             rv = txl.local_scalar("float32")
             pa = txl.local_scalar("uint32")
@@ -770,7 +773,7 @@ def bwd_tma(C, K, wdt, cf):
                 idx = i * NC + tid
                 k = idx // CB
                 c = idx % CB
-                with txl.If((idx < K * CB) & (c < nch)), txl.Then():
+                with txl.if_((idx < K * CB) & (c < nch)), txl.then_():
                     txl.assign(r, txl.float32(0.0))
                     for q in range(KF):
                         txl.ptx.mapa.shared__cluster.u32(pa, cvta(red2.ptr_to([idx])), txl.uint32(q))
@@ -779,7 +782,7 @@ def bwd_tma(C, K, wdt, cf):
                     store_w(dw, (c0 + c) * K + k, r, wdt)
         cluster_sync()
 
-    return entry_function(conv_bwd_tma.compile())
+    return entry_function(conv_bwd_tma.compile(TARGET))
 
 
 def bwd_cl_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, tid, warp, lane, full, empty, stage, phase,
@@ -808,7 +811,7 @@ def bwd_cl_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, tid, warp, lane, ful
     for k in range(K):
         txl.assign(pacc[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
     it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.While(u < nrt):
+    with txl.while_(u < nrt):
         bs = u % nbs
         bb = u // nbs
         txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
@@ -828,12 +831,12 @@ def bwd_cl_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, tid, warp, lane, ful
             txl.ptx["add.rn.f32x2"](pacc[k], pacc[k], pw[k])
         b = it % NDX
         # thread 0 owns the bulk-store group: its read-completion wait overlaps the others' conversion
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
         for i in range(TG2):
             txl.ptx["cvt.rn.bf16x2.f32"](hv[i], f2(out[i], 1), f2(out[i], 0))
         bar_named(1, NC)
-        with txl.If(act), txl.Then():
+        with txl.if_(act), txl.then_():
             for i in range(TG2):
                 txl.ptx["st.shared.b32"](dxs.ptr_to([b * T * WMAX + (tg * TG2 + i) * nch + c2]), hv[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
@@ -873,7 +876,7 @@ def bwd_clm_compute(gs, xs, dxs, red, w, C, K, c0, nch, tid, warp, lane, full, e
             load_w_bf16(wk[e][k], w, (c0 + c2 + e) * K + k, c0 + c2 + e < C)
             txl.assign(pacc[e][k], txl.float32(0.0))
     it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.While(u < nrt):
+    with txl.while_(u < nrt):
         bs = u % nbs
         bb = u // nbs
         txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
@@ -900,12 +903,12 @@ def bwd_clm_compute(gs, xs, dxs, red, w, C, K, c0, nch, tid, warp, lane, full, e
                     txl.ptx["fma.rn.f32.bf16"](pw[e][k], gv[e][i], xv[e][i + k], pw[e][k])
                 txl.assign(pacc[e][k], pacc[e][k] + pw[e][k])
         b = it % NDX
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
         for i in range(TG2):
             txl.ptx["cvt.rn.bf16x2.f32"](hv[i], out[1][i], out[0][i])
         bar_named(1, NC)
-        with txl.If(act), txl.Then():
+        with txl.if_(act), txl.then_():
             for i in range(TG2):
                 txl.ptx["st.shared.b32"](dxs.ptr_to([b * T * WMAX + (tg * TG2 + i) * nch + c2]), hv[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
@@ -955,7 +958,7 @@ def bwd_cf_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lane
     for i in range(2 * K):
         txl.assign(pacc[i], txl.float32(0.0))
     it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.While(u < nrt):
+    with txl.while_(u < nrt):
         bs = u % nbs
         bb = u // nbs
         txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
@@ -979,9 +982,9 @@ def bwd_cf_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lane
                 txl.ptx["ld.shared.b16"](xv[j], xs.ptr_to([xb + (tq * TG + j) * nch]))
             else:
                 if j % 2 == 0:
-                    txl.assign(gv[j], txl.reinterpret("float32", wv << txl.uint32(16)))
+                    txl.assign(gv[j], txl.reinterpret(wv << txl.uint32(16), ty='float32'))
                 else:
-                    txl.assign(gv[j], txl.reinterpret("float32", wv & txl.uint32(0xFFFF0000)))
+                    txl.assign(gv[j], txl.reinterpret(wv & txl.uint32(0xFFFF0000), ty='float32'))
                 ld_s_bf16(xv[j], xs.ptr_to([xb + (tq * TG + j) * nch]))
         release(empty, stage, lane)
         if mixed:
@@ -996,12 +999,12 @@ def bwd_cf_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lane
             for k in range(K):
                 txl.assign(pacc[h * K + k], pacc[h * K + k] + pw[k])
         b = it % NDX
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
         for i in range(TG):
             txl.ptx["cvt.rn.bf16.f32"](hv[i], out[i])
         bar_named(1, NC)
-        with txl.If(act), txl.Then():
+        with txl.if_(act), txl.then_():
             for i in range(TG):
                 txl.ptx["st.shared.b16"](dxs.ptr_to([b * T * WMAX + (tq * TG + i) * nch + ch]), hv[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
@@ -1051,7 +1054,7 @@ def bwd_cf2_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lan
     for k in range(K):
         txl.assign(pacc[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
     it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.While(u < nrt):
+    with txl.while_(u < nrt):
         bs = u % nbs
         bb = u // nbs
         txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
@@ -1073,11 +1076,11 @@ def bwd_cf2_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lan
             g0 = gw[0][j // 2]
             g1 = gw[1][j // 2]
             if j % 2 == 0:
-                lo = txl.reinterpret("float32", g0 << txl.uint32(16))
-                hi = txl.reinterpret("float32", g1 << txl.uint32(16))
+                lo = txl.reinterpret(g0 << txl.uint32(16), ty='float32')
+                hi = txl.reinterpret(g1 << txl.uint32(16), ty='float32')
             else:
-                lo = txl.reinterpret("float32", g0 & txl.uint32(0xFFFF0000))
-                hi = txl.reinterpret("float32", g1 & txl.uint32(0xFFFF0000))
+                lo = txl.reinterpret(g0 & txl.uint32(0xFFFF0000), ty='float32')
+                hi = txl.reinterpret(g1 & txl.uint32(0xFFFF0000), ty='float32')
             txl.assign(gv[j], txl.cuda.make_float2(lo, hi))
             txl.ptx["ld.shared.b32"](wa, xs.ptr_to([xb + (tg * TG2 + j) * nch]))
             txl.assign(xv[j], bf16x2_to_f32x2(wa))
@@ -1087,12 +1090,12 @@ def bwd_cf2_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lan
         for k in range(K):
             txl.ptx["add.rn.f32x2"](pacc[k], pacc[k], pw[k])
         b = it % NDX
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
         for i in range(TG2):
             txl.ptx["cvt.rn.bf16x2.f32"](hv[i], f2(out[i], 1), f2(out[i], 0))
         bar_named(1, NC)
-        with txl.If(act), txl.Then():
+        with txl.if_(act), txl.then_():
             for i in range(TG2):
                 txl.ptx["st.shared.b32"](dxs.ptr_to([b * T * WMAX + (tg * TG2 + i) * nch + c2]), hv[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
@@ -1127,7 +1130,7 @@ def g2s_chunk(V, words, gptr_, sptr, valid):
     dt = "uint32" if V >= 2 else "uint16"
     for i in range(nw):
         txl.assign(words[i], txl.Cast(dt, 0))
-    with txl.If(valid), txl.Then():
+    with txl.if_(valid), txl.then_():
         if V == 8:
             txl.ptx["ld.global.nc.v4.b32"](words[0], words[1], words[2], words[3], gptr_)
         elif V == 4:
@@ -1159,7 +1162,7 @@ def stage_rows(V, words, src, sbuf, tid, first_row, nrows_valid, R, C, c0, rowba
         gr = first_row + row
         c = c0 + chn * V
         valid = (gr >= 0) & (gr < nrows_valid) & (c < C) & (idx < total)
-        with txl.If(idx < total), txl.Then():
+        with txl.if_(idx < total), txl.then_():
             g2s_chunk(V, words, src.ptr_to([rowbase + i64(gr * C + c)]), sbuf.ptr_to([row * CB + chn * V]), valid)
 
 
@@ -1170,16 +1173,9 @@ def fwd_plain(C, K, wdt):
     V = vec_width(C)
     YP = T + 2
 
-    @txl.kernel(warps=NCW, grid=lambda p: [(p["S"] + T - 1) // T, NCB, p["B"]])
-    def conv_fwd_plain(
-        x: txl.gptr[txl.bf16],
-        w: txl.gptr[wdt],
-        y: txl.gptr[txl.bf16],
-        L: txl.i32,
-        S: txl.i32,
-        offset: txl.i32,
-        B: txl.i32,
-    ):
+    @txl.kernel()
+    def conv_fwd_plain(x: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), wdt), y: txl.Tensor((txl.int64(),), txl.bf16), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(S + T - 1) // T, NCB, B], block=NCW * 32))
         bt, bc, bb = txl.cta_id()
         tid = txl.thread_id()
         warp = txl.warp_id()
@@ -1212,11 +1208,11 @@ def fwd_plain(C, K, wdt):
             idx = i * NC + tid
             c = idx // T
             t = idx % T
-            with txl.If((c0 + c < C) & (t0 + t < S)), txl.Then():
+            with txl.if_((c0 + c < C) & (t0 + t < S)), txl.then_():
                 txl.ptx["ld.shared.b16"](h, ys.ptr_to([c * YP + t]))
                 txl.ptx["st.global.b16"](y.ptr_to([ybase + i64((c0 + c) * S + t0 + t)]), h)
 
-    return entry_function(conv_fwd_plain.compile())
+    return entry_function(conv_fwd_plain.compile(TARGET))
 
 
 @functools.cache
@@ -1230,21 +1226,9 @@ def bwd_plain(C, K, wdt, mode):
     V = vec_width(C)
     GP = CB + 2 if mode == "gen" else CB
 
-    @txl.kernel(warps=NCW, grid=lambda p: [(p["L"] + T - 1) // T, NCB, p["B"]])
-    def conv_bwd_plain(
-        g: txl.gptr[txl.bf16],
-        x: txl.gptr[txl.bf16],
-        w: txl.gptr[wdt],
-        dx: txl.gptr[txl.bf16],
-        dwp: txl.gptr[txl.f32],
-        L: txl.i32,
-        S: txl.i32,
-        offset: txl.i32,
-        B: txl.i32,
-        gsb: txl.i64,
-        gst: txl.i64,
-        gsc: txl.i64,
-    ):
+    @txl.kernel()
+    def conv_bwd_plain(g: txl.Tensor((txl.int64(),), txl.bf16), x: txl.Tensor((txl.int64(),), txl.bf16), w: txl.Tensor((txl.int64(),), wdt), dx: txl.Tensor((txl.int64(),), txl.bf16), dwp: txl.Tensor((txl.int64(),), txl.f32), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32, gsb: txl.int64, gst: txl.int64, gsc: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(L + T - 1) // T, NCB, B], block=NCW * 32))
         bs, bc, bb = txl.cta_id()
         tid = txl.thread_id()
         warp = txl.warp_id()
@@ -1268,9 +1252,9 @@ def bwd_plain(C, K, wdt, mode):
                 c = idx % CB
                 t = s0 - offset + row
                 txl.assign(h, txl.uint16(0))
-                with txl.If((t >= 0) & (t < S) & (c0 + c < C) & (idx < R * CB)), txl.Then():
+                with txl.if_((t >= 0) & (t < S) & (c0 + c < C) & (idx < R * CB)), txl.then_():
                     txl.ptx["ld.global.nc.b16"](h, g.ptr_to([i64(bb) * gsb + i64(t) * gst + i64(c0 + c) * gsc]))
-                with txl.If(idx < R * CB), txl.Then():
+                with txl.if_(idx < R * CB), txl.then_():
                     txl.ptx["st.shared.b16"](gs.ptr_to([row * GP + c]), h)
         ch = lane + 32 * (warp % 2)
         tg = warp // 2
@@ -1292,11 +1276,11 @@ def bwd_plain(C, K, wdt, mode):
         h2 = txl.local_scalar("uint16")
         for i in range(TG):
             s = s0 + tg * TG + i
-            with txl.If((s < L) & (c0 + ch < C)), txl.Then():
+            with txl.if_((s < L) & (c0 + ch < C)), txl.then_():
                 txl.ptx["cvt.rn.bf16.f32"](h2, out[i])
                 txl.ptx["st.global.b16"](dx.ptr_to([xbase + i64(s * C + c0 + ch)]), h2)
         u = bb * nbs + bs
-        with txl.If(c0 + ch < C), txl.Then():
+        with txl.if_(c0 + ch < C), txl.then_():
             for hf in range(2):
                 for k in range(K):
                     txl.ptx["st.global.f32"](
@@ -1304,7 +1288,7 @@ def bwd_plain(C, K, wdt, mode):
                         pw[hf * K + k],
                     )
 
-    return entry_function(conv_bwd_plain.compile())
+    return entry_function(conv_bwd_plain.compile(TARGET))
 
 
 @functools.cache
@@ -1315,8 +1299,9 @@ def dw_kernel(C, K, wdt):
     N = C * K
     KF = kfac(cdiv(C, CB))
 
-    @txl.kernel(warps=8, grid=lambda p: (N + 255) // 256)
-    def dw_reduce(dwp: txl.gptr[txl.f32], dw: txl.gptr[wdt], nrt: txl.i32):
+    @txl.kernel()
+    def dw_reduce(dwp: txl.Tensor((txl.int64(),), txl.f32), dw: txl.Tensor((txl.int64(),), wdt), nrt: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(N + 255) // 256, block=256))
         idx = txl.cta_id() * 256 + txl.thread_id()
         k = idx // C
         c = idx % C
@@ -1325,14 +1310,14 @@ def dw_kernel(C, K, wdt):
         a = txl.local_scalar("float32")
         rv = txl.local_scalar("float32")
         uu = txl.local_scalar("int32")
-        with txl.If(idx < N), txl.Then():
+        with txl.if_(idx < N), txl.then_():
             txl.assign(out, txl.float32(0.0))
             for q in range(KF):
                 txl.assign(r, txl.float32(0.0))
                 for tg in range(NTG):
                     txl.assign(a, txl.float32(0.0))
                     txl.assign(uu, txl.int32(q))
-                    with txl.While(uu < nrt):
+                    with txl.while_(uu < nrt):
                         txl.ptx["ld.global.f32"](
                             rv, dwp.ptr_to([((i64(uu) * NTG + tg) * K + i64(k)) * C + i64(c)])
                         )
@@ -1342,7 +1327,7 @@ def dw_kernel(C, K, wdt):
                 txl.assign(out, out + r)
             store_w(dw, c * K + k, out, wdt)
 
-    return entry_function(dw_reduce.compile())
+    return entry_function(dw_reduce.compile(TARGET))
 
 
 # ------------------------------------------------------------------------------------------

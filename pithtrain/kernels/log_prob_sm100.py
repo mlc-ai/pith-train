@@ -25,17 +25,42 @@ targets on an int64 copy.
 
 Evolved with TIRx-harness: run log_prob, frontier member hardware-redux-max (commit c12d48b0,
 25669.0 us vs 37896.2 us, 1.476x over the previous SM100 path, the Triton kernels now in
-log_prob_sm90, in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+log_prob_sm90, in the task's benchmark). Compiled once per process by tvm_tirx.tirx.compile(...,
+pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
 
 import torch
+import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+
 __all__ = ["log_prob_bwd_sm100", "log_prob_fwd_sm100"]
+
+def old_max(a, b):
+    """
+    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN operand
+    (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
+    """
+    return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_f32(a, b) else txl.max(a, b)
+
+
+def old_min(a, b):
+    """
+    txl.min as apache-tvm 0.27 emitted it: CUDA fminf for float32 operands, txl.min otherwise.
+    """
+    return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_f32(a, b) else txl.min(a, b)
+
+
+def is_f32(*xs):
+    """
+    Whether any operand is a float32 expression (the other may be a Python float).
+    """
+    return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
+
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
@@ -77,12 +102,12 @@ def load(x, dtype, vec, idx, f, off):
             w = txl.alloc_local([4], "uint32")
             txl.ptx["ld.global.nc.L1::no_allocate.v4.b32"](w[0], w[1], w[2], w[3], x.ptr_to([idx]))
             for i in range(4):
-                txl.assign(f[off + 2 * i], txl.reinterpret("float32", w[i] << txl.uint32(16)))
-                txl.assign(f[off + 2 * i + 1], txl.reinterpret("float32", w[i] & txl.uint32(0xFFFF0000)))
+                txl.assign(f[off + 2 * i], txl.reinterpret(w[i] << txl.uint32(16), ty="float32"))
+                txl.assign(f[off + 2 * i + 1], txl.reinterpret(w[i] & txl.uint32(0xFFFF0000), ty="float32"))
         else:
             h = txl.alloc_local([1], "uint16")
             txl.ptx["ld.global.nc.b16"](h[0], x.ptr_to([idx]))
-            txl.assign(f[off], txl.reinterpret("float32", txl.Cast("uint32", h[0]) << txl.uint32(16)))
+            txl.assign(f[off], txl.reinterpret(txl.Cast("uint32", h[0]) << txl.uint32(16), ty="float32"))
     else:
         if vec == 4:
             txl.ptx["ld.global.nc.L1::no_allocate.v4.f32"](f[off], f[off + 1], f[off + 2], f[off + 3], x.ptr_to([idx]))
@@ -112,7 +137,7 @@ def store(x, dtype, vec, idx, g, off):
 
 
 def finite(v):
-    return (txl.reinterpret("uint32", v) & txl.uint32(0x7F800000)) != txl.uint32(0x7F800000)
+    return (txl.reinterpret(v, ty="uint32") & txl.uint32(0x7F800000)) != txl.uint32(0x7F800000)
 
 
 def ex2(dst, src):
@@ -121,8 +146,8 @@ def ex2(dst, src):
 
 def shfl(dst, v, delta):
     peer = txl.alloc_local([1], "uint32")
-    txl.ptx.shfl_sync.bfly.b32(peer[0], txl.reinterpret("uint32", v), txl.uint32(delta), txl.uint32(31), txl.uint32(FULL))
-    txl.assign(dst, txl.reinterpret("float32", peer[0]))
+    txl.ptx.shfl_sync.bfly.b32(peer[0], txl.reinterpret(v, ty="uint32"), txl.uint32(delta), txl.uint32(31), txl.uint32(FULL))
+    txl.assign(dst, txl.reinterpret(peer[0], ty="float32"))
 
 
 def warp_merge(st, rounds):
@@ -158,27 +183,16 @@ def sweep(x, dtype, vec, base, nvec, tid, f, body, j0=0, nt=NT):
             body(q * vec, j0 + it * (UNROLL * nt) + q * nt + tid)
     with txl.serial((nvec - tail0 + nt - 1) // nt) as it:
         j = tail0 + it * nt + tid
-        with txl.If(j < nvec), txl.Then():
+        with txl.if_(j < nvec), txl.then_():
             load(x, dtype, vec, base + i64(j0 + j) * vec, f, 0)
             body(0, j0 + j)
 
 
 @functools.cache
 def fwd_kernel(dtype, vec):
-    @txl.kernel(warps=WARPS, grid="n_rows")
-    def log_prob_fwd(
-        x: txl.gptr[dtype],
-        tgt: txl.gptr[txl.i64],
-        logp: txl.gptr[txl.f32],
-        ent: txl.gptr[txl.f32],
-        rmax: txl.gptr[txl.f32],
-        lsum: txl.gptr[txl.f32],
-        n_rows: txl.i32,
-        n_cols: txl.i32,
-        x_stride: txl.i64,
-        t_stride: txl.i64,
-        inv_t: txl.f32,
-    ):
+    @txl.kernel()
+    def log_prob_fwd(x: txl.Tensor((txl.int64(),), dtype), tgt: txl.Tensor((txl.int64(),), txl.i64), logp: txl.Tensor((txl.int64(),), txl.f32), ent: txl.Tensor((txl.int64(),), txl.f32), rmax: txl.Tensor((txl.int64(),), txl.f32), lsum: txl.Tensor((txl.int64(),), txl.f32), n_rows: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, inv_t: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_rows, block=(WARPS) * 32))
         tid = txl.thread_id()
         lane = txl.lane_id()
         warp = txl.warp_id()
@@ -202,19 +216,19 @@ def fwd_kernel(dtype, vec):
         # Target logit (thread 0), loaded early.
         y = txl.local_scalar("int64", init=txl.int64(-1))
         xy = txl.alloc_local([1], "float32")
-        with txl.If(tid == 0), txl.Then():
+        with txl.if_(tid == 0), txl.then_():
             txl.ptx["ld.global.nc.b64"](y, tgt.ptr_to([i64(row) * t_stride]))
             txl.assign(xy[0], f32(0.0))
-            with txl.If(txl.And(y >= txl.int64(0), y < i64(n_cols))), txl.Then():
+            with txl.if_(txl.And(y >= txl.int64(0), y < i64(n_cols))), txl.then_():
                 load(x, dtype, 1, base + y, xy, 0)
 
         # ---- fast path: one fixed reference per thread ----
         txl.assign(st[0], f32(-1e30))
-        with txl.If(tid < nvec), txl.Then():
+        with txl.if_(tid < nvec), txl.then_():
             load(x, dtype, vec, base + i64(tid) * vec, f, 0)
             cm = txl.local_scalar("float32", init=f[0])
             for k in range(1, vec):
-                txl.assign(cm, txl.max(cm, f[k]))
+                txl.assign(cm, old_max(cm, f[k]))
             txl.assign(st[0], cm * c + f32(MARGIN))
         for q in range(UNROLL):
             txl.assign(dd[q], f32(0.0))
@@ -244,9 +258,9 @@ def fwd_kernel(dtype, vec):
         def slow(off, j):
             cm = txl.local_scalar("float32", init=f[off])
             for k in range(1, vec):
-                txl.assign(cm, txl.max(cm, f[off + k]))
-            nm = txl.local_scalar("float32", init=txl.max(st[0], cm * c))
-            with txl.If(nm > st[0]), txl.Then():
+                txl.assign(cm, old_max(cm, f[off + k]))
+            nm = txl.local_scalar("float32", init=old_max(st[0], cm * c))
+            with txl.if_(nm > st[0]), txl.then_():
                 sc = txl.local_scalar("float32")
                 ex2(sc, st[0] - nm)
                 for q in range(UNROLL):
@@ -254,7 +268,7 @@ def fwd_kernel(dtype, vec):
                     txl.assign(dd[q], dd[q] * sc)
                 txl.assign(st[0], nm)
             for k in range(vec):
-                txl.assign(u[0], txl.max(f[off + k] * c - st[0], f32(-3.0e38)))
+                txl.assign(u[0], old_max(f[off + k] * c - st[0], f32(-3.0e38)))
                 ex2(ev[k], u[0])
                 txl.assign(sv[k], ev[k] * u[0])
             accumulate(off)
@@ -268,7 +282,7 @@ def fwd_kernel(dtype, vec):
         l2t = txl.local_scalar("float32")
         txl.ptx.lg2.approx.ftz.f32(l2t, st[1])
         bad = txl.Or(txl.Not(txl.And(finite(st[1]), finite(st[2]))), l2t > f32(REDO_LOG2))
-        with txl.If(bad), txl.Then():
+        with txl.if_(bad), txl.then_():
             txl.assign(st[0], f32(-1e30))
             for q in range(UNROLL):
                 txl.assign(dd[q], f32(0.0))
@@ -279,25 +293,25 @@ def fwd_kernel(dtype, vec):
 
         # ---- CTA merge ----
         warp_merge(st, (16, 8, 4, 2, 1))
-        with txl.If(lane == 0), txl.Then():
+        with txl.if_(lane == 0), txl.then_():
             for q in range(3):
                 txl.ptx["st.shared.f32"](red.ptr_to([warp * 3 + q]), st[q])
         txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NT))
-        with txl.If(warp == 0), txl.Then():
-            with txl.If(lane < WARPS):
-                with txl.Then():
+        with txl.if_(warp == 0), txl.then_():
+            with txl.if_(lane < WARPS):
+                with txl.then_():
                     for q in range(3):
                         txl.ptx["ld.shared.f32"](st[q], red.ptr_to([lane * 3 + q]))
-                with txl.Else():
+                with txl.else_():
                     txl.assign(st[0], f32(-1e30))
                     txl.assign(st[1], f32(0.0))
                     txl.assign(st[2], f32(0.0))
             warp_merge(st, tuple(1 << i for i in reversed(range(WARPS.bit_length() - 1))))
-            with txl.If(tid == 0), txl.Then():
+            with txl.if_(tid == 0), txl.then_():
                 l2d = txl.local_scalar("float32")
                 txl.ptx.lg2.approx.ftz.f32(l2d, st[1])
                 lp = txl.local_scalar("float32", init=f32(0.0))
-                with txl.If(txl.And(y >= txl.int64(0), y < i64(n_cols))), txl.Then():
+                with txl.if_(txl.And(y >= txl.int64(0), y < i64(n_cols))), txl.then_():
                     txl.assign(lp, ((xy[0] * c - st[0]) - l2d) * f32(LN2))
                 r = i64(row)
                 txl.ptx["st.global.f32"](logp.ptr_to([r]), lp)
@@ -315,24 +329,9 @@ BNT = BWARPS * 32
 
 @functools.cache
 def bwd_kernel(dtype, vec):
-    @txl.kernel(warps=BWARPS, grid="n_ctas")
-    def log_prob_bwd(
-        x: txl.gptr[dtype],
-        tgt: txl.gptr[txl.i64],
-        rmax: txl.gptr[txl.f32],
-        lsum: txl.gptr[txl.f32],
-        ent: txl.gptr[txl.f32],
-        glogp: txl.gptr[txl.f32],
-        gent: txl.gptr[txl.f32],
-        n_ctas: txl.i32,
-        n_chunks: txl.i32,
-        n_cols: txl.i32,
-        x_stride: txl.i64,
-        t_stride: txl.i64,
-        gl_stride: txl.i64,
-        ge_stride: txl.i64,
-        inv_t: txl.f32,
-    ):
+    @txl.kernel()
+    def log_prob_bwd(x: txl.Tensor((txl.int64(),), dtype), tgt: txl.Tensor((txl.int64(),), txl.i64), rmax: txl.Tensor((txl.int64(),), txl.f32), lsum: txl.Tensor((txl.int64(),), txl.f32), ent: txl.Tensor((txl.int64(),), txl.f32), glogp: txl.Tensor((txl.int64(),), txl.f32), gent: txl.Tensor((txl.int64(),), txl.f32), n_ctas: txl.int32, n_chunks: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, gl_stride: txl.int64, ge_stride: txl.int64, inv_t: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_ctas, block=(BWARPS) * 32))
         tid = txl.thread_id()
         cta = txl.cta_id()
         row = txl.local_scalar("int32", init=cta // n_chunks)
@@ -341,7 +340,7 @@ def bwd_kernel(dtype, vec):
         base = txl.local_scalar("int64", init=r * x_stride)
         c = txl.local_scalar("float32", init=inv_t * f32(LOG2E))
         nvec = n_cols // vec
-        cnt = txl.local_scalar("int32", init=txl.min(nvec - j0, CHUNK))
+        cnt = txl.local_scalar("int32", init=old_min(nvec - j0, CHUNK))
 
         y = txl.local_scalar("int64")
         txl.ptx["ld.global.nc.b64"](y, tgt.ptr_to([r * t_stride]))
@@ -366,11 +365,11 @@ def bwd_kernel(dtype, vec):
 
         def body(off, j):
             for k in range(vec):
-                txl.assign(u[0], txl.max((f[off + k] * c - sc[0]) - sc[1], f32(-256.0)))
+                txl.assign(u[0], old_max((f[off + k] * c - sc[0]) - sc[1], f32(-256.0)))
                 ex2(p[0], u[0])
                 txl.assign(f[off + k], p[0] * (aa + bb * u[0]))
             # The target's own lane takes + g_logp / T before the single rounding.
-            with txl.If(j == yv), txl.Then():
+            with txl.if_(j == yv), txl.then_():
                 for k in range(vec):
                     txl.assign(f[off + k], f[off + k] + txl.Select(yr == k, ga, f32(0.0)))
             store(x, dtype, vec, base + i64(j) * vec, f, off)
@@ -409,7 +408,7 @@ def x_view(inp):
 @functools.cache
 def compiled(kind, dtype, vec):
     k = (fwd_kernel if kind == "fwd" else bwd_kernel)(dtype, vec)
-    return entry_function(k.compile())
+    return entry_function(k.compile(TARGET))
 
 
 DT = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
