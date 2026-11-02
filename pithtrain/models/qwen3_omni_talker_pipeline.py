@@ -21,6 +21,7 @@ from pithtrain.models.qwen3_omni_moe import (
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker, replay_indices
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
 from pithtrain.pipeline.dualpipev import layer_partition
 
 
@@ -73,8 +74,22 @@ class Qwen3OmniMoeTalkerPipelineMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         return self.shared_expert_gate(hidden).sigmoid() * self.shared_expert(hidden)
 
     def reference_forward(self, hidden):
-        # Retain the HF addition order: routed + shared, then the layer residual.
-        return super().reference_forward(hidden) + self.shared_forward(hidden)
+        """Retain Talker eager-HF serial rounding independently of Thinker grouped summation."""
+        shape = hidden.shape
+        replay_idx = replay_indices(self.gate, hidden, self.num_experts_per_tok)
+        indices, weights, lb_loss = self.gate(hidden, replay_idx)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
+        indices, order = indices.sort(dim=-1)
+        weights = weights.gather(-1, order)
+        flat = hidden.reshape(-1, shape[-1])
+        repeated = flat[:, None].expand(-1, self.num_experts_per_tok, -1).reshape(-1, shape[-1])
+        tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
+            repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
+        )
+        outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
+        routed = _combine_expert_order(outputs, weights, None, hidden.dtype).view(shape)
+        return routed + self.shared_forward(hidden)
 
 
 class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
