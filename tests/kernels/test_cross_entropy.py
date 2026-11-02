@@ -134,3 +134,48 @@ def test_non_contiguous_logits_return_a_copy():
     assert not strided_target.is_contiguous() or strided_target.stride(-1) != 1
     loss2, _ = cross_entropy_fwd_bwd(logits.contiguous(), strided_target, IGNORE)
     torch.testing.assert_close(loss2, want_loss, rtol=1e-5, atol=1e-5)
+
+
+# Entries far below the row max (down to ~1e-11 of it) keep fp32 precision until the final round:
+# an intermediate exp(x - max) in a narrower type (f16 underflows below e^-16.6 and is subnormal
+# from e^-9.7) would zero or blur them while the absolute tolerance of check() still passes.
+# V = 32000 / 151936 take the cluster-resident path, V = 5003 the streaming path.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("vocab", [5003, 32000, 151936])
+def test_small_gradient_entries_relative(dtype, vocab):
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    tokens = 64
+    # fp16 gradients are subnormal below 6e-5: there the window is 3..11 below the max, else 10..25
+    lo, span, window, share = (
+        (3.0, 8.0, 1e-2, 20) if dtype == torch.float16 else (10.0, 15.0, 1e-6, 4)
+    )
+    logits = torch.rand(tokens, vocab, generator=gen, device="cuda") * -span - lo
+    hot = torch.randint(0, vocab, (tokens, 4), generator=gen, device="cuda")
+    logits.scatter_(1, hot, torch.rand(tokens, 4, generator=gen, device="cuda"))  # row max ~0..1
+    logits = logits.to(dtype)
+    target = torch.randint(0, vocab, (tokens,), generator=gen, device="cuda")
+    _, want_grad, _ = reference(logits, target, IGNORE)
+    inp = logits.clone()
+    _, grad = cross_entropy_fwd_bwd(inp, target, IGNORE)
+    grad = grad.float()
+    row_max = want_grad.abs().amax(dim=1, keepdim=True)
+    small = (
+        (want_grad > 0)
+        & (want_grad <= window * row_max)
+        & (want_grad >= torch.finfo(dtype).smallest_normal)
+    )
+    small[torch.arange(tokens, device="cuda"), target] = False
+    # bf16 / fp32: most entries, 1e-11 .. 1e-6 of the row max
+    assert int(small.sum()) > tokens * vocab // share
+    rtol = 1e-5 if dtype == torch.float32 else torch.finfo(dtype).eps
+    rel = (grad[small] - want_grad[small]).abs() / want_grad[small]
+    assert float(rel.max()) <= rtol, f"max relative error {float(rel.max()):.3g} on small entries"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_no_rows(dtype):
+    inp = torch.empty(0, 32000, dtype=dtype, device="cuda")
+    target = torch.empty(0, dtype=torch.int64, device="cuda")
+    loss, grad = cross_entropy_fwd_bwd(inp, target, IGNORE)
+    assert loss.dtype == torch.float32 and loss.dim() == 0 and float(loss) == 0.0
+    assert grad.shape == (0, 32000) and grad.dtype == dtype
