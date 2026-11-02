@@ -1,146 +1,35 @@
 """
 SM90 dense chunked gated delta rule (chunk size 64), forward and the pieces both directions share.
-With T a multiple of the chunk size the forward runs two CuTe-DSL kernels: WyRepresentation (the
-gate cumsum, the solved WY matrix A and w, u) and ChunkStateOutput (the chunk-state recurrence fused
-with the output, h and v_new never leaving the SM). When T is not a multiple of the chunk size it
-launches FLA's Triton kernels directly with the configs FLA's autotuner picks on H200, skipping
-FLA's per-launch Python wrappers; the launch machinery here (launch, CONFIGS,
-pinned_launch_supported) serves both directions.
+The forward runs two CuTe-DSL kernels at every T: WyRepresentation (the gate cumsum, the solved WY
+matrix A and w, u) and ChunkStateOutput (the chunk-state recurrence fused with the output, h and
+v_new never leaving the SM). When T is not a multiple of the chunk size each kernel runs its
+ragged variant (compiled on the first such call, T staying a runtime argument), whose last chunk
+behaves as if zero-padded to 64 rows: predicated loads with zero fill (copy_rows), the gate cumsum
+over zeros, so padded rows repeat the chunk's last valid gate, and stores of rows below T only.
+That is FLA's ragged semantics, and the result on valid rows is bit-identical to the aligned
+kernels on inputs zero-padded to a multiple of 64.
 
-The FLA launches keep the launch order, allocations, in-place accumulations and dtypes of FLA
-0.5.2's chunk_gated_delta_rule_fwd on the dense path (no cu_seqlens, no initial or final state), so
-they are bit-identical to FLA while the pinned configs are FLA's picks (pinned_launch_supported
-checks the FLA and Triton versions and the kernels' signatures, not the picks). The CuTe forward
-follows FLA's chunk algorithm and rounding points (bf16 A, w, u, h, v_new, fp32 accumulation, exp2
-of the log2 gate, TF32 block merges of A with truncated operands, as FLA's tl.dot on Hopper) and
-matches it to bf16 rounding. The ops stay opaque to torch.compile. Grouped value heads run on
-unrepeated q / k, which the kernels index per group. The backward is
-gated_delta_rule_pinned_bwd_sm90.
+The CuTe forward follows FLA 0.5.2's chunk algorithm and rounding points (bf16 A, w, u, h, v_new,
+fp32 accumulation, exp2 of the log2 gate, TF32 block merges of A with truncated operands, as FLA's
+tl.dot on Hopper) and matches it to bf16 rounding; g_cum and A are bit-identical to FLA's. The
+ops stay opaque to torch.compile. Grouped value heads run on unrepeated q / k, which the kernels
+index per group. The backward is gated_delta_rule_pinned_bwd_sm90. No Triton kernel runs here.
 """
 
 import cutlass
 import cutlass.cute as cute
-import fla
 import torch
-import triton
 from cutlass import BFloat16, Float32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, chunk_gated_delta_rule_fwd_kernel_h_blockdim64
-from fla.ops.common.chunk_o import chunk_bwd_kernel_dqkwg, chunk_bwd_kernel_dv_local, chunk_fwd_kernel_o
-from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_kkt_solve_kernel
-from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd_kernel, recompute_w_u_fwd_kernel
-from fla.ops.utils.constant import RCP_LN2
-from fla.ops.utils.cumsum import chunk_local_cumsum_scalar_kernel
 from flash_attn.cute.ampere_helpers import gemm, gemm_rs, get_smem_layout_atom
 from quack.layout_utils import reshape_acc_to_frgA
-from triton import knobs
 
-from pithtrain.kernels.arch import ARCH_MAJOR
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 
-__all__ = ["BT", "CONFIGS", "ChunkStateOutput", "HEAD_DIM", "STATE_BV", "STATE_STAGES", "STATE_THREADS", "WyRepresentation", "chunk_copies", "chunk_cumsum", "chunk_gdr_fwd_pinned_sm90", "compute_chunk_states", "launch", "multiply_a", "operand_copies", "pinned_launch_supported", "recompute_w_u", "scale_kv"]
+__all__ = ["BT", "ChunkStateOutput", "HEAD_DIM", "STATE_BV", "STATE_STAGES", "STATE_THREADS", "WyRepresentation", "chunk_copies", "chunk_gdr_fwd_pinned_sm90", "copy_rows", "multiply_a", "operand_copies", "scale_kv"]
 
 BT = 64  # chunk size
-BC = 16  # sub-chunk of the fused kkt + triangular solve, fixed by FLA at BT = 64
-
-# Launch configs FLA's autotuner selects on H200 at H = HV = 32, K = V = 128 (bf16 q/k/v/beta,
-# fp32 gate). The BK / BV the launches below pass explicitly are FLA's own constants on Hopper.
-VERSIONS = {"fla": "0.5.2", "triton": "3.7.1"}
-CONFIGS = {"cumsum_fwd": dict(num_warps=1, num_stages=3), "cumsum_rev": dict(num_warps=1, num_stages=3), "kkt_solve": dict(BK=64, num_warps=1, num_stages=3), "w_u": dict(num_warps=4, num_stages=4), "fwd_h": dict(BV=32, num_warps=4, num_stages=3), "fwd_o": dict(BK=64, BV=64, num_warps=4, num_stages=3), "dv_local": dict(num_warps=2, num_stages=3), "bwd_dhu": dict(BV=32, num_warps=4, num_stages=3), "dqkwg": dict(num_warps=4, num_stages=3), "wy_bwd": dict(num_warps=4, num_stages=4)}
-
-KERNELS = {"cumsum": chunk_local_cumsum_scalar_kernel, "kkt_solve": chunk_gated_delta_rule_fwd_kkt_solve_kernel, "w_u": recompute_w_u_fwd_kernel, "fwd_h": chunk_gated_delta_rule_fwd_kernel_h_blockdim64, "fwd_o": chunk_fwd_kernel_o, "dv_local": chunk_bwd_kernel_dv_local, "bwd_dhu": chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, "dqkwg": chunk_bwd_kernel_dqkwg, "wy_bwd": prepare_wy_repr_bwd_kernel}
-
-# The parameter lists the launches below are written against.
-SIGNATURES = {"cumsum": "s o scale cu_seqlens chunk_indices T B H BT REVERSE HAS_SCALE IS_VARLEN HEAD_FIRST", "kkt_solve": "k g beta A cu_seqlens chunk_indices T H HV K BT BC BK USE_G IS_VARLEN", "w_u": "k v beta w u A g cu_seqlens chunk_indices T H HV K V BT BK BV USE_G IS_VARLEN", "fwd_h": "k v w v_new g gk h h0 ht cu_seqlens chunk_offsets T H HV K V BT BV USE_G USE_GK USE_INITIAL_STATE STORE_FINAL_STATE SAVE_NEW_VALUE STATE_V_FIRST IS_VARLEN", "fwd_o": "q k v h g g_gamma o cu_seqlens chunk_indices scale T H HV K V BT BK BV USE_G USE_G_GAMMA STATE_V_FIRST IS_VARLEN", "dv_local": "q k g g_gamma A do dv cu_seqlens chunk_indices scale T H HV K V BT BK BV USE_G USE_G_GAMMA USE_A IS_VARLEN", "bwd_dhu": "q k w g gk dht dh0 do dh dv dv2 cu_seqlens chunk_offsets scale T H HV K V BT BV USE_G USE_GK USE_INITIAL_STATE USE_FINAL_STATE_GRADIENT STATE_V_FIRST IS_VARLEN", "dqkwg": "q k v g g_gamma h do dh dq dk dw dv dg cu_seqlens chunk_indices scale B T H HV K V BT BK BV USE_G USE_G_GAMMA USE_DW STATE_V_FIRST IS_VARLEN", "wy_bwd": "k v beta g A dw du dk dv db dg cu_seqlens chunk_indices T H HV K V BT BK BV USE_G IS_VARLEN"}
-
-
-def unwrap_kernel(name: str) -> triton.JITFunction:
-    """
-    The raw JITFunction under FLA's Heuristics(CachedAutotuner(...)) wrappers.
-    """
-    return KERNELS[name].fn.fn
-
-
-compiled: dict[tuple, object] = {}
-key_positions: dict[str, tuple[list[int], list[int]]] = {}
-
-
-def launch(name: str, grid: tuple, **kwargs) -> None:
-    """
-    jit_fn[grid](**kwargs), with the compiled kernel cached and launched straight through its C
-    launcher on the device's current stream. The cache key is what Triton specializes these kernels
-    on: each tensor's dtype and 16-byte alignment, the value of every other argument except T
-    (do_not_specialize) and float scalars (never specialized), plus the device and launch config.
-    """
-    jit_fn = unwrap_kernel(name)
-    args = [kwargs[arg_name] for arg_name in jit_fn.arg_names]
-    if name not in key_positions:
-        tensor_positions = [i for i, arg in enumerate(args) if isinstance(arg, torch.Tensor)]
-        value_positions = [i for i, arg_name in enumerate(jit_fn.arg_names) if i not in tensor_positions and arg_name != "T"]
-        key_positions[name] = tensor_positions, value_positions
-    tensor_positions, value_positions = key_positions[name]
-    device = args[tensor_positions[0]].device.index
-    # None (e.g. an absent scale) is a constexpr, so it keys on its value.
-    key = (name, device, kwargs["num_warps"], kwargs["num_stages"], *(float if args[i].__class__ is float else args[i] for i in value_positions), *((args[i].dtype, args[i].data_ptr() & 15) for i in tensor_positions))
-    fn = compiled.get(key)
-    if fn is None:
-        compiled[key] = jit_fn[grid](**kwargs)
-        return
-    grid = (*grid, 1, 1)
-    stream = torch._C._cuda_getCurrentRawStream(device)
-    enter_hook, exit_hook = knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook
-    metadata = None if enter_hook is None else fn.launch_metadata(grid, stream, *args)
-    fn.run(grid[0], grid[1], grid[2], stream, fn.function, fn.packed_metadata, metadata, enter_hook, exit_hook, *args)
-
-
-supported: list[bool] = []
-
-
-@torch.compiler.assume_constant_result
-def pinned_launch_supported() -> bool:
-    """
-    Whether the pinned configs apply in this process: the recorded FLA and Triton versions, SM90,
-    and FLA kernels whose wrappers and parameter lists match the launches here.
-    """
-    if not supported:
-        supported.append(check_supported())
-    return supported[0]
-
-
-def check_supported() -> bool:
-    if fla.__version__ != VERSIONS["fla"] or triton.__version__ != VERSIONS["triton"]:
-        return False
-    if ARCH_MAJOR != 9:
-        return False
-    for name, kernel in KERNELS.items():
-        inner = getattr(getattr(kernel, "fn", None), "fn", None)
-        if not isinstance(inner, triton.JITFunction) or inner.arg_names != SIGNATURES[name].split():
-            return False
-    return True
-
-
-def chunk_cumsum(x: torch.Tensor, reverse: bool) -> torch.Tensor:
-    B, T, H = x.shape
-    out = torch.empty_like(x, dtype=torch.float)
-    config = CONFIGS["cumsum_rev" if reverse else "cumsum_fwd"]
-    launch("cumsum", (triton.cdiv(T, BT), B * H), s=x, o=out, scale=None if reverse else RCP_LN2, cu_seqlens=None, chunk_indices=None, T=T, B=B, H=H, BT=BT, REVERSE=reverse, HAS_SCALE=not reverse, IS_VARLEN=False, HEAD_FIRST=False, **config)
-    return out
-
-
-def recompute_w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, HV, V = *k.shape, *v.shape[2:]
-    w, u = k.new_empty(B, T, HV, K), torch.empty_like(v)
-    launch("w_u", (triton.cdiv(T, BT), B * HV), k=k, v=v, beta=beta, w=w, u=u, A=A, g=g, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK=64, BV=64, USE_G=True, IS_VARLEN=False, **CONFIGS["w_u"])
-    return w, u
-
-
-def compute_chunk_states(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, HV, V = *k.shape, *u.shape[2:]
-    h, v_new = k.new_empty(B, triton.cdiv(T, BT), HV, K, V), torch.empty_like(u)
-    config = CONFIGS["fwd_h"]
-    launch("fwd_h", (triton.cdiv(V, config["BV"]), B * HV), k=k, v=u, w=w, v_new=v_new, g=g, gk=None, h=h, h0=None, ht=None, cu_seqlens=None, chunk_offsets=None, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_GK=False, USE_INITIAL_STATE=False, STORE_FINAL_STATE=False, SAVE_NEW_VALUE=True, STATE_V_FIRST=False, IS_VARLEN=False, **config)
-    return h, v_new
-
+RCP_LN2 = 1.4426950216  # 1 / ln 2 as FLA 0.5.2 writes it (fp32 0x3FB8AA3B): g_cum is in log2 units
 
 HEAD_DIM = 128  # K == V, fixed by pinned_shapes
 TF32_STRIDE = 68  # fp32 row stride of the 64 x 64 solve buffers: conflict-free TF32 A-fragment loads
@@ -201,6 +90,27 @@ def operand_copies(mma: cute.TiledMma, tidx) -> tuple:
 
 
 @cute.jit
+def copy_rows(tiled_copy: cute.TiledCopy, src: cute.Tensor, dst: cute.Tensor, coords: cute.Tensor, valid, zero_fill: cutlass.Constexpr[bool]):
+    """
+    cute.copy(tiled_copy, src, dst) of the 16-byte vectors whose tile row, coords[0, m, n][0] (the
+    copy's partition of the tile's identity tensor), is below valid: all of them when valid >= BT,
+    so only a chunk cut by the end of the sequence pays the predicates. With zero_fill (a load into
+    shared memory) the thread that owns a skipped vector zeroes it, since a skipped cp.async writes
+    nothing; the stage barrier that publishes the cp.async data publishes the zeros too.
+    """
+    if valid >= BT:
+        cute.copy(tiled_copy, src, dst)
+    else:
+        for m in cutlass.range_constexpr(cute.size(src, mode=[1])):
+            for n in cutlass.range_constexpr(cute.size(src, mode=[2])):
+                if coords[0, m, n][0] < valid:
+                    cute.copy(tiled_copy, src[None, m, n], dst[None, m, n])
+                else:
+                    if const_expr(zero_fill):
+                        dst[None, m, n].fill(0.0)
+
+
+@cute.jit
 def scale_kv(load: cute.TiledCopy, s_k: cute.Tensor, s_v: cute.Tensor, s_gcum: cute.Tensor, s_beta: cute.Tensor, key_rounding: cutlass.Constexpr[bool]):
     """
     In place, 8 columns per access: v <- bf16(v beta), and k <- bf16(bf16(k beta) 2^g) with
@@ -244,10 +154,14 @@ class WyRepresentation:
     bf16(v beta). The inverse: the four 16 x 16 diagonal blocks by fp32 forward substitution, then
     block rows 1..3 as X_ij = -X_ii sum_k L_ik X_kj, each 16 x 16 product one TF32 warp MMA (FLA's
     merge order and its precision on Hopper).
+
+    With ragged (T not a multiple of BT) the last chunk is cut by the end of the sequence and runs
+    as if zero-padded to BT rows: its k and v rows past T load as zeros, g and beta as 0 (so g_cum
+    repeats the last valid row and L's padded rows vanish), and only rows below T are stored.
     """
 
-    def __init__(self, H: int, HV: int):
-        self.H, self.HV = H, HV
+    def __init__(self, H: int, HV: int, ragged: bool = False):
+        self.H, self.HV, self.ragged = H, HV, ragged
 
     @cute.jit
     def __call__(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, stream):
@@ -255,7 +169,8 @@ class WyRepresentation:
         mma_tf32 = cute.make_tiled_mma(warp.MmaTF32Op((16, 8, 8)), (1, 1, 1), permutation_mnk=(16, 16, 8))
         chunk_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM), (0, 1))
         a_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT), (0, 1))
-        self.kernel(mK, mV, mG, mBeta, mGcum, mA, mW, mU, mma_bf16, mma_tf32, chunk_layout, a_layout).launch(grid=[mG.shape[0] // BT, self.HV, 1], block=[WY_THREADS, 1, 1], stream=stream)
+        num_chunks = (mG.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mG.shape[0] // BT
+        self.kernel(mK, mV, mG, mBeta, mGcum, mA, mW, mU, mma_bf16, mma_tf32, chunk_layout, a_layout).launch(grid=[num_chunks, self.HV, 1], block=[WY_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mma_bf16: cute.TiledMma, mma_tf32: cute.TiledMma, chunk_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout):
@@ -279,10 +194,18 @@ class WyRepresentation:
         gV = cute.local_tile(mV[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))
         gA = cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))
 
-        cute.copy(load, load.partition_S(gK), load.partition_D(s_k))
-        cute.arch.cp_async_commit_group()
-        cute.copy(load, load.partition_S(gV), load.partition_D(s_v))
-        cute.arch.cp_async_commit_group()
+        if const_expr(self.ragged):
+            valid = mG.shape[0] - chunk_idx * BT
+            rows_128, rows_64 = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM))), store_64.partition_D(cute.make_identity_tensor((BT, BT)))
+            copy_rows(load, load.partition_S(gK), load.partition_D(s_k), rows_128, valid, True)
+            cute.arch.cp_async_commit_group()
+            copy_rows(load, load.partition_S(gV), load.partition_D(s_v), rows_128, valid, True)
+            cute.arch.cp_async_commit_group()
+        else:
+            cute.copy(load, load.partition_S(gK), load.partition_D(s_k))
+            cute.arch.cp_async_commit_group()
+            cute.copy(load, load.partition_S(gV), load.partition_D(s_v))
+            cute.arch.cp_async_commit_group()
         self.cumsum_gate(mG, mBeta, mGcum, s_gcum, s_beta, tidx, chunk_idx * BT, head_idx)
         cute.arch.cp_async_wait_group(1)
         cute.arch.barrier()
@@ -291,10 +214,16 @@ class WyRepresentation:
         self.merge_blocks(mma_tf32, s_l, s_inverse, tidx)
         self.convert_inverse(s_inverse, s_a, tidx)
         # k again from L2 into L's buffer, which the inverse no longer reads
-        cute.copy(load, load.partition_S(gK), load.partition_D(s_k_again))
+        if const_expr(self.ragged):
+            copy_rows(load, load.partition_S(gK), load.partition_D(s_k_again), rows_128, valid, True)
+        else:
+            cute.copy(load, load.partition_S(gK), load.partition_D(s_k_again))
         cute.arch.cp_async_commit_group()
         cute.arch.barrier()
-        cute.copy(store_64, store_64.partition_S(s_a), store_64.partition_D(gA))
+        if const_expr(self.ragged):
+            copy_rows(store_64, store_64.partition_S(s_a), store_64.partition_D(gA), rows_64, valid, False)
+        else:
+            cute.copy(store_64, store_64.partition_S(s_a), store_64.partition_D(gA))
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
         scale_kv(load, s_k_again, s_v, s_gcum, s_beta, True)
@@ -302,7 +231,10 @@ class WyRepresentation:
             s_x = s_v if const_expr(which == 0) else s_k_again
             mOut = mU if const_expr(which == 0) else mW
             multiply_a(mma_bf16, thr, ld_A, ldt_B, s_a, s_x)
-            cute.copy(store_128, store_128.partition_S(s_x), store_128.partition_D(cute.local_tile(mOut[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))))
+            if const_expr(self.ragged):
+                copy_rows(store_128, store_128.partition_S(s_x), store_128.partition_D(cute.local_tile(mOut[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))), rows_128, valid, False)
+            else:
+                cute.copy(store_128, store_128.partition_S(s_x), store_128.partition_D(cute.local_tile(mOut[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))))
 
     @cute.jit
     def cumsum_gate(self, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, s_gcum: cute.Tensor, s_beta: cute.Tensor, tidx, row_start, head_idx):
@@ -310,10 +242,19 @@ class WyRepresentation:
         Warp 0: the chunk-local cumsum of g in log2 units (written to g_cum) and beta, in FLA's
         tl.cumsum order: lane l owns rows l and l + 32, each half is scanned over the lanes
         (shuffles up by 1 .. 16), the second half adds the first half's total, then the scale.
+        With ragged, rows past T read g = beta = 0 and are not stored.
         """
         if tidx < 32:
             row = row_start + tidx
-            first, second = Float32(mG[row, head_idx]), Float32(mG[row + 32, head_idx])
+            if const_expr(self.ragged):
+                T = mG.shape[0]
+                first, second, beta_first, beta_second = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+                if row < T:
+                    first, beta_first = Float32(mG[row, head_idx]), Float32(mBeta[row, head_idx])
+                if row + 32 < T:
+                    second, beta_second = Float32(mG[row + 32, head_idx]), Float32(mBeta[row + 32, head_idx])
+            else:
+                first, second = Float32(mG[row, head_idx]), Float32(mG[row + 32, head_idx])
             for i in cutlass.range_constexpr(5):
                 from_first, from_second = cute.arch.shuffle_sync_up(first, offset=1 << i, mask_and_clamp=0), cute.arch.shuffle_sync_up(second, offset=1 << i, mask_and_clamp=0)
                 if tidx >= (1 << i):
@@ -321,8 +262,15 @@ class WyRepresentation:
             second = second + cute.arch.shuffle_sync(first, offset=31)
             cum_first, cum_second = first * RCP_LN2, second * RCP_LN2
             s_gcum[tidx], s_gcum[tidx + 32] = cum_first, cum_second
-            mGcum[row, head_idx], mGcum[row + 32, head_idx] = cum_first, cum_second
-            s_beta[tidx], s_beta[tidx + 32] = Float32(mBeta[row, head_idx]), Float32(mBeta[row + 32, head_idx])
+            if const_expr(self.ragged):
+                if row < T:
+                    mGcum[row, head_idx] = cum_first
+                if row + 32 < T:
+                    mGcum[row + 32, head_idx] = cum_second
+                s_beta[tidx], s_beta[tidx + 32] = beta_first, beta_second
+            else:
+                mGcum[row, head_idx], mGcum[row + 32, head_idx] = cum_first, cum_second
+                s_beta[tidx], s_beta[tidx + 32] = Float32(mBeta[row, head_idx]), Float32(mBeta[row + 32, head_idx])
 
     @cute.jit
     def compute_l(self, mma: cute.TiledMma, thr: cute.ThrMma, ld_A: cute.TiledCopy, ld_B: cute.TiledCopy, s_k: cute.Tensor, s_l: cute.Tensor, s_gcum: cute.Tensor, s_beta: cute.Tensor):
@@ -429,10 +377,14 @@ class ChunkStateOutput:
     scale). h_n and v_new pass through double-buffered shared memory, stored transposed (STATE_BV
     rows) so every B operand is a plain ldmatrix; FULL[n % 2] says chunk n is ready, EMPTY[n % 2]
     that the output warpgroup is done with it. Neither h nor v_new is written to global memory.
+
+    With ragged (T not a multiple of BT) the last chunk runs as if zero-padded to BT rows: its q, k,
+    w and u rows past T load as zeros and its gate rows as g_cum[T - 1] (so g_last is the last valid
+    row's), and only o's rows below T are stored.
     """
 
-    def __init__(self, H: int, HV: int, has_h0: bool, has_ht: bool):
-        self.H, self.HV, self.has_h0, self.has_ht = H, HV, has_h0, has_ht
+    def __init__(self, H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bool = False):
+        self.H, self.HV, self.has_h0, self.has_ht, self.ragged = H, HV, has_h0, has_ht, ragged
         self.scale = HEAD_DIM ** -0.5
         self.recurrence_threads, self.output_threads = STATE_THREADS, STATE_THREADS
 
@@ -463,26 +415,40 @@ class ChunkStateOutput:
         if tid < self.recurrence_threads:
             self.recurrence_loop(mK, mW, mU, mGcum, mH0, mHt, mma, buffers, tid, col_tile, head_idx)
         else:
-            self.output_loop(mQ, mO, mma, buffers, tid - self.recurrence_threads, col_tile, head_idx, mGcum.shape[0] // BT)
+            self.output_loop(mQ, mO, mma, buffers, tid - self.recurrence_threads, col_tile, head_idx, (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT)
 
     @cute.jit
-    def issue_chunk(self, load: cute.TiledCopy, load_u: cute.TiledCopy, load_gate: cute.TiledCopy, sources: tuple, targets: tuple, chunk: int, stage: int, tidx):
+    def issue_chunk(self, load: cute.TiledCopy, load_u: cute.TiledCopy, load_gate: cute.TiledCopy, sources: tuple, targets: tuple, chunk: int, stage: int, tidx, tail: tuple):
         """
-        cp.async of chunk's k, w, u and g into ring stage, one commit group.
+        cp.async of chunk's k, w, u and g into ring stage, one commit group. With ragged, tail is
+        (rows of load's vectors, rows of load_u's, g_cum, its head, s_gcum) for the chunk cut by T.
         """
         t_k_src, t_w_src, t_u_src, t_g_src = sources
         t_k_dst, t_w_dst, t_u_dst, t_g_dst = targets
-        cute.copy(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage])
-        cute.copy(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage])
-        cute.copy(load_u, t_u_src[None, None, None, chunk], t_u_dst[None, None, None, stage])
-        if tidx < BT:
-            cute.copy(load_gate, t_g_src[None, None, chunk], t_g_dst[None, None, stage])
+        if const_expr(self.ragged):
+            rows_wide, rows_narrow, mGcum, head_idx, s_gcum = tail
+            T = mGcum.shape[0]
+            valid = T - chunk * BT
+            copy_rows(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage], rows_wide, valid, True)
+            copy_rows(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage], rows_wide, valid, True)
+            copy_rows(load_u, t_u_src[None, None, None, chunk], t_u_dst[None, None, None, stage], rows_narrow, valid, True)
+            if tidx < BT:
+                if tidx < valid:
+                    cute.copy(load_gate, t_g_src[None, None, chunk], t_g_dst[None, None, stage])
+                else:
+                    s_gcum[tidx, stage] = mGcum[T - 1, head_idx]
+        else:
+            cute.copy(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage])
+            cute.copy(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage])
+            cute.copy(load_u, t_u_src[None, None, None, chunk], t_u_dst[None, None, None, stage])
+            if tidx < BT:
+                cute.copy(load_gate, t_g_src[None, None, chunk], t_g_dst[None, None, stage])
         cute.arch.cp_async_commit_group()
 
     @cute.jit
     def recurrence_loop(self, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, mma: cute.TiledMma, buffers: tuple, tidx, col_tile, head_idx):
         s_k, s_w, _, s_u, s_h, s_vnew, s_vscaled, _, s_gcum = buffers
-        num_chunks = mGcum.shape[0] // BT
+        num_chunks = (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT
         key_head_idx = head_idx // (self.HV // self.H)
         threads = self.recurrence_threads
         load, _, _ = chunk_copies(threads, tidx)
@@ -495,10 +461,11 @@ class ChunkStateOutput:
         gGcum = cute.local_tile(mGcum[None, head_idx], (BT,), (None,))
         sources = (load.partition_S(gK), load.partition_S(gW), load_u.partition_S(gU), load_gate.partition_S(gGcum))
         targets = (load.partition_D(s_k), load.partition_D(s_w), load_u.partition_D(s_u), load_gate.partition_D(s_gcum))
+        tail = (load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM))), load_u.partition_D(cute.make_identity_tensor((BT, STATE_BV))), mGcum, head_idx, s_gcum) if const_expr(self.ragged) else None
         # an empty commit group stands in for a missing chunk, so the group count stays fixed
         for stage in cutlass.range_constexpr(STATE_STAGES - 1):
             if stage < num_chunks:
-                self.issue_chunk(load, load_u, load_gate, sources, targets, stage, stage, tidx)
+                self.issue_chunk(load, load_u, load_gate, sources, targets, stage, stage, tidx, tail)
             else:
                 cute.arch.cp_async_commit_group()
         thr = mma.get_slice(tidx)
@@ -548,7 +515,7 @@ class ChunkStateOutput:
                 cute.arch.barrier(barrier_id=BAR_EMPTY + 1 - parity, number_of_threads=threads + self.output_threads)
             upcoming = chunk + STATE_STAGES - 1
             if upcoming < num_chunks:
-                self.issue_chunk(load, load_u, load_gate, sources, targets, upcoming, upcoming % STATE_STAGES, tidx)
+                self.issue_chunk(load, load_u, load_gate, sources, targets, upcoming, upcoming % STATE_STAGES, tidx, tail)
             else:
                 cute.arch.cp_async_commit_group()
             cute.arch.barrier(barrier_id=BAR_RECURRENCE, number_of_threads=threads)
@@ -571,12 +538,20 @@ class ChunkStateOutput:
         t_q_src, t_q_dst = load.partition_S(gQ), load.partition_D(s_q)
         s_coords = thr.partition_C(cute.make_identity_tensor((BT, BT)))
         o_coords = thr.partition_C(cute.make_identity_tensor((BT, STATE_BV)))
-        cute.copy(load, t_q_src[None, None, None, 0], t_q_dst[None, None, None, 0])
+        if const_expr(self.ragged):
+            T = mQ.shape[0]
+            rows_q, rows_o = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM))), store_o.partition_D(cute.make_identity_tensor((BT, STATE_BV)))
+            copy_rows(load, t_q_src[None, None, None, 0], t_q_dst[None, None, None, 0], rows_q, T, True)
+        else:
+            cute.copy(load, t_q_src[None, None, None, 0], t_q_dst[None, None, None, 0])
         cute.arch.cp_async_commit_group()
         for chunk in cutlass.range(num_chunks, unroll=1):
             stage, parity = chunk % STATE_STAGES, chunk % 2
             if chunk + 1 < num_chunks:
-                cute.copy(load, t_q_src[None, None, None, chunk + 1], t_q_dst[None, None, None, 1 - parity])
+                if const_expr(self.ragged):
+                    copy_rows(load, t_q_src[None, None, None, chunk + 1], t_q_dst[None, None, None, 1 - parity], rows_q, T - (chunk + 1) * BT, True)
+                else:
+                    cute.copy(load, t_q_src[None, None, None, chunk + 1], t_q_dst[None, None, None, 1 - parity])
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(1)
             cute.arch.barrier(barrier_id=BAR_FULL + parity, number_of_threads=self.recurrence_threads + threads)
@@ -606,48 +581,54 @@ class ChunkStateOutput:
             r_o.store((acc_o.load() * self.scale + acc_intra.load() * self.scale).to(BFloat16))
             cute.copy(st_C, st_C.retile(r_o), st_C.partition_D(s_o))
             cute.arch.barrier(barrier_id=BAR_OUTPUT, number_of_threads=threads)
-            cute.copy(store_o, store_o.partition_S(s_o), store_o.partition_D(gO[None, None, chunk]))
+            if const_expr(self.ragged):
+                copy_rows(store_o, store_o.partition_S(s_o), store_o.partition_D(gO[None, None, chunk]), rows_o, T - chunk * BT, False)
+            else:
+                cute.copy(store_o, store_o.partition_S(s_o), store_o.partition_D(gO[None, None, chunk]))
             cute.arch.barrier(barrier_id=BAR_OUTPUT, number_of_threads=threads)
 
 
 COMPILED: dict[tuple, object] = {}
 
 
-def compile_wy(H: int, HV: int) -> object:
+def compile_wy(H: int, HV: int, ragged: bool = False) -> object:
     T = cute.sym_int()
     key_shape, value_shape, gate_shape = (T, H, HEAD_DIM), (T, HV, HEAD_DIM), (T, HV)
     key_stride, value_stride, gate_stride = (H * HEAD_DIM, HEAD_DIM, 1), (HV * HEAD_DIM, HEAD_DIM, 1), (HV, 1)
     keys, values = fake(BFloat16, key_shape, key_stride), fake(BFloat16, value_shape, value_stride)
     gate, beta = fake(Float32, gate_shape, gate_stride, 4), fake(BFloat16, gate_shape, gate_stride, 2)
     a = fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1))
-    return cute.compile(WyRepresentation(H, HV), keys, values, gate, beta, gate, a, values, values, fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(WyRepresentation(H, HV, ragged), keys, values, gate, beta, gate, a, values, values, fake_stream(), options="--enable-tvm-ffi")
 
 
-def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool) -> object:
+def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bool = False) -> object:
     T = cute.sym_int()
     keys = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1))
     values = fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1))
     gate = fake(Float32, (T, HV), (HV, 1), 4)
     state = fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
-    return cute.compile(ChunkStateOutput(H, HV, has_h0, has_ht), keys, keys, values, values, gate, values, state if has_h0 else None, state if has_ht else None, fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(ChunkStateOutput(H, HV, has_h0, has_ht, ragged), keys, keys, values, values, gate, values, state if has_h0 else None, state if has_ht else None, fake_stream(), options="--enable-tvm-ffi")
 
 
 def chunk_gdr_fwd_cute(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    chunk_gdr_fwd_pinned_sm90 on the CuTe kernels: B == 1 and T a multiple of BT.
+    chunk_gdr_fwd_pinned_sm90 on the CuTe kernels, B == 1; their ragged variants (compiled on the
+    first such call) when T is not a multiple of BT.
     """
     _, T, H, _ = k.shape
     HV = v.shape[2]
+    ragged = T % BT != 0
     g_cum = torch.empty(1, T, HV, device=k.device, dtype=torch.float32)
     A = torch.empty(1, T, HV, BT, device=k.device, dtype=k.dtype)
     w, u, o = k.new_empty(1, T, HV, HEAD_DIM), torch.empty_like(v), torch.empty_like(v)
-    key = ("wy_representation", H, HV, k.device.index)
+    key = ("wy_representation", H, HV, k.device.index, ragged)
     if key not in COMPILED:
-        COMPILED[key] = compile_wy(H, HV)
+        COMPILED[key] = compile_wy(H, HV, ragged)
     COMPILED[key](k[0], v[0], g[0], beta[0], g_cum[0], A[0], w[0], u[0])
-    key = ("chunk_state_output", H, HV, k.device.index)
+    has_h0, has_ht = False, False
+    key = ("chunk_state_output", H, HV, k.device.index, has_h0, has_ht, ragged)
     if key not in COMPILED:
-        COMPILED[key] = compile_state_output(H, HV, False, False)
+        COMPILED[key] = compile_state_output(H, HV, has_h0, has_ht, ragged)
     COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], o[0], None, None)
     return o, g_cum, A
 
@@ -662,23 +643,9 @@ def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     j // (HV / H). Inputs are not modified.
 
     o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV), the chunk-local cumulative gate. A: bf16 (B, T,
-    HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned_sm90. With T a
-    multiple of 64 the CuTe kernels, matching FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k
-    repeat-interleaved to HV heads to bf16 rounding; otherwise FLA's kernels on the recorded launch
-    configs, bit-identical to it while those are its autotuner's picks (CONFIGS, FLA's on H200).
-    Deterministic. Only where gated_delta_rule_pinned_supported is True.
+    HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned_sm90. The CuTe
+    kernels at every T (the ragged variants when T is not a multiple of 64), matching FLA 0.5.2's
+    chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads to bf16 rounding, g_cum and A
+    bit for bit. Deterministic. Only where gated_delta_rule_pinned_supported is True.
     """
-    B, T, H, K, HV, V = *k.shape, *v.shape[2:]
-    if T % BT == 0:
-        return chunk_gdr_fwd_cute(q, k, v, g, beta)
-    num_chunks = triton.cdiv(T, BT)
-    g_cum = chunk_cumsum(g, reverse=False)
-    # The fused kkt + solve stores only the triangular blocks: A must start zeroed.
-    A = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    launch("kkt_solve", (num_chunks, B * HV), k=k, g=g_cum, beta=beta, A=A, cu_seqlens=None, chunk_indices=None, T=T, H=H, HV=HV, K=K, BT=BT, BC=BC, USE_G=True, IS_VARLEN=False, **CONFIGS["kkt_solve"])
-    w, u = recompute_w_u(k, v, beta, A, g_cum)
-    h, v_new = compute_chunk_states(k, w, u, g_cum)
-    o = torch.empty_like(v_new)
-    config = CONFIGS["fwd_o"]
-    launch("fwd_o", (triton.cdiv(V, config["BV"]), num_chunks, B * HV), q=q, k=k, v=v_new, h=h, g=g_cum, g_gamma=None, o=o, cu_seqlens=None, chunk_indices=None, scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_G=True, USE_G_GAMMA=False, STATE_V_FIRST=False, IS_VARLEN=False, **config)
-    return o, g_cum, A
+    return chunk_gdr_fwd_cute(q, k, v, g, beta)

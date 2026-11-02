@@ -162,13 +162,13 @@ def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
     gated_delta_rule without context parallelism, through the pinned kernels; callers check
     gated_delta_rule_pinned_supported first.
 
-    On SM90, with the length a multiple of 64, the forward and backward run CuTe kernels on FLA
-    0.5.2's chunk algorithm and rounding points; the forward's saved g_cum and A are bit-identical
+    On SM90 the forward and backward run CuTe kernels on FLA 0.5.2's chunk algorithm and rounding
+    points at every length (no Triton kernel; a length that is not a multiple of 64 runs as if
+    zero-padded to one, FLA's ragged semantics); the forward's saved g_cum and A are bit-identical
     to FLA's. Against the fp32 recurrence, measured against FLA: calc_diff within 1.001x of FLA's
     and the largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 /
-    8192, 3 seeds), and within the verifier's 1.10x bounds in its cases. Otherwise (a ragged length)
-    FLA's kernels on the recorded H200 launch configs, bit-identical to FLA while those are its
-    autotuner's picks.
+    8192, 3 seeds), and within the verifier's 1.10x bounds in its cases. The context-parallel path
+    and calls off the pinned geometry still run FLA (gdr_fwd / gdr_bwd).
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape

@@ -140,7 +140,7 @@ Only what training code calls directly: autograd functions and custom ops with t
 - **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans` (and, one packed document at a time, as `zigzag_varlen_index`), converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
 - **FlashAttention v4** (`flash_attn_v4.py`) — custom ops around the FA4 kernel (host-side launch memoization: `memoized_launch`)
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
-- **Linear attention** — `gated_delta_rule.py` (Qwen3.5 Gated DeltaNet, including the dense path through the pinned kernels: FLA's with pinned configs on SM90, TIRx on SM100), `causal_conv1d.py` (channels-last causal depthwise conv)
+- **Linear attention** — `gated_delta_rule.py` (Qwen3.5 Gated DeltaNet, including the dense path through the pinned kernels: CuTe-DSL on SM90 at every length, no Triton, TIRx on SM100; context parallelism and inputs off the pinned geometry still go through FLA's chunked kernels), `causal_conv1d.py` (channels-last causal depthwise conv)
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — orchestration of expert-parallel token dispatch with deduplication (index math: `ep_dispatch_send_idx`, `ep_dispatch_recv_idx`)
 - **Token Scatter** (`token_scatter.py`) — scatter of tokens by expert ahead of the grouped GEMM, padded index gather, per-row group ids

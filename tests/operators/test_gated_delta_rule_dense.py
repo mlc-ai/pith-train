@@ -3,8 +3,9 @@ Test the dense gated delta rule custom ops (pithtrain::gated_delta_rule_dense_fw
 Qwen3.5 geometry, H = 16 key heads over HV = 32 value heads, where they run the pinned kernels:
 
 - under torch.compile with a symbolic sequence length, against the fp32 token-by-token recurrence,
-  the key-head gradients summed over each group by the expand's backward;
-- no recompilation across sequence lengths;
+  the key-head gradients summed over each group by the expand's backward, at aligned lengths and
+  lengths that are not a multiple of 64 (the kernels' ragged variants) in alternation;
+- no recompilation across sequence lengths, aligned or ragged;
 - the fakes against the real ops (shapes, dtypes, strides) with torch.library.opcheck;
 - batch 2, off the pinned geometry, taking FLA's path through gated_delta_rule, against the same
   recurrence.
@@ -76,7 +77,7 @@ def naive_gdr(q, k, v, g, beta):
 def test_compiled_against_recurrence_without_recompiles() -> None:
     torch._dynamo.reset()
     compiled = torch.compile(dense_gated_delta_rule, dynamic=True, fullgraph=True)
-    for step, S in enumerate((256, 512, 1024)):
+    for step, S in enumerate((256, 63, 64, 65, 1000, 1024, 512)):
         q, k, v, g, beta, do = make_inputs(S, seed=S)
         leaves = [x.clone().requires_grad_() for x in (q, k, v, g, beta)]
         if step >= 1:

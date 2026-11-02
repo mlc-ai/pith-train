@@ -1,8 +1,8 @@
 """
 Verifier of the pinned dense chunked gated delta rule (gated_delta_rule_pinned_supported,
 chunk_gdr_fwd_pinned, chunk_gdr_bwd_pinned), the dense path of Qwen3.5's Gated DeltaNet (CuTe-DSL
-kernels on the H200 when T is a multiple of 64, FLA's kernels with pinned launch configs otherwise,
-TIRx kernels on the B200).
+kernels on the H200 at every T, a ragged variant of each when T is not a multiple of 64; TIRx
+kernels on the B200).
 
 The recurrence, per value head with state S of shape (K, V) and scale = K ** -0.5:
 
@@ -16,21 +16,25 @@ Checked, each test on its own (none skips on the H200):
 - the capability query: True at the Qwen3.5 geometry (batch 1, 32 value heads, 16 or
   32 key heads, dim 128, bf16 q / k / v / beta, fp32 gate), False off it;
 - the forward and backward (dq, dk per value head, dv, dg for the raw gate, dbeta) against a naive
-  token-by-token fp32 recurrence and its autograd, at aligned and ragged lengths, H = 16 and 32, the
-  model's gate and a mild one, and packed-document resets (g = -128) on and next to chunk
-  boundaries. The kernels keep some chunk intermediates in bf16, so the check is calc_diff below
-  1e-4 (output) and 1e-3 (gradients), plus a max absolute error within 2e-2 of the reference's
-  largest magnitude;
+  token-by-token fp32 recurrence and its autograd, at aligned and ragged lengths (T = 1 .. 8191,
+  last-chunk sizes around the 8- and 16-row copy blocks), H = 16 and 32, the model's gate and a
+  mild one, and packed-document resets (g = -128) on and next to chunk boundaries, inside a
+  partial last chunk, on the final token, and 64 in a row ending on it. The kernels keep some chunk
+  intermediates in bf16, so the check is calc_diff below 1e-4 (output) and 1e-3 (gradients), plus a
+  max absolute error within 2e-2 of the reference's largest magnitude, and every value finite;
 - given FLA's own g_cum and A (FLA's chunked gated delta rule on q / k repeated to the value heads,
-  its autotuners restricted to the recorded launch configs), the backward's error against the fp32
-  recurrence is at most 1.10 x FLA's backward's plus 1e-7, per gradient, in calc_diff and in max
-  absolute error, so the backward is no less precise than FLA's apart from summation order;
-- the forward against FLA's within bf16 rounding where T is a multiple of 64, and forward and
-  backward bit for bit against FLA's where T is not (the FLA fallback);
-- determinism: repeated calls, and a call in a fresh process (cold compile), are bit-identical;
-- which kernels run: only CuTe kernels in both directions at T = 4096 and 8192, FLA's at T = 1000;
-- that the comparisons see errors: a perturbed gate, a dg without its in-chunk reverse cumsum, and a
-  changed FLA launch config all fail them.
+  its autotuners restricted to the recorded launch configs, a test-only oracle), the backward's
+  error against the fp32 recurrence is at most 1.10 x FLA's backward's plus 1e-7, per gradient, in
+  calc_diff and in max absolute error, so the backward is no less precise than FLA's apart from
+  summation order, at aligned and ragged T;
+- the forward against FLA's within bf16 rounding, and its saved g_cum and A bit for bit FLA's at
+  ragged T;
+- determinism: repeated calls, and a call in a fresh process (cold compile), are bit-identical, at
+  aligned and ragged T; the same results on non-default streams;
+- which kernels run: only the CuTe kernels, once each, in both directions at aligned and ragged T,
+  and one compile per kernel and variant over a sweep of lengths;
+- that the comparisons see errors: a perturbed gate and a dg without its in-chunk reverse cumsum
+  fail them.
 """
 
 import os
@@ -186,7 +190,9 @@ def test_not_supported_off_the_geometry() -> None:
 
 
 # (S, H, gate, resets): every aligned length with both H; resets at, before and after chunk
-# boundaries and on the final token; the last four lengths are ragged (the FLA fallback).
+# boundaries and on the final token. Then ragged lengths (the ragged kernel variants): resets at row
+# 0, the row before the partial last chunk, its first row, its middle and the final token, and 64 in
+# a row ending on the final token; last-chunk sizes around the copies' 8- and 16-row blocks.
 CASES = [
     (64, 16, "model", ()),
     (64, 32, "mild", (0, 31, 63)),
@@ -202,10 +208,35 @@ CASES = [
     (2048, 32, "mild", ()),
     (4096, 16, "mild", ()),
     (4096, 32, "model", (63, 64, 127, 4095)),
+    (1, 16, "model", ()),
+    (1, 32, "mild", (0,)),
+    (2, 32, "model", ()),
+    (3, 16, "mild", (2,)),
+    (37, 16, "model", (0, 18, 36)),
+    (37, 32, "mild", ()),
+    (63, 32, "model", (0, 31, 62)),
+    (63, 16, "mild", ()),
+    (65, 16, "model", (0, 63, 64)),
+    (65, 32, "mild", (64,)),
     (100, 16, "mild", ()),
+    (100, 32, "model", (0, 63, 64, 81, 99)),
+    (127, 32, "model", (0, 63, 64, 95, 126)),
+    (127, 16, "model", tuple(range(63, 127))),
+    (129, 16, "model", (127, 128)),
+    (129, 32, "mild", ()),
     (300, 16, "mild", (0, 77, 128, 250)),
+    (300, 32, "model", (0, 255, 256, 278, 299)),
     (1000, 16, "mild", ()),
     (1000, 32, "model", (0, 999)),
+    (1000, 16, "model", tuple(range(936, 1000))),
+    (4097, 16, "model", (0, 4095, 4096)),
+    (4097, 32, "mild", ()),
+    (8191, 16, "mild", ()),
+    (8191, 32, "model", (0, 8127, 8128, 8160, 8190)),
+    *(
+        (64 + tail, (16, 32)[i % 2], ("model", "mild")[i // 2 % 2], (63, 64, 63 + tail))
+        for i, tail in enumerate((7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63))
+    ),
 ]
 
 
@@ -253,8 +284,8 @@ def test_comparison_is_sensitive() -> None:
         assert calc_diff(wrong, ref_grads["dg"]) > 1e-3
 
 
-# The launch configs FLA's autotuner picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1), which
-# the pinned FLA launches use. FLA is restricted to them so both sides run the same kernels.
+# The launch configs FLA's autotuner picks on H200 at this geometry (FLA 0.5.2, Triton 3.7.1). The
+# test-only FLA oracle is restricted to them so its kernels are the same on every run.
 RECORDED = {
     "cumsum": dict(num_warps=1, num_stages=3),
     "kkt_solve": dict(BK=64, num_warps=1, num_stages=3),
@@ -337,6 +368,9 @@ NAMES = ("o", "g_cum", "A", "dq", "dk", "dv", "dg", "dbeta")
         (4096, 32, "model", (0, 63, 64, 127, 4095)),
         (4096, 16, "model", (0, 300, 1777, 2048, 4091)),
         (8192, 16, "mild", ()),
+        (1000, 16, "model", (0, 959, 960, 980, 999)),
+        (4097, 32, "model", (0, 4095, 4096)),
+        (4097, 16, "mild", ()),
     ],
 )
 def test_backward_no_less_precise_than_fla(
@@ -383,37 +417,23 @@ def test_forward_close_to_fla(monkeypatch: pytest.MonkeyPatch, S: int, resets, H
 
 @pytest.mark.parametrize("H", [32, 16])
 @pytest.mark.parametrize(
-    "S,resets", [(100, ()), (300, (0, 77, 128, 250)), (1000, ()), (1000, (0, 999))]
+    "S,resets", [(100, ()), (300, (0, 77, 128, 250)), (1000, (0, 999)), (4097, ()), (8191, (8190,))]
 )
-def test_ragged_bit_exact_against_fla(
+def test_ragged_forward_saved_tensors_are_fla(
     monkeypatch: pytest.MonkeyPatch, S: int, resets, H: int
 ) -> None:
     """
-    T not a multiple of 64 runs FLA's kernels: forward and backward bit for bit FLA's.
+    At ragged T the saved g_cum and A are bit for bit FLA's (FLA loads the rows past T as zeros, as
+    the ragged kernels do), and o is within bf16 rounding of FLA's.
     """
     pin_fla(monkeypatch, RECORDED)
     q, k, v, g, beta, do = make_inputs(S, H=H, gate="mild", seed=S, resets=resets)
     ref = fla_reference(q, k, v, g, beta, do)
-    got = (
-        *chunk_gdr_fwd_pinned(q, k, v, g, beta),
-        *chunk_gdr_bwd_pinned(q, k, v, ref[1], beta, ref[2], do),
-    )
-    for name, got_part, ref_part in zip(NAMES, got, ref):
-        assert got_part.dtype == ref_part.dtype and got_part.shape == ref_part.shape, name
-        assert torch.equal(got_part, ref_part), name
-
-
-def test_fla_config_drift_detected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Another launch config on FLA's side (dqkwg's num_warps) changes the gate gradient of the FLA
-    fallback, so the exact comparison above detects config drift.
-    """
-    configs = dict(RECORDED, dqkwg=dict(RECORDED["dqkwg"], num_warps=2))
-    pin_fla(monkeypatch, configs)
-    q, k, v, g, beta, do = make_inputs(1000, H=32, gate="mild")
-    ref = fla_reference(q, k, v, g, beta, do)
-    grads = chunk_gdr_bwd_pinned(q, k, v, ref[1], beta, ref[2], do)
-    assert not torch.equal(grads[3], ref[6])
+    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+    assert torch.equal(g_cum, ref[1]), "g_cum"
+    assert torch.equal(A, ref[2]), "A"
+    assert o.dtype == ref[0].dtype and o.shape == ref[0].shape
+    assert calc_diff(o, ref[0]) < 1e-6, f"o: calc_diff {calc_diff(o, ref[0]):.2e}"
 
 
 COLD_RUN = """
@@ -427,7 +447,7 @@ torch.save([o.cpu(), *(x.cpu() for x in chunk_gdr_bwd_pinned(q, k, v, g_cum, bet
 """
 
 
-@pytest.mark.parametrize("S", [256, 8192])
+@pytest.mark.parametrize("S", [256, 1000, 4097, 8192])
 def test_deterministic(tmp_path, S: int) -> None:
     """
     Two calls in this process and one in a fresh process (its kernels compiled cold) agree bit for bit.
@@ -452,11 +472,12 @@ def test_deterministic(tmp_path, S: int) -> None:
         assert torch.equal(x.cpu(), y), name
 
 
-@pytest.mark.parametrize("S", [64, 128, 192])
+@pytest.mark.parametrize("S", [1, 63, 64, 65, 127, 128, 192])
 def test_short_pipelines_repeat(S: int) -> None:
     """
-    Fewer chunks than the state-gradient ring's depth (1, 2, 3 chunks): 20 back-to-back backward
-    launches agree bit for bit, so no barrier or ring-stage race shows at short lengths.
+    Fewer chunks than the state-gradient ring's depth (1, 2, 3 chunks, the partial last chunk the
+    first one the reverse recurrence processes): 20 back-to-back backward launches agree bit for
+    bit, so no barrier or ring-stage race shows at short lengths.
     """
     q, k, v, g, beta, do = make_inputs(S, H=16, gate="model", seed=S)
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
@@ -477,10 +498,11 @@ def kernel_names(fn) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("S", [4096, 8192])
-def test_only_cute_kernels_when_aligned(S: int) -> None:
+@pytest.mark.parametrize("S", [1, 63, 65, 1000, 4096, 4097, 8192])
+def test_only_cute_kernels(S: int) -> None:
     """
-    Each direction launches exactly its CuTe kernels, once each, and nothing else.
+    Each direction launches exactly its CuTe kernels, once each, and nothing else (no Triton or
+    other kernel), at aligned and ragged T.
     """
     q, k, v, g, beta, do = make_inputs(S, H=16)
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
@@ -496,9 +518,57 @@ def test_only_cute_kernels_when_aligned(S: int) -> None:
         assert launched == sorted(expected), f"{direction} at T={S} launches {launched}"
 
 
-def test_fla_kernels_when_ragged() -> None:
-    q, k, v, g, beta, do = make_inputs(1000, H=16)
+@pytest.mark.parametrize("S", [65, 4097])
+def test_side_streams(S: int) -> None:
+    """
+    The compiled kernels launch on the caller's current stream (resolved per call, not cached): on
+    two non-default streams, after the default stream compiled and ran them, the same results.
+    """
+    q, k, v, g, beta, do = make_inputs(S, H=16, gate="model", seed=9, resets=(0, S - 1))
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
-    names = kernel_names(lambda: chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do))
-    assert any("chunk_bwd_kernel_dqkwg" in name for name in names), sorted(names)
-    assert not any(cute in name for name in names for cute in CUTE_KERNELS), sorted(names)
+    first = (o, g_cum, A, *chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do))
+    torch.cuda.synchronize()
+    for _ in range(2):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)  # the stream is still busy when the kernels are enqueued
+            o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+            again = (o, g_cum, A, *chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do))
+        torch.cuda.current_stream().wait_stream(stream)
+        for name, x, y in zip(("o", "g_cum", "A", *GRADS), first, again):
+            assert torch.equal(x, y), name
+
+
+COMPILE_COUNT = """
+import sys, torch
+import cutlass.cute as cute
+sys.path.insert(0, {tests!r})
+compiles = []
+compile_kernel = cute.compile
+cute.compile = lambda kernel, *args, **kwargs: compiles.append(type(kernel).__name__) or compile_kernel(kernel, *args, **kwargs)
+from test_gated_delta_rule_pinned import make_inputs
+from pithtrain.kernels import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned
+for S in range(1, 201):
+    q, k, v, g, beta, do = make_inputs(S, H=16, gate="model", seed=S)
+    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+    chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
+torch.cuda.synchronize()
+print(" ".join(sorted(compiles)))
+"""
+
+
+def test_one_compile_per_kernel_variant() -> None:
+    """
+    A sweep of T = 1 .. 200 in a fresh process compiles each of the six kernels twice, the aligned
+    and the ragged variant, and nothing per length (T stays a runtime argument).
+    """
+    code = COMPILE_COUNT.format(tests=os.path.dirname(__file__))
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, CUDA_VISIBLE_DEVICES=os.environ.get("CUDA_VISIBLE_DEVICES", "0")),
+    )
+    assert out.stdout.split() == sorted(2 * CUTE_KERNELS), out.stdout
