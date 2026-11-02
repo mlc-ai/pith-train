@@ -1,7 +1,25 @@
 """
-SM100 scatter_by_expert as one cooperative TIRx-lite kernel with a dynamic row queue.
+SM100 scatter_by_expert as TIRx-lite kernels: a host-count plan kernel when the group counts are
+known on the host, else one cooperative kernel with a dynamic row queue.
 
-One launch, grid = co-resident CTAs (cooperative launch, txl.cuda.grid_sync):
+Host-count path (group_counts given, at most 256 groups, contiguous 16-byte-aligned rows): the counts
+ride in as 128 packed int64 kernel parameters, so every CTA block-scans the group starts and pad
+rows locally (no histogram, no grid sync, no reverse-index round trip, no cooperative launch); CTA 0
+writes grouped_mm_offs / ks_tensor. P = 3 pipeline warps pull tasks of R = 8 rows from a global
+queue (a static first task per ring slot, then queue grabs consumed one refill later) in two-stream
+order (queue item q takes copy task q / 2 of the first half of the input when q is even, of the
+second half when odd; zero-row tasks keep their order). Lane 0 moves a task's R source rows with one
+grouped cp.async.bulk G2S into a D = 2 shared-memory ring; each copy lane claims its row's rank
+inside its group with one warp-aggregated global atomic per distinct expert (match.any; the two
+static slots share one batch), written as the row's reverse index, and stores the row with an
+independent hint-free cp.async.bulk S2G. Zero rows (the group padding and the tail up to a multiple
+of 1024 rows) are stored from an immutable zeroed shared buffer in one terminal bulk group per warp.
+Each (device, stream) keeps two counter banks used alternately: a call clears the bank the next
+call uses, so no CTA resets counters at exit. Expert ids are read as their low 32-bit word on this
+path (the contract bounds them to [0, num_groups)).
+
+Cooperative fallback (no host counts, more than 256 groups, strided or unaligned rows), one launch,
+grid = co-resident CTAs (cooperative launch, txl.cuda.grid_sync):
   1. CTA c histograms its token slice [c*tpc, (c+1)*tpc) in shared memory; the shared atomic's
      return is the token's rank within (CTA, expert). Each nonzero CTA count claims its base inside
      the expert with one global atomic on a persistent counter array, and a second pass parks
@@ -16,16 +34,19 @@ One launch, grid = co-resident CTAs (cooperative launch, txl.cuda.grid_sync):
      Each warp uses a D-deep shared-memory task ring and issues the first D - 1 loads before the
      histogram. Arbitrary row strides and unaligned rows retain the register path.
   5. the last CTA to finish re-zeroes the persistent counters and the queue for the next call.
+Without host counts, ks is read back with one device-to-host copy and stream sync (as before).
 Rows are raw bytes: kernels are keyed on (row bytes, vector width) only, shared by every dtype.
 
-Evolved with TIRx-harness: run token_scatter, frontier member coop-grouped-tma-ring (commit 0386099,
-196.5 us vs 561.8 us summed over the task's 3 rows, 2.859x over the previous SM100 path in the
+Evolved with TIRx-harness: run token_scatter, frontier member host-plan-tma-ring (commit 00207e06,
+179.456 us vs 561.641 us summed over the task's 3 rows, 3.13x over the previous SM100 path in the
 task's benchmark). Compiled once per process (tirx_kernels.runner.compile_kernel) and launched
-through tvm-ffi on torch's current stream. The launch is cooperative: every CTA must be resident at
-once, so it runs only when the whole grid fits beside whatever other streams are running.
+through tvm-ffi on torch's current stream. The fallback launch is cooperative: every CTA must be
+resident at once, so it runs only when the whole grid fits beside whatever other streams are
+running.
 """
 
 import functools
+import inspect
 import math
 import os
 from typing import Optional
@@ -58,19 +79,19 @@ KREG = 2  # tokens per thread whose (expert, rank) stay in registers through pha
 CHUNK_BATCH = 32  # register path: vector chunks per lane loaded before storing
 TASK_ROWS = 4  # register path: rows per copy task
 ZERO_ROWS = 1  # register path: rows per zero task (fine-grained tail)
-BULK_R = int(os.environ.get("TS_R", 4))  # bulk path: rows per task (lanes per warp)
-BULK_D = int(os.environ.get("TS_D", 3))  # bulk path: ring depth in tasks
-BULK_P = int(os.environ.get("TS_P", 4))  # bulk path: pipeline warps
+BULK_R = int(os.environ.get("TS_R", 8))  # bulk path: rows per task (lanes per warp)
+BULK_D = int(os.environ.get("TS_D", 2))  # bulk path: ring depth in tasks
+BULK_P = int(os.environ.get("TS_P", 3))  # bulk path: pipeline warps
 BULK_EARLY = int(os.environ.get("TS_EARLY", 1))  # issue the first loads before the histogram
 BULK = int(os.environ.get("TS_BULK", 1))  # 0 forces the register path
 VMAX = int(os.environ.get("TS_VMAX", 16))  # widest register access (32: 256-bit ld/st)
 RING_BUDGET = 192 * 1024
 ZB = 4096  # zero source bytes in shared memory
 POLICY = {0: 0x1000000000000000, 1: 0x12F0000000000000, 2: 0x14F0000000000000}  # L2 normal / evict_first / evict_last
-LD_POL = int(os.environ.get("TS_LDPOL", 1))  # source rows: read once
-ST_POL = int(os.environ.get("TS_STPOL", 2))  # output rows: the grouped GEMM reads them next
+LD_POL = int(os.environ.get("TS_LDPOL", 0))  # source rows: evict_normal (hints screened neutral-to-worse)
+ST_POL = int(os.environ.get("TS_STPOL", 0))  # output rows: evict_normal
 G2S = "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-S2G = "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint"
+S2G = "cp.async.bulk.global.shared::cta.bulk_group"
 # persistent scratch words: [0, GMAX) expert counters, GMAX queue head, GMAX + 1 done counter
 STATE_WORDS = GMAX + 2
 
@@ -153,6 +174,25 @@ def init_kernel():
     from tirx_kernels.runner import compile_kernel
 
     return entry_function(compile_kernel(token_scatter_state_init.func, arch="sm_100a"))
+
+
+hstate: dict = {}
+
+
+def get_host_state(device):
+    """
+    Two zeroed counter banks for the host-count kernel and the index of the bank the next call uses.
+    """
+    # one pair of banks per (device, stream): the bank alternation relies on stream order, so
+    # launches on two streams never share them
+    key = (device.type, device.index, torch.cuda.current_stream(device).cuda_stream)
+    hs = hstate.get(key)
+    if hs is None:
+        banks = [torch.empty((STATE_WORDS,), device=device, dtype=torch.int32) for _ in range(2)]
+        for b in banks:
+            init_kernel()(b)
+        hs = hstate[key] = [banks, 0]
+    return hs
 
 
 def get_state(device):
@@ -465,7 +505,6 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                                     out.ptr_to([dest * txl.int64(row_bytes)]),
                                     s_ring.ptr_to([(slot(b) * R + lane) * row_bytes]),
                                     txl.uint32(row_bytes),
-                                    txl.uint64(POLICY[ST_POL]),
                                 )
                         with txl.Else():
                             z = (task - n_copy) * R + lane
@@ -478,7 +517,6 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
                                         out.ptr_to([dst + txl.int64(q)]),
                                         s_zero.ptr_to([0]),
                                         txl.uint32(min(zb, row_bytes - q)),
-                                        txl.uint64(POLICY[ST_POL]),
                                     )
                     txl.ptx.cp.async_.bulk.commit_group()
 
@@ -612,13 +650,13 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
 
         # ---- phase 5: the last CTA out resets the persistent counters ---------------------
         with txl.If(tid == 0), txl.Then():
-            txl.ptx.fence.acq_rel.gpu()
             old = txl.local_scalar("int32")
-            txl.ptx.atom.global_.add.s32(old, state.ptr_to([DONE]), txl.int32(1))
+            txl.ptx.atom.acq_rel.gpu.global_.add.s32(
+                old, state.ptr_to([DONE]), txl.int32(1)
+            )
             sts(s_wa, 0, old)
         bar()
         with txl.If(lds(s_wa, 0) == num_ctas - 1), txl.Then():
-            txl.ptx.fence.acq_rel.gpu()
             with txl.serial(tid, G, step=NT) as g:
                 txl.ptx["st.global.s32"](state.ptr_to([txl.cast(g, "int64")]), txl.int32(0))
             with txl.If(tid == 0), txl.Then():
@@ -628,6 +666,410 @@ def build(row_bytes: int, vec: int, cfg, instr: bool = False):
     func = token_scatter.func.with_attr(
         "tirx.kernel_launch_params",
         ["blockIdx.x", "threadIdx.x", "tirx.use_cooperative_launch", "tirx.use_dyn_shared_memory"],
+    )
+    from tirx_kernels.runner import compile_kernel
+
+    return entry_function(compile_kernel(func, arch="sm_100a"))
+
+
+HOST_PARAMS = 128  # fast host-count path: 256 experts packed two per int64 parameter
+HOST_GMAX = 2 * HOST_PARAMS
+HOST = int(os.environ.get("TS_HOST", 1))
+
+
+@functools.cache
+def build_host(row_bytes: int, cfg):
+    """
+    Host-count path. Group starts follow from the counts passed as kernel parameters, so there is no
+    histogram, no grid sync and no rev round trip: each copy row claims its rank inside its group
+    with one global atomic issued inside the TMA pipeline, a ring step before the row is stored.
+    """
+    P, R, D = cfg
+    assert D == 2 and 2 * R <= 32
+    zb = min(row_bytes, ZB)
+    QHEAD = GMAX
+    IPH = HOST_GMAX // NT  # groups per thread in the block scan
+    store_warps = list(range(P, WARPS)) if P < WARPS else list(range(WARPS))
+
+    def body(x, eidx, out, rev, offs, ks_t, state, state_nx, m, G, align, num_ctas, *hc):
+        c = txl.cta_id()
+        tid = txl.thread_id()
+        lane = tid & 31
+        warp = tid >> 5
+
+        pool = txl.smem_pool()
+        s_hc = pool.alloc((HOST_PARAMS,), "int64")
+        s_tot = pool.alloc((HOST_GMAX,), "int32")
+        s_start = pool.alloc((HOST_GMAX,), "int32")
+        s_zp = pool.alloc((HOST_GMAX,), "int32")
+        s_wa = pool.alloc((WARPS,), "int32")
+        s_wb = pool.alloc((WARPS,), "int32")
+        s_mbar = pool.alloc((P * D,), "uint64", align=8)
+        s_zero = pool.alloc((zb,), "uint8", align=128)
+        s_ring = pool.alloc((P * D * R * row_bytes,), "uint8", align=128)
+
+        def bar():
+            txl.ptx.bar.sync(txl.uint32(0))
+
+        def lds(buf, i):
+            v = txl.local_scalar("int32")
+            txl.ptx["ld.shared.s32"](v, buf.ptr_to([i]))
+            return v
+
+        def sts(buf, i, v):
+            txl.ptx["st.shared.s32"](buf.ptr_to([i]), v)
+
+        def shfl0(v):
+            out_v = txl.local_scalar("int32")
+            txl.ptx.shfl_sync.idx.b32(out_v, v, txl.uint32(0), txl.uint32(31), txl.uint32(0xFFFFFFFF))
+            return out_v
+
+        def warp_incl(v):
+            acc = txl.local_scalar("int32", init=v)
+            for step in (1, 2, 4, 8, 16):
+                peer = txl.local_scalar("int32")
+                txl.ptx.shfl_sync.up.b32(peer, acc, txl.uint32(step), txl.uint32(0), txl.uint32(0xFFFFFFFF))
+                txl.assign(acc, txl.Select(lane >= step, acc + peer, acc))
+            return acc
+
+        n_static = num_ctas * P * D  # every ring slot starts with a static task
+        nxt = txl.local_scalar("int32", init=txl.int32(0))  # raw queue head, consumed one refill later
+
+        def grab_into(v):
+            with txl.If(lane == 0), txl.Then():
+                txl.ptx.atom.global_.add.s32(v, state.ptr_to([QHEAD]), txl.int32(1))
+
+        n_copy = txl.local_scalar("int32", init=(m + R - 1) // R)
+        pw = txl.local_scalar("int32", init=warp)
+        is_pipe = txl.And(warp < P, lane < R)
+        is_loader = txl.And(warp < P, lane == 0)
+
+        def slot(b):
+            return pw * D + b
+
+        # Two-stream copy order: queue item q takes copy task q/2 from the first half of the
+        # input (q even) or from the second half (q odd).  ceil-half makes this a bijection on
+        # [0, n_copy) for any n_copy; zero tasks (q >= n_copy) keep their order.
+        il_half = txl.local_scalar("int32", init=(n_copy + 1) >> 1)
+
+        def remap(raw):
+            return txl.Select(
+                raw < n_copy,
+                txl.Select((raw & 1) == 1, il_half + (raw >> 1), raw >> 1),
+                raw,
+            )
+
+        cur = [txl.local_scalar("int32", init=txl.int32(0)) for _ in range(D)]
+        ph = [txl.local_scalar("uint32", init=txl.uint32(0)) for _ in range(D)]
+        # Expert IDs are contractually nonnegative and below HOST_GMAX, so the
+        # low word of their int64 storage is the complete value on this path.
+        pe = [txl.local_scalar("int32", init=txl.int32(0)) for _ in range(D)]
+        pr = [txl.local_scalar("int32", init=txl.int32(0)) for _ in range(D)]
+        lb = [txl.local_scalar("int32", init=txl.int32(0)) for _ in range(D)]
+        mst = [txl.local_scalar("uint32", init=txl.uint32(0)) for _ in range(D)]
+        bef = [txl.local_scalar("uint32", init=txl.uint32(0)) for _ in range(D)]
+
+        def copy_lane(b):
+            t = cur[b] * R + lane
+            return txl.And(is_pipe, txl.And(cur[b] < n_copy, t < m))
+
+        def issue_load(b):
+            t = cur[b] * R
+            with txl.If(txl.And(is_loader, txl.And(cur[b] < n_copy, t < m))), txl.Then():
+                rows = txl.min(txl.int32(R), m - t)
+                copy_bytes = rows * row_bytes
+                mb = s_mbar.ptr_to([slot(b)])
+                txl.ptx.mbarrier.arrive.expect_tx.shared.b64(mb, txl.cast(copy_bytes, "uint32"))
+                txl.ptx[G2S](
+                    s_ring.ptr_to([slot(b) * R * row_bytes]),
+                    x.ptr_to([txl.cast(t, "int64") * row_bytes]),
+                    txl.cast(copy_bytes, "uint32"),
+                    mb,
+                    txl.uint64(POLICY[LD_POL]),
+                )
+
+        def issue_eidx(b):
+            with txl.If(copy_lane(b)), txl.Then():
+                txl.ptx["ld.global.nc.u32"](pe[b], eidx.ptr_to([txl.cast(cur[b] * R + lane, "int64")]))
+
+        def issue_atom(b):
+            # Adjacent dispatched rows are commonly expert-minor.  Collapse equal
+            # experts within the warp to one global atomic while retaining a
+            # unique rank for every participating lane.  Invalid lanes use -1,
+            # which is outside the expert-id contract, but still participate in
+            # the warp-wide match and shuffle instructions.
+            valid = copy_lane(b)
+            key = txl.local_scalar(
+                "int32", init=txl.Select(valid, pe[b], txl.int32(-1))
+            )
+            peers = txl.local_scalar("uint32")
+            txl.ptx.match.any.sync.b32(peers, key, txl.uint32(0xFFFFFFFF))
+            master = txl.local_scalar("uint32")
+            txl.ptx.bfind.u32(master, peers)
+            count = txl.local_scalar("uint32")
+            txl.ptx.popc.b32(count, peers)
+            lane_mask = txl.shift_left(txl.uint32(1), txl.cast(lane, "uint32")) - txl.uint32(1)
+            txl.ptx.popc.b32(bef[b], txl.bitwise_and(peers, lane_mask))
+            txl.assign(mst[b], master)
+            with txl.If(txl.And(valid, lane == txl.cast(master, "int32"))), txl.Then():
+                txl.ptx.atom.global_.add.s32(
+                    lb[b], state.ptr_to([key]), txl.cast(count, "int32")
+                )
+
+        def issue_static_pair_atom():
+            # The two static slots are adjacent tasks.  Present both slots as one keyed
+            # 2R-lane batch to match.any, halving rank atomics at startup and allowing an
+            # expert run that crosses the slot boundary to share a single claim.
+            in0 = lane < R
+            in1 = txl.And(lane >= R, lane < 2 * R)
+            t0 = cur[0] * R + lane
+            t1 = cur[1] * R + (lane - R)
+            valid0 = txl.And(in0, txl.And(cur[0] < n_copy, t0 < m))
+            valid1 = txl.And(in1, txl.And(cur[1] < n_copy, t1 < m))
+            e1 = txl.local_scalar("int32")
+            src1 = txl.Select(lane < R, lane, lane - R)
+            txl.ptx.shfl_sync.idx.b32(
+                e1, pe[1], txl.cast(src1, "uint32"),
+                txl.uint32(31), txl.uint32(0xFFFFFFFF)
+            )
+            key = txl.local_scalar(
+                "int32",
+                init=txl.Select(
+                    valid0,
+                    pe[0],
+                    txl.Select(valid1, e1, txl.int32(-1)),
+                ),
+            )
+            peers = txl.local_scalar("uint32")
+            txl.ptx.match.any.sync.b32(peers, key, txl.uint32(0xFFFFFFFF))
+            master = txl.local_scalar("uint32")
+            txl.ptx.bfind.u32(master, peers)
+            count = txl.local_scalar("uint32")
+            txl.ptx.popc.b32(count, peers)
+            lane_mask = txl.shift_left(txl.uint32(1), txl.cast(lane, "uint32")) - txl.uint32(1)
+            before = txl.local_scalar("uint32")
+            txl.ptx.popc.b32(before, txl.bitwise_and(peers, lane_mask))
+            pair_lb = txl.local_scalar("int32", init=txl.int32(0))
+            with txl.If(txl.And(txl.Or(valid0, valid1), lane == txl.cast(master, "int32"))), txl.Then():
+                txl.ptx.atom.global_.add.s32(
+                    pair_lb, state.ptr_to([key]), txl.cast(count, "int32")
+                )
+            # finish_atom consumes these per-slot views later, after the count scan.
+            txl.assign(lb[0], pair_lb)
+            txl.assign(lb[1], pair_lb)
+            txl.assign(mst[0], master)
+            txl.assign(bef[0], before)
+            master1 = txl.local_scalar("uint32")
+            before1 = txl.local_scalar("uint32")
+            src_hi = txl.Select(lane < R, lane + R, lane)
+            txl.ptx.shfl_sync.idx.b32(
+                master1, master, txl.cast(src_hi, "uint32"),
+                txl.uint32(31), txl.uint32(0xFFFFFFFF)
+            )
+            txl.ptx.shfl_sync.idx.b32(
+                before1, before, txl.cast(src_hi, "uint32"),
+                txl.uint32(31), txl.uint32(0xFFFFFFFF)
+            )
+            txl.assign(mst[1], master1)
+            txl.assign(bef[1], before1)
+
+        def finish_atom(b):
+            # warp-converged: the leader's atomic return is consumed only here, just before the store
+            base = txl.local_scalar("int32")
+            txl.ptx.shfl_sync.idx.b32(
+                base, lb[b], mst[b], txl.uint32(31), txl.uint32(0xFFFFFFFF)
+            )
+            txl.assign(pr[b], txl.Select(copy_lane(b), base + txl.cast(bef[b], "int32"), txl.int32(0)))
+
+        # ---- phase 0: first loads and expert ids, then the host counts into shared memory --------
+        with txl.If(is_loader), txl.Then():
+            for b in range(D):
+                txl.ptx.mbarrier.init.shared.b64(s_mbar.ptr_to([slot(b)]), txl.uint32(1))
+            txl.ptx.fence.mbarrier_init.release.cluster()
+        with txl.If(warp < P), txl.Then():
+            for b in range(D):
+                txl.assign(cur[b], remap((c * P + warp) * D + b))
+            for b in range(D):
+                issue_eidx(b)
+            grab_into(nxt)
+            for b in range(D):
+                issue_load(b)
+        with txl.serial(tid, zb // 16, step=NT) as q:
+            txl.ptx["st.shared.v4.b32"](
+                s_zero.ptr_to([q * 16]), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0)
+            )
+        txl.ptx.fence.proxy.async_.shared__cta()
+        # The next call uses the other counter bank: clear it now (the previous call that used it has
+        # completed in stream order, and nothing in this call touches it), so no CTA resets at exit.
+        with txl.If(c == num_ctas - 1), txl.Then():
+            with txl.serial(tid, HOST_GMAX, step=NT) as g:
+                txl.ptx["st.global.s32"](state_nx.ptr_to([txl.cast(g, "int64")]), txl.int32(0))
+            with txl.If(tid == 0), txl.Then():
+                txl.ptx["st.global.s32"](state_nx.ptr_to([QHEAD]), txl.int32(0))
+        for i, w in enumerate(store_warps):
+            with txl.If(txl.And(warp == w, lane == 0)), txl.Then():
+                for p in range(i, HOST_PARAMS, len(store_warps)):
+                    txl.ptx["st.shared.s64"](s_hc.ptr_to([p]), hc[p])
+        with txl.If(warp < P), txl.Then():
+            issue_static_pair_atom()  # rank claims of both static slots overlap the scan
+        bar()
+
+        # ---- phase 1: block scan of padded sizes and pad rows -------------------------------
+        ks_l = []
+        pad_l = []
+        for j in range(IPH):
+            g = tid * IPH + j
+            w64 = txl.local_scalar("int64")
+            txl.ptx["ld.shared.s64"](w64, s_hc.ptr_to([g >> 1]))
+            half = txl.Select((g & 1) == 1, txl.shift_right(w64, txl.int64(32)), w64)
+            cnt = txl.local_scalar("int32", init=txl.Select(g < G, txl.cast(txl.bitwise_and(half, txl.int64(0xFFFFFFFF)), "int32"), txl.int32(0)))
+            ks = txl.local_scalar("int32", init=(cnt + align - 1) // align * align)
+            ks_l.append(ks)
+            pad_l.append(ks - cnt)
+            sts(s_tot, g, cnt)
+        a = ks_l[0]
+        b_ = pad_l[0]
+        for j in range(1, IPH):
+            a = a + ks_l[j]
+            b_ = b_ + pad_l[j]
+        a_s = txl.local_scalar("int32", init=a)
+        b_s = txl.local_scalar("int32", init=b_)
+        ia = warp_incl(a_s)
+        ib = warp_incl(b_s)
+        with txl.If(lane == 31), txl.Then():
+            sts(s_wa, warp, ia)
+            sts(s_wb, warp, ib)
+        bar()
+        ea = txl.local_scalar("int32", init=ia - a_s)
+        eb = txl.local_scalar("int32", init=ib - b_s)
+        M = txl.local_scalar("int32", init=txl.int32(0))
+        ZP = txl.local_scalar("int32", init=txl.int32(0))
+        for w in range(WARPS):
+            wa = lds(s_wa, w)
+            wb = lds(s_wb, w)
+            txl.assign(ea, ea + txl.Select(warp > w, wa, txl.int32(0)))
+            txl.assign(eb, eb + txl.Select(warp > w, wb, txl.int32(0)))
+            txl.assign(M, M + wa)
+            txl.assign(ZP, ZP + wb)
+        for j in range(IPH):
+            g = tid * IPH + j
+            sts(s_start, g, ea)
+            sts(s_zp, g, eb)
+            with txl.If(txl.And(c == 0, g < G)), txl.Then():
+                txl.ptx["st.global.s32"](offs.ptr_to([txl.cast(g, "int64")]), ea + ks_l[j])
+                txl.ptx["st.global.s32"](ks_t.ptr_to([txl.cast(g, "int64")]), ks_l[j])
+            txl.assign(ea, ea + ks_l[j])
+            txl.assign(eb, eb + pad_l[j])
+        bar()
+
+        Mr = (M + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT
+        Z = txl.local_scalar("int32", init=ZP + (Mr - M))
+        n_task = txl.local_scalar("int32", init=n_copy + (Z + R - 1) // R)
+
+        def zero_row(z):
+            zrow = txl.local_scalar("int32")
+            with txl.If(z < ZP):
+                with txl.Then():
+                    lo = txl.local_scalar("int32", init=txl.int32(0))
+                    hi = txl.local_scalar("int32", init=G)
+                    with txl.While(hi - lo > 1):
+                        mid = (lo + hi) >> 1
+                        with txl.If(lds(s_zp, mid) <= z):
+                            with txl.Then():
+                                txl.assign(lo, mid)
+                            with txl.Else():
+                                txl.assign(hi, mid)
+                    txl.assign(zrow, lds(s_start, lo) + lds(s_tot, lo) + (z - lds(s_zp, lo)))
+                with txl.Else():
+                    txl.assign(zrow, M + (z - ZP))
+            return zrow
+
+        # ---- phase 2: D-deep ring of row slots per lane, tasks from the queue ----------------
+        def process(b):
+            task = cur[b]
+            with txl.If(is_pipe), txl.Then():
+                with txl.If(task < n_copy):
+                    with txl.Then():
+                        t = task * R + lane
+                        with txl.If(t < m), txl.Then():
+                            e = pe[b]
+                            dest = txl.local_scalar("int64", init=txl.cast(lds(s_start, e) + pr[b], "int64"))
+                            txl.ptx["st.global.s64"](rev.ptr_to([txl.cast(t, "int64")]), dest)
+                            txl.cuda.mbarrier_wait(s_mbar.ptr_to([slot(b)]), ph[b])
+                            txl.assign(ph[b], ph[b] ^ txl.uint32(1))
+                            txl.ptx[S2G](
+                                out.ptr_to([dest * txl.int64(row_bytes)]),
+                                s_ring.ptr_to([(slot(b) * R + lane) * row_bytes]),
+                                txl.uint32(row_bytes),
+                            )
+                            # Copy groups are committed individually because the
+                            # following wait.read protects reuse of this ring slot.
+                            txl.ptx.cp.async_.bulk.commit_group()
+                    with txl.Else():
+                        z = (task - n_copy) * R + lane
+                        with txl.If(z < Z), txl.Then():
+                            dst = txl.local_scalar(
+                                "int64", init=txl.cast(zero_row(z), "int64") * txl.int64(row_bytes)
+                            )
+                            for q in range(0, row_bytes, zb):
+                                txl.ptx[S2G](
+                                    out.ptr_to([dst + txl.int64(q)]),
+                                    s_zero.ptr_to([0]),
+                                    txl.uint32(min(zb, row_bytes - q)),
+                                )
+                        # s_zero is immutable, so all terminal zero stores can remain
+                        # uncommitted and share one group drained at warp exit.
+
+        with txl.If(warp < P), txl.Then():
+            first = txl.local_scalar("int32", init=txl.int32(1))
+            with txl.While(cur[0] < n_task):
+                for b in range(D):
+                    with txl.If(cur[b] < n_copy), txl.Then():
+                        finish_atom(b)
+                    process(b)
+                    nb = (b + D - 1) % D  # the slot processed one step ago
+                    with txl.If(first == 0), txl.Then():
+                        txl.assign(cur[nb], remap(shfl0(nxt) + n_static))
+                        grab_into(nxt)
+                        # Zero refills neither reuse the ring nor need expert/rank
+                        # metadata.  Avoid the otherwise unconditional match.any,
+                        # bfind, popc, and rank shuffle on the terminal suffix.
+                        with txl.If(cur[nb] < n_copy), txl.Then():
+                            with txl.If(is_pipe), txl.Then():
+                                txl.ptx.cp.async_.bulk.wait_group.read(1)
+                            issue_load(nb)
+                            issue_eidx(nb)
+                            issue_atom(nb)
+                    txl.assign(first, txl.int32(0))
+            with txl.If(is_pipe), txl.Then():
+                txl.ptx.cp.async_.bulk.commit_group()
+                txl.ptx.cp.async_.bulk.wait_group(0)
+        # No CTA barrier is needed at exit: every issuing lane has drained its
+        # own bulk group, and no thread accesses shared state after this point.
+
+
+    def token_scatter_host(*args):
+        return body(*args)
+
+    K = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    params = [
+        inspect.Parameter("x", K, annotation=txl.gptr[txl.u8]),
+        inspect.Parameter("eidx", K, annotation=txl.gptr[txl.i64]),
+        inspect.Parameter("out", K, annotation=txl.gptr[txl.u8]),
+        inspect.Parameter("rev", K, annotation=txl.gptr[txl.i64]),
+        inspect.Parameter("offs", K, annotation=txl.gptr[txl.i32]),
+        inspect.Parameter("ks_t", K, annotation=txl.gptr[txl.i32]),
+        inspect.Parameter("state", K, annotation=txl.gptr[txl.i32]),
+        inspect.Parameter("state_nx", K, annotation=txl.gptr[txl.i32]),
+        inspect.Parameter("m", K, annotation=txl.i32),
+        inspect.Parameter("G", K, annotation=txl.i32),
+        inspect.Parameter("align", K, annotation=txl.i32),
+        inspect.Parameter("num_ctas", K, annotation=txl.i32),
+    ] + [inspect.Parameter(f"hc{p}", K, annotation=txl.i64) for p in range(HOST_PARAMS)]
+    token_scatter_host.__signature__ = inspect.Signature(params)
+    kern = txl.kernel(warps=WARPS, arch="sm_100a", min_blocks_per_sm=1, grid="num_ctas")(token_scatter_host)
+    func = kern.func.with_attr(
+        "tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_dyn_shared_memory"]
     )
     from tirx_kernels.runner import compile_kernel
 
@@ -650,6 +1092,9 @@ def scatter_by_expert_sm100(
     padding_alignment: int = 128,
     group_counts: Optional[list[int]] = None,
 ):
+    """
+    scatter_by_expert on SM100 (see the picker's contract).
+    """
     global DBG
     num_tokens, hidden = input_tokens.shape[0], input_tokens.shape[1]
     device = input_tokens.device
@@ -699,23 +1144,20 @@ def scatter_by_expert_sm100(
 
     span = (num_tokens - 1) * input_tokens.stride(0) + hidden
     x_bytes = torch.as_strided(input_tokens, (span,), (1,)).view(torch.uint8)
-    kern = build(row_bytes, vec, bulk_cfg(row_bytes, vec, src_stride == row_bytes), INSTR)
-    kern(
-        x_bytes,
-        expert_idxs,
-        out.view(-1).view(torch.uint8),
-        rev,
-        offs,
-        ks_tensor,
-        state,
-        dbg,
-        num_tokens,
-        num_groups,
-        padding_alignment,
-        src_stride,
-        tpc,
-        num_ctas,
-    )
+    cfg = bulk_cfg(row_bytes, vec, src_stride == row_bytes)
+    if HOST and not INSTR and cfg is not None and group_counts is not None and num_groups <= HOST_GMAX:
+        gc = [int(n) for n in group_counts] + [0] * (HOST_GMAX - num_groups)
+        packed = []
+        for p in range(HOST_PARAMS):
+            word = gc[2 * p] | (gc[2 * p + 1] << 32)
+            packed.append(word if word < (1 << 63) else word - (1 << 64))
+        hs = get_host_state(device)
+        banks, bank = hs
+        hs[1] = bank ^ 1
+        build_host(row_bytes, cfg)(x_bytes, expert_idxs, out.view(-1).view(torch.uint8), rev, offs, ks_tensor, banks[bank], banks[bank ^ 1], num_tokens, num_groups, padding_alignment, num_ctas, *packed)
+        return out[: sum(ks)], rev, offs, ks_tensor, ks
+    kern = build(row_bytes, vec, cfg, INSTR)
+    kern(x_bytes, expert_idxs, out.view(-1).view(torch.uint8), rev, offs, ks_tensor, state, dbg, num_tokens, num_groups, padding_alignment, src_stride, tpc, num_ctas)
     if ks is None:
         ks_host = pinned_buffer(num_groups)
         ks_host.copy_(ks_tensor, non_blocking=True)
