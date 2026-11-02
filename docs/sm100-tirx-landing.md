@@ -32,7 +32,7 @@ and compiling the touched TIRx builders with nvcc on the CPU.
 | fp8gemm | pair2cta-hybrid (db8dbbc) | 8021 vs 11612, 1.45x | 1b2ddd0 | updated |
 | clamped_swiglu | flat-f32x2 (e4d9461) | 336.6 vs 660.6, 1.96x | 0b89bb1 | new SM100 path |
 | silu_mul | packed-f32x2-stream (6ce8ceb) | 487.8 vs 493.1, 1.01x | 4ff4e4a | new SM100 path |
-| cross_entropy | cluster-resident-tma (fce2df2) | 10880 vs 19448, 1.79x | da69e8a | new SM100 path |
+| cross_entropy | cluster-resident-tma (fce2df2) | 10880 vs 19448, 1.79x; 11471 (1.70x) with the fp32 fix | da69e8a, 0ace1e8, 36c98b7 | new SM100 path; 16-bit logits kept in fp32 (+5.4%, KCoral re-measured) |
 | causal_conv1d | tma-ring-cluster-dw (f48a3ab) | 305.2 vs 793.6, 2.60x | d8b6cd8 | new SM100 path |
 | log_prob | hardware-redux-max (c12d48b) | 25669 vs 37896, 1.48x | 4c8530e | new SM100 path; kernels moved out of operators/ |
 | gated_delta_rule_cp | tma-intra-bulk-state-layout (fe5e80c) | 4551 vs 12948 (FLA CP), 2.84x | e683c32 | new SM100 path |
@@ -74,7 +74,7 @@ the same results.
   landing (1178 us).
 - **token_scatter, gpt-oss rows.** gpt-oss's 5760-byte rows (H=2880) with host counts take a ring
   setup no KCoral row exercised; add an H=2880 host-count case to `test_token_scatter.py`.
-- **segment_sum and CUDA graphs.** Its scratch is valid only alongside a per-call tag passed in from
+- **segment_sum and CUDA graphs.** Its tagged scratch (owned per stream, zeroed on epoch wrap) is valid only alongside a per-call tag passed in from
   the host, so the kernel is not safe under CUDA-graph replay. pith-train captures no graphs today.
 - **bf16gemm wgrads skip the usual wait for the previous kernel (PDL).** They are safe unless a
   kernel from another module that releases its dependents early produces their inputs right before
@@ -92,3 +92,23 @@ the same results.
   - cross_entropy: compute-sanitizer last ran on the previous version.
 - **The scatter rowwise scale is now MN-major.** `fp8_grouped_gemm` copies it to row-major on
   SM100, a small copy (clamped already pays the same).
+
+## Known limitations (accepted, documented)
+
+- **cross_entropy row loss at very large logits.** The SM100 kernels form each row's loss as
+  `(m + log s) - x_target` in fp32. At |logits| around 1e8 the fp32 spacing is 8, so `m + log s`
+  rounds before `x_target` is subtracted and the row loss can be off by several units (PyTorch's
+  reference subtracts `x_target - m` first). Gradients are unaffected. Real logits are many orders
+  of magnitude smaller; a model producing them has already diverged.
+- **log_prob's -1e30 idle-lane sentinel.** The SM100 log_prob kernels seed the running max of lanes
+  with no elements (and of the exact fallback) with -1e30, not -inf. A row whose largest logit is
+  finite and below -1e30 is merged against that sentinel, its sum underflows to zero and its
+  log-probability / entropy come out wrong (-inf / NaN). Logits below -1e30 do not occur in
+  training.
+- **ep_dispatch's start-gated launch is not a cooperative launch.** The send kernel waits for other
+  CTAs only after it has seen every CTA of the grid start (otherwise it exits and leaves its work to
+  a shared chunk queue the last starter drains), so it does not deadlock when other streams hold
+  SMs. It still assumes that a CTA which has started keeps making progress until it exits, which
+  the CUDA programming model only guarantees for cooperative launches. It holds on B200 as used in
+  training; compute preemption (a debugger, MPS time-slicing, compute-sanitizer) can stall the
+  waiting CTAs until the preempted ones resume, and a platform that never resumes them would hang.
