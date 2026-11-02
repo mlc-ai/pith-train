@@ -1,7 +1,8 @@
 """
 SM100 bf16_expert_slots in TIRx-lite: one launch per call (two for indexed segment_sum), no memsets.
 
-group_slots: one cluster of 8 CTAs, each owning a slice of the slots held in registers: per-(tile,
+group_slots: five clusters of 16 CTAs, each cluster computing the histograms and scan redundantly
+and storing a fifth of the slots, each CTA owning a slice of the slots held in registers: per-(tile,
 warp) match.any counts and a slice histogram that every CTA pushes into every peer's shared memory
 before one cluster barrier; the mask is zeroed by its owners before that barrier and OR-ed with
 global reductions after it, then each slice is ranked with no further barrier (a slice too large
@@ -12,11 +13,12 @@ a unit's rows in ascending expert order.
 gather_rows is a 16-byte vector copy. segment_sum without an index gives each warp one 256-row
 chunk, streamed through a per-thread cp.async ring, and adds the chunk sums in order through shared
 memory; with an index it takes two launches: one warp per (chunk, 512-column block) writes the
-chunk's fp32 sum, then a second kernel adds each segment's chunk sums in order.
+chunk's fp32 sum, then a second kernel, launched with programmatic dependent launch so its launch
+and prologue overlap the first one's tail, adds each segment's chunk sums in order.
 
-Evolved with TIRx-harness: run slots, frontier member tma-gather (commit 3a959b6, 986 us vs 10312 us, 10.455x over the
-previous SM100 path in the task's benchmark). Compiled once per process by tvm.compile(...,
-tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+Evolved with TIRx-harness: run slots, frontier member tma-gather (commit 6e1b68f, 972 us vs 10401
+us, 10.699x over the previous SM100 path in the task's benchmark). Compiled once per process by
+tvm.compile(..., tir_pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -227,7 +229,7 @@ def group_slots_kernel(G: int, has_x: bool):
 
 
 CCS = 16  # (non-portable cluster size, launches on B200) cluster group_slots: the whole call is one cluster of CCS CTAs, CTA r owns slots [r * SP, r * SP + SP)
-NCL = 4  # clusters: each computes the histograms/scan redundantly and stores 1/NCL of the slots
+NCL = 5  # clusters: each computes the histograms/scan redundantly and stores 1/NCL of the slots (five shorten the large-row rank/store tail)
 CSP = (1024, 2048, 4096, 8192)  # slots per CTA held in registers: the smaller fits if it can (fewer registers); larger S rescans
 
 
@@ -690,6 +692,7 @@ GS_PRODUCER_WARP = True  # tma3: a dedicated producer warp and per-slot empty ba
 GS_SPIN = True  # tma3 consumers wait with a hint-free try_wait spin
 GS3 = True  # multi-token units (below) instead of one token per unit
 GS3_CFG = {2048: (4, 3, 4), 2880: (4, 2, 4)}  # by H: (pipeline stages, CTAs per SM, grouped rows per unit); producer-warp sweep
+GS3_CFG_BY_G = {(64, 2048): (3, 3, 5), (8, 2048): (6, 3, 3)}  # by (G, H), ahead of GS3_CFG: sparse EP4 packs more consecutive tokens per unit, dense local masks trade unit width for a deeper ring
 LAST_BIT = 1 << 30
 NOROW_BIT = 1 << 29
 
@@ -704,7 +707,7 @@ def gather_sum_tma3_kernel(G: int, H: int):
     """
     V = H // 8
     NW = (V + 31) // 32
-    ST, CPS, KB = GS3_CFG.get(H, (2, 2, 4))
+    ST, CPS, KB = GS3_CFG_BY_G.get((G, H), GS3_CFG.get(H, (2, 2, 4)))
     GRID = NUM_SMS * CPS
     RW = H // 2  # u32 words per row
     RB = H * 2  # bytes per row
@@ -1171,6 +1174,8 @@ def segment_chunks_kernel(N: int, has_idx: bool):
         G: txl.i32,
         NC: txl.i32,
     ):
+        if SEG_PDL:
+            txl.ptx.griddepcontrol.launch_dependents()  # the combine may launch now; it waits for our writes
         b = txl.cta_id()
         c = b // NCB
         cb = b % NCB
@@ -1270,8 +1275,11 @@ def segment_chunks_kernel(N: int, has_idx: bool):
     return entry_function(segment_chunks.compile())
 
 
+SEG_PDL = True  # combine launched with programmatic dependent launch: its launch and cu prologue overlap the chunk tail
+
+
 @functools.cache
-def segment_combine_kernel(N: int):
+def segment_combine_kernel(N: int, pdl: bool):
     """
     Kernel 2 of 2: out[g, col] = chunk sums of segment g added in order (0 for an empty segment).
     """
@@ -1296,6 +1304,8 @@ def segment_combine_kernel(N: int):
             txl.assign(base, base + (e_ - s_ + 255) // 256)
         txl.ptx.ld.global_.nc.s32(s_, cu.ptr_to([g]))
         txl.ptx.ld.global_.nc.s32(e_, cu.ptr_to([g + 1]))
+        if pdl:
+            txl.ptx.griddepcontrol.wait()  # the chunk kernel's partial sums are complete and visible
         tot = txl.local_scalar(txl.f32, init=txl.float32(0))
         pv = txl.alloc_local([8], txl.f32)
         nc_ = (e_ - s_ + 255) // 256
@@ -1309,6 +1319,8 @@ def segment_combine_kernel(N: int):
                         txl.assign(tot, tot + pv[q])
             txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + col]), tot)
 
+    if pdl:
+        segment_combine.func = segment_combine.func.with_attr("tirx.kernel_launch_params", ["blockIdx.x", "threadIdx.x", "tirx.use_programtic_dependent_launch"])
     return entry_function(segment_combine.compile())
 
 
@@ -1321,7 +1333,7 @@ def bf16_expert_segment_sum_sm100(x, cu_host, cu, idx=None):
         part = torch.empty(max(NC, 1) * N, dtype=torch.float32, device=x.device)
         if NC:
             segment_chunks_kernel(N, has_idx)(x.view(-1).view(torch.uint32), idx if has_idx else cu, cu, part, G, NC)
-        segment_combine_kernel(N)(cu, part, out.view(-1), G)
+        segment_combine_kernel(N, SEG_PDL and NC > 0)(cu, part, out.view(-1), G)
         return out
     if G:
         k = segment_sum_kernel(N, idx is not None)
