@@ -54,22 +54,18 @@ def folded_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
 
 def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the geometry of
-    pinned_shapes, on SM90 or SM100. Otherwise the caller uses FLA's autotuned entry points.
-    On SM90 also the folded geometry of folded_shapes (a batch folded into the heads). Constant per
-    geometry: torch.compile guards on the shape, device and dtype checks.
+    Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call. On SM90 the geometry of
+    pinned_shapes, and also the folded geometry of folded_shapes (a batch folded into the heads).
+    On SM100 the geometry the TIRx kernels were evolved and verified at, one sample's heads:
+    pinned_shapes with H 16 or 32 key heads over the 32 value heads (not a folded batch, whose
+    samples a caller runs one at a time). Otherwise False. Constant per geometry: torch.compile
+    guards on the shape, device and dtype checks.
     """
-    if not pinned_shapes(q, k, v, g, beta):
-        match ARCH_MAJOR:
-            case 9:
-                return folded_shapes(q, k, v, g, beta)
-            case _:
-                return False
     match ARCH_MAJOR:
         case 9:
-            return True
+            return pinned_shapes(q, k, v, g, beta) or folded_shapes(q, k, v, g, beta)
         case 10:
-            return True
+            return pinned_shapes(q, k, v, g, beta) and k.shape[2] in (16, 32)
         case _:
             return False
 

@@ -8,7 +8,8 @@ Qwen3.5 geometry, H = 16 key heads over HV = 32 value heads, where they run the 
 - no recompilation across sequence lengths, aligned or ragged;
 - the fakes against the real ops (shapes, dtypes, strides) with torch.library.opcheck;
 - batch 2 and 3 through gated_delta_rule, folded into the heads before the key-head repeat onto the
-  pinned kernels (batch 1, H 16 b / HV 32 b), against the same recurrence;
+  pinned kernels (batch 1, H 16 b / HV 32 b; one sample at a time where the kernels take only one
+  sample's heads), against the same recurrence;
 - geometries the capability query rejects, also batched, taking FLA's path against the recurrence.
 """
 
@@ -142,8 +143,8 @@ def test_batch_folds_onto_the_pinned_kernels(
 ) -> None:
     """
     A batch folds into the heads before the key-head repeat: the pinned kernels see batch 1 at H
-    16 B / HV 32 B (never q / k repeated to HV), and the output and the five gradients match the
-    per-sample fp32 recurrence.
+    16 B / HV 32 B, or B calls at H 16 / HV 32 where they take one sample's heads only (never q / k
+    repeated to HV), and the output and the five gradients match the per-sample fp32 recurrence.
     """
     q, k, v, g, beta, do = make_inputs(S, seed=7, B=B)
     assert not gated_delta_rule_pinned_supported(q, k, v, g, beta)
@@ -151,7 +152,8 @@ def test_batch_folds_onto_the_pinned_kernels(
     leaves = [x.clone().requires_grad_() for x in (q, k, v, g, beta)]
     out = gated_delta_rule(*leaves)
     out.backward(do)
-    assert seen == [(1, H * B, HV * B)], seen
+    # Folded where the kernels take the fold (SM90), else one sample at a time (SM100).
+    assert seen in ([(1, H * B, HV * B)], [(1, H, HV)] * B), seen
     refs = [x.detach().float().requires_grad_() for x in (q, k, v, g, beta)]
     ref = naive_gdr(*refs)
     ref.backward(do.float())

@@ -250,7 +250,8 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
     The recurrence is independent per head, so the batch folds into the head axis before anything
     else: value head j = b * value_heads + h of the fold reads key head j // (value_heads / heads)
     = b * heads + h // (value_heads / heads), the same grouping, and the pinned kernels run batch
-    b at b times the heads.
+    b at b times the heads where they take that geometry (SM90); where they take only one sample's
+    heads (SM100) the samples run one at a time.
     """
     b = q.shape[0]
     if cp_group is None:
@@ -259,6 +260,9 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
         folded = tuple(fold_batch(t).contiguous() for t in (q, k, v, g, beta))
         if gated_delta_rule_pinned_supported(*folded):
             return unfold_batch(dense_gated_delta_rule(*folded), b)
+        if b > 1 and gated_delta_rule_pinned_supported(*(t[:1].contiguous() for t in (q, k, v, g, beta))):  # fmt: skip
+            # The kernels take one sample's heads but not the fold (SM100): one sample at a time.
+            return torch.cat([dense_gated_delta_rule(*(t[i : i + 1] for t in (q, k, v, g, beta))) for i in range(b)])  # fmt: skip
         repeats = v.shape[2] // q.shape[2]
         if repeats > 1:
             q = q.repeat_interleave(repeats, dim=2)
