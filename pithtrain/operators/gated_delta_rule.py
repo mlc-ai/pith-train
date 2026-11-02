@@ -2,8 +2,11 @@
 Chunked gated delta rule of the Qwen3.5 Gated DeltaNet as custom ops, so that the linear-attention
 region compiles as one graph (FLA's own entry point is excluded from torch.compile).
 
-Under context parallelism it runs FLA's context-parallel path, which needs the contiguous layout
-and batch 1; the recurrence is independent per head, so the batch folds into the head axis.
+Under context parallelism it needs the contiguous layout and batch 1; the recurrence is independent
+per head, so the batch folds into the head axis. Where gated_delta_rule_cp_supported says so (SM100
+at Qwen3.5's geometry) it runs the library's CP kernels, each direction as two stages around one
+all-gather of the ranks' state summaries over the CP group, run here; elsewhere FLA's
+context-parallel path, which runs the same all-gather itself.
 """
 
 from functools import lru_cache
@@ -14,12 +17,18 @@ import torch
 from fla.ops.cp import build_cp_context
 from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd, chunk_gated_delta_rule_fwd
 from fla.ops.utils import prepare_chunk_indices
-from torch.distributed import ProcessGroup, get_world_size
+from torch.distributed import ProcessGroup, all_gather_into_tensor, get_rank, get_world_size
 from torch.distributed.distributed_c10d import _resolve_process_group
 
 from pithtrain.kernels import (
     chunk_gdr_bwd_pinned,
+    chunk_gdr_cp_bwd_post,
+    chunk_gdr_cp_bwd_pre,
+    chunk_gdr_cp_fwd_post,
+    chunk_gdr_cp_fwd_pre,
     chunk_gdr_fwd_pinned,
+    gated_delta_rule_cp_plan,
+    gated_delta_rule_cp_supported,
     gated_delta_rule_pinned_supported,
 )
 
@@ -51,9 +60,39 @@ def cp_state(group_name: Optional[str], seq_len: int) -> Tuple:
     return context, chunk_indices
 
 
+@lru_cache(maxsize=None)
+def cp_plan(group_name: str, seq_len: int) -> dict:
+    """
+    The CP kernels' host-side plan for this rank, from FLA's context of cp_state.
+    """
+    context, _ = cp_state(group_name, seq_len)
+    rank = get_rank(_resolve_process_group(group_name))
+    return gated_delta_rule_cp_plan(context.cu_seqlens, context.cu_seqlens_cpu, rank, context.is_first_rank, context.is_last_rank, context.pre_num_ranks, context.post_num_ranks)  # fmt: skip
+
+
+def cp_all_gather(payload: torch.Tensor, group_name: str) -> torch.Tensor:
+    """
+    Every rank's payload stacked in rank order, (world_size, *payload.shape): the one collective of
+    each CP direction, as FLA's CP path runs it.
+    """
+    group = _resolve_process_group(group_name)
+    gathered = payload.new_empty(get_world_size(group), *payload.shape)
+    all_gather_into_tensor(gathered, payload, group=group)
+    return gathered
+
+
 @torch.library.custom_op("pithtrain::gated_delta_rule_fwd", mutates_args=())
-def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
+def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str], cp_kernels: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
+    """
+    cp_kernels (decided once by the caller, so the backward takes the same path): run the
+    library's CP kernels instead of FLA's CP path; only with a cp_group_name.
+    """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+    if cp_kernels:
+        plan = cp_plan(cp_group_name, q.shape[1])
+        payload, saved = chunk_gdr_cp_fwd_pre(q, k, v, g, beta, plan)
+        o, g_out, A, initial_state = chunk_gdr_cp_fwd_post(cp_all_gather(payload, cp_group_name), saved, plan)  # fmt: skip
+        return o, g_out, A, [initial_state]
     cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
     g_out, o, A, _, initial_state, _ = chunk_gated_delta_rule_fwd(q=q, k=k, v=v, g=g, beta=beta, scale=q.shape[-1] ** -0.5, initial_state=None, output_final_state=False, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, A_log=None, dt_bias=None)  # fmt: skip
     # Under CP initial_state is the merged predecessor state; the backward recomputes h from it
@@ -62,7 +101,7 @@ def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, 
 
 
 @gdr_fwd.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str]):  # fmt: skip
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str], cp_kernels: bool):  # fmt: skip
     b, s, hv, vd = v.shape
     o = torch.empty((b, s, hv, vd), dtype=q.dtype, device=q.device)
     A = torch.empty((b, s, hv, CHUNK_SIZE), dtype=q.dtype, device=q.device)
@@ -71,30 +110,36 @@ def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: 
 
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_bwd", mutates_args=())
-def gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+def gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str], cp_kernels: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
     q, k, v, g_out, beta, A, do = (t.contiguous() for t in (q, k, v, g_out, beta, A, do))
+    if cp_kernels:
+        # g_out, A and initial_state are the CP kernels' own, so the forward's path is taken.
+        plan = cp_plan(cp_group_name, q.shape[1])
+        payload, saved = chunk_gdr_cp_bwd_pre(q, k, v, g_out, beta, A, do, initial_state[0], plan)
+        return chunk_gdr_cp_bwd_post(cp_all_gather(payload, cp_group_name), saved, plan)
     cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
     dq, dk, dv, db, dg, _, _, _ = chunk_gated_delta_rule_bwd(q=q, k=k, v=v, g=g_out, beta=beta, A=A, scale=q.shape[-1] ** -0.5, initial_state=initial_state[0] if initial_state else None, do=do, dht=None, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, g_input=None, A_log=None, dt_bias=None)  # fmt: skip
     return dq.to(q.dtype).contiguous(), dk.to(k.dtype).contiguous(), dv.to(v.dtype).contiguous(), dg.to(g_out.dtype).contiguous(), db.to(beta.dtype).contiguous()  # fmt: skip
 
 
 @gdr_bwd.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str]):  # fmt: skip
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str], cp_kernels: bool):  # fmt: skip
     # Contiguous like the real gradients; plain empty_like would inherit the input strides.
     contiguous = torch.contiguous_format
     return torch.empty_like(q, memory_format=contiguous), torch.empty_like(k, memory_format=contiguous), torch.empty_like(v, memory_format=contiguous), torch.empty_like(g_out, memory_format=contiguous), torch.empty_like(beta, memory_format=contiguous)  # fmt: skip
 
 
 def gdr_setup_context(ctx: torch.autograd.function.FunctionCtx, inputs: Tuple, output: Tuple) -> None:  # fmt: skip
-    q, k, v, _, beta, cp_group_name = inputs
+    q, k, v, _, beta, cp_group_name, cp_kernels = inputs
     _, g_out, A, state = output
     ctx.save_for_backward(q, k, v, g_out, beta, A, *state)
-    ctx.cp_group_name = cp_group_name
+    ctx.cp_group_name, ctx.cp_kernels = cp_group_name, cp_kernels
 
 
 def gdr_backward(ctx: torch.autograd.function.FunctionCtx, do: torch.Tensor, *_) -> Tuple:
     q, k, v, g_out, beta, A, *state = ctx.saved_tensors
-    return *gdr_bwd(q, k, v, g_out, beta, A, do, state, ctx.cp_group_name), None
+    grads = gdr_bwd(q, k, v, g_out, beta, A, do, state, ctx.cp_group_name, ctx.cp_kernels)
+    return *grads, None, None
 
 
 gdr_fwd.register_autograd(gdr_backward, setup_context=gdr_setup_context)
@@ -193,9 +238,9 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
         q = q.repeat_interleave(repeats, dim=2)
         k = k.repeat_interleave(repeats, dim=2)
     if cp_group is None:
-        o, *_ = gdr_fwd(q, k, v, g, beta, None)
+        o, *_ = gdr_fwd(q, k, v, g, beta, None, False)
         return o
     b, s = q.shape[:2]
-    folded = (fold_batch(t) for t in (q, k, v, g, beta))
-    o, *_ = gdr_fwd(*folded, cp_group.group_name)
+    folded = [fold_batch(t) for t in (q, k, v, g, beta)]
+    o, *_ = gdr_fwd(*folded, cp_group.group_name, gated_delta_rule_cp_supported(*folded))
     return o.reshape(s, b, -1, o.shape[-1]).transpose(0, 1)

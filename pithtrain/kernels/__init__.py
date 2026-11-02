@@ -3,8 +3,8 @@ PithTrain's kernel library. __all__ is its whole interface: code outside this pa
 from pithtrain.kernels, never a submodule. Each name's docstring is its contract, verified against
 PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100 implementation
 itself; callers that need to know whether a fused path exists use the capability queries
-fp8_fused_experts_supported, bf16_experts_supported and gated_delta_rule_pinned_supported. Importing
-the package never loads cutlass, QuACK or tvm.
+fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported and
+gated_delta_rule_cp_supported. Importing the package never loads cutlass, QuACK or tvm.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad
@@ -23,6 +23,7 @@ from pithtrain.kernels.fp8_scale_layout import act_scale_like
 from pithtrain.kernels.fp8_scatter_quant import scatter_quant
 from pithtrain.kernels.fp8_silu_mul_quant import fp8_silu_mul_bwd, fp8_silu_mul_gu_bwd, fp8_silu_mul_fwd, fp8_silu_mul_gu_fwd
 from pithtrain.kernels.fp8_weight_quant import fp8_pack_transpose, fp8_scales, fp8_scales_multi, fp8_shard_amax, fp8_shard_amax_multi, fp8_shard_cast, fp8_quant_weight, fp8_quant_weight_grouped
+from pithtrain.kernels.gated_delta_rule_cp import chunk_gdr_cp_bwd_post, chunk_gdr_cp_bwd_pre, chunk_gdr_cp_fwd_post, chunk_gdr_cp_fwd_pre, gated_delta_rule_cp_plan, gated_delta_rule_cp_supported
 from pithtrain.kernels.gated_delta_rule_pinned import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned, gated_delta_rule_pinned_supported
 from pithtrain.kernels.group_bias_add import group_bias_add
 from pithtrain.kernels.log_prob import log_prob_bwd, log_prob_fwd
@@ -107,6 +108,14 @@ __all__.append("bf16_expert_segment_sum")
 __all__.append("chunk_gdr_bwd_pinned")
 __all__.append("chunk_gdr_fwd_pinned")
 __all__.append("gated_delta_rule_pinned_supported")
+
+# Gated DeltaNet under context parallelism (TIRx on SM100; SM90 runs FLA in the operator)
+__all__.append("chunk_gdr_cp_bwd_post")
+__all__.append("chunk_gdr_cp_bwd_pre")
+__all__.append("chunk_gdr_cp_fwd_post")
+__all__.append("chunk_gdr_cp_fwd_pre")
+__all__.append("gated_delta_rule_cp_plan")
+__all__.append("gated_delta_rule_cp_supported")
 
 # Log-probability and entropy of a tempered softmax (RL objectives)
 __all__.append("log_prob_bwd")
