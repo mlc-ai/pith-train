@@ -9,7 +9,9 @@ Row placement within a group is the kernel's choice, so reverse_shuffle_idxs onl
 placement: each token inside its expert's rows, all rows distinct. The reference scatters the
 tokens through it into a zero bf16 matrix and quantizes that in PyTorch; every quantized output,
 padding rows included (zero bytes), must match exactly. Where the op documents a stable placement
-(SM100, and SM90's fused kernels) it is also checked to keep token order within each expert.
+(SM90's fused kernels, recognised by their K-major per-channel layout) it is also checked to keep
+token order within each expert, and repeated calls to give identical outputs; on SM100 CTA runs
+within a group are ordered by an atomic add, so only the placement-independent outputs repeat.
 
 Recipe: per 128-element block, scale = 2^ceil(log2(max(amax, 1e-4) / 448)), at least 2^-126, and
 fp8 = e4m3_satfinite(x * (1 / scale)), rounded to nearest even; amax ignores NaN.
@@ -195,6 +197,14 @@ def check_stable(expert_idxs: torch.Tensor, G: int, reverse_idxs: torch.Tensor, 
     assert torch.equal(reverse_idxs, starts[expert_idxs] + rank)
 
 
+def stable_layout(out: tuple) -> bool:
+    """
+    Whether the output comes from a kernel documenting a stable placement: the SM90 fused kernels,
+    whose per-channel FP8 is K-major (flat); the SM100 (M, N) layout's placement is atomic-ordered.
+    """
+    return out[0][2].ndim == 1
+
+
 def run_case(sizes: list[int], N: int, dedup: int, segmented: bool, host_counts: bool) -> None:
     G = len(sizes)
     seed = sum(sizes) * 7 + N + dedup
@@ -209,7 +219,8 @@ def run_case(sizes: list[int], N: int, dedup: int, segmented: bool, host_counts:
         gathered = make_tokens(expert_idxs.numel(), N, seed)
         out = scatter_quant(gathered, expert_idxs, G, padding_alignment=128, group_counts=counts)
         check(gathered, expert_idxs, G, None, counts, out)
-    check_stable(expert_idxs, G, out[1], out[2])
+    if stable_layout(out):
+        check_stable(expert_idxs, G, out[1], out[2])
 
 
 BALANCED = [2048] * 16
@@ -268,9 +279,15 @@ def test_scatter_quant_determinism() -> None:
     x = make_tokens(expert_idxs.numel(), 2048, 1)
     first = scatter_quant(x, expert_idxs, 16)
     second = scatter_quant(x, expert_idxs, 16)
-    for tensor_a, tensor_b in zip(first[0], second[0]):
-        assert torch.equal(as_bytes(tensor_a), as_bytes(tensor_b))
-    assert torch.equal(first[1], second[1]) and torch.equal(first[2], second[2]) and first[3] == second[3]  # fmt: skip
+    assert torch.equal(first[2], second[2]) and first[3] == second[3]
+    if stable_layout(first):
+        for tensor_a, tensor_b in zip(first[0], second[0]):
+            assert torch.equal(as_bytes(tensor_a), as_bytes(tensor_b))
+        assert torch.equal(first[1], second[1])
+    else:
+        # Placement may differ; each slot's rowwise FP8 and scales may not.
+        for k in (0, 1):
+            assert torch.equal(as_bytes(first[0][k][first[1]]), as_bytes(second[0][k][second[1]]))
 
 
 def test_scatter_quant_back_to_back() -> None:

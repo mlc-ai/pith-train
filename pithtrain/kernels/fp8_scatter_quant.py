@@ -26,11 +26,13 @@ def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups:
       list of the padded group sizes; ks_tensor: the same as int32 (G,) on the device. With m == 0
       every output is empty, grouped_mm_offs and ks_tensor of shape (0,).
 
-    Row placement within a group: stable (slot order, fully deterministic) on SM100 and where the
-    fused SM90 kernels cover the input; atomic_add order otherwise on SM90 (m or N zero, more than
-    512 groups, N not a multiple of 8, non-contiguous or misaligned inputs, non-int64 indices). The rowwise
-    FP8 of each slot, grouped_mm_offs and ks do not depend on placement; the per-channel FP8 does
-    (128-row blocks share a scale). Consumers locate a slot only through reverse_shuffle_idxs.
+    Row placement within a group: stable (slot order, fully deterministic) where the fused SM90
+    kernels cover the input; atomic_add order otherwise on SM90 (m or N zero, more than 512 groups,
+    N not a multiple of 8, non-contiguous or misaligned inputs, non-int64 indices). On SM100 each
+    CTA's slots keep slot order inside its run of a group, but the runs of different CTAs are
+    ordered by an atomic add, so placement may change from call to call. The rowwise FP8 of each
+    slot, grouped_mm_offs and ks do not depend on placement; the per-channel FP8 does (128-row
+    blocks share a scale). Consumers locate a slot only through reverse_shuffle_idxs.
 
     Used where fp8_fused_experts_supported(). The per-channel pair is K-major per group on SM90 and
     (M, N) with scale (M / 128, N) on SM100, the layouts k_grouped_fp8_gemm reads on each. Scale
