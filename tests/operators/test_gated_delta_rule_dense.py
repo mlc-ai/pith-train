@@ -7,8 +7,9 @@ Qwen3.5 geometry, H = 16 key heads over HV = 32 value heads, where they run the 
   lengths that are not a multiple of 64 (the kernels' ragged variants) in alternation;
 - no recompilation across sequence lengths, aligned or ragged;
 - the fakes against the real ops (shapes, dtypes, strides) with torch.library.opcheck;
-- batch 2, off the pinned geometry, taking FLA's path through gated_delta_rule, against the same
-  recurrence.
+- batch 2 and 3 through gated_delta_rule, folded into the heads before the key-head repeat onto the
+  pinned kernels (batch 1, H 16 b / HV 32 b), against the same recurrence;
+- geometries the capability query rejects, also batched, taking FLA's path against the recurrence.
 """
 
 import pytest
@@ -119,19 +120,59 @@ def test_fakes_match_the_ops(S: int) -> None:
         assert got.shape == like.shape and got.dtype == like.dtype and got.is_contiguous()
 
 
-def test_batch_two_falls_back_and_matches_recurrence() -> None:
-    q, k, v, g, beta, do = make_inputs(192, seed=7, B=2)
+def spy_pinned(monkeypatch: pytest.MonkeyPatch) -> list:
+    """
+    Record the (key heads, value heads) of every pinned forward the operator launches.
+    """
+    import pithtrain.operators.gated_delta_rule as op
+
+    seen, forward = [], op.chunk_gdr_fwd_pinned
+
+    def recording(q, k, v, g, beta):
+        seen.append((q.shape[0], k.shape[2], v.shape[2]))
+        return forward(q, k, v, g, beta)
+
+    monkeypatch.setattr(op, "chunk_gdr_fwd_pinned", recording)
+    return seen
+
+
+@pytest.mark.parametrize("B,S", [(2, 192), (3, 64), (3, 1000)])
+def test_batch_folds_onto_the_pinned_kernels(
+    monkeypatch: pytest.MonkeyPatch, B: int, S: int
+) -> None:
+    """
+    A batch folds into the heads before the key-head repeat: the pinned kernels see batch 1 at H
+    16 B / HV 32 B (never q / k repeated to HV), and the output and the five gradients match the
+    per-sample fp32 recurrence.
+    """
+    q, k, v, g, beta, do = make_inputs(S, seed=7, B=B)
     assert not gated_delta_rule_pinned_supported(q, k, v, g, beta)
+    seen = spy_pinned(monkeypatch)
     leaves = [x.clone().requires_grad_() for x in (q, k, v, g, beta)]
     out = gated_delta_rule(*leaves)
     out.backward(do)
+    assert seen == [(1, H * B, HV * B)], seen
     refs = [x.detach().float().requires_grad_() for x in (q, k, v, g, beta)]
     ref = naive_gdr(*refs)
     ref.backward(do.float())
+    assert out.shape == v.shape
     assert calc_diff(out, ref) < 1e-4
     for name, leaf, ref_leaf in zip(("dq", "dk", "dv", "dg", "dbeta"), leaves, refs):
+        assert leaf.grad.shape == leaf.shape, name
         diff = calc_diff(leaf.grad, ref_leaf.grad)
         assert diff < 1e-3, f"{name}: calc_diff {diff:.2e}"
+
+
+def test_repeat_before_fold_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The fold-order check has power: q / k repeated to HV before the fold (the old CP order) reach
+    the kernels as H == HV, which the assertion above rejects.
+    """
+    q, k, v, g, beta, _ = make_inputs(64, seed=7, B=3)
+    seen = spy_pinned(monkeypatch)
+    q, k = (x.repeat_interleave(HV // H, dim=2) for x in (q, k))
+    gated_delta_rule(q, k, v, g, beta)
+    assert (1, H * 3, HV * 3) not in seen, seen
 
 
 def general_inputs(
@@ -178,7 +219,9 @@ def to_dtypes(case: str, q, k, v, g, beta):
 
 # (B, S, H, HV, K, V): geometries the predicate rejects, plus a supported one given as strided views.
 FALLBACK_CASES = {
-    "batch 2": (2, 192, 16, 32, 128, 128),
+    "batch 2, key dim 64": (2, 192, 16, 32, 64, 128),
+    "48 value heads": (1, 192, 16, 48, 128, 128),
+    "batch 3, 96 value heads over 32 key heads": (3, 64, 32, 96, 128, 128),
     "16 value heads": (1, 192, 16, 16, 128, 128),
     "key dim 64": (1, 192, 16, 32, 64, 128),
     "value dim 64": (1, 192, 16, 32, 128, 64),

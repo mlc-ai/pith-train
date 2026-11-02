@@ -51,6 +51,7 @@ KERNELS = PKG / "kernels"
 # SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
 SM90_ONLY = {
     "group_indices_sm90",
+    "gated_delta_rule_cp_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
 SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90", "row_slice_sm90"}
@@ -61,6 +62,8 @@ SM90_CROSS_EDGES = {
     ("fp8_clamped_swiglu_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_clamped_swiglu_quant_sm90", "clamped_swiglu_sm90"),
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
+    ("gated_delta_rule_cp_sm90", "gated_delta_rule_pinned_fwd_sm90"),
+    ("gated_delta_rule_cp_sm90", "gated_delta_rule_pinned_bwd_sm90"),
 }
 # What models/ may import from modules/ (from kernels/ only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}

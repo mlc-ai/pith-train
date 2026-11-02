@@ -2,8 +2,10 @@
 Chunked gated delta rule of the Qwen3.5 Gated DeltaNet as custom ops, so that the linear-attention
 region compiles as one graph (FLA's own entry point is excluded from torch.compile).
 
-Under context parallelism it runs FLA's context-parallel path, which needs the contiguous layout
-and batch 1; the recurrence is independent per head, so the batch folds into the head axis.
+Without context parallelism the batch folds into the head axis first (batch 1 at b times the
+heads) and the pinned kernels run where gated_delta_rule_pinned_supported says so. Under context
+parallelism it runs FLA's context-parallel path, which needs the contiguous layout and batch 1;
+the recurrence is independent per head, so the batch folds into the head axis.
 """
 
 from functools import lru_cache
@@ -187,27 +189,43 @@ def fold_batch(t: torch.Tensor) -> torch.Tensor:
     return t.transpose(0, 1).reshape(1, t.shape[1], -1, *t.shape[3:])
 
 
+def unfold_batch(o: torch.Tensor, b: int) -> torch.Tensor:
+    """
+    fold_batch's inverse on the output, [1, s, b * heads, dim] -> [b, s, heads, dim].
+    """
+    return o if b == 1 else o.reshape(o.shape[1], b, -1, o.shape[-1]).transpose(0, 1)
+
+
 def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group: Optional[ProcessGroup] = None) -> torch.Tensor:  # fmt: skip
     """
     Chunked gated delta rule of q and k [b, s, heads, dim], v [b, s, value_heads, value_dim], g and
     beta [b, s, value_heads], returning [b, s, value_heads, value_dim]. value_heads is a multiple
     of heads, and each key head serves a group of consecutive value heads. With a cp_group the
     recurrence is sharded over it: s is the rank-local length, in the contiguous layout.
+
+    The recurrence is independent per head, so the batch folds into the head axis before anything
+    else: value head j = b * value_heads + h of the fold reads key head j // (value_heads / heads)
+    = b * heads + h // (value_heads / heads), the same grouping, and the pinned kernels run batch
+    b at b times the heads.
     """
+    b = q.shape[0]
     if cp_group is None:
         # Contiguous before the check: the pinned kernels take contiguous tensors, and both paths copy
         # anyway (dense_gated_delta_rule and gdr_fwd).
-        q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
-        if gated_delta_rule_pinned_supported(q, k, v, g, beta):
-            return dense_gated_delta_rule(q, k, v, g, beta)
+        folded = tuple(fold_batch(t).contiguous() for t in (q, k, v, g, beta))
+        if gated_delta_rule_pinned_supported(*folded):
+            return unfold_batch(dense_gated_delta_rule(*folded), b)
+        repeats = v.shape[2] // q.shape[2]
+        if repeats > 1:
+            q = q.repeat_interleave(repeats, dim=2)
+            k = k.repeat_interleave(repeats, dim=2)
+        o, *_ = gdr_fwd(q, k, v, g, beta, None)
+        return o
+    # Under CP, FLA's context-parallel path: q and k repeated to the value heads, then folded.
     repeats = v.shape[2] // q.shape[2]
     if repeats > 1:
         q = q.repeat_interleave(repeats, dim=2)
         k = k.repeat_interleave(repeats, dim=2)
-    if cp_group is None:
-        o, *_ = gdr_fwd(q, k, v, g, beta, None)
-        return o
-    b, s = q.shape[:2]
     folded = (fold_batch(t) for t in (q, k, v, g, beta))
     o, *_ = gdr_fwd(*folded, cp_group.group_name)
-    return o.reshape(s, b, -1, o.shape[-1]).transpose(0, 1)
+    return unfold_batch(o, b)

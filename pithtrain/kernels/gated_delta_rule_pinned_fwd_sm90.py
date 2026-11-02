@@ -26,7 +26,7 @@ from quack.layout_utils import reshape_acc_to_frgA
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 
-__all__ = ["BT", "ChunkStateOutput", "HEAD_DIM", "STATE_BV", "STATE_STAGES", "STATE_THREADS", "WyRepresentation", "chunk_copies", "chunk_gdr_fwd_pinned_sm90", "copy_rows", "multiply_a", "operand_copies", "scale_kv"]
+__all__ = ["BT", "ChunkStateOutput", "HEAD_DIM", "STATE_BV", "STATE_STAGES", "STATE_THREADS", "TF32_STRIDE", "WyRepresentation", "chunk_copies", "chunk_gdr_fwd_pinned_sm90", "copy_rows", "multiply_a", "operand_copies", "scale_kv", "state_output", "wy_representation"]
 
 BT = 64  # chunk size
 RCP_LN2 = 1.4426950216  # 1 / ln 2 as FLA 0.5.2 writes it (fp32 0x3FB8AA3B): g_cum is in log2 units
@@ -610,27 +610,48 @@ def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bo
     return cute.compile(ChunkStateOutput(H, HV, has_h0, has_ht, ragged), keys, keys, values, values, gate, values, state if has_h0 else None, state if has_ht else None, fake_stream(), options="--enable-tvm-ffi")
 
 
-def chunk_gdr_fwd_cute(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def wy_representation(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    chunk_gdr_fwd_pinned_sm90 on the CuTe kernels, B == 1; their ragged variants (compiled on the
-    first such call) when T is not a multiple of BT.
+    WyRepresentation, B == 1: fresh (g_cum, A, w, u); its ragged variant (compiled on the first
+    such call) when T is not a multiple of BT.
     """
     _, T, H, _ = k.shape
     HV = v.shape[2]
     ragged = T % BT != 0
     g_cum = torch.empty(1, T, HV, device=k.device, dtype=torch.float32)
     A = torch.empty(1, T, HV, BT, device=k.device, dtype=k.dtype)
-    w, u, o = k.new_empty(1, T, HV, HEAD_DIM), torch.empty_like(v), torch.empty_like(v)
+    w, u = k.new_empty(1, T, HV, HEAD_DIM), torch.empty_like(v)
     key = ("wy_representation", H, HV, k.device.index, ragged)
     if key not in COMPILED:
         COMPILED[key] = compile_wy(H, HV, ragged)
     COMPILED[key](k[0], v[0], g[0], beta[0], g_cum[0], A[0], w[0], u[0])
-    has_h0, has_ht = False, False
+    return g_cum, A, w, u
+
+
+def state_output(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_cum: torch.Tensor, h0: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    ChunkStateOutput, B == 1: a fresh o, the state starting at h0, fp32 (HV, K, V) contiguous, when
+    one is passed, else at zero.
+    """
+    _, T, H, _ = k.shape
+    HV = u.shape[2]
+    ragged = T % BT != 0
+    o = torch.empty_like(u)
+    has_h0, has_ht = h0 is not None, False
     key = ("chunk_state_output", H, HV, k.device.index, has_h0, has_ht, ragged)
     if key not in COMPILED:
         COMPILED[key] = compile_state_output(H, HV, has_h0, has_ht, ragged)
-    COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], o[0], None, None)
-    return o, g_cum, A
+    COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], o[0], h0, None)
+    return o
+
+
+def chunk_gdr_fwd_cute(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    chunk_gdr_fwd_pinned_sm90 on the CuTe kernels, B == 1; their ragged variants (compiled on the
+    first such call) when T is not a multiple of BT.
+    """
+    g_cum, A, w, u = wy_representation(k, v, g, beta)
+    return state_output(q, k, w, u, g_cum), g_cum, A
 
 
 def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

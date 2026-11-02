@@ -38,14 +38,33 @@ def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
     return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
+def folded_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
+    """
+    Whether a call has the geometry of Qwen3.5's heads with the batch folded into the head axis:
+    B == 1, HV a multiple of 32 and H == HV / 2 (b samples of H 16 / HV 32 fold to H 16 b / HV 32
+    b), K == V == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry. The SM90
+    kernels index every head by HV and H, so this is pinned_shapes' geometry repeated b times.
+    """
+    if not consistent_geometry(q, k, v, g, beta):
+        return False
+    B, _, H, K = k.shape
+    HV, V = v.shape[2:]
+    return B == 1 and HV % 32 == 0 and HV == 2 * H and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
+
+
 def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call: the geometry of
     pinned_shapes, on SM90 or SM100. Otherwise the caller uses FLA's autotuned entry points.
-    Constant per geometry: torch.compile guards on the shape, device and dtype checks.
+    On SM90 also the folded geometry of folded_shapes (a batch folded into the heads). Constant per
+    geometry: torch.compile guards on the shape, device and dtype checks.
     """
     if not pinned_shapes(q, k, v, g, beta):
-        return False
+        match ARCH_MAJOR:
+            case 9:
+                return folded_shapes(q, k, v, g, beta)
+            case _:
+                return False
     match ARCH_MAJOR:
         case 9:
             return True

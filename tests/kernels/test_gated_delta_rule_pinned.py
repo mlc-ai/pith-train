@@ -72,13 +72,16 @@ def make_inputs(
     gate: str = "model",
     seed: int = 0,
     resets: tuple[int, ...] = (),
+    hv: int = HV,
 ) -> tuple[torch.Tensor, ...]:
     """
     Return q / k (B, S, H, D) L2-normalized bf16, v (B, S, HV, D) bf16, g (B, S, HV) fp32, beta
     (B, S, HV) bf16 and do like v. gate="model" draws the gate as the model computes it,
     -exp(A_log) * softplus(a + dt_bias) with A_log = log U(0, 16); "mild" keeps a long memory.
-    resets are packed-document starts, where g = -128 as the model sets it.
+    resets are packed-document starts, where g = -128 as the model sets it. hv value heads (HV
+    unless a folded batch is wanted: b samples fold to H 16 b / HV 32 b).
     """
+    HV = hv
     gen = torch.Generator(device="cuda").manual_seed(seed)
     device, bf16 = "cuda", torch.bfloat16
 
@@ -131,15 +134,22 @@ def naive_gdr(q, k, v, g, beta):
     return torch.stack(out, 1)
 
 
-def per_value_head(x: torch.Tensor) -> torch.Tensor:
-    return x.repeat_interleave(HV // x.shape[2], dim=2)
+def per_value_head(x: torch.Tensor, hv: int) -> torch.Tensor:
+    return x.repeat_interleave(hv // x.shape[2], dim=2)
 
 
 def naive_reference(q, k, v, g, beta, do) -> tuple[torch.Tensor, dict]:
     """
     The fp32 recurrence's output and its autograd gradients (dq, dk per value head).
     """
-    leaves = [per_value_head(q).float(), per_value_head(k).float(), v.float(), g, beta.float()]
+    hv = v.shape[2]
+    leaves = [
+        per_value_head(q, hv).float(),
+        per_value_head(k, hv).float(),
+        v.float(),
+        g,
+        beta.float(),
+    ]
     leaves = [leaf_value.detach().clone().requires_grad_() for leaf_value in leaves]
     ref = naive_gdr(*leaves)
     ref.backward(do.float())
@@ -183,6 +193,9 @@ def test_not_supported_off_the_geometry() -> None:
         "gate on the host": (q, k, v, g.cpu(), beta),
         "rank-3 q / k": (q[0], k[0], v, g, beta),
         "rank-2 gate": (q, k, v, g[0], beta),
+        "48 value heads over 16 key heads": make_inputs(256, H=16, hv=48)[:5],
+        "96 value heads over 32 key heads": make_inputs(256, H=32, hv=96)[:5],
+        "64 value heads over 64 key heads": make_inputs(256, H=64, hv=64)[:5],
         "non-contiguous v": (q, k, v.transpose(1, 2).contiguous().transpose(1, 2), g, beta),
     }
     for name, args in off.items():
@@ -260,6 +273,66 @@ def test_against_naive_recurrence(S: int, H: int, gate: str, resets: tuple[int, 
     assert_close_to(o, ref, "o", 1e-4)
     for name, got in zip(GRADS, grads):
         assert_close_to(got, ref_grads[name], name, 1e-3)
+
+
+# (S, b, gate, resets): b samples of H 16 / HV 32 folded into the heads (H 16 b / HV 32 b, value head
+# j reading key head j // 2), as gated_delta_rule folds a batch; aligned and ragged, with resets.
+FOLDED_CASES = [
+    (64, 3, "model", ()),
+    (64, 2, "mild", (0, 63)),
+    (65, 3, "model", (64,)),
+    (1000, 2, "model", (0, 999)),
+    (2048, 3, "mild", ()),
+    (4000, 3, "model", (0, 63, 64, 3999)),
+    (4096, 3, "model", (63, 64, 4095)),
+    (4096, 2, "mild", ()),
+    (8192, 3, "model", (0, 8191)),
+]
+
+
+@pytest.mark.parametrize("S,b,gate,resets", FOLDED_CASES)
+def test_folded_batch_against_naive_recurrence(
+    S: int, b: int, gate: str, resets: tuple[int, ...]
+) -> None:
+    """
+    The folded geometry (the SM90 widening of the capability query; skipped where it is False):
+    forward and backward against the fp32 recurrence, as test_against_naive_recurrence.
+    """
+    q, k, v, g, beta, do = make_inputs(S, H=16 * b, gate=gate, seed=S + b, resets=resets, hv=32 * b)
+    if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
+        pytest.skip("the folded geometry runs the pinned kernels on SM90 only")
+    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+    assert o.shape == v.shape and A.shape == (1, S, 32 * b, 64)
+    grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
+    assert grads[0].shape == grads[1].shape == (1, S, 32 * b, D)
+    ref, ref_grads = naive_reference(q, k, v, g, beta, do)
+    assert_close_to(o, ref, "o", 1e-4)
+    for name, got in zip(GRADS, grads):
+        assert_close_to(got, ref_grads[name], name, 1e-3)
+
+
+@pytest.mark.parametrize("S", [64, 4000])
+def test_folded_batch_is_per_sample(S: int) -> None:
+    """
+    Folding is exact: each sample's slice of the folded call's outputs and gradients equals the
+    pinned call on that sample alone, bit for bit (every head's recurrence is independent).
+    """
+    b = 3
+    q, k, v, g, beta, do = make_inputs(
+        S, H=16 * b, gate="model", seed=7, resets=(0, S // 2), hv=32 * b
+    )
+    if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
+        pytest.skip("the folded geometry runs the pinned kernels on SM90 only")
+    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+    folded = (o, g_cum, A, *chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do))
+    for i in range(b):
+        keys, values = slice(16 * i, 16 * (i + 1)), slice(32 * i, 32 * (i + 1))
+        qi, ki = q[:, :, keys].contiguous(), k[:, :, keys].contiguous()
+        vi, gi, bi, doi = (x[:, :, values].contiguous() for x in (v, g, beta, do))
+        oi, gci, Ai = chunk_gdr_fwd_pinned(qi, ki, vi, gi, bi)
+        single = (oi, gci, Ai, *chunk_gdr_bwd_pinned(qi, ki, vi, gci, bi, Ai, doi))
+        for name, x, y in zip(("o", "g_cum", "A", *GRADS), folded, single):
+            assert torch.equal(x[:, :, values], y), (i, name)
 
 
 def test_comparison_is_sensitive() -> None:
@@ -347,7 +420,7 @@ def fla_reference(q, k, v, g, beta, do):
         chunk_gated_delta_rule_fwd,
     )
 
-    q, k = per_value_head(q).contiguous(), per_value_head(k).contiguous()
+    q, k = per_value_head(q, v.shape[2]).contiguous(), per_value_head(k, v.shape[2]).contiguous()
     scale = D**-0.5
     g_cum, o, A, *_ = chunk_gated_delta_rule_fwd(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale, initial_state=None, output_final_state=False
