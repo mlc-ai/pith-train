@@ -519,9 +519,12 @@ def send_def(k, ep, epr, ids_dtype):
 
 
 # Self-resetting int32 workspace of the send kernel, one per (device, stream, ne, ep), so launches
-# on two streams never share it.
+# on two streams never share it. At most WORKSPACE_ENTRIES are cached (least recently used evicted);
+# an evicted workspace is kept alive in RETIRED until an event recorded on its stream at eviction has
+# completed, so its memory is never released while a launch on that stream may still use it.
 WORKSPACES: dict = {}
 WORKSPACE_ENTRIES = 8
+RETIRED: list = []  # (event, workspace) of evicted workspaces whose stream may still be using them
 
 
 def workspace(device, ne, ep):
@@ -529,16 +532,22 @@ def workspace(device, ne, ep):
     int32: counters and words, zeroed once and kept zero by the kernel's last CTA; then the per-CTA
     bases (SEND_MAX_CTAS * (ne + ep)), rewritten every launch.
     """
-    key = (device, torch.cuda.current_stream(device).cuda_stream, ne, ep)
-    ws = WORKSPACES.get(key)
-    if ws is None:
+    stream = torch.cuda.current_stream(device)
+    key = (device, stream.cuda_stream, ne, ep)
+    ent = WORKSPACES.pop(key, None)
+    if ent is None:
         off = words(ne, ep)["cb_off"]
         ws = torch.empty(off + SEND_MAX_CTAS * (ne + ep), dtype=torch.int32, device=device)
         zero_kernel(off)(ws)
-        if len(WORKSPACES) >= WORKSPACE_ENTRIES:
-            WORKSPACES.clear()
-        WORKSPACES[key] = ws
-    return ws
+        RETIRED[:] = [(ev, old) for ev, old in RETIRED if not ev.query()]
+        while len(WORKSPACES) >= WORKSPACE_ENTRIES:
+            old, old_stream = WORKSPACES.pop(next(iter(WORKSPACES)))
+            ev = torch.cuda.Event()
+            ev.record(old_stream)
+            RETIRED.append((ev, old))
+        ent = (ws, stream)
+    WORKSPACES[key] = ent  # most recently used last
+    return ent[0]
 
 
 def send_idx_torch(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor) -> tuple[torch.Tensor, ...]:
