@@ -4,14 +4,20 @@ Branch `haok/tirx-standalone-sm100` (from `haok/tirx-evolved-sm100` @ bf9d16f). 
 TIRx kernel modules move from apache-tvm 0.27 to the standalone TIRx compiler, so pith-train drops
 the full `apache-tvm` dependency. The evolved schedules are unchanged; only the API changed.
 
-**Verdict (in progress).** <!--VERDICT-->Every kernel builds on tvm_tirx with no new intrinsics or
-hand-written PTX. On a B200, every kernel verified so far produces outputs bitwise identical to the
-apache-tvm 0.27 build on its frontier and held-out workloads (token_scatter is nondeterministic on
-both stacks and passes its check), and pith-train's `tests/kernels` gives the same result on both
-stacks. The rows marked "not yet verified" are still running. The emitted SASS differs in scalar
-code nearly everywhere (one upstream pipeline gap above all: no CSE inside kernel bodies) and, in
-the bf16 expert GEMM, in nvcc's unrolling; speed was not measured cleanly enough to quote (other
-users' jobs shared the only usable GPU), see the codegen section.<!--/VERDICT-->
+**Verdict.** <!--VERDICT-->All 21 SM100 kernel modules run on tvm_tirx with no new intrinsics and no
+hand-written PTX. On a B200, 18 of them give outputs bitwise identical to the apache-tvm 0.27 build on
+every frontier and held-out workload of their TIRx-harness tasks; the other three (token_scatter,
+ep_dispatch, fp8_scatter_quant) place rows nondeterministically on both stacks (two old-stack runs
+already differ) and pass their tasks' checks on every workload. pith-train's tests/kernels and
+operator / layer tests give the same result on both stacks. Two host-side contract changes of
+tvm_tirx and two semantic changes were neutralized in the port. The SASS differs in scalar code
+nearly everywhere (mostly one upstream gap: no CSE inside kernel bodies) and, in the bf16 expert GEMM,
+in nvcc's unrolling. Speed was only measured on the side of the correctness runs (1 trial, 10 iterations;
+runs that shared the GPU with another user's job discarded): 14 of the 18 tasks with clean timing are
+within 1.5% of the old stack on both workload sets (most within 0.5%), the other four (causal_conv1d
+held-out, gated_delta_rule frontier, ep_dispatch, silu_mul) on few, noisy rows (see the table); the three kernels whose SASS families
+changed most (bf16 expert GEMM, fp8_clamped_swiglu_quant, cross_entropy) have no clean timing yet,
+so equal speed is not established for them.<!--/VERDICT-->
 
 ## Stacks
 
@@ -188,41 +194,90 @@ none changes what memory, tensor-core, barrier or TMA operations a kernel issues
 | fp8_grouped_gemm_sm100 | pith_fp8_grouped_gemm | 66/66 bitwise equal (2 runs) | 66/66 bitwise equal (2 runs) | 66/66 + 66/66 |
 | bf16_expert_gemm_sm100 | pith_bf16_expert_gemm | 78/78 bitwise equal (2 runs) | 76/76 bitwise equal (2 runs) | 78/78 + 76/76 |
 | bf16_expert_slots_sm100 | pith_bf16_expert_slots | 74/74 bitwise equal (2 runs) | 68/68 bitwise equal (2 runs) | 74/74 + 68/68 |
-| token_scatter_sm100 | pith_token_scatter | not bitwise comparable; task check 34/34 new, 34/34 old | not bitwise comparable; task check 37/37 new, 37/37 old | 34/34 + 37/37 |
+| token_scatter_sm100 | pith_token_scatter | nondeterministic on both stacks (old vs old equal on 2/34, new vs old on 4/68); task check passes | nondeterministic on both stacks (old vs old equal on 2/37, new vs old on 4/74); task check passes | 34/34 + 37/37 |
 | segment_sum_sm100 | pith_segment_sum | 30/30 bitwise equal (2 runs) | 31/31 bitwise equal (2 runs) | 30/30 + 31/31 |
 | fp8_clamped_swiglu_quant_sm100 | pith_fp8_clamped_swiglu_quant | 79/79 bitwise equal (2 runs) | 82/82 bitwise equal (2 runs) | 79/79 + 82/82 |
-| fp8_scatter_quant_sm100 | pith_fp8_scatter_quant | **not yet verified** | **not yet verified** | - |
-| fp8_silu_mul_quant_sm100 | pith_fp8_silu_mul_quant | **not yet verified** | **not yet verified** | - |
-| fp8_weight_quant_sm100 | pith_fp8_weight_quant | **not yet verified** | **not yet verified** | - |
-| fp8_rowwise_blockwise_transpose_sm100 | pith_fp8_quant_act | **not yet verified** | **not yet verified** | - |
-| fp8_rowwise_transpose_sm100 | pith_fp8_quant_grad | **not yet verified** | **not yet verified** | - |
-| fp8_rowwise_colwise_sm100 | pith_fp8_quant_grouped | **not yet verified** | **not yet verified** | - |
-| cross_entropy_sm100 | pith_cross_entropy | 25/25 bitwise equal (2 runs) | **not yet verified** | 25/25 |
+| fp8_scatter_quant_sm100 | pith_fp8_scatter_quant | nondeterministic on both stacks (old vs old equal on 3/56, new vs old on 6/112); task check passes | nondeterministic on both stacks (old vs old equal on 3/51, new vs old on 6/100); task check passes; task check old [50, 50] new [50, 50] of 51 | 56/56 + 50/51 |
+| fp8_silu_mul_quant_sm100 | pith_fp8_silu_mul_quant | 100/100 bitwise equal (2 runs) | 100/100 bitwise equal (2 runs) | 100/100 + 100/100 |
+| fp8_weight_quant_sm100 | pith_fp8_weight_quant | 410/410 bitwise equal (1 run) | 383/383 bitwise equal (2 runs) | 410/410 + 383/383 |
+| fp8_rowwise_blockwise_transpose_sm100 | pith_fp8_quant_act | 102/102 bitwise equal (2 runs) | 112/112 bitwise equal (2 runs) | 102/102 + 112/112 |
+| fp8_rowwise_transpose_sm100 | pith_fp8_quant_grad | 248/248 bitwise equal (2 runs) | 258/258 bitwise equal (2 runs) | 248/248 + 258/258 |
+| fp8_rowwise_colwise_sm100 | pith_fp8_quant_grouped | 103/103 bitwise equal (2 runs) | 103/103 bitwise equal (2 runs) | 103/103 + 103/103 |
+| cross_entropy_sm100 | pith_cross_entropy | 25/25 bitwise equal (2 runs) | 7/7 bitwise equal (kernel outputs hashed, 1 run; the task's reference check runs out of memory on both stacks at these vocabularies) | 25/25 |
 | log_prob_sm100 | pith_log_prob | 128/128 bitwise equal (2 runs) | 116/116 bitwise equal (2 runs) | 128/128 + 116/116 |
-| ep_dispatch_sm100 | pith_ep_dispatch | **not yet verified** | **not yet verified** | - |
+| ep_dispatch_sm100 | pith_ep_dispatch | nondeterministic on both stacks (old vs old equal on 198/288, new vs old on 395/576); task check passes | nondeterministic on both stacks (old vs old equal on 186/262, new vs old on 371/524); task check passes | 288/288 + 262/262 |
 | clamped_swiglu_sm100 | pith_clamped_swiglu | 64/64 bitwise equal (2 runs) | 66/66 bitwise equal (2 runs) | 64/64 + 66/66 |
 | silu_mul_sm100 | pith_silu_mul | 92/92 bitwise equal (2 runs) | 92/92 bitwise equal (2 runs) | 92/92 + 92/92 |
 <!--/GPU-->
 
+### Speed on the side (indicative only)
+
+New / old kernel time, sum of per-workload medians over the clean timed rows of the correctness runs
+(1 trial x 10 iterations per run, 2 runs per stack, old and new alternating; KCoral = its leased
+B200, local = catalyst GPU 5; runs that saw another user's process on the GPU are excluded):
+
+| task | frontier | held-out |
+|---|---|---|
+| group_bias_add | 0.999 (6 rows) | 1.000 (7) |
+| causal_conv1d | 1.003 (7) | 0.984 (7, rows 0.89-1.08) |
+| gated_delta_rule_cp | 1.000 (10) | 1.013 (4) |
+| gated_delta_rule | 0.963 (4, rows 0.89-1.00) | 0.999 (8) |
+| fp8_grouped_gemm | 1.001 (36) | 1.001 (36) |
+| bf16_expert_gemm | no clean run | no clean run |
+| bf16_expert_slots | 1.002 (27) | 1.005 (21) |
+| token_scatter | 0.999 (3) | 1.001 (6) |
+| segment_sum | 0.999 (6) | 1.000 (7) |
+| fp8_clamped_swiglu_quant | no clean run | no clean run |
+| fp8_scatter_quant | 1.002 (16) | 1.002 (10) |
+| fp8_silu_mul_quant | 1.000 (32) | 1.000 (32) |
+| fp8_weight_quant | 1.003 (42) | 1.001 (15) |
+| fp8_quant_act | 1.000 (14) | 0.998 (24) |
+| fp8_quant_grad | 1.000 (14) | 1.004 (24) |
+| fp8_quant_grouped | 1.002 (16) | 1.003 (16) |
+| cross_entropy | no clean run | - |
+| log_prob | 1.001 (16) | 1.000 (4) |
+| ep_dispatch | 0.979 (40, rows 0.74-1.17: few-us kernels) | 0.987 (14) |
+| clamped_swiglu | 1.001 (4) | 1.000 (6) |
+| silu_mul | 1.036 (14, one row 1.34) | 1.049 (14, one row 1.62) |
+
+These are too short to resolve differences below ~1%, and the outlier rows (silu_mul, ep_dispatch,
+causal_conv1d held-out) were not re-measured. A proper interleaved timing pass (more trials, an
+exclusive GPU) is still to do, first for bf16_expert_gemm, whose unrolling changed.
+
 ## pith-train tests under the new stack
 
 <!--TESTS-->
-Run on a B200 (catalyst GPU 5, picked empty at launch and pinned by UUID; KCoral for some), the old
-tree (bf9d16f, apache-tvm 0.27) and the new tree (tvm_tirx 0.1.0a6) side by side, same torch 2.14.
-DeepGEMM does not build against torch 2.14 in this environment and FA4 is not installed, so a stub
-`deep_gemm` that raises when called stands in (the `fp8_gemm_nt` / DeepGEMM-backed tests error
-on both stacks) and `tests/kernels/test_flash_attn_memoize.py` is skipped.
+First run of pith-train's SM100 code on a B200 (catalyst GPU 5, picked empty at launch, pinned by
+UUID): the old tree (haok/tirx-evolved-sm100 @ bf9d16f, apache-tvm 0.27) and the new tree (this
+branch, tvm_tirx 0.1.0a6) side by side, same torch 2.14.0+cu132, FA4 4.0.0b28, quack 0.6.5.
+DeepGEMM does not build against torch 2.14 here, so a stand-in `deep_gemm` that raises when called
+is on the path (the DeepGEMM-backed `fp8_gemm_nt` tests fail on both stacks for that reason).
 
-| suite | old stack | new stack |
+| suite | old stack (landing) | new stack (this branch) |
 |---|---|---|
-| `tests/kernels` (all features, both directions) | 1744 passed, 27 failed, 20 skipped (11.0 min) | 1744 passed, 27 failed, 20 skipped (24.7 min) |
-| failures, identical on both | 21 `test_fp8_gemm` (DeepGEMM stub); `test_clamped_swiglu::test_matches_autograd[bf16]`; `test_cross_entropy::test_small_gradient_entries_relative[*-fp16]` (3); `test_log_prob::test_masked_logits` (2) | same 27 tests |
-| operators + layer tests (`tests/operators/test_cp_sequence.py`, `tests/test_log_prob.py`, `tests/test_clamped_swiglu.py`, `tests/test_silu_mul.py`, `tests/test_indexed_bias_add.py`) | <!--OLDOPS--> | 90 passed, 13 failed, 14 skipped: `test_packed_positions` (3, need FA4) and `tests/test_clamped_swiglu.py::test_clamped_swiglu_forward_backward` (10) |
+| `tests/kernels` (every feature, forward and backward; FA4's file run with the operators) | 1744 passed, 27 failed, 20 skipped (11.0 min) | 1744 passed, 27 failed, 20 skipped (24.9 min) |
+| `tests/operators`, `tests/test_*.py`, `tests/kernels/test_flash_attn_memoize.py` | 135 passed, 18 failed, 27 skipped | 135 passed, 18 failed, 27 skipped |
 
-The 6 non-DeepGEMM `tests/kernels` failures fail on the old tree too (the first B200 run of these
-suites): they are not from the port, and are left for the kernels' owners. The new stack's suite is
-slower only because it compiles every kernel 2-7x slower on the first call.
+The failing test ids are identical on both stacks, so none comes from the port:
+
+| failures | count | cause |
+|---|---|---|
+| `tests/kernels/test_fp8_gemm.py` (`fp8_gemm_nt`), `tests/test_deepgemm_fp8_linear_correctness.py`, `tests/test_muon_fp8.py::test_muon_step_on_fp8_gradients` | 21 + 7 + 1 | DeepGEMM stand-in (environment) |
+| `tests/kernels/test_cross_entropy.py::test_small_gradient_entries_relative[*-float16]` | 3 | test bug (fp16 gradients of these rows are subnormal, so its relative window is empty): fp16 case dropped, e001984 |
+| `tests/kernels/test_log_prob.py::test_masked_logits[*]` | 2 | test bug (rows 6 and 8 kept random targets on masked columns, whose gradient is legitimately nonzero): fixed, 6589681; passes on the B200 |
+| `tests/kernels/test_clamped_swiglu.py::test_matches_autograd[bfloat16]`, `tests/test_clamped_swiglu.py::test_clamped_swiglu_forward_backward[*]` | 1 + 10 | reference convention: torch 2.14's clamp backward is 0 at the clamp boundary (x == limit), the kernels (SM90 Triton and SM100 TIRx alike) pass the gradient there; every mismatching element has gate == 7.0 or up == +-7.0 exactly. pith-train pins torch < 2.14; kernels left as they are |
+
+Multi-GPU tests (`tests/test_dualpipev.py`'s torchrun entry, FSDP / Muon multi-rank cases) skip with one
+visible GPU. The new stack's suites run longer only because it compiles every kernel 2-7x slower.
 <!--/TESTS-->
+
+## Known merge hazards
+
+- **haok/kda-sm90 (93ad34c, c75a394)** changes the shared `gated_delta_rule` operator: the batch is
+  folded into heads before the shape check. Merged with this branch, a few non-Qwen3.5 shapes would
+  take the pinned SM100 TIRx kernels (`gated_delta_rule_pinned_sm100`, evolved and verified only at
+  Qwen3.5's geometry) instead of FLA, and that branch's new batched dense-test cases fail on SM100.
+  Resolve by keeping the SM100 capability gate on the geometry the kernels cover when merging.
 
 ## Blockers and caveats
 
@@ -246,6 +301,10 @@ slower only because it compiles every kernel 2-7x slower on the first call.
 - **token_scatter** cannot be compared bitwise (old vs old already differs); its task check passes
   on both stacks for every workload.
 - **cross_entropy held-out:** the harness's own comparison runs out of memory on the held-out
-  vocabularies (15 GiB allocation with 172 GiB in use) on the old stack as well; retried with one
-  correctness run.
+  vocabularies (15 GiB allocation with 172 GiB in use) on the old stack as well, so its 7 held-out
+  workloads were checked by hashing the kernels' outputs on both stacks (bitwise equal), without the
+  task's reference check.
+- **KCoral request limits:** a request's 3600 s limit includes time spent waiting for the GPU lease,
+  and its worker's scratch space holds only a couple of runs' full outputs; the cross-stack driver
+  submits one request at a time and keeps output hashes (full tensors only below 64 MiB).
 <!--CAVEATS-->
