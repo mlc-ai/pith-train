@@ -25,6 +25,7 @@ from pithtrain.kernels.fp8_silu_mul_quant import fp8_silu_mul_bwd, fp8_silu_mul_
 from pithtrain.kernels.fp8_weight_quant import fp8_pack_transpose, fp8_scales, fp8_scales_multi, fp8_shard_amax, fp8_shard_amax_multi, fp8_shard_cast, fp8_quant_weight, fp8_quant_weight_grouped
 from pithtrain.kernels.gated_delta_rule_pinned import chunk_gdr_bwd_pinned, chunk_gdr_fwd_pinned, gated_delta_rule_pinned_supported
 from pithtrain.kernels.group_bias_add import group_bias_add
+from pithtrain.kernels.log_prob import log_prob_bwd, log_prob_fwd
 from pithtrain.kernels.segment_sum import segment_sum
 from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
 from pithtrain.kernels.token_scatter import scatter_by_expert
@@ -106,6 +107,10 @@ __all__.append("bf16_expert_segment_sum")
 __all__.append("chunk_gdr_bwd_pinned")
 __all__.append("chunk_gdr_fwd_pinned")
 __all__.append("gated_delta_rule_pinned_supported")
+
+# Log-probability and entropy of a tempered softmax (RL objectives)
+__all__.append("log_prob_bwd")
+__all__.append("log_prob_fwd")
 
 
 # Launch-config tuning
