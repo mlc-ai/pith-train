@@ -143,6 +143,20 @@ def _combine_expert_order(moe_outs, topk_weight, moe_local_idxs, output_dtype):
     return result
 
 
+def _combine_expert_sum(moe_outs, topk_weight, moe_local_idxs, output_dtype):
+    """Match HF grouped experts: BF16 products, one FP32-accumulating K sum.
+
+    Dispatch return indices restore the original top-k slots before reducing.
+    Keep the serial eager helper separate: Talker relies on that arithmetic.
+    """
+    if moe_local_idxs is not None:
+        slots = moe_outs.new_zeros(topk_weight.numel(), moe_outs.shape[-1])
+        moe_outs = slots.index_copy(0, moe_local_idxs, moe_outs)
+    outputs = moe_outs.view(*topk_weight.shape, -1)
+    products = outputs * topk_weight[..., None]
+    return products.sum(dim=1).to(output_dtype)
+
+
 class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -161,16 +175,14 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         indices, weights, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
-        # Expert-ID accumulation order is independent of dispatch row layout.
-        indices, order = indices.sort(dim=-1)
-        weights = weights.gather(-1, order)
+        # Preserve HF top-k slot order; expert dispatch handles grouping independently.
         flat = hidden_states.reshape(-1, shape[-1])
         repeated = flat[:, None].expand(-1, self.num_experts_per_tok, -1).reshape(-1, shape[-1])
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
             repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
         )
         outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
-        return _combine_expert_order(outputs, weights, None, hidden_states.dtype).view(shape)
+        return _combine_expert_sum(outputs, weights, None, hidden_states.dtype).view(shape)
 
 
 class Qwen3OmniMoeThinkerTextMLP(nn.Module):
@@ -296,9 +308,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
-        # Canonicalize only the K selected slots; retain the dispatch policy below.
-        indices, order = indices.sort(dim=-1)
-        weights = weights.gather(-1, order)
+        # Preserve top-k slots for the HF grouped-expert reduction.
         tokens, routing = prepare_dispatch(
             hidden_states,
             indices,
@@ -328,7 +338,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     def _forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         if not self.is_moe:
             return residual + moe_outs
-        combined = _combine_expert_order(
+        combined = _combine_expert_sum(
             moe_outs,
             topk_weight,
             moe_local_idxs if distributed.ep_size > 1 else None,

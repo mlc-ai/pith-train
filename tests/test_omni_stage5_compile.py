@@ -35,12 +35,13 @@ def layer_type(ep, *, media=False):
         path = ROOT / "pithtrain/models" / file
         tree = ast.parse(path.read_text())
         if file == "qwen3_omni_moe.py":
-            helper = next(
+            helpers = [
                 n
                 for n in tree.body
-                if isinstance(n, ast.FunctionDef) and n.name == "_combine_expert_order"
-            )
-            exec(compile(ast.Module(body=[helper], type_ignores=[]), str(path), "exec"), namespace)
+                if isinstance(n, ast.FunctionDef)
+                and n.name in ("_combine_expert_order", "_combine_expert_sum")
+            ]
+            exec(compile(ast.Module(body=helpers, type_ignores=[]), str(path), "exec"), namespace)
         definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
         for method in methods:
             method_owner = definition
@@ -100,9 +101,7 @@ def test_image_preserves_bf16_deepstack_and_all_gradients(ep, deterministic_toke
     outputs = torch.randn(24, 8, dtype=torch.bfloat16, requires_grad=True)
     indexes = torch.randperm(24) if ep == 2 else None
     returned = outputs[indexes] if ep == 2 else outputs
-    combined = outputs.new_zeros(3, 8)
-    for slot in range(8):
-        combined = combined + outputs.view(3, 8, 8)[:, slot] * weights[:, slot, None]
+    combined = (outputs.view(3, 8, 8) * weights[..., None]).sum(dim=1)
     hidden = residual[..., :8] + combined.view(1, 3, 8)
     expected = torch.cat((hidden + residual[..., 16:24], residual[..., 8:]), -1)
     actual = layer.forward_stage5(returned, indexes, weights, residual)

@@ -28,7 +28,7 @@ def layer_type(ep):
     methods = ("_forward_stage5", "forward_stage5")
     namespace = load_definitions(
         "pithtrain/models/qwen3_omni_moe.py",
-        ("_combine_expert_order",),
+        ("_combine_expert_order", "_combine_expert_sum"),
         dict(torch=torch, distributed=SimpleNamespace(ep_size=ep)),
     )
     namespace = load_definitions(
