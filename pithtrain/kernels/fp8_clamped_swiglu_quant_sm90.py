@@ -25,7 +25,7 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.arch import SM_COUNT
-from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
+from pithtrain.kernels.clamped_swiglu_sm90 import clamped_swiglu_bwd_sm90, clamped_swiglu_fwd_sm90
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, ld_v4, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, ptx_f32, quant4_e4m3
@@ -54,7 +54,7 @@ def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: tor
     bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does.
     """
     x = biased_gate_up(gate_up, bias, grouped_mm_offs)
-    return clamped_swiglu_bwd(dh.to(x.dtype), x, alpha, limit)
+    return clamped_swiglu_bwd_sm90(dh.to(x.dtype), x, alpha, limit)
 
 BLOCK = 128  # rows per quantization group and output columns per CTA tile
 THREADS = 512
@@ -584,7 +584,7 @@ def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gro
     if M == 0 or N == 0:
         return allocate_outputs(M, N, gate_up.device)
     if not clamped_swiglu_quant_fusable(gate_up, bias, grouped_mm_offs):
-        h = clamped_swiglu_fwd(biased_gate_up(gate_up, bias, grouped_mm_offs), alpha, limit)
+        h = clamped_swiglu_fwd_sm90(biased_gate_up(gate_up, bias, grouped_mm_offs), alpha, limit)
         return fp8cast_rowwise_kmajor_sm90(h, grouped_mm_offs)
     KP = N if kmajor_channels is None else kmajor_channels
     assert KP >= N
