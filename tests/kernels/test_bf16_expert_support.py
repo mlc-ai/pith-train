@@ -56,17 +56,17 @@ def test_too_many_groups(num_groups):
     assert not bf16_experts_supported(num_groups)
 
 
-def test_query_imports_neither_quack_nor_cutlass():
+def test_query_imports_no_kernel_compiler():
     run(
         """
         import sys
         import pithtrain.kernels
-        assert not any(m.split(".")[0] in ("quack", "cutlass", "tvm") for m in sys.modules)
+        assert not any(m.split(".")[0] in ("quack", "cutlass", "tvm", "tvm_tirx", "tirx_kernels") for m in sys.modules)
         from pithtrain.kernels import bf16_experts_supported
         bf16_experts_supported()
         bf16_experts_supported(16)
         bf16_experts_supported(128)
-        bad = sorted(m for m in sys.modules if m.split(".")[0] in ("quack", "cutlass", "tvm"))
+        bad = sorted(m for m in sys.modules if m.split(".")[0] in ("quack", "cutlass", "tvm", "tvm_tirx", "tirx_kernels"))
         assert not bad, bad
         """
     )
