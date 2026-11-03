@@ -1,6 +1,6 @@
 """
 SM90 context-parallel chunked gated delta rule (chunk size 64): FLA 0.5.2's context-parallel
-structure (FLA's ops/cp/chunk_delta_h.py) on CuTe-DSL kernels, no Triton kernel. Each rank holds a
+structure (FLA's ops/cp/chunk_delta_h.py) on CuTe-DSL kernels. Each rank holds a
 contiguous slice of one sequence. In the forward it computes its affine state map from zero,
 h_end = M h_start + he, where he is the recurrence run from a zero state (StateRecompute with a
 final state and no per-chunk stores, FLA's pre-process h half) and M is the product of the per-chunk
@@ -16,9 +16,9 @@ Rounding follows FLA's kernels: bf16 k~ = bf16(k 2^(g_last - g)) (exp2 with ftz,
 even), the M_c product on bf16 tensor cores with fp32 accumulation in increasing K order, the
 subtraction from the diagonal in fp32 after the product, and the chain M <- M_c M and the merge h
 <- M_s h + he_s as TF32 tensor-core products of the raw fp32 bits (truncated, no rounding
-conversion) in increasing K8 order, the merge's he_s the accumulator the products are added to.
-The K-order inside each K8 TF32 instruction is a compile-time choice, k_order, of the three
-mappings Triton's warp-MMA and warp-group-MMA lowerings use; the verifier compares each with FLA.
+conversion) in increasing K8 order, each instruction's slot p reading k = 8 j + p of block j, the
+merge's he_s the accumulator the products are added to. The verifier
+(tests/kernels/test_gated_delta_rule_cp.py) compares every piece with a float64 PyTorch evaluation.
 """
 
 import cutlass
@@ -32,7 +32,7 @@ from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.gated_delta_rule_pinned_bwd_sm90 import bwd_prologue, chunk_gradients, state_final, state_gradient, state_gradient_initial, state_recompute
 from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import BT, HEAD_DIM, copy_rows, operand_copies, state_output, wy_representation
 
-__all__ = ["K_ORDERS", "StateMerge", "TransitionChain", "gdr_cp_bwd_local_sm90", "gdr_cp_bwd_output_sm90", "gdr_cp_bwd_states_sm90", "gdr_cp_fwd_local_sm90", "gdr_cp_fwd_output_sm90", "gdr_cp_merge_sm90", "gated_delta_rule_cp_supported_sm90"]
+__all__ = ["StateMerge", "TransitionChain", "gdr_cp_bwd_local_sm90", "gdr_cp_bwd_output_sm90", "gdr_cp_bwd_states_sm90", "gdr_cp_fwd_local_sm90", "gdr_cp_fwd_output_sm90", "gdr_cp_merge_sm90", "gated_delta_rule_cp_supported_sm90"]
 
 CHAIN_BV = 32  # transition columns per CTA
 CHAIN_THREADS = 128
@@ -40,35 +40,17 @@ CHAIN_STAGES = 2  # chunks of k, w and g in flight
 MERGE_BV = 32  # state columns per CTA of the merge
 MERGE_THREADS = 128
 F32_PAD = 4  # fp32 row padding of the TF32 operand tiles
-# The K-order of a TF32 product inside each K8 instruction: "natural" (hardware slot p reads k =
-# 8 j + p of block j), "pairs" (slot t + 4 i reads 8 j + 2 t + i, Triton's warp-MMA operand layout)
-# or "split16" (each 16-wide block j: instruction i reads the k of parity i, slot t + 4 s reading
-# 16 j + 2 t + 8 s + i, the layout FLA's 16 x 16 solve merges use).
-K_ORDERS = ("natural", "pairs", "split16")
-DEFAULT_K_ORDER = "natural"
-
-
-def k_layout(order: str, extent: int, stride: int) -> cute.Layout:
-    """
-    The K mode of a TF32 operand view: logical position -> element offset, extent a multiple of 16.
-    """
-    if order == "pairs":
-        return cute.make_layout(((4, 2), extent // 8), stride=((2 * stride, stride), 8 * stride))
-    if order == "split16":
-        return cute.make_layout(((4, 2), 2, extent // 16), stride=((2 * stride, 8 * stride), stride, 16 * stride))
-    return cute.make_layout(extent, stride=stride)
 
 
 @cute.jit
-def tf32_product(mma_tf32: cute.TiledMma, thr: cute.ThrMma, acc: cute.Tensor, s_a: cute.Tensor, s_b: cute.Tensor, rows: cutlass.Constexpr[int], cols: cutlass.Constexpr[int], order: cutlass.Constexpr[str]):
+def tf32_product(mma_tf32: cute.TiledMma, thr: cute.ThrMma, acc: cute.Tensor, s_a: cute.Tensor, s_b: cute.Tensor, rows: cutlass.Constexpr[int], cols: cutlass.Constexpr[int]):
     """
     acc (rows x cols) += s_a @ s_b on the warps' TF32 MMA: s_a (rows, HEAD_DIM) fp32 row-major with
     row stride HEAD_DIM + F32_PAD, s_b (HEAD_DIM, cols) fp32 row-major with row stride cols +
     F32_PAD. The fp32 values go to the MMA as they are (recast, not converted), so it reads them
-    truncated to TF32. K8 blocks in increasing order, each instruction's K slots per order.
+    truncated to TF32. K8 blocks in increasing order, slot p of each instruction reading k = 8 j + p.
     """
-    a_k, b_k = k_layout(order, HEAD_DIM, 1), k_layout(order, HEAD_DIM, cols + F32_PAD)
-    s_a_k, s_b_k = cute.make_tensor(s_a.iterator, cute.make_layout((rows, a_k.shape), stride=(HEAD_DIM + F32_PAD, a_k.stride))), cute.make_tensor(s_b.iterator, cute.make_layout((cols, b_k.shape), stride=(1, b_k.stride)))
+    s_a_k, s_b_k = cute.make_tensor(s_a.iterator, cute.make_layout((rows, HEAD_DIM), stride=(HEAD_DIM + F32_PAD, 1))), cute.make_tensor(s_b.iterator, cute.make_layout((cols, HEAD_DIM), stride=(1, cols + F32_PAD)))
     t_a, t_b = thr.partition_A(s_a_k), thr.partition_B(s_b_k)
     tf32 = lambda r: cute.make_tensor(cute.recast_ptr(r.iterator, dtype=cutlass.TFloat32), r.layout)
     # registers in the atom's fragment order (partition_shape), one K8 block at a time
@@ -93,8 +75,8 @@ class TransitionChain:
     rows past T load as zeros, gate rows as g_cum[T - 1] (so g_last is the last valid row's).
     """
 
-    def __init__(self, H: int, HV: int, reverse: bool, ragged: bool = False, order: str = DEFAULT_K_ORDER):
-        self.H, self.HV, self.reverse, self.ragged, self.order = H, HV, reverse, ragged, order
+    def __init__(self, H: int, HV: int, reverse: bool, ragged: bool = False):
+        self.H, self.HV, self.reverse, self.ragged = H, HV, reverse, ragged
 
     @cute.jit
     def __call__(self, mK: cute.Tensor, mW: cute.Tensor, mGcum: cute.Tensor, mOut: cute.Tensor, stream):
@@ -171,7 +153,7 @@ class TransitionChain:
                     s_mc[row, col] = diagonal - acc_p[elem]
             cute.arch.barrier()
             acc_m.fill(0.0)
-            tf32_product(mma_tf32, thr_tf32, acc_m, s_mc, s_m, HEAD_DIM, CHAIN_BV, self.order)
+            tf32_product(mma_tf32, thr_tf32, acc_m, s_mc, s_m, HEAD_DIM, CHAIN_BV)
             cute.arch.barrier()
             t_m = thr_tf32.partition_C(s_m)
             for elem in cutlass.range_constexpr(cute.size(acc_m)):
@@ -219,8 +201,8 @@ class StateMerge:
     double buffer of cp.async loads, the next rank's loaded during the current product.
     """
 
-    def __init__(self, HV: int, reverse: bool, order: str = DEFAULT_K_ORDER):
-        self.HV, self.reverse, self.order = HV, reverse, order
+    def __init__(self, HV: int, reverse: bool):
+        self.HV, self.reverse = HV, reverse
 
     @cute.jit
     def __call__(self, mAg: cute.Tensor, mOut: cute.Tensor, rank: Int32, count: Int32, stream):
@@ -258,7 +240,7 @@ class StateMerge:
                 acc[elem] = mAg[source(idx), head_idx, coords[elem][0], col_tile * MERGE_BV + coords[elem][1]]
             cute.arch.cp_async_wait_group(1)
             cute.arch.barrier()
-            tf32_product(mma_tf32, thr, acc, s_m[None, None, buffer], s_h, HEAD_DIM, MERGE_BV, self.order)
+            tf32_product(mma_tf32, thr, acc, s_m[None, None, buffer], s_h, HEAD_DIM, MERGE_BV)
             cute.arch.barrier()
             t_h = thr.partition_C(s_h)
             for elem in cutlass.range_constexpr(cute.size(acc)):
@@ -288,32 +270,32 @@ def gated_delta_rule_cp_supported_sm90(q: torch.Tensor, k: torch.Tensor, v: torc
     return consistent and B == 1 and HV % 32 == 0 and HV == 2 * H and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
-def chain_kernel(H: int, HV: int, reverse: bool, device: int, ragged: bool, order: str) -> object:
+def chain_kernel(H: int, HV: int, reverse: bool, device: int, ragged: bool) -> object:
     """
-    TransitionChain compiled once per (H, HV, reverse, device, order, ragged), T symbolic.
+    TransitionChain compiled once per (H, HV, reverse, device, ragged), T symbolic.
     """
-    key = ("transition_chain", H, HV, device, (reverse, order), ragged)
+    key = ("transition_chain", H, HV, device, reverse, ragged)
     if key not in COMPILED:
         T = cute.sym_int()
         keys, values, gate, out = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1)), fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1)), fake(Float32, (T, HV), (HV, 1), 4), fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1))
-        COMPILED[key] = cute.compile(TransitionChain(H, HV, reverse, ragged, order), keys, values, gate, out, fake_stream(), options="--enable-tvm-ffi")
+        COMPILED[key] = cute.compile(TransitionChain(H, HV, reverse, ragged), keys, values, gate, out, fake_stream(), options="--enable-tvm-ffi")
     return COMPILED[key]
 
 
-def merge_kernel(HV: int, reverse: bool, device: int, order: str) -> object:
+def merge_kernel(HV: int, reverse: bool, device: int) -> object:
     """
-    StateMerge compiled once per (HV, reverse, device, order); the gathered rank count, the rank
+    StateMerge compiled once per (HV, reverse, device); the gathered rank count, the rank
     and the predecessor / successor count are runtime arguments.
     """
-    key = ("state_merge", 0, HV, device, (reverse, order), False)
+    key = ("state_merge", 0, HV, device, reverse, False)
     if key not in COMPILED:
         W = cute.sym_int()
         ag, out = fake(Float32, (W, HV, HEAD_DIM, 2 * HEAD_DIM), (HV * 2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1)), fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
-        COMPILED[key] = cute.compile(StateMerge(HV, reverse, order), ag, out, Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
+        COMPILED[key] = cute.compile(StateMerge(HV, reverse), ag, out, Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
     return COMPILED[key]
 
 
-def gdr_cp_fwd_local_sm90(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, transition: bool, order: str = DEFAULT_K_ORDER) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def gdr_cp_fwd_local_sm90(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, transition: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     (g_cum, A, w, u, hm): WyRepresentation, and with transition the rank's forward map into hm, fp32
     (HV, K, V + K) = (he | M); without it hm is allocated and left unwritten (the last rank's slot,
@@ -325,11 +307,11 @@ def gdr_cp_fwd_local_sm90(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, bet
     hm = torch.empty(HV, HEAD_DIM, 2 * HEAD_DIM, device=k.device, dtype=torch.float32)
     if transition:
         state_final(k, w, u, g_cum, hm[:, :, :HEAD_DIM])
-        chain_kernel(H, HV, False, k.device.index, T % BT != 0, order)(k[0], w[0], g_cum[0], hm[:, :, HEAD_DIM:])
+        chain_kernel(H, HV, False, k.device.index, T % BT != 0)(k[0], w[0], g_cum[0], hm[:, :, HEAD_DIM:])
     return g_cum, A, w, u, hm
 
 
-def gdr_cp_merge_sm90(ag: torch.Tensor, rank: int, count: int, reverse: bool, order: str = DEFAULT_K_ORDER) -> torch.Tensor:
+def gdr_cp_merge_sm90(ag: torch.Tensor, rank: int, count: int, reverse: bool) -> torch.Tensor:
     """
     The folded state, fp32 (HV, K, V): of the count ranks before rank (forward) or after it
     (reverse) in ag, (W, HV, K, V + K) fp32; zeros when count is 0.
@@ -337,7 +319,7 @@ def gdr_cp_merge_sm90(ag: torch.Tensor, rank: int, count: int, reverse: bool, or
     W, HV = ag.shape[:2]
     out = torch.zeros(HV, HEAD_DIM, HEAD_DIM, device=ag.device, dtype=torch.float32) if count == 0 else torch.empty(HV, HEAD_DIM, HEAD_DIM, device=ag.device, dtype=torch.float32)
     if count > 0:
-        merge_kernel(HV, reverse, ag.device.index, order)(ag, out, rank, count)
+        merge_kernel(HV, reverse, ag.device.index)(ag, out, rank, count)
     return out
 
 
@@ -348,7 +330,7 @@ def gdr_cp_fwd_output_sm90(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u:
     return state_output(q, k, w, u, g_cum, h0)
 
 
-def gdr_cp_bwd_local_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, transition: bool, order: str = DEFAULT_K_ORDER) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def gdr_cp_bwd_local_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, transition: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     (w, u, dv_local, dhm): BwdPrologue, and with transition the rank's backward map into dhm, fp32
     (HV, K, V + K) = (dh from zero | M^T); without it dhm is allocated and left unwritten (the first
@@ -360,7 +342,7 @@ def gdr_cp_bwd_local_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_c
     dhm = torch.empty(HV, HEAD_DIM, 2 * HEAD_DIM, device=k.device, dtype=torch.float32)
     if transition:
         state_gradient_initial(q, k, w, do, dv_local, g_cum, dhm[:, :, :HEAD_DIM])
-        chain_kernel(H, HV, True, k.device.index, T % BT != 0, order)(k[0], w[0], g_cum[0], dhm[:, :, HEAD_DIM:])
+        chain_kernel(H, HV, True, k.device.index, T % BT != 0)(k[0], w[0], g_cum[0], dhm[:, :, HEAD_DIM:])
     return w, u, dv_local, dhm
 
 
