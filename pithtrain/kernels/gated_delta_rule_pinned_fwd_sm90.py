@@ -46,8 +46,8 @@ def block_product(thr: cute.ThrMma, mma_tf32: cute.TiledMma, acc: cute.Tensor, s
     m16n8k8 per 8 columns). The fp32 values go to the MMA as they are (recast, not converted), so it
     reads them truncated to TF32, as FLA's tl.dot does. The two k8 instructions take k = 0 .. 7 and
     8 .. 15, or with even_odd_k the even and the odd k (lane slot t + 4 j of instruction i reads
-    k = 2 t + 8 j + i), the split of Triton's kWidth = 2 operand layout, which FLA's inner merge
-    products use. The order changes the fp32 accumulation, not the products.
+    k = 2 t + 8 j + i), the split FLA's inner merge products use. The order changes the fp32
+    accumulation, not the products.
     """
     stride = TF32_STRIDE
     k_left = cute.make_layout(((4, 2), 2), stride=((2, 8), 1)) if const_expr(even_odd_k) else cute.make_layout(16, stride=1)

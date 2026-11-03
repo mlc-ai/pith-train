@@ -27,7 +27,7 @@ MAX_SLICE_BYTES, PREFERRED_SLICE_BYTES = 200 * 1024, 80 * 1024
 @dsl_user_op
 def exp_shifted(x: Float32, shift: Float32, use_ftz: bool, *, loc=None, ip=None) -> Float32:
     """
-    exp(x - shift) as Triton's tl.exp computes it: sub, multiply by log2(e), ex2.approx. The ftz
+    exp(x - shift) as sub, multiply by log2(e), then ex2.approx. The ftz
     form differs from the full-range ex2 only for results below 2^-126.
     """
     ex2_op = "ex2.approx.ftz.f32" if use_ftz else "ex2.approx.f32"
@@ -231,7 +231,7 @@ class CrossEntropy:
     @cute.jit
     def grad_of(self, value: Float32, row_max: Float32, rcp_sum: Float32, rcp_counted: Float32, use_ftz: bool) -> Float32:
         """
-        (e / sum) / n in Triton's order, each division a multiply by the correctly rounded reciprocal of
+        (e / sum) / n in that order, each division a multiply by the correctly rounded reciprocal of
         the row's divisor, taken once per row.
         """
         return Float32(asm(T.f32(), [to_ir(exp_shifted(value, row_max, use_ftz), Float32), to_ir(rcp_sum, Float32), to_ir(rcp_counted, Float32)], "{\n.reg .f32 t;\nmul.rn.f32 t, $1, $2;\nmul.rn.f32 $0, t, $3;\n}", "=f,f,f,f"))

@@ -42,8 +42,7 @@ def quantize_4x4(words: list, row_rcp: list, col_rcp: list, *, loc=None, ip=None
     words[2 * row + half] holds columns 2 * half and 2 * half + 1 of that row. Returns four rowwise
     words (one row, columns 0..3, times row_rcp of the row) and four K-major words (one column, rows
     0..3, times col_rcp of the column); byte k of a word is its element k.
-    cvt.rn.satfinite.e4m3x2.f32 is what Triton's .to(tl.float8e4nv) lowers to on SM90, which keeps
-    the bytes identical.
+    cvt.rn.satfinite.e4m3x2.f32 is the recipe's e4m3 cast (round to nearest even, saturating).
     """
     ptx_lines = ["{", ".reg .b32 x<16>;", ".reg .f32 y<4>;", ".reg .b16 l, h;"]
     # x[row * 4 + col] = element (row, col) as fp32: a bf16 is the high half of its fp32

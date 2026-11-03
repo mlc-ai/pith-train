@@ -111,7 +111,7 @@ def e8m0_scale(amax: Float32, *, loc=None, ip=None) -> Float32:
     """
     The recipe's SM90 E8M0 scale: power-of-2 ceil of max(amax, 1e-4) / 448.
 
-    0f38D1B717 is fp32(1e-4) and 0f3B124925 is fp32(1/448), the constants Triton folds. The final
+    0f38D1B717 is fp32(1e-4) and 0f3B124925 is fp32(1/448), the recipe's constants. The final
     max.u32 with 0x00800000 clamps to the smallest normal (2^-126); on non-negative floats an
     unsigned compare of the bits orders like the float compare.
     """

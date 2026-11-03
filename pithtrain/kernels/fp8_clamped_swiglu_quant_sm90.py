@@ -7,7 +7,7 @@ fp8cast_rowwise_kmajor of h; the backward reads dh, gate_up and the bias and wri
 for d(gate_up) plus fp32 per-128-row-block column sums that block_segment_sum_sm90 turns into the
 bias gradient. Neither materializes the bf16 biased gate_up, h or d(gate_up). The FP8 bytes and scales
 are bit-identical to the unfused sequence: the bias add is one fp32 add rounded to bf16, and the
-activation replays the Triton clamped_swiglu kernels' PTX. Both scales come back MN-major.
+activation is clamped_swiglu_sm90's PTX. Both scales come back MN-major.
 
 Only N % 8 == 0 with 1 to 1024 groups and a bf16 bias runs fused; anything else takes the unfused
 sequence (biased_gate_up, the clamped_swiglu kernels and fp8cast_rowwise_kmajor_sm90).

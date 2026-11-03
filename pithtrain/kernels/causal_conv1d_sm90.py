@@ -51,7 +51,7 @@ TMA_CHANNELS = 64  # channels per CTA of the TMA kernels: one 128-byte box row
 TMA_CONSUMERS = 128  # consumer threads of the TMA kernels: 8 channel groups x 16 token blocks
 TMA_MAX_TAPS = 4  # K of the TMA kernels: 2 .. 4 (box rows and registers checked for these)
 MAX_TAPS = 8  # K of any input: the direct kernels keep K taps per channel in registers and K partials per channel in smem
-BWD_TMA_ROWS, BWD_TMA_STAGES = 64, 4  # tuned on H200: (1, 2048 .. 8192, 8192)
+BWD_TMA_ROWS, BWD_TMA_STAGES = 64, 4
 FWD_TMA_ROWS, FWD_TMA_STAGES, FWD_TMA_GROUPS = 128, 8, 2
 SMEM_LIMIT = 227 * 1024
 

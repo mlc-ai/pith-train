@@ -34,7 +34,7 @@ TINY_FWD_SLICE_BYTES, TINY_BWD_SLICE_BYTES = 40 * 1024, 2 * 1024
 
 def exp_approx(value: Float32, use_ftz: bool) -> Float32:
     """
-    exp(value) as Triton's tl.exp computes it: multiply by log2(e), ex2.approx. The ftz form differs
+    exp(value) as multiply by log2(e), then ex2.approx. The ftz form differs
     from the full-range ex2 only for results below 2^-126.
     """
     ex2_op = "ex2.approx.ftz.f32" if use_ftz else "ex2.approx.f32"
@@ -51,8 +51,7 @@ def mul_rounded(first: Float32, second: Float32) -> Float32:
 def centered_value(value: Float32, inv_temperature: Float32, shift: Float32) -> Float32:
     """
     value * inv_temperature - shift rounded once (fma.rn): z - max with one rounding, never more
-    than Triton's z = x * inv_temperature, then z - max (two at source level, one where it is
-    contracted).
+    than z = x * inv_temperature, then z - max rounded twice.
     """
     return Float32(asm(T.f32(), [to_ir(value, Float32), to_ir(inv_temperature, Float32), to_ir(shift, Float32)], "{\n.reg .f32 t;\nneg.f32 t, $3;\nfma.rn.f32 $0, $1, $2, t;\n}", "=f,f,f,f"))
 

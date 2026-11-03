@@ -273,7 +273,7 @@ def bf16_hi(x: Uint32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def pack_bf16(x_lo: Float32, x_hi: Float32, *, loc=None, ip=None) -> Uint32:
     """
-    Round two fp32 to BF16 (RN, as Triton's .to(tl.bfloat16)) and pack {x_lo, x_hi}.
+    Round two fp32 to BF16 (round to nearest even) and pack {x_lo, x_hi}.
     """
     return Uint32(asm_args_last(T.i32(), "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f", [to_ir(x_hi, Float32, loc, ip), to_ir(x_lo, Float32, loc, ip)]))
 
@@ -286,7 +286,7 @@ def abs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
 @dsl_user_op
 def max2(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
     """
-    NaN-ignoring, like Triton's max.f32.
+    NaN-ignoring (max.bf16x2 returns the other operand when one is NaN).
     """
     return Uint32(asm_args_last(T.i32(), "max.bf16x2 $0, $1, $2;", "=r,r,r", [to_ir(first, Uint32, loc, ip), to_ir(second, Uint32, loc, ip)]))
 

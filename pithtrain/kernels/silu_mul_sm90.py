@@ -3,7 +3,7 @@ SM90 silu_mul: CuTe-DSL kernels computing silu(gate) * up and its two gradients,
 over numel. Each thread of a 128-thread CTA owns one 16-byte vector of every tensor (8 bf16 / fp16
 or 4 fp32 elements), one CTA per 128 vectors, and CTA 0 computes the numel % vector-size tail.
 When any pointer is not 16-byte aligned the same kernel runs one element per thread. The math is
-the Triton kernel's fp32 instruction sequence (SIGMOID_PTX, swiglu_fwd, swiglu_bwd): bf16 outputs
+a fixed fp32 instruction sequence (SIGMOID_PTX, swiglu_fwd, swiglu_bwd): bf16 outputs
 equal silu_mul_sm100's bit for bit (the sigmoid sequence is checked over every bf16 gate); fp16 and
 fp32 run the same sequence and are verified to one output ulp of the fp32 reference. The fused FP8
 kernels of fp8_silu_mul_quant_sm90 share those helpers.
@@ -27,7 +27,7 @@ THREADS = 128
 MAX_ELEMENTS = 2**31  # vector indices are Int32 (byte offsets are Int64)
 
 
-# sigmoid(x) = 1 / (1 + exp(-x)). Triton 3.7 emits, for fp32:
+# sigmoid(x) = 1 / (1 + exp(-x)), the fp32 sequence
 #     sub.f32 t, 0, x;  mul.f32 t, t, log2e;  ex2.approx.f32 e, t;  add.f32 d, e, 1;
 #     div.full.f32 s, 1, d
 # This 5-instruction sequence gives the same bits for every bf16 gate value (checked exhaustively):
@@ -35,7 +35,7 @@ MAX_ELEMENTS = 2**31  # vector indices are Int32 (byte offsets are Int64)
 # - ex2 non-ftz differs from ftz only when e is subnormal, and then 1 + e == 1 either way.
 # - div.full(1, d) == 0.25 * rcp(0.25 * d) for every fp32 d >= 1 (also checked exhaustively),
 #   and 0.25 * (1 + e) == fma(e, 0.25, 0.25) because scaling by 0.25 is exact here.
-# .rn pins every mul/add so ptxas cannot contract differently from the Triton kernels.
+# .rn pins every mul/add so ptxas cannot contract them into an fma, which rounds differently.
 SIGMOID_PTX = (
     "mul.rn.f32 t, $G, 0fBFB8AA3B;\n"
     "ex2.approx.ftz.f32 t, t;\n"
@@ -48,7 +48,7 @@ SIGMOID_PTX = (
 @dsl_user_op
 def swiglu_fwd(gate: Float32, up: Float32, *, loc=None, ip=None) -> Float32:
     """
-    silu(gate) * up in fp32 as (sigmoid(gate) * gate) * up, the Triton forward's exact op order.
+    silu(gate) * up in fp32 as (sigmoid(gate) * gate) * up, in that op order.
     """
     return Float32(asm_args_last(T.f32(), "{\n.reg .f32 t, s;\n" + SIGMOID_PTX.replace("$G", "$1") + "mul.rn.f32 s, s, $1;\nmul.rn.f32 $0, s, $2;\n}", "=f,f,f", [to_ir(gate, Float32, loc, ip), to_ir(up, Float32, loc, ip)]))
 
@@ -56,7 +56,7 @@ def swiglu_fwd(gate: Float32, up: Float32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def swiglu_bwd(grad_h: Float32, gate: Float32, up: Float32, *, loc=None, ip=None) -> tuple:
     """
-    (grad_gate, grad_up) in fp32, the Triton backward's ops after LLVM contraction:
+    (grad_gate, grad_up) in fp32, in this op order (the one fma as written):
 
     grad_up   = grad_h * (s * gate)
     grad_gate = ((grad_h * up) * s) * fma(-s, gate, 1 + gate)      with s = sigmoid(gate)
@@ -117,7 +117,7 @@ def f16_hi(x: Uint32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def pack_f16(x_lo: Float32, x_hi: Float32, *, loc=None, ip=None) -> Uint32:
     """
-    Round two fp32 to fp16 (RN, as Triton's .to(tl.float16)) and pack {x_lo, x_hi}.
+    Round two fp32 to fp16 (round to nearest even) and pack {x_lo, x_hi}.
     """
     return Uint32(asm(T.i32(), [to_ir(x_hi, Float32, loc, ip), to_ir(x_lo, Float32, loc, ip)], "cvt.rn.f16x2.f32 $0, $1, $2;", "=r,f,f"))
 

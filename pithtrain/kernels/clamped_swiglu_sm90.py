@@ -3,9 +3,9 @@ gpt-oss's clamped SwiGLU over an interleaved gate_up and its gradient, in CuTe-D
 
 Flat over the M * N outputs: each thread owns one 16-byte vector of outputs (8 bf16 / fp16, 4 fp32,
 2 fp64), reads its gate_up pairs with two 16-byte loads (backward: plus one of grad_output), applies
-the Triton clamped_swiglu kernels' PTX in fp32 and writes the vector with one 16-byte store
-(backward: two). The thread holding the last partial vector, and every thread when a pointer is not
-16-byte aligned, goes element by element. The bf16 outputs are bit-identical to the Triton kernels.
+a fixed fp32 PTX sequence (ex2.approx, div.full.f32, .rn on every mul and add) and writes the
+vector with one 16-byte store (backward: two). The thread holding the last partial vector, and every
+thread when a pointer is not 16-byte aligned, goes element by element.
 
 The PTX replay (make_fwd_op, make_bwd_op) is also the activation of the fused FP8 kernels in
 fp8_clamped_swiglu_quant_sm90.
@@ -34,13 +34,12 @@ DTYPES = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16, torc
 
 def f32(x: float) -> float:
     """
-    x rounded to float32, as Triton receives a Python float scalar argument.
+    x rounded to float32, the precision alpha and limit take in the kernels.
     """
     return struct.unpack("<f", struct.pack("<f", x))[0]
 
 
-# The clamped SwiGLU math replays the exact PTX the Triton clamped_swiglu kernels compile to (Triton
-# 3.7), with L = limit, a = alpha:
+# The clamped SwiGLU math is this PTX, with L = limit, a = alpha:
 #   gc = min.f32(g, L);  uc = min.f32(max.f32(u, 0 - L), L)
 #   sigmoid(a * gc):  t = fma(-a, gc, 0);  t = t * log2e;  e = ex2.approx.f32 t;  d = e + 1;
 #                     s = div.full.f32(1, d)
@@ -142,7 +141,7 @@ def f16_hi(x: Uint32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def pack_f16(x_lo: Float32, x_hi: Float32, *, loc=None, ip=None) -> Uint32:
     """
-    Round two fp32 to FP16 (RN, as Triton's .to(tl.float16)) and pack {x_lo, x_hi}.
+    Round two fp32 to FP16 (round to nearest even) and pack {x_lo, x_hi}.
     """
     return Uint32(asm_args_last(T.i32(), "cvt.rn.f16x2.f32 $0, $1, $2;", "=r,f,f", [to_ir(x_hi, Float32, loc, ip), to_ir(x_lo, Float32, loc, ip)]))
 

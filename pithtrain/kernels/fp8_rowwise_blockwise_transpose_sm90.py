@@ -1,8 +1,7 @@
 """
 CuTe-DSL (SM90) rowwise FP8 quantization of x and 128x128 blockwise FP8 quantization of x.T from one
-read of x, the same bytes and scales as fp8_rowwise_blockwise_transpose_sm100 and the Triton kernel
-it replaced. Covers every
-input, so there is no fallback.
+read of x, the recipe's bytes and scales (the same as fp8_rowwise_blockwise_transpose_sm100). Covers
+every input, so there is no fallback.
 
 One CTA of 1024 / R threads per 128x128 tile, R = 8 (large grids) or 4 (small grids); each thread
 owns R consecutive rows of 16 columns, so the transposed store needs no smem transpose: it writes
@@ -73,8 +72,8 @@ def quantize4_words(words: list, elem_picks: list, kind: str, rcp: Float32, *, l
     """
     Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte). elem_picks[k] =
     (j, half) picks element k from words[j] (half 0 = low 16 bits); rcp is an exact power of 2.
-    The cvt is the one Triton emits for .to(tl.float8e4nv) on SM90; its first source lands in
-    the upper byte.
+    The cvt is the recipe's e4m3 cast (cvt.rn.satfinite.e4m3x2.f32); its first source lands in the
+    upper byte.
     """
     num_words = len(words)
     rcp_operand = f"${num_words + 1}"
