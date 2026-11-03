@@ -332,6 +332,29 @@ def test_folded_batch_is_per_sample(S: int) -> None:
             assert torch.equal(x[:, :, values], y), (i, name)
 
 
+@pytest.mark.parametrize("S", [256, 1000])
+def test_zero_and_tiny_beta(S: int) -> None:
+    """
+    beta exactly 0 and below 1e-9 (a sigmoid far in its tail) on a sixth of the positions: every
+    gradient, dbeta at those positions included, against the fp32 recurrence with the usual bounds.
+    """
+    q, k, v, g, beta, do = make_inputs(S, H=16, gate="mild", seed=S + 5)
+    gen = torch.Generator(device="cuda").manual_seed(S)
+    pick = torch.rand(beta.shape, generator=gen, device="cuda")
+    beta = torch.where(pick < 1 / 12, 0.0, beta)
+    beta = torch.where((pick >= 1 / 12) & (pick < 1 / 6), 2.0**-40, beta).to(torch.bfloat16)
+    o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
+    grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
+    ref, ref_grads = naive_reference(q, k, v, g, beta, do)
+    assert_close_to(o, ref, "o", 1e-4)
+    for name, got in zip(GRADS, grads):
+        assert_close_to(got, ref_grads[name], name, 1e-3)
+    small = pick < 1 / 6
+    dbeta, want = grads[4].float()[small], ref_grads["dbeta"][small]
+    err = float((dbeta - want).abs().max())
+    assert err <= 2e-2 * float(ref_grads["dbeta"].abs().max()), f"dbeta at small beta: {err:.3e}"
+
+
 def test_comparison_is_sensitive() -> None:
     """
     A 10% weaker gate in the forward, a 30% weaker one in the backward (on its saved tensors), a dg

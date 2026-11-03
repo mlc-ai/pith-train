@@ -11,6 +11,12 @@ from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["chunk_gdr_bwd_pinned", "chunk_gdr_fwd_pinned", "gated_delta_rule_pinned_supported"]
 
+# The SM100 backward recovers dbeta by dividing a beta-scaled product by beta + 1e-10, which loses
+# the gradient at beta == 0 and scales it down below ~1e-9. Both SM100 directions see beta raised to
+# this floor (a power of two, exact in bf16), where that division is accurate to ~1e-4; the
+# returned dbeta is the gradient there, passed straight through to the caller's beta.
+SM100_BETA_FLOOR = 2.0**-20
+
 
 def consistent_geometry(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
@@ -84,8 +90,8 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     the implementation's (on SM90 FLA's chunk-local cumulative gate and solved WY matrix, bit for
     bit). On SM90 equal to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV
     heads up to bf16 rounding, at every T (a T that is not a multiple of 64 runs as if zero-padded
-    to one, FLA's ragged semantics). Deterministic. Only where gated_delta_rule_pinned_supported is
-    True.
+    to one, FLA's ragged semantics). On SM100 a beta below 2^-20 runs as 2^-20 (SM100_BETA_FLOOR),
+    in both directions. Deterministic. Only where gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
         case 9:
@@ -93,7 +99,7 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
             return chunk_gdr_fwd_pinned_sm90(q, k, v, g, beta)
         case 10:
             from pithtrain.kernels.gated_delta_rule_pinned_sm100 import chunk_gdr_fwd_pinned_sm100
-            return chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta)
+            return chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta.clamp(min=SM100_BETA_FLOOR))
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
@@ -111,7 +117,9 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     0.5.2's chunk algorithm and rounding points. Against the fp32 recurrence, measured against
     FLA's chunk_gdr_bwd on repeat-interleaved q / k: calc_diff within 1.001x of FLA's and the
     largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 / 8192, 3
-    seeds), and within the verifier's 1.10x bounds in its cases. Deterministic. Only where
+    seeds), and within the verifier's 1.10x bounds in its cases. On SM100 a beta below 2^-20 runs
+    as 2^-20, as in the forward, and dbeta there is the gradient at 2^-20 (the kernel's dbeta loses
+    the gradient at beta == 0 otherwise). Deterministic. Only where
     gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
@@ -120,6 +128,6 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
             return chunk_gdr_bwd_pinned_sm90(q, k, v, g_cum, beta, A, do)
         case 10:
             from pithtrain.kernels.gated_delta_rule_pinned_sm100 import chunk_gdr_bwd_pinned_sm100
-            return chunk_gdr_bwd_pinned_sm100(q, k, v, g_cum, beta, A, do)
+            return chunk_gdr_bwd_pinned_sm100(q, k, v, g_cum, beta.clamp(min=SM100_BETA_FLOOR), A, do)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
