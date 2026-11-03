@@ -1,2 +1,0 @@
-node 1 fs-mbz-gpu-634 arm b723719 2026-11-01T20:39:31Z
-W1101 20:39:34.637000 2283652 /mnt/weka/shrd/ci/haok/haok-pith-train-kda90/.venv/lib/python3.14/site-packages/torch/distributed/run.py:865] node_rank is only used for static rdzv_backend. It will be ignored for rdzv_backend=c10d.
