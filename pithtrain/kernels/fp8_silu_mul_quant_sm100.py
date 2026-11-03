@@ -14,8 +14,8 @@ flight (three half-tile units), N=512 backward a quarter-tile ring one tile deep
 half-tile ring. The one CTA-wide exchange is the column amax: per-warp partials, 64 reducer
 threads, an rcp broadcast.
 
-Arithmetic runs on packed pairs (f32x2 / bf16x2). Triton's sigmoid, 1 / (1 + ex2.approx(x)) with
-div.full.f32, is reproduced as 0.25 * rcp.approx.ftz(fma(ex2.approx.ftz(x), 0.25, 0.25)): this
+Arithmetic runs on packed pairs (f32x2 / bf16x2). The sigmoid of silu_mul, 1 / (1 + ex2.approx(x))
+with div.full.f32, is computed as 0.25 * rcp.approx.ftz(fma(ex2.approx.ftz(x), 0.25, 0.25)): this
 is bit-identical for every bf16 input (checked exhaustively, including inf and NaN), since
 1 + e absorbs any subnormal e and the 0.25 pre-scale reproduces div.full's large-divisor path.
 
@@ -25,10 +25,6 @@ takes ranges c, c + G, ... so concurrent CTAs read adjacent columns of the same 
 du of the previous window in thread-private shared memory and recomputes it (halo) at range starts.
 
 N not a multiple of 8 falls back to a non-persistent kernel with narrower predicated loads.
-
-Evolved with TIRx-harness: run silu, frontier member persistent-cpasync (commit 23cc854, 2126.9 us vs 8709.9 us, 4.095x over the
-previous SM100 path in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -39,7 +35,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # sm_100a SASS only, as the old -gencode nvcc build
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["fp8_silu_mul_fwd_sm100", "fp8_silu_mul_bwd_sm100", "fp8_silu_mul_gu_fwd_sm100", "fp8_silu_mul_gu_bwd_sm100"]
 
@@ -158,7 +154,7 @@ def c2(v):
 
 def sigmoid(g):
     """
-    Packed Triton sigmoid of the pair g, times 4 (see module docstring).
+    Packed sigmoid of the pair g, times 4 (see module docstring).
     """
     x = mul2(g.r, c2(NEG_LOG2E))
     e0 = txl.local_scalar("float32")
@@ -431,7 +427,7 @@ def build(mode, N):
         # DeepSeek's N=1408 backward rows benefit from dividing each tile load into two
         # independently pipelined 64-row units.  This exposes the second half's load
         # while the first half is copied to registers, without changing tile ownership
-        # or the quantization protocol.  Other compile-time widths retain the frontier
+        # or the quantization protocol.  Other compile-time widths keep the unsplit
         # schedule because the same split regressed qwen and dense rows.
         HU = CFG["hu"].get(f"{mode}:{N}", CFG["hu"].get(mode, 0))
         HP = CFG["hp"].get(f"{mode}:{N}", CFG["hp"].get(mode, 2))  # row parts per tile load

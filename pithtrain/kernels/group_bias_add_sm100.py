@@ -14,11 +14,6 @@ Flat fallback (M not a multiple of 4, rows wider than two vectors per thread, in
 a flat W-word vector index space, two vectors per thread, also tail-first; rows whose byte length is
 not a multiple of 4 take a 16-bit scalar kernel. Offsets are int32 (launches are chunked so every
 chunk has < 2^30 elements). Plans are cached per (dtype, index dtype, H, pointer alignment).
-
-Evolved with TIRx-harness: run group_bias_add, frontier member rowtile-packed-direct-retire (commit
-4a1608d3, 587.085 us vs 671.33 us, 1.1435x over the previous SM100 path in the task's benchmark).
-Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") for sm_100a with nvcc and
-launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -29,7 +24,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["group_bias_add_sm100"]
 

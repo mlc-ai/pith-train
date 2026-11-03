@@ -29,11 +29,6 @@ them independent of every launch that may still run on the stream (byte extents)
 overlap variant: cluster-launch-control dynamic tile scheduling and no griddepcontrol.wait before
 the main loop, so their clusters fill the SMs the previous kernel frees in its tail; they wait for
 the previous grid at exit, so completion order is unchanged.
-
-Evolved with TIRx-harness: run bf16gemm, frontier member cluster2-cpasync-tmareduce (commit
-59570dc, 15702 us vs 267991 us, 17.068x over the previous SM100 path in the task's benchmark).
-Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through
-tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -44,7 +39,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["bf16_expert_gate_up_fwd_sm100", "bf16_expert_down_fwd_sm100", "bf16_expert_down_dgrad_sm100", "bf16_expert_gate_up_dgrad_sm100", "bf16_expert_gate_up_wgrad_sm100", "bf16_expert_down_wgrad_sm100"]
 
@@ -149,25 +144,6 @@ def act2(g, u, clamped, alpha, limit):
     return (uc + txl.float32(1.0)) * gc * sigmoid(alpha * gc)
 
 
-def dact(g, u, dh, clamped, alpha, limit):
-    """
-    (dg, du) of the saved bf16 gate / up and the fp32 dh.
-    """
-    if not clamped:
-        sig = sigmoid(g)
-        dg = dh * u * sig * (txl.float32(1.0) + g * (txl.float32(1.0) - sig))
-        du = dh * g * sig
-        return dg, du
-    gc = txl.Select(g < limit, g, limit)
-    uc = txl.Select(u < limit, txl.Select(u > -limit, u, -limit), limit)
-    sig = txl.local_scalar("float32")
-    txl.assign(sig, sigmoid(alpha * gc))
-    dg = dh * (uc + txl.float32(1.0)) * (sig + alpha * gc * sig * (txl.float32(1.0) - sig))
-    dg = txl.Select(g <= limit, dg, txl.float32(0.0))
-    du = txl.Select((u <= limit) & (u >= -limit), dh * gc * sig, txl.float32(0.0))
-    return dg, du
-
-
 def params2(kind, has_bias, clamped, far=False):
     i32, i64, f32 = "int32", "int64", "float32"
     # a fresh Tensor type (own symbolic extent) per parameter: a shared one would make the host
@@ -237,7 +213,8 @@ def use_swap(M, G, rows=SWAP_ROWS):
 
 def use_materialized_gu_fwd(M, G, H, inter):
     """
-    The pure-TMA frontier wins only for GPT-OSS forward rows at >=4096 rows/expert.
+    The materialized gather plus pure-TMA GEMM is faster only for GPT-OSS forward rows at >= 4096 rows
+    per expert.
     """
     return H == 2880 and inter == 2880 and M >= 1024 * G
 
@@ -269,7 +246,7 @@ def build(kind, H, inter, has_bias, clamped, swap=False, materialized=False, far
     B_BYTES = (HNT if b_major == "k" else HN) * BK * 2
     # For large GPT-OSS forward rows, a separate coalesced gather followed by a pure-TMA
     # gate/up GEMM is faster than issuing the indexed cp.async gather inside every K stage.
-    # Keep the frontier path for every other kind and shape.
+    # Keep the indexed cp.async path for every other kind and shape.
     MAT_GU = materialized and kind == "gu_fwd"
     if MAT_GU:
         a_gather = False

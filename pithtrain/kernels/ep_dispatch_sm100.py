@@ -6,7 +6,7 @@ shared memory and claims its base in every expert / rank bin with one global ato
 spins on the others only after it has seen every CTA of the grid start, so the spin always ends even
 when comm kernels on other streams hold SMs; otherwise it exits and leaves its placement to a shared
 chunk queue (see send_def). Placement within a bucket uses shared-memory atomics, so the order
-within a bucket is launch-dependent, as on the Triton path it replaces. The workspace (bin counters,
+within a bucket is launch-dependent. The workspace (bin counters,
 start / arrive / place / exit words and per-CTA bases) is int32, kept per (device, stream) and
 re-zeroed by the last CTA out, so it is zeroed once on first use and never again from the host.
 
@@ -17,11 +17,6 @@ Inputs the kernels do not cover (more than SEND_MAX_BINS bins or RECV_MAX_SEGMEN
 than 32 ranks on the receiver side, 2^31 or more slots or dedup entries) take a PyTorch path with
 the same outputs; topk_ids of another integer dtype or with a non-unit inner stride are converted to
 contiguous int64 first. Neither side, nor the PyTorch path, synchronizes the device with the host.
-
-Evolved with TIRx-harness: run ep_dispatch, frontier member single-launch-start-gated (commit
-1be128ef, 788.6 us vs 2384.8 us, 3.024x over the previous SM100 path in the task's benchmark).
-Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through
-tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -31,7 +26,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["ep_dispatch_recv_idx_sm100", "ep_dispatch_send_idx_sm100"]
 

@@ -4,10 +4,6 @@ fp8_quant_grouped_sm100: rowwise 1x128 + per-channel 128x1 FP8 quantization from
 One CTA per 128x128 tile, the tile held in registers (256 threads, 8 rows x 8 cols each).
 Scales are exact powers of two, so x * (1/scale) is exact in bf16 and the bf16x2 -> e4m3x2
 satfinite cvt rounds once, matching the fp32 reference bit for bit.
-
-Evolved with TIRx-harness: run grouped, frontier member regtile-v8-l2pf (commit 158986c, 1.758x over the
-previous SM100 path in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -18,7 +14,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["fp8_quant_grouped_sm100"]
 

@@ -6,10 +6,6 @@ CTAs, 3 per SM. One-wave grids load coalesced 128-bit chunks straight into regis
 grids remain persistent and load 128x128 tiles with TMA as 8 row parts, with each warp reloading its
 own next row part after reading the current one. Each tile uses packed bf16x2 quantization, TMA stores
 for both FP8 layouts, and column-major row scales. Everything else runs a generic scalar kernel.
-
-Evolved with TIRx-harness: run act, frontier member selfprod-persistent (commit 1ef3160, 226.061 us vs 289.362 us, 1.28x over the
-previous SM100 path in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -19,7 +15,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["fp8_quant_act_sm100"]
 

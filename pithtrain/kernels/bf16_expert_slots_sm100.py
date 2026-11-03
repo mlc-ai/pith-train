@@ -15,10 +15,6 @@ chunk, streamed through a per-thread cp.async ring, and adds the chunk sums in o
 memory; with an index it takes two launches: one warp per (chunk, 512-column block) writes the
 chunk's fp32 sum, then a second kernel, launched with programmatic dependent launch so its launch
 and prologue overlap the first one's tail, adds each segment's chunk sums in order.
-
-Evolved with TIRx-harness: run slots, frontier member tma-gather (commit 6e1b68f, 972 us vs 10401
-us, 10.699x over the previous SM100 path in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -29,7 +25,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["bf16_expert_group_slots_sm100", "bf16_expert_gather_sum_sm100", "bf16_expert_gather_rows_sm100", "bf16_expert_segment_sum_sm100"]
 

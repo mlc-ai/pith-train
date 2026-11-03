@@ -20,13 +20,8 @@ whole row. u = (x * c - m2) - log2 d = log2 p, dx = p * (A + B * u) + [i == y] g
 adds g_logp / T to that lane before the single rounding.
 
 The kernels read bf16 or fp32 logits and int64 targets. Other float logits run them on an fp32 copy
-(the gradient is computed in fp32 and rounded once into inp, as the Triton path does), other integer
+(the gradient is computed in fp32 and rounded once into inp), other integer
 targets on an int64 copy.
-
-Evolved with TIRx-harness: run log_prob, frontier member hardware-redux-max (commit c12d48b0,
-25669.0 us vs 37896.2 us, 1.476x over the previous SM100 path, the Triton kernels now in
-log_prob_sm90, in the task's benchmark). Compiled once per process by tvm_tirx.tirx.compile(...,
-pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -36,7 +31,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["log_prob_bwd_sm100", "log_prob_fwd_sm100"]
 

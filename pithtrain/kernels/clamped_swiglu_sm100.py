@@ -1,21 +1,15 @@
 """
 clamped_swiglu_sm100: the clamped SwiGLU forward and backward of an interleaved gate_up on SM100,
-TIRx-lite kernels with the bits of the SM90 Triton kernels.
+TIRx-lite kernels, the same bits as clamped_swiglu_sm90.
 
 Flat elementwise kernels over n = M * N outputs. Each thread owns UNROLL groups of VEC consecutive
 outputs (groups spaced one CTA-tile apart so every warp access stays coalesced); it issues all of
-its wide loads before computing, then writes packed results. The fp32 sequence gives the bits of
-the Triton kernels (sigmoid = 1 / (1 + ex2.approx(x * -log2 e)), div.full.f32), with the ex2 /
-division range fixups that cannot change the result removed (see sigmoid_parts) and the products
+its wide loads before computing, then writes packed results. The fp32 sequence is sigmoid = 1 /
+(1 + ex2.approx(x * -log2 e)) with div.full.f32 semantics, the ex2 / division range fixups that
+cannot change the result removed (see sigmoid_parts), and the products
 issued two outputs at a time as packed f32x2 (same per-lane rn rounding). Shapes, alpha and limit
 are runtime arguments. bf16, fp16 and fp32 run natively; any other float dtype is widened to fp32,
-run through the fp32 kernel and rounded once back, the same bits as the Triton kernels (which also
-compute in fp32 and round once).
-
-Evolved with TIRx-harness: run clamped_swiglu, frontier member flat-f32x2 (commit e4d94613, 336.6
-us vs 660.6 us, 1.963x over the previous SM100 path, the Triton kernels, in the task's benchmark).
-Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through
-tvm-ffi on torch's current stream.
+run through the fp32 kernel and rounded once back (the arithmetic is fp32 with one rounding).
 """
 
 import functools
@@ -25,7 +19,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["clamped_swiglu_bwd_sm100", "clamped_swiglu_fwd_sm100"]
 
@@ -43,7 +37,7 @@ def entry_function(ex):
 
 
 CFG = {"fwd": {"threads": 256, "vec": 16, "unroll": 1, "ld": "ld.global.v8.b32", "st": "st.global.v8.b32"}, "bwd": {"threads": 64, "vec": 16, "unroll": 1, "ld": "ld.global.v8.b32", "st": "st.global.v8.b32"}}  # per entry: threads, outputs per thread (vec), unroll, load / store instruction
-NEG_LOG2E_BITS = 0xBFB8AA3B  # Triton's -log2(e) constant
+NEG_LOG2E_BITS = 0xBFB8AA3B  # -log2(e) rounded to fp32
 DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 
 
@@ -59,7 +53,7 @@ def op(chain, *args, dtype="float32"):
 
 def sigmoid_parts(g, alpha):
     """
-    x = alpha * g and s = sigmoid(x), Triton's exact sequence.
+    x = alpha * g and s = sigmoid(x), in the module's fp32 sequence.
     """
     x = op("mul.rn.f32", alpha, g)
     t = op("mul.rn.f32", x, f32_bits(NEG_LOG2E_BITS))

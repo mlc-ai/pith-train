@@ -26,11 +26,6 @@ the epoch would wrap (every 65535 calls) the buffer is zeroed again, in stream o
 call, so a stale word can never carry the current tag. The tag is a host argument fixed per launch,
 so this path must not be captured in a CUDA graph (replays would reuse one tag over the previous
 replay's words).
-
-Evolved with TIRx-harness: run segment_sum, frontier member compact-swizzle-tagreduce (commit
-3bc9af80, 181.894 us vs 640.179 us, 3.52x over the previous SM100 path in the task's benchmark).
-Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through
-tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -41,7 +36,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["segment_sum_sm100"]
 
@@ -304,8 +299,7 @@ class View:
 
 
 SR = 32  # rows per ring stage (one bulk copy per producer lane)
-NWC = 4  # consumer warps; each owns two of the frontier's row classes
-BULK_G2S = "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+NWC = 4  # consumer warps; each owns two of the row classes
 EVICT_FIRST = 0x12F0000000000000
 EVICT_LAST = 0x14F0000000000000
 SMEM_BUDGET = 100000
@@ -313,7 +307,6 @@ LONG_TILES = 16  # average tiles per group from which the chunked reduce is used
 CPS = 1  # persistent CTAs per SM
 DMIN = 16  # groups from which the direct kernel may be used (fewer: compact ring)
 SHORT_ROWS = 512  # average rows per group up to which the direct kernel is used regardless of waves
-CVT = 48  # target vectors per column chunk
 TAILK = 6  # ring: last ~TAILK units per CTA claimed dynamically from a shared pool (0 = fully static)
 LEAD = 2  # static units before the end at which the first claim is issued
 IDLE_JOIN = 0  # CTAs beyond n_eff also claim pool units
@@ -360,26 +353,6 @@ def group_ring_layout(dtype, H):
 
 
 DIRECT_SMEM = 66000  # direct kernel ring budget: 4 stages of 16 KB, three CTAs per SM
-
-
-def search(offs, sigma, M, G, idtype, lane):
-    """
-    (group, first row, valid rows) of tile slot sigma, by a warp ballot over f(g).
-    """
-    cnt = txl.local_scalar("int32")
-    txl.assign(cnt, txl.int32(0))
-    with txl.serial((G + 31) // 32) as it:
-        g = it * 32 + lane
-        gs = txl.Select(g < G, g, txl.int32(0))
-        s, _ = bounds(offs, gs, M, idtype)
-        ok = txl.And(g < G, g + s // TILE <= sigma)
-        bal = txl.alloc_local([1], "uint32")
-        txl.ptx.vote_sync.ballot.b32(bal[0], ok, txl.uint32(0xFFFFFFFF))
-        txl.assign(cnt, cnt + txl.cast(txl.popcount(bal[0]), "int32"))
-    grp = cnt - 1
-    s, e = bounds(offs, grp, M, idtype)
-    r0 = s + (sigma - grp - s // TILE) * TILE
-    return r0, txl.min(e - r0, txl.int32(TILE))
 
 
 GS = 2048  # groups whose clamped ends are staged in shared memory (more: global ballot search)

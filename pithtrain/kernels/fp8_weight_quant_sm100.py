@@ -5,10 +5,6 @@ including one-launch multi variants of the shard amax and scales.
 
 Every kernel is a @txl.kernel compiled once per process (functools.cache, keyed only on
 compile-time constants) and launched through tvm-ffi on torch's current stream.
-
-Evolved with TIRx-harness: run weight, frontier member tile-pdl (commit 24e4366, 4102 us vs 5452 us, 1.329x over the
-previous SM100 path in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -18,7 +14,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["fp8_quant_weight_sm100", "fp8_quant_weight_grouped_sm100", "fp8_shard_amax_sm100", "fp8_shard_cast_sm100", "fp8_scales_sm100", "fp8_pack_transpose_sm100", "fp8_shard_amax_multi_sm100", "fp8_scales_multi_sm100"]
 

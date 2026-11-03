@@ -4,9 +4,9 @@ K ** -0.5) under context parallelism on SM100, in TIRx-lite kernels. The rank ho
 shard of the sequence split over the CP group, at Qwen3.5's geometry (batch 1, 32 heads, head dims
 128).
 
-Numerically it mirrors FLA 0.5.2's chunked CP path (the same bf16 / TF32 rounding points), so the
-sharded recurrence matches FLA's dense run within the CP verifier's 1e-4 relative L2 bound, and its
-all-gather payloads are FLA's (HV, K, V + K) fp32 state summaries. Each direction is two stages
+Numerically it follows the chunked CP algorithm of FLA 0.5.2 (the same bf16 / TF32 rounding
+points): the sharded recurrence matches the fp64 PyTorch reference of the CP verifier, and its
+all-gather payloads are (HV, K, V + K) fp32 state summaries of each rank. Each direction is two stages
 around the one all-gather the caller runs over the CP group:
 
 - forward, before: the persistent intra-chunk kernel (intra2: cumulative gate, WY matrix A, w, u
@@ -27,12 +27,6 @@ around the one all-gather the caller runs over the CP group:
 h / dh and v_new / dv2 travel between the kernels in bgrad2's 128 B XOR-swizzled UMMA operand
 layouts (private scratch); A, the cumulative gate and the initial state are private to this
 forward / backward pair.
-
-Evolved with TIRx-harness: run gated_delta_rule_cp, frontier member tma-intra-bulk-state-layout
-(commit fe5e80ca, 4551 us vs 12948 us, 2.845x over FLA 0.5.2's Triton CP path, the previous SM100
-path, in the task's benchmark). Compiled once per process by tvm_tirx.tirx.compile(...,
-pipeline="tirx") with nvcc's fast math off, as the member was evolved, and launched through tvm-ffi
-on torch's current stream.
 """
 
 import functools
@@ -42,7 +36,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin", "nvcc": []}}})  # nvcc without --use_fast_math (as TVM_CUDA_NVCC_NO_FAST_MATH=1 built it before); a cubin (sm_100a SASS only, as the old -gencode build)
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin", "nvcc": []}}})  # nvcc without --use_fast_math
 
 __all__ = ["chunk_gdr_cp_bwd_post_sm100", "chunk_gdr_cp_bwd_pre_sm100", "chunk_gdr_cp_fwd_post_sm100", "chunk_gdr_cp_fwd_pre_sm100", "gated_delta_rule_cp_plan_sm100"]
 
@@ -3722,7 +3716,6 @@ def BGRAD2_make_bgrad2(HV, kv=False, static_chunks=None, tgemm=False, persistent
                     txl.ptx.ld.global_.b16(bnext, beta.ptr_to([(t0 + tid) * HV + head]))
 
         def tile(c_in, head_in, par, active, nxt_in):
-            txl.local_scalar('int32', init=c_in)  # unused chunk scalar, kept so the traced kernel stays the member's
             head = txl.local_scalar('int32', init=head_in)
             nxt = txl.local_scalar('int32', init=nxt_in)
             gS = txl.if_then_else(tpar == 0, BGRAD2_G_S, B3G_S)
@@ -4220,7 +4213,7 @@ def compile_kernel(kernel):
     """
     Compile a traced kernel once and return its entry function (Executable.__call__ re-resolves it
     on every call); the executable stays alive in EXECUTABLES. TARGET runs nvcc without
-    --use_fast_math, as the kernels were evolved.
+    --use_fast_math.
     """
     ex = kernel.compile(TARGET)
     EXECUTABLES.append(ex)

@@ -16,11 +16,6 @@ parameters, so the group starts are known at entry and one grid sync (before the
    For N=2880 the complete 256-column tiles run wide, then the first CTAs to finish claim 512-row x 64-column
    tail tasks from a second persistent queue; this removes the mostly predicated last wide-tile wave.
 Without host counts, a small counting kernel and the one allowed device-to-host copy size the outputs.
-
-Evolved with TIRx-harness: run scatter, frontier member coop-route-colorder (commit 81a96a7, 992 us
-vs 6252 us, 6.3x over the previous SM100 path in the task's benchmark). Compiled once per process
-by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current
-stream.
 """
 
 import functools
@@ -31,7 +26,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # sm_100a SASS only, as the old -gencode nvcc build
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["scatter_quant_sm100"]
 

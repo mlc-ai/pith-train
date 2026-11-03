@@ -21,12 +21,7 @@ the ring and write the results to a double-buffered staging tile that one thread
 Plain path (any C, S, K, strides of g): the same tiles and arithmetic with plain loads / stores, dw
 partials summed in the TMA path's order by a second kernel.
 Inputs outside the contract the kernels read directly (w of another float dtype, non-contiguous x
-or w) are converted first: w to fp32 (as the Triton path reads it), dw rounded back to w's dtype.
-
-Evolved with TIRx-harness: run causal_conv1d, frontier member tma-ring-cluster-dw (commit f48a3abe,
-305.2 us vs 793.6 us, 2.6x over the previous SM100 path, the Triton kernels now in
-causal_conv1d_sm90, in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
+or w) are converted first: w to fp32, dw rounded back to the dtype of w.
 """
 
 import functools
@@ -36,7 +31,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["causal_conv1d_bwd_sm100", "causal_conv1d_fwd_sm100"]
 
@@ -60,7 +55,6 @@ TG2 = 16  # tokens per compute thread (packed TMA kernels: 2 channels x TG2 toke
 NTG = 8  # dw token groups per tile (T // TG2), the same in every path
 NCW = 8  # compute warps
 NC = NCW * 32  # compute threads
-NS_FWD = 3  # ring stages
 NS_BWD = 2
 CTAS_PER_SM = 2
 NUM_SMS = 148
@@ -555,8 +549,8 @@ def bwd_plan(C, cf):
     56/48 split. Other valid channel counts retain the nearly even plan.
     """
     units = C // 8
-    # Timed contiguous-g rows keep the best frontier's fixed 64-channel blocks.
-    # Only channels-first g uses the 296-CTA balanced partition that won that row.
+    # Contiguous g keeps fixed 64-channel blocks; only channels-first g uses the 296-CTA balanced
+    # partition.
     if C == 8192 and not cf:
         return 128, 8, 1, 0
     ncl = max(min(NUM_SMS * CTAS_PER_SM // KF, units), cdiv(units, CB // 8))
@@ -848,7 +842,6 @@ def bwd_cl_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, tid, warp, lane, ful
     for k in range(K):
         for e in range(2):
             txl.ptx["st.shared.f32"](red.ptr_to([(tg * K + k) * CB + c2 + e]), f2(pacc[k], e))
-
 
 
 def bwd_clm_compute(gs, xs, dxs, red, w, C, K, c0, nch, tid, warp, lane, full, empty, stage, phase,
@@ -1349,8 +1342,7 @@ def realigned(t):
 
 def covered_weight(w):
     """
-    w flattened in a dtype the kernels read: other float dtypes are read as fp32, as the Triton path
-    does.
+    w flattened in a dtype the kernels read: other float dtypes are read as fp32.
     """
     wf = w.reshape(-1)
     return wf if w.dtype in WDT else wf.float()

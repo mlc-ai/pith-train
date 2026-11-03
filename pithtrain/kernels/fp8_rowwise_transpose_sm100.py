@@ -9,10 +9,6 @@ then one barrier and the column phase from shared memory (8 lanes per column pai
 column abs-max reduced in-warp, 128 B coalesced stores per xtq row). Scales use an exact integer E8M0
 formula; quantization is an exact power-of-two bf16x2 multiply plus cvt.rn.satfinite.e4m3x2.bf16x2.
 Everything else (fp32/fp16, odd shapes, arbitrary strides) takes a scalar generic kernel.
-
-Evolved with TIRx-harness: run grad, frontier member oneshot-regload-tile (commit f103d83, 217.9 us vs 379.1 us, 1.74x over the
-previous SM100 path in the task's benchmark). Compiled once per process by
-tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current stream.
 """
 
 import functools
@@ -22,7 +18,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["fp8_quant_grad_sm100"]
 

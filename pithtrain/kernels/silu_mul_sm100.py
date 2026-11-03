@@ -1,22 +1,16 @@
 """
 silu_mul_sm100: the SwiGLU product silu(gate) * up and its two gradients on SM100, TIRx-lite
-kernels bit-exact with the SM90 Triton kernels.
+kernels, the same bits as silu_mul_sm90.
 
 Flat elementwise kernels: each thread moves VPT 16-byte vectors per tensor. Exact-tile BF16
 launches use Blackwell packed-f32x2 add/mul/FMA for two independent FP32 lanes at once, while
-ex2/rcp remain scalar. The fp32 math reproduces the Triton PTX bit for bit: sigmoid(x) = div.full(1,
-ex2.approx(x * -log2e) + 1), computed here with ex2.approx.ftz and rcp.approx.ftz(d / 4) / 4, which
-is identical on all 2^32 fp32 inputs and drops div.full's range check; every product is a separate
-mul.f32 as in Triton (no product feeds an add, so nothing can contract), and the backward's (1 + g -
-silu) is the single fma.rn Triton emits. bf16, fp16 and fp32 run natively; any other float dtype
-(or a backward with mixed dtypes) is widened to fp32, run through the fp32 kernels and rounded once
-back, the same bits as the Triton kernels (which also compute in fp32 and round once). Bases not
-16-byte aligned take a scalar kernel.
-
-Evolved with TIRx-harness: run silu_mul, frontier member packed-f32x2-stream (commit 6ce8ceb4,
-487.818 us vs 493.082 us, 1.011x over the previous SM100 path, the Triton kernels, in the task's
-benchmark). Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and
-launched through tvm-ffi on torch's current stream.
+ex2/rcp remain scalar. The fp32 math: sigmoid(x) = div.full(1, ex2.approx(x * -log2e) + 1),
+computed with ex2.approx.ftz and rcp.approx.ftz(d / 4) / 4, which is identical on all 2^32 fp32
+inputs and drops div.full's range check; every product is a separate mul.rn.f32 (no product feeds
+an add, so nothing can contract), and the backward's (1 + g - silu) is a single fma.rn. bf16, fp16
+and fp32 run natively; any other float dtype (or a backward with mixed dtypes) is widened to fp32,
+run through the fp32 kernels and rounded once back. Bases not 16-byte aligned take a scalar
+kernel.
 """
 
 import functools
@@ -26,7 +20,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["silu_mul_bwd_sm100", "silu_mul_fwd_sm100"]
 
@@ -44,7 +38,7 @@ def entry_function(ex):
 
 
 DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
-NEG_LOG2E = -1.4426950408889634  # rounds to 0xBFB8AA3B, Triton's constant
+NEG_LOG2E = -1.4426950408889634  # rounds to 0xBFB8AA3B
 VBYTES = 16  # bytes per vector load / store
 POLICY = {"first": 0x12F0000000000000, "normal": 0x1000000000000000, "last": 0x14F0000000000000}
 

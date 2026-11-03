@@ -3,7 +3,7 @@ SM100 fp8_clamped_swiglu_quant: fused TIRx-lite kernels (v2: packed math, 128x12
 
 One CTA (8 warps) owns a 128-row x 128-output-column tile. Each thread holds 8 consecutive
 output columns of 8 rows (rows rg + 16 i). The clamped SwiGLU (forward) or its gradient
-(backward) reproduces pith-train's Triton fp32 sequence bit for bit, using cheaper exact
+(backward) is clamped_swiglu's fp32 sequence bit for bit, using cheaper exact
 equivalents: ex2.approx.ftz (only differs where 1 + e rounds to 1 anyway) and
 div.full(1, d) == 0.25 * rcp.approx(0.25 * d) for d >= 1 (div.full's own range scaling),
 with independent element pairs in f32x2 instructions. Quantization multiplies the bf16
@@ -13,11 +13,6 @@ groups) folds them into d_bias per group inside the same launch: each CTA publis
 through a GPU-scope exit word once every persistent CTA has started, and late-exiting CTAs reduce
 them in block order (the last CTA out is the fallback). The register-direct fallback kernel reduces
 them with a second kernel.
-
-Evolved with TIRx-harness: run clamped, frontier member tma-ring-fused-dbias (commit 256df46,
-1669.9 us vs 14016.2 us, 8.394x over the previous SM100 path in the task's benchmark). Compiled
-once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on
-torch's current stream.
 """
 
 import contextlib
@@ -29,7 +24,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # sm_100a SASS only, as the old -gencode nvcc build
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["clamped_swiglu_quant_fwd_sm100", "fp8_clamped_swiglu_rowwise_sm100", "fp8_clamped_swiglu_kmajor_sm100", "fp8_clamped_swiglu_bwd_sm100"]
 
@@ -96,7 +91,7 @@ def op2(op, *args):
 
 def sigmoid2(gc2, alpha2, consts):
     """
-    (alpha*gc, sigmoid(alpha*gc)) for a pair, bit-identical to Triton's
+    (alpha*gc, sigmoid(alpha*gc)) for a pair, bit-identical to clamped_swiglu's
     1 / (1 + ex2.approx(alpha*gc*-log2e)) with div.full.
     """
     a2 = op2("mul.rn", alpha2, gc2)
@@ -170,10 +165,6 @@ def amax2(a, b):
     max(|a|, |b|) per bf16 lane (sign is garbage; NaN ignored unless both).
     """
     return u2("max.xorsign.abs.bf16x2", a, b)
-
-
-def bmax2(a, b):
-    return u2("max.bf16x2", a, b)
 
 
 def abs2(w):
@@ -689,7 +680,6 @@ def segsum1_kernel(C: int):
 TMA_2D = "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
 TMA_2D_H = TMA_2D + ".L2::cache_hint"
 TMA_PF_2D = "cp.async.bulk.prefetch.tensor.2d.L2.global.tile"
-TMA_PF_2D_H = TMA_PF_2D + ".L2::cache_hint"
 POLICY_EVICT_FIRST = 0x12F0000000000000
 POLICY_EVICT_LAST = 0x14F0000000000000
 PWARPS = 16
@@ -809,7 +799,7 @@ def pipe_kernel(N: int, bwd: bool, write_row: bool, write_col: bool, bf16_clamp:
     has_tail = C % BLOCK != 0
     # Backward uses two independent 8-warp CTAs per SM.  Each CTA has one
     # consumer group and two ring stages; together the pair has the same
-    # 16-warps/four-stages capacity as the frontier's single 16-warp CTA.
+    # 16-warp / four-stage capacity as one 16-warp CTA.
     P_WARPS = 8 if bwd else PWARPS
     NGROUPS = 1 if bwd else 2
     GW = P_WARPS // NGROUPS

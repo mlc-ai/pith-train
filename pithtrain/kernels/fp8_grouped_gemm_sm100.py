@@ -16,14 +16,8 @@ tiles as two N=128 sub-MMAs over rotating slots for long qwen rows, or 2-CTA BN=
 tiles. The k-grouped GEMM claims 256 x 256 pair tiles dynamically from a per-(device, stream)
 counter and is launched with programmatic dependent launch (its prologue overlaps the previous
 kernel's tail; every global access follows griddepcontrol.wait).
-
-Evolved with TIRx-harness: run fp8gemm, frontier member pair2cta-hybrid (commit db8dbbc, 8021 us
-vs 11612 us, 1.448x over the previous SM100 path in the task's benchmark). Compiled once per process
-by tvm_tirx.tirx.compile(..., pipeline="tirx") and launched through tvm-ffi on torch's current
-stream.
 """
 
-import contextlib
 import functools
 
 import torch
@@ -36,7 +30,7 @@ from tvm_tirx.backend.cuda.cpp.descriptors import (
     encode_smem_descriptor_base_uint64,
 )
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc as before; a cubin (sm_100a SASS only, as the old -gencode build), since -arch sm_100a would also emit compute_100 PTX, which rejects sm_100a-only instructions
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["fp8_grouped_gemm_sm100", "k_grouped_fp8_gemm_sm100"]
 
@@ -99,13 +93,6 @@ def with_sf_id(desc, sf_id):
     return txl.bitwise_or(out, txl.shift_left(u322(sf_id), txl.uint32(4)))
 
 
-def e8(bits_u32):
-    """
-    Biased exponent byte of an fp32 power of two: its UE8M0 encoding.
-    """
-    return txl.bitwise_and(txl.shift_right(bits_u32, txl.uint32(23)), txl.uint32(0xFF))
-
-
 def pack4(vals, base):
     lo = txl.local_scalar("uint16")
     hi = txl.local_scalar("uint16")
@@ -125,23 +112,10 @@ AB_DESC_BASE = encode_smem_descriptor_base_uint64(0, 64, 3)  # SW128, 8 rows x 1
 MMA_CHAIN = "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X"
 UTCCP_CHAIN = "tcgen05.cp.cta_group::1.32x128b.warpx4"
 LOAD2D = "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-LOAD2D_MC = "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
 LOAD3D = "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
 STORE2D = "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
 PREFETCH3D = "cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint"
 REDUCE3D = "cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.tile.bulk_group"
-
-
-@contextlib.contextmanager
-def ktail(ki, cond):
-    """
-    Guard a K step past the first of a 128-wide K block: skipped beyond K (zero-filled K tail).
-    """
-    if ki == 0:
-        yield
-    else:
-        with txl.if_(cond), txl.then_():
-            yield
 
 
 def dadd(desc, byte_off):
@@ -1966,7 +1940,6 @@ def build_mgrouped_1cta(STAGES, VSF=False):
             txl.ptx["tcgen05.dealloc.cta_group::1.sync.aligned.b32"](txl.uint32(0), txl.uint32(512))
 
     return mgrouped_1cta
-
 
 
 def build_mgrouped_swap(STAGES, VSF=False, TAIL_STEPS=4):

@@ -16,14 +16,9 @@ Design (cluster-resident rows):
 bf16, fp16 and fp32 logits with int32 or int64 targets run the kernels; other integer targets are
 widened to int64 first, and other logit dtypes take a PyTorch path with the same contract.
 
-Evolved with TIRx-harness: run cross_entropy, frontier member cluster-resident-tma (commit fce2df20,
-10880 us vs 19448 us, 1.788x over the previous SM100 path, the Triton kernel adapted from
-TransformerEngine, in the task's benchmark). Changed since: for 16-bit logits the cluster path keeps
-the logits in shared memory and recomputes exp(x - max) in fp32 in the gradient pass, where the
-member stored an f16 exp(x - chunk max) that zeroed terms more than ~16.6 below it; through KCoral
-on the same task that costs 11471 us vs 10883 us for the member in the same session (1.696x over
-the Triton kernel). Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and
-launched through tvm-ffi on torch's current stream.
+For 16-bit logits the cluster path keeps the logits in shared memory and recomputes exp(x - max)
+in fp32 in the gradient pass, since an f16 copy of the exponentials would flush terms more than
+~16.6 below the chunk max to zero.
 """
 
 import functools
@@ -34,7 +29,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["cross_entropy_fwd_bwd_sm100"]
 
@@ -58,7 +53,6 @@ def is_f32(*xs):
     Whether any operand is a float32 expression (the other may be a Python float).
     """
     return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
-
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
@@ -164,22 +158,6 @@ def block_merge(m, s, red, warps, lane, warp):
             txl.assign(m, txl.float32(NEG_BIG))
             txl.assign(s, txl.float32(0.0))
     warp_merge(m, s)
-
-
-def to_f32(dst, words, nwords, ldt):
-    """
-    Unpack nwords 32-bit words of ldt logits into dst[0 : elems].
-    """
-    if ldt == "float32":
-        for k in range(nwords):
-            txl.assign(dst[k], txl.reinterpret(words[k], ty="float32"))
-    elif ldt == "bfloat16":
-        for k in range(nwords):
-            txl.assign(dst[2 * k], txl.reinterpret(words[k] << txl.uint32(16), ty="float32"))
-            txl.assign(dst[2 * k + 1], txl.reinterpret(words[k] & txl.uint32(0xFFFF0000), ty="float32"))
-    else:
-        for k in range(nwords):
-            txl.idioms.cast_f16x2_to_f32x2(dst, k, words[k])
 
 
 def from_f32(words, src, nwords, ldt):
@@ -426,7 +404,7 @@ def cluster_func(ldt, tdt, C, CAP_BYTES, warps=CLUSTER_WARPS):
     def ce_cluster(inp: txl.Tensor((txl.int64(),), ldt, data_alignment=1), target: txl.Tensor((txl.int64(),), tdt, data_alignment=1), tstride: txl.int64, stats: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), row_loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), N: txl.int32, V: txl.int32, ii: txl.int64, done: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), loss: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=N * C, block=(warps) * 32, cluster=(C,) if C > 1 else None), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=blocks_per_sm(CAP_BYTES)))
         cta = txl.cta_id()
-        rank = txl.cuda.mov_sreg(32, "cluster_ctarank") if C > 1 else txl.int32(0)  # %cluster_ctarank, as before: %cluster_ctaid.x costs a division by the cluster size
+        rank = txl.cuda.mov_sreg(32, "cluster_ctarank") if C > 1 else txl.int32(0)  # %cluster_ctarank: %cluster_ctaid.x costs a division by the cluster size
         # Rows run last-to-first: the restore copy (or producer) wrote the tail last, so it is
         # the part most likely still resident in L2.
         row = N - 1 - cta // C
