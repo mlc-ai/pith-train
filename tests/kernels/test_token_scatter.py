@@ -180,6 +180,18 @@ def test_empty_input():
     assert offs.dtype == torch.int32 and ks_tensor.dtype == torch.int32
 
 
+def test_length_mismatch_raises():
+    """
+    An expert_idxs length other than the input row count raises ValueError, before any launch, also
+    with no input rows.
+    """
+    x = torch.randn(100, 64, device="cuda").to(torch.bfloat16)
+    with pytest.raises(ValueError):
+        scatter_by_expert(x, torch.zeros(50, dtype=torch.long, device="cuda"), 4)
+    with pytest.raises(ValueError):
+        scatter_by_expert(x[:0], torch.zeros(3, dtype=torch.long, device="cuda"), 4)
+
+
 CALL_SHAPES = [(100, 256, 4), (70000, 128, 64), (5000, 64, 2048), (1, 32, 1), (20000, 2880, 16), (4096, 100, 300), (70000, 64, 8)]  # fmt: skip
 
 
