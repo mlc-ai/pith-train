@@ -34,15 +34,11 @@ grid = co-resident CTAs (cooperative launch, txl.cuda.grid_sync):
      Each warp uses a D-deep shared-memory task ring and issues the first D - 1 loads before the
      histogram. Arbitrary row strides and unaligned rows retain the register path.
   5. the last CTA to finish re-zeroes the persistent counters and the queue for the next call.
-Without host counts, ks is read back with one device-to-host copy and stream sync (as before).
+Without host counts, ks is read back with one device-to-host copy and stream sync.
 Rows are raw bytes: kernels are keyed on (row bytes, vector width) only, shared by every dtype.
 
-Evolved with TIRx-harness: run token_scatter, frontier member host-plan-tma-ring (commit 00207e06,
-179.456 us vs 561.641 us summed over the task's 3 rows, 3.13x over the previous SM100 path in the
-task's benchmark). Compiled once per process by tvm_tirx.tirx.compile(..., pipeline="tirx") and
-launched through tvm-ffi on torch's current stream. The fallback launch is cooperative: every CTA
-must be resident at once, so it runs only when the whole grid fits beside whatever other streams
-are running.
+The fallback launch is cooperative: every CTA must be resident at once, so it runs only when the
+whole grid fits beside whatever other streams are running.
 """
 
 import functools
@@ -56,7 +52,7 @@ import tvm_tirx
 
 import tirx_kernels.tirx_lite as txl
 
-TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})  # nvcc, as TVM_CUDA_COMPILE_MODE=nvcc chose before
+TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_config": {"cuda": {"compiler": "nvcc", "target_format": "cubin"}}})
 
 __all__ = ["scatter_by_expert_sm100"]
 
@@ -1104,6 +1100,8 @@ def scatter_by_expert_sm100(
     global DBG
     num_tokens, hidden = input_tokens.shape[0], input_tokens.shape[1]
     device = input_tokens.device
+    if expert_idxs.shape[0] != num_tokens:
+        raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {num_tokens=}")
     if num_tokens == 0:
         return (
             torch.empty((0, hidden), device=device, dtype=input_tokens.dtype),
@@ -1112,8 +1110,6 @@ def scatter_by_expert_sm100(
             torch.empty((0,), device=device, dtype=torch.int32),
             [],
         )
-    if expert_idxs.shape[0] != num_tokens:
-        raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {num_tokens=}")
     if num_groups > GMAX:
         return scatter_by_expert_torch(input_tokens, expert_idxs, num_groups, padding_alignment, group_counts)
     if input_tokens.stride(1) != 1 and hidden > 1:
