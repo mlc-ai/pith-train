@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.distributed import ProcessGroup
 
 from pithtrain.contexts import distributed
+from pithtrain.kernels import gated_delta_rule_cp_supported
 from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.cp_sequence import (
     contiguous_to_zigzag,
@@ -198,7 +199,24 @@ class RecurrenceRequest:
     HK: int = 0  # key heads (q, k); 0: H, one per value head
     K: int = 128
     V: int = 128
-    atol: float = 1e-4
+
+
+# Relative L2 bound of the sharded recurrence against the dense one, per CP path. The CuTe CP
+# kernels (gated_delta_rule_cp_supported) measured an error of exactly 0 in every output, rank and
+# case below at seeds 42, 1, 2 and 3 on the H200 (4203270: the gate decays a rank's state to about
+# 1e-28 within a shard, and a rank's initial state comes from the same kernels the dense path runs);
+# 1e-4 leaves room for bf16 one-ulp flips from a change of rounding order. The SM100 TIRx CP stages
+# measured about 3e-3 against the fp32 recurrence, as does the dense path, and 6e-3 against the
+# dense path (B200, one-process emulation, 2 and 4 ranks, b 1 to 3, S 1024 to 2048): 1e-2. A
+# mis-merged summary errs by O(1) (the next-rank control below reads about 1.4).
+CUTE_CP_BOUND, TIRX_CP_BOUND = 1e-4, 1e-2
+
+
+def fold_batch(t: torch.Tensor) -> torch.Tensor:
+    """
+    [b, s, heads, ...] -> [1, s, b * heads, ...] contiguous, the operator's fold.
+    """
+    return t.transpose(0, 1).reshape(1, t.shape[1], -1, *t.shape[3:]).contiguous()
 
 
 def relative_error(ref: torch.Tensor, got: torch.Tensor) -> float:
@@ -248,29 +266,31 @@ def verify_recurrence(req: RecurrenceRequest) -> None:
         return {"out": out, **{f"d{n}": t.grad for n, t in leaves.items()}}
 
     dense = run(full, None)
-    local = run({name: shard(t) for name, t in full.items()}, cp_group)
+    shards = {name: shard(t) for name, t in full.items()}
+    local = run(shards, cp_group)
+    folded = [fold_batch(shards[n]) for n in ("q", "k", "v", "g", "beta")]
+    bound = CUTE_CP_BOUND if gated_delta_rule_cp_supported(*folded) else TIRX_CP_BOUND
 
     for name, got in local.items():
         error = relative_error(shard(dense[name]), got)
         # The next rank's shard is the cheapest wrong answer, so it calibrates the tolerance.
         control = relative_error(contiguous_shard(dense[name], (cp_rank + 1) % cp_size, cp_size), got)  # fmt: skip
-        if error >= req.atol:
+        if error >= bound:
             raise AssertionError(f"{name} diverged under cp={cp_size}: {error=:.2e} {control=:.2e}")
         if control <= 10 * error:
             raise AssertionError(f"{name} control too close under cp={cp_size}: {error=:.2e} {control=:.2e}")  # fmt: skip
 
 
 # Qwen3.5's geometry (16 key heads, 32 value heads), the one the kernels cover: the CP kernels
-# against the pinned dense kernels, which round differently, while a mis-merged summary still errs
-# by O(1). SM100 repeats q / k to the value heads in the operator; SM90's CuTe kernels take the key
+# against the pinned dense kernels, with the bounds above. SM100 repeats q / k to the value heads in the operator; SM90's CuTe kernels take the key
 # heads. B > 1 folds into the heads on SM90 and runs one sample at a time on SM100.
 RECURRENCE = [
-    pytest.param(2, RecurrenceRequest(B=1, S=512, H=32, HK=16, atol=1e-2), id="CP2-B1"),
-    pytest.param(2, RecurrenceRequest(B=3, S=512, H=32, HK=16, atol=1e-2), id="CP2-B3"),
-    pytest.param(4, RecurrenceRequest(B=1, S=1024, H=32, HK=16, atol=1e-2), id="CP4-B1"),
-    pytest.param(4, RecurrenceRequest(B=2, S=4096, H=32, HK=16, atol=1e-2), id="CP4-B2-S4K"),
-    pytest.param(2, RecurrenceRequest(B=1, S=4096, H=32, HK=16, atol=1e-2), id="CP2-B1-S4K"),
-    pytest.param(4, RecurrenceRequest(B=1, S=2048, H=32, HK=16, atol=1e-2), id="CP4-B1-S2K"),
+    pytest.param(2, RecurrenceRequest(B=1, S=512, H=32, HK=16), id="CP2-B1"),
+    pytest.param(2, RecurrenceRequest(B=3, S=512, H=32, HK=16), id="CP2-B3"),
+    pytest.param(4, RecurrenceRequest(B=1, S=1024, H=32, HK=16), id="CP4-B1"),
+    pytest.param(4, RecurrenceRequest(B=2, S=4096, H=32, HK=16), id="CP4-B2-S4K"),
+    pytest.param(2, RecurrenceRequest(B=1, S=4096, H=32, HK=16), id="CP2-B1-S4K"),
+    pytest.param(4, RecurrenceRequest(B=1, S=2048, H=32, HK=16), id="CP4-B1-S2K"),
 ]
 
 
