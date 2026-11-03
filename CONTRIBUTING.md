@@ -10,7 +10,7 @@ PithTrain's value is that an agent *or* a human can read the whole codebase and 
 
 1. **Compact over comprehensive.** We do not aim for broad model/feature/hardware coverage. Prefer the smallest change that solves the problem. Adding a feature that only some users need? Consider whether it belongs here at all. Growth is fine; growth that respects the other three principles is the bar.
 
-2. **Python-native.** Keep the framework navigable in one language. Custom kernels go through a Python DSL (Triton) where possible; reach for external compiled libraries (DeepGEMM, FlashAttention) only when they are the right tool, and wrap them behind a thin Python operator. Avoid in-tree C++/CUDA build steps.
+2. **Python-native.** Keep the framework navigable in one language. Custom kernels go through a Python DSL (CuTe-DSL on SM90, TIRx-lite on SM100) where possible; reach for external compiled libraries (DeepGEMM, FlashAttention) only when they are the right tool, and wrap them behind a thin Python operator. Avoid in-tree C++/CUDA build steps.
 
 3. **Minimal implicit indirection.** Aim for code where what runs at a call site is discoverable by reading it. Avoid introducing plugin registries, string-keyed dispatch tables, or runtime "spec" objects that resolve which submodule to build; instantiate directly where you reasonably can. Each model being a self-contained file that builds its own layers is the pattern to follow — we accept a little duplication across model files in exchange for local readability.
 
@@ -85,7 +85,7 @@ Use the **`add-new-model`** skill — it covers the full scope below and runs th
 
 ### Add a new operator / kernel
 
-1. Implement the kernel in `pithtrain/kernels/<feature>.py` (Triton preferred; an SM90-specific CuTe-DSL version goes in `<feature>_sm90.py` next to the Triton `<feature>_sm100.py`, behind a picker `<feature>.py`, see AGENTS.md "Kernels") and its autograd op or layer in `pithtrain/operators/<op>.py`.
+1. Implement the kernel in `pithtrain/kernels/` (a CuTe-DSL `<feature>_sm90.py` and a TIRx-lite `<feature>_sm100.py` behind a picker `<feature>.py`, or a plain `<feature>.py` both architectures run, see AGENTS.md "Kernels") and its autograd op or layer in `pithtrain/operators/<op>.py`.
 2. **Ship a PyTorch reference implementation in the same module** — this is the layer's contract and what the test compares against.
 3. Add `tests/test_<op>.py` comparing fused vs reference (use `calc_diff` and an appropriate tolerance for reduced precision; remember the `grouped_mm` padding gotcha).
 4. Optionally add a benchmark under `benchmarks/operators/`.
