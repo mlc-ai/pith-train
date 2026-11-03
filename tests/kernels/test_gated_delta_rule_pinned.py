@@ -23,7 +23,7 @@ Checked, each test on its own (none skips on the H200):
   intermediates in bf16, so the check is calc_diff per output below BOUNDS plus a max absolute
   error within MAX_ABS of the reference's largest magnitude, and every value finite. The bounds are
   about 2.5 to 3 times the largest error measured on the H200 over every case here at the test's
-  seed and three more (e316a97): calc_diff 8.1e-6 (o), 8.1e-6 (dq), 1.1e-5 (dk), 6.1e-6 (dv),
+  seed and three more: calc_diff 8.1e-6 (o), 8.1e-6 (dq), 1.1e-5 (dk), 6.1e-6 (dv),
   3.6e-5 (dg, at T = 2), 7.7e-6 (dbeta), and a largest absolute error of 9.3e-3 of the reference's
   largest magnitude (dg at T = 2; 8.7e-3 elsewhere);
 - at long and ragged T (4096 .. 8192, with resets), the forward and backward against the

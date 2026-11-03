@@ -203,12 +203,13 @@ class RecurrenceRequest:
 
 # Relative L2 bound of the sharded recurrence against the dense one, per CP path. The CuTe CP
 # kernels (gated_delta_rule_cp_supported) measured an error of exactly 0 in every output, rank and
-# case below at seeds 42, 1, 2 and 3 on the H200 (4203270: the gate decays a rank's state to about
-# 1e-28 within a shard, and a rank's initial state comes from the same kernels the dense path runs);
-# 1e-4 leaves room for bf16 one-ulp flips from a change of rounding order. The SM100 TIRx CP stages
-# measured about 3e-3 against the fp32 recurrence, as does the dense path, and 6e-3 against the
-# dense path (B200, one-process emulation, 2 and 4 ranks, b 1 to 3, S 1024 to 2048): 1e-2. A
-# mis-merged summary errs by O(1) (the next-rank control below reads about 1.4).
+# case below at seeds 42, 1, 2 and 3 on the H200 (the gate decays a rank's state to about 1e-28
+# within a shard, and a rank's initial state comes from the same kernels the dense path runs); 1e-4
+# leaves room for bf16 one-ulp flips from a change of rounding order. The SM100 TIRx CP stages
+# measured 3e-3 to 4e-3 against the fp32 recurrence, as does the dense path (2.5e-3 to 3.5e-3), so
+# at most about 7e-3 between them, and below 1e-2 when compared directly (B200, one-process
+# emulation, 2 and 4 ranks, b 1 to 3, S 1024 to 2048): 1e-2. A mis-merged summary errs by O(1)
+# (the next-rank control below reads about 1.4).
 CUTE_CP_BOUND, TIRX_CP_BOUND = 1e-4, 1e-2
 
 
