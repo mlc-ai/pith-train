@@ -1287,6 +1287,16 @@ def segment_sum_sm100(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype:
     out = torch.empty((G, H), dtype=out_dtype, device=x.device)
     if G == 0 or H == 0:
         return out
+    if x.data_ptr() % 16:
+        x = x.clone()  # the kernels read 16-byte vectors from the base: an aligned copy, the same bits
+    if grouped_mm_offs.dtype != torch.int32 or not grouped_mm_offs.is_contiguous():
+        # The kernels read contiguous int32 or int64 ends below 2^31; any other integer dtype or stride,
+        # and int64 ends past the int32 range, become contiguous int32 ends clamped to M (one small
+        # device-side conversion, no host synchronization).
+        wide = grouped_mm_offs.to(torch.int64)
+        if grouped_mm_offs.dtype == torch.uint64:
+            wide = torch.where(wide < 0, M, wide)  # ends at or past 2^63 wrapped negative: past M
+        grouped_mm_offs = wide.clamp(max=M).to(torch.int32)
     dt, it, ot = DT[x.dtype], IT[grouped_mm_offs.dtype], DT[out_dtype]
     ring = ring_layout(dt, H)
     xf = x.view(-1) if M > 0 else torch.empty(1, dtype=x.dtype, device=x.device)

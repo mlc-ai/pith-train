@@ -22,7 +22,9 @@ def segment_sum(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch
     - grouped_mm_offs: integer (G,) non-decreasing cumulative group ends; ends past M are clamped to
       M and rows past the last end are ignored. Groups need not be multiples of 128; an empty group
       sums to zero. On SM90 32- and 64-bit integer offsets of any stride are read as they are
-      (ends clamped in 64 bits); a narrower integer dtype costs one device-side conversion.
+      (ends clamped in 64 bits); a narrower integer dtype costs one device-side conversion. On
+      SM100 offsets other than contiguous int32 are converted to them, clamped to M, first (one
+      small device-side conversion).
     - out_dtype: the result dtype; the sums are fp32, rounded once.
 
     Deterministic summation order: each group is cut into 128-row tiles from its own start, and the
