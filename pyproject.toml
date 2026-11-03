@@ -28,7 +28,6 @@ include = ["pithtrain*"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
-constraint-dependencies = ["kcoral==0.1.0"]  # the version the TIRx SM100 kernels were evolved with
 
 [[tool.uv.index]]
 name = "torch-cu130"
