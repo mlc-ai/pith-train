@@ -62,7 +62,7 @@ def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call. On SM90 the geometry of
     pinned_shapes, and also the folded geometry of folded_shapes (a batch folded into the heads).
-    On SM100 the geometry the TIRx kernels were evolved and verified at, one sample's heads:
+    On SM100 the geometry the TIRx kernels were verified at, one sample's heads:
     pinned_shapes with H 16 or 32 key heads over the 32 value heads (not a folded batch, whose
     samples a caller runs one at a time). Otherwise False. Constant per geometry: torch.compile
     guards on the shape, device and dtype checks.

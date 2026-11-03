@@ -58,7 +58,7 @@ def gdr_cp_fwd_local(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: to
     k: bf16 (1, T, H, K) contiguous, unrepeated key heads; v: bf16 (1, T, HV, V); g: fp32 (1, T,
     HV), the raw log gate; beta: bf16 (1, T, HV). Value head j reads key head j // (HV / H).
     g_cum: fp32 (1, T, HV), the chunk-local cumulative gate in log2 units, and A: bf16 (1, T, HV,
-    64), the solved WY matrix, both bit for bit FLA's and what the backward reads; w: bf16 (1, T,
+    64), the solved WY matrix, on the chunk algorithm of FLA 0.5.2 and what the backward reads; w: bf16 (1, T,
     HV, K) and u: bf16 (1, T, HV, V), FLA's recompute_w_u. hm: fp32 (HV, K, V + K): with transition
     the rank's affine state map from a zero state, he (columns :V, the final state of the
     recurrence) and M (columns V:, the product of the chunk transitions, a TF32 chain) as FLA's
@@ -161,7 +161,7 @@ SM100_ONLY = "the TIRx context-parallel gated delta rule kernels run on SM100 on
 def chunk_gdr_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether the chunk_gdr_cp_* entry points apply to this rank's call: on SM100, at the geometry the
-    kernels were evolved and verified at: q, k, v bf16 (1, S, 32, 128) with S >= 1 (q / k given per
+    kernels were verified at: q, k, v bf16 (1, S, 32, 128) with S >= 1 (q / k given per
     value head, so already repeated to the 32 value heads where fewer key heads serve them), g fp32
     (1, S, 32), beta bf16 (1, S, 32); otherwise False. Depends only on
     shapes, dtypes and the device, so it gives the same answer on every rank of a CP group and for
