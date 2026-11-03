@@ -268,8 +268,8 @@ def chunk_gdr_cp_bwd_post(gathered: torch.Tensor, saved: tuple, plan: dict) -> t
 
     dq, dk: bf16 (1, S, HV, K) per value head (the caller sums each group for key-head gradients);
     dv: bf16 like v; dg: fp32 (1, S, HV), with respect to the raw gate g; dbeta: bf16 like beta.
-    Matches FLA 0.5.2's CP chunk_gated_delta_rule_bwd to its CP verifier's 1e-4 relative L2 (not
-    bit for bit). Only where chunk_gdr_cp_supported is True.
+    Matches the fp64 chunked recurrence of tests/kernels/test_gated_delta_rule_cp.py within its
+    bounds (calc_diff below 1e-3, not bit for bit). Only where chunk_gdr_cp_supported is True.
     """
     match ARCH_MAJOR:
         case 10:

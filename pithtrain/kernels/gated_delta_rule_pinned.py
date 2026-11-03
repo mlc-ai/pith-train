@@ -117,10 +117,9 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     with respect to the raw gate g; dbeta like beta. On SM90 CuTe kernels at every T, on FLA
     0.5.2's chunk algorithm and rounding points. The gradients match the fp32 recurrence's autograd
     to calc_diff < 1e-3 and a largest absolute error within 2e-2 of the reference's largest
-    magnitude. On SM100 a beta below 2^-20 runs
-    as 2^-20, as in the forward, and dbeta there is the gradient at 2^-20 (the kernel's dbeta loses
-    the gradient at beta == 0 otherwise). Deterministic. Only where
-    gated_delta_rule_pinned_supported is True.
+    magnitude. On SM100 a beta below 2^-20 runs as 2^-20, as in the forward, and dbeta there is the
+    gradient at 2^-20 (the kernel's dbeta loses the gradient at beta == 0 otherwise). Deterministic.
+    Only where gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
         case 9:

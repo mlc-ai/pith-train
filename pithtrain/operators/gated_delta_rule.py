@@ -11,7 +11,8 @@ two stages around one all-gather of the ranks' state summaries over the CP group
 gated_delta_rule_cp_supported says so (SM90 at Qwen3.5's geometry, q and k with the unrepeated key
 heads) the CuTe kernels of FLA's context-parallel structure, each direction around one all-gather
 of the ranks' state maps. The all-gathers run here. Any other call raises ValueError naming the
-geometry the kernels cover: no other implementation is kept.
+geometry the kernels cover: no other implementation is kept. On SM100 the dense path raises a beta
+below 2^-20 to 2^-20 in both directions (see dense_gated_delta_rule).
 """
 
 from functools import lru_cache
@@ -259,13 +260,12 @@ def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
     gated_delta_rule without context parallelism, through the pinned kernels; callers check
     gated_delta_rule_pinned_supported first.
 
-    On SM90 the forward and backward run CuTe kernels on FLA 0.5.2's chunk algorithm and rounding
-    points at every length (no Triton kernel; a length that is not a multiple of 64 runs as if
-    zero-padded to one, FLA's ragged semantics); the forward's saved g_cum and A are bit-identical
-    to FLA's. Against the fp32 recurrence, measured against FLA: calc_diff within 1.001x of FLA's
-    and the largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 /
-    8192, 3 seeds), and within the verifier's 1.10x bounds in its cases. On SM100 TIRx kernels at
-    Qwen3.5's geometry.
+    CuTe kernels on SM90 and TIRx kernels on SM100, on the chunk algorithm of FLA 0.5.2 at every
+    length (a length that is not a multiple of 64 runs as if zero-padded to one). The output and the
+    gradients match the fp32 recurrence to the bounds of the pinned verifier
+    (tests/kernels/test_gated_delta_rule_pinned.py). On SM100 a beta below 2^-20 runs as 2^-20 in both directions (see chunk_gdr_fwd_pinned): the
+    output differs from the recurrence only by such a beta's own term, and dbeta there is the
+    gradient at 2^-20.
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape
