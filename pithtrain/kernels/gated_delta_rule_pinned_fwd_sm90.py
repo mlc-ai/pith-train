@@ -6,14 +6,13 @@ v_new never leaving the SM). When T is not a multiple of the chunk size each ker
 ragged variant (compiled on the first such call, T staying a runtime argument), whose last chunk
 behaves as if zero-padded to 64 rows: predicated loads with zero fill (copy_rows), the gate cumsum
 over zeros, so padded rows repeat the chunk's last valid gate, and stores of rows below T only.
-That is FLA's ragged semantics, and the result on valid rows is bit-identical to the aligned
-kernels on inputs zero-padded to a multiple of 64.
+That is FLA's ragged semantics: the result on valid rows is that of the aligned kernels on inputs
+zero-padded to a multiple of 64.
 
 The CuTe forward follows FLA 0.5.2's chunk algorithm and rounding points (bf16 A, w, u, h, v_new,
 fp32 accumulation, exp2 of the log2 gate, TF32 block merges of A with truncated operands, as FLA's
-tl.dot on Hopper) and matches it to bf16 rounding; g_cum and A are bit-identical to FLA's. The
-ops stay opaque to torch.compile. Grouped value heads run on unrepeated q / k, which the kernels
-index per group. The backward is gated_delta_rule_pinned_bwd_sm90. No Triton kernel runs here.
+tl.dot on Hopper). The ops stay opaque to torch.compile. Grouped value heads run on unrepeated
+q / k, which the kernels index per group. The backward is gated_delta_rule_pinned_bwd_sm90.
 """
 
 import cutlass
@@ -632,8 +631,10 @@ def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
     o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV), the chunk-local cumulative gate. A: bf16 (B, T,
     HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned_sm90. The CuTe
-    kernels at every T (the ragged variants when T is not a multiple of 64), matching FLA 0.5.2's
-    chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV heads to bf16 rounding, g_cum and A
-    bit for bit. Deterministic. Only where gated_delta_rule_pinned_supported is True.
+    kernels at every T (the ragged variants when T is not a multiple of 64), on FLA 0.5.2's chunk
+    algorithm and rounding points. o matches the fp32 recurrence to calc_diff < 1e-4 and a largest
+    absolute error within 2e-2 of the reference's largest magnitude
+    (tests/kernels/test_gated_delta_rule_pinned.py). Deterministic. Only where
+    gated_delta_rule_pinned_supported is True.
     """
     return chunk_gdr_fwd_cute(q, k, v, g, beta)

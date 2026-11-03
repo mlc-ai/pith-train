@@ -5,8 +5,8 @@ split over the CP group. Two families of entry points, one per architecture, eac
 stages around one all-gather over the CP group that the caller runs:
 
 - SM90, CuTe-DSL kernels (gated_delta_rule_cp_supported, gdr_cp_*): the per-rank pieces of FLA
-  0.5.2's context-parallel structure on unrepeated key heads, no Triton kernel. Forward, on rank
-  r of n ranks holding consecutive slices of one sequence:
+  0.5.2's context-parallel structure on unrepeated key heads. Forward, on rank r of n ranks
+  holding consecutive slices of one sequence:
       g_cum, A, w, u, hm = gdr_cp_fwd_local(k, v, g, beta, transition=r < n - 1)
       ag = all_gather(hm)                       # (n, HV, K, V + K)
       h0 = gdr_cp_merge(ag, r, r, reverse=False) if r > 0 else None

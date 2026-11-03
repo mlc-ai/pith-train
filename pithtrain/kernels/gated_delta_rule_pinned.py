@@ -1,7 +1,7 @@
 """
 Picker of the pinned dense chunked gated delta rule (chunk size 64, no initial or final state) at
 Qwen3.5's geometry: on SM90 CuTe-DSL kernels in both directions at every T (a ragged variant of
-each when T is not a multiple of 64, no Triton kernel); TIRx kernels on SM100. The callers' custom
+each when T is not a multiple of 64); TIRx kernels on SM100. The callers' custom
 ops keep both opaque to torch.compile.
 """
 
@@ -87,11 +87,12 @@ def chunk_gdr_fwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
 
     o: bf16 (B, T, HV, V). g_cum: fp32 (B, T, HV) and A: bf16 (B, T, HV, 64) are what the backward
     reads, inputs of chunk_gdr_bwd_pinned only: their shapes and dtypes are fixed, their contents
-    the implementation's (on SM90 FLA's chunk-local cumulative gate and solved WY matrix, bit for
-    bit). On SM90 equal to FLA 0.5.2's chunk_gated_delta_rule_fwd on q / k repeat-interleaved to HV
-    heads up to bf16 rounding, at every T (a T that is not a multiple of 64 runs as if zero-padded
-    to one, FLA's ragged semantics). On SM100 a beta below 2^-20 runs as 2^-20 (SM100_BETA_FLOOR),
-    in both directions. Deterministic. Only where gated_delta_rule_pinned_supported is True.
+    the implementation's (on SM90 the chunk-local cumulative gate and solved WY matrix of FLA
+    0.5.2's chunk algorithm). On SM90 at every T (a T that is not a multiple of 64 runs as if
+    zero-padded to one, FLA's ragged semantics). o matches the fp32 recurrence to calc_diff < 1e-4
+    and a largest absolute error within 2e-2 of the reference's largest magnitude. On SM100 a beta
+    below 2^-20 runs as 2^-20 (SM100_BETA_FLOOR), in both directions. Deterministic. Only where
+    gated_delta_rule_pinned_supported is True.
     """
     match ARCH_MAJOR:
         case 9:
@@ -114,10 +115,9 @@ def chunk_gdr_bwd_pinned(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     dq, dk: (B, T, HV, K) in q's / k's dtype, per value head (the caller sums each group of HV / H
     heads, in repeat_interleave order, for the key-head gradients). dv like v; dg: fp32 (B, T, HV),
     with respect to the raw gate g; dbeta like beta. On SM90 CuTe kernels at every T, on FLA
-    0.5.2's chunk algorithm and rounding points. Against the fp32 recurrence, measured against
-    FLA's chunk_gdr_bwd on repeat-interleaved q / k: calc_diff within 1.001x of FLA's and the
-    largest single-element error within 1.04x of FLA's in grad_check's cases (T = 4096 / 8192, 3
-    seeds), and within the verifier's 1.10x bounds in its cases. On SM100 a beta below 2^-20 runs
+    0.5.2's chunk algorithm and rounding points. The gradients match the fp32 recurrence's autograd
+    to calc_diff < 1e-3 and a largest absolute error within 2e-2 of the reference's largest
+    magnitude. On SM100 a beta below 2^-20 runs
     as 2^-20, as in the forward, and dbeta there is the gradient at 2^-20 (the kernel's dbeta loses
     the gradient at beta == 0 otherwise). Deterministic. Only where
     gated_delta_rule_pinned_supported is True.

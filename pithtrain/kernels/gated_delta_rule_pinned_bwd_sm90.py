@@ -9,7 +9,7 @@ product in the dh update with truncated operands, as FLA's tl.dot on Hopper; dk 
 where FLA adds them through bf16 / fp32 buffers. When T is not a multiple of the chunk size each
 kernel runs its ragged variant, whose last chunk behaves as if zero-padded to 64 rows (copy_rows'
 zero-filled loads, gate rows past T reading g_cum[T - 1], stores of rows below T only); the
-intermediates keep T rows. No Triton kernel runs here.
+intermediates keep T rows.
 """
 
 import cutlass
@@ -990,10 +990,9 @@ def chunk_gdr_bwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     heads, in repeat_interleave order, for the key-head gradients). dv like v; dg: fp32 (B, T, HV),
     with respect to the raw gate g; dbeta like beta. The CuTe kernels at every T (the ragged
     variants when T is not a multiple of 64), on FLA 0.5.2's chunk algorithm and rounding points
-    (fp32 accumulation, so dk and dg skip the bf16 / fp32 buffers FLA adds them through). Against
-    the fp32 recurrence, measured against FLA's chunk_gated_delta_rule_bwd on repeat-interleaved q /
-    k: calc_diff within 1.001x of FLA's and the largest single-element error within 1.04x of FLA's
-    in grad_check's cases (T = 4096 / 8192, 3 seeds), and within the verifier's 1.10x bounds in its
-    cases. Deterministic. Only where gated_delta_rule_pinned_supported is True.
+    (fp32 accumulation, so dk and dg skip the bf16 / fp32 buffers FLA adds them through). Matches
+    the fp32 recurrence's autograd to calc_diff < 1e-3 and a largest absolute error within 2e-2 of
+    the reference's largest magnitude (tests/kernels/test_gated_delta_rule_pinned.py).
+    Deterministic. Only where gated_delta_rule_pinned_supported is True.
     """
     return chunk_gdr_bwd_cute(q, k, v, g_cum, beta, A, do)
