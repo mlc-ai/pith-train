@@ -1064,6 +1064,33 @@ INSTR = False
 DBG = None
 
 
+def scatter_by_expert_torch(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int, group_counts) -> tuple:
+    """
+    scatter_by_expert in PyTorch, for more groups than the kernel's GMAX: the same outputs, tokens in
+    token order within each group.
+    """
+    num_tokens, hidden = input_tokens.shape
+    device = input_tokens.device
+    counts = torch.bincount(expert_idxs, minlength=num_groups)[:num_groups]
+    ks_tensor = ((counts + padding_alignment - 1) // padding_alignment * padding_alignment).to(torch.int32)
+    offs = ks_tensor.cumsum(0).to(torch.int32)
+    if group_counts is not None:
+        ks = [(n + padding_alignment - 1) // padding_alignment * padding_alignment for n in group_counts]
+    else:
+        ks = ks_tensor.tolist()
+    order = torch.argsort(expert_idxs, stable=True)
+    ordered = expert_idxs[order]
+    first = torch.searchsorted(ordered, torch.arange(num_groups, device=device, dtype=ordered.dtype))
+    rank = torch.empty_like(order)
+    rank[order] = torch.arange(num_tokens, device=device) - first[ordered]
+    rev = (offs - ks_tensor).long()[expert_idxs] + rank
+    total = sum(ks)
+    rows = (total + GEMM_ALLOC_ALIGNMENT - 1) // GEMM_ALLOC_ALIGNMENT * GEMM_ALLOC_ALIGNMENT
+    out = torch.zeros((max(rows, 1), hidden), device=device, dtype=input_tokens.dtype)
+    out.index_copy_(0, rev, input_tokens)
+    return out[:total], rev, offs, ks_tensor, ks
+
+
 def scatter_by_expert_sm100(
     input_tokens: torch.Tensor,
     expert_idxs: torch.Tensor,
@@ -1088,7 +1115,7 @@ def scatter_by_expert_sm100(
     if expert_idxs.shape[0] != num_tokens:
         raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {num_tokens=}")
     if num_groups > GMAX:
-        raise ValueError(f"num_groups={num_groups} exceeds the supported {GMAX}")
+        return scatter_by_expert_torch(input_tokens, expert_idxs, num_groups, padding_alignment, group_counts)
     if input_tokens.stride(1) != 1 and hidden > 1:
         raise ValueError("input_tokens must have unit inner stride")
 

@@ -35,7 +35,8 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
       ks == [].
 
     Rows are copied exactly. Placement within a group: token order on SM90 (so every output is
-    deterministic); unspecified on SM100 (atomic_add order, not deterministic). Consumers locate a
+    deterministic); unspecified on SM100 (atomic_add order, not deterministic; with more than 1024
+    groups SM100 takes a PyTorch path, in token order). Consumers locate a
     token only through reverse_shuffle_idxs. An expert_idxs length other than num_tokens raises
     ValueError on SM90 (also for num_tokens == 0); SM100 does not check it.
     """
