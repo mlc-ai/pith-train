@@ -52,7 +52,6 @@ KERNELS = PKG / "kernels"
 SM90_ONLY = {
     "group_indices_sm90",
     "fp8_rowwise_kmajor_sm90",
-    "gated_delta_rule_cp_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
 SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90", "row_slice_sm90"}
@@ -65,8 +64,6 @@ SM90_CROSS_EDGES = {
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
     ("fp8_clamped_swiglu_quant_sm90", "segment_sum_sm90"),
     ("fp8_scatter_quant_sm90", "token_scatter_sm90"),
-    ("fp8_clamped_swiglu_quant_sm90", "clamped_swiglu_sm90"),
-    ("fp8_silu_mul_quant_sm90", "silu_mul_sm90"),
     ("gated_delta_rule_cp_sm90", "gated_delta_rule_pinned_fwd_sm90"),
     ("gated_delta_rule_cp_sm90", "gated_delta_rule_pinned_bwd_sm90"),
 }
@@ -458,8 +455,7 @@ def find_violations() -> set[tuple[str, str, str]]:
                     own = sm90_feature(stem)
                     ts = stem_of(t)
                     ok = (
-                        ts == own + "_sm100"
-                        or ts in SM90_HELPERS
+                        ts in SM90_HELPERS
                         or (stem, ts) in SM90_CROSS_EDGES
                         or (ts.endswith("_sm90") and sm90_feature(ts) == own)
                     )
@@ -470,6 +466,22 @@ def find_violations() -> set[tuple[str, str, str]]:
                     found.add(("sm100-imports-picker", mod, t))
                 if mod in PICKERS and t != mod:
                     found.add(("picker-imports-picker", mod, t))
+
+    # No Triton anywhere in pithtrain/: no import of triton and no @triton.jit.
+    for mod, path in sorted(MODULES.items()):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            if any(n == "triton" or n.startswith("triton.") for n in names):
+                found.add(("triton-import", mod, f"line {node.lineno}"))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    if "triton" in ast.unparse(dec):
+                        found.add(("triton-jit", mod, node.name))
 
     for mod in sorted(eager_closure("pithtrain.kernels")):
         heavy = [t for t in top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]
