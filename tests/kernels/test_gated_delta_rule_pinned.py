@@ -25,7 +25,8 @@ Checked, each test on its own (none skips on the H200):
   about 2.5 to 3 times the largest error measured on the H200 over every case here at the test's
   seed and three more: calc_diff 8.1e-6 (o), 8.1e-6 (dq), 1.1e-5 (dk), 6.1e-6 (dv),
   3.6e-5 (dg, at T = 2), 7.7e-6 (dbeta), and a largest absolute error of 9.3e-3 of the reference's
-  largest magnitude (dg at T = 2; 8.7e-3 elsewhere);
+  largest magnitude (dg at T = 2; 8.7e-3 elsewhere). On the B200 (the folded cases unsupported):
+  6.9e-6, 7.0e-6, 1.0e-5, 7.2e-6, 3.6e-5 (dg, at T = 2), 1.2e-5, and 9.3e-3;
 - at long and ragged T (4096 .. 8192, with resets), the forward and backward against the
   recurrence in fp64, in its chunked form (itself checked against the token-by-token one), with the
   same bounds;
