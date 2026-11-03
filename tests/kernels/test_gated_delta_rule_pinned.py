@@ -20,8 +20,12 @@ Checked, each test on its own (none skips on the H200):
   last-chunk sizes around the 8- and 16-row copy blocks), H = 16 and 32, the model's gate and a
   mild one, and packed-document resets (g = -128) on and next to chunk boundaries, inside a
   partial last chunk, on the final token, and 64 in a row ending on it. The kernels keep some chunk
-  intermediates in bf16, so the check is calc_diff below 1e-4 (output) and 1e-3 (gradients), plus a
-  max absolute error within 2e-2 of the reference's largest magnitude, and every value finite;
+  intermediates in bf16, so the check is calc_diff per output below BOUNDS plus a max absolute
+  error within MAX_ABS of the reference's largest magnitude, and every value finite. The bounds are
+  about 2.5 to 3 times the largest error measured on the H200 over every case here at the test's
+  seed and three more (e316a97): calc_diff 8.1e-6 (o), 8.1e-6 (dq), 1.1e-5 (dk), 6.1e-6 (dv),
+  3.6e-5 (dg, at T = 2), 7.7e-6 (dbeta), and a largest absolute error of 9.3e-3 of the reference's
+  largest magnitude (dg at T = 2; 8.7e-3 elsewhere);
 - at long and ragged T (4096 .. 8192, with resets), the forward and backward against the
   recurrence in fp64, in its chunked form (itself checked against the token-by-token one), with the
   same bounds;
@@ -114,6 +118,12 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     return float(1 - 2 * (x * y).sum() / denom) if denom > 0 else 0.0
 
 
+# calc_diff bound per output and the largest absolute error over the reference's largest magnitude:
+# about 2.5 to 3 times the largest measured errors listed in the module docstring.
+BOUNDS = {"o": 2e-5, "dq": 2e-5, "dk": 3e-5, "dv": 2e-5, "dg": 1e-4, "dbeta": 2e-5}
+MAX_ABS = 2e-2
+
+
 def naive_gdr(q, k, v, g, beta):
     """
     q / k are per value head, (B, T, HV, D).
@@ -153,13 +163,13 @@ def naive_reference(q, k, v, g, beta, do) -> tuple[torch.Tensor, dict]:
     return ref.detach(), {name: leaf.grad for name, leaf in zip(GRADS, leaves)}
 
 
-def assert_close_to(got: torch.Tensor, ref: torch.Tensor, name: str, diff: float) -> None:
+def assert_close_to(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
     assert got.shape == ref.shape, name
     assert torch.isfinite(got).all(), name
     diff_value = calc_diff(got, ref)
-    assert diff_value < diff, f"{name}: calc_diff {diff_value:.2e}"
+    assert diff_value < BOUNDS[name], f"{name}: calc_diff {diff_value:.2e} >= {BOUNDS[name]:.0e}"
     err = float((got.float() - ref).abs().max())
-    bound = 2e-2 * float(ref.abs().max())
+    bound = MAX_ABS * float(ref.abs().max())
     assert err <= bound, f"{name}: max abs err {err:.3e} > {bound:.3e}"
 
 
@@ -267,9 +277,9 @@ def test_against_naive_recurrence(S: int, H: int, gate: str, resets: tuple[int, 
     assert all(grad.is_contiguous() for grad in grads)
 
     ref, ref_grads = naive_reference(q, k, v, g, beta, do)
-    assert_close_to(o, ref, "o", 1e-4)
+    assert_close_to(o, ref, "o")
     for name, got in zip(GRADS, grads):
-        assert_close_to(got, ref_grads[name], name, 1e-3)
+        assert_close_to(got, ref_grads[name], name)
 
 
 # (S, b, gate, resets): b samples of H 16 / HV 32 folded into the heads (H 16 b / HV 32 b, value head
@@ -303,9 +313,9 @@ def test_folded_batch_against_naive_recurrence(
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
     assert grads[0].shape == grads[1].shape == (1, S, 32 * b, D)
     ref, ref_grads = naive_reference(q, k, v, g, beta, do)
-    assert_close_to(o, ref, "o", 1e-4)
+    assert_close_to(o, ref, "o")
     for name, got in zip(GRADS, grads):
-        assert_close_to(got, ref_grads[name], name, 1e-3)
+        assert_close_to(got, ref_grads[name], name)
 
 
 @pytest.mark.parametrize("S", [64, 4000])
@@ -346,13 +356,13 @@ def test_zero_and_tiny_beta(S: int) -> None:
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
     ref, ref_grads = naive_reference(q, k, v, g, beta, do)
-    assert_close_to(o, ref, "o", 1e-4)
+    assert_close_to(o, ref, "o")
     for name, got in zip(GRADS, grads):
-        assert_close_to(got, ref_grads[name], name, 1e-3)
+        assert_close_to(got, ref_grads[name], name)
     small = pick < 1 / 6
     dbeta, want = grads[4].float()[small], ref_grads["dbeta"][small]
     err = float((dbeta - want).abs().max())
-    assert err <= 2e-2 * float(ref_grads["dbeta"].abs().max()), f"dbeta at small beta: {err:.3e}"
+    assert err <= MAX_ABS * float(ref_grads["dbeta"].abs().max()), f"dbeta at small beta: {err:.3e}"
 
 
 def test_comparison_is_sensitive() -> None:
@@ -364,17 +374,17 @@ def test_comparison_is_sensitive() -> None:
     q, k, v, g, beta, do = make_inputs(256, gate="model", seed=3)
     ref, ref_grads = naive_reference(q, k, v, g, beta, do)
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g * 0.9, beta)
-    assert calc_diff(o, ref) > 1e-4
+    assert calc_diff(o, ref) > BOUNDS["o"]
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g * 0.7, beta)
     for name, got in zip(GRADS, chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)):
-        assert calc_diff(got, ref_grads[name]) > 1e-3, name
+        assert calc_diff(got, ref_grads[name]) > BOUNDS[name], name
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     dg = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)[3]
     chunks = dg.view(1, -1, BT, HV)
     no_cumsum = (chunks - F.pad(chunks[:, :, 1:], (0, 0, 0, 1))).view_as(dg)
     whole_sequence = dg.flip(1).cumsum(1).flip(1)
     for wrong in (no_cumsum, whole_sequence):
-        assert calc_diff(wrong, ref_grads["dg"]) > 1e-3
+        assert calc_diff(wrong, ref_grads["dg"]) > BOUNDS["dg"]
 
 
 def chunked_reference(q, k, v, g, beta, do, chunk: int = BT) -> tuple[torch.Tensor, dict]:
@@ -429,8 +439,7 @@ def test_chunked_reference_is_the_recurrence() -> None:
         torch.testing.assert_close(ref_grads[name], leaf.grad, rtol=1e-8, atol=1e-8)
 
 
-# (S, H, gate, resets): the long and ragged cases the FLA oracle used to cover, now against the
-# fp64 chunked recurrence with the verifier's bounds.
+# (S, H, gate, resets): long and ragged lengths, against the fp64 chunked recurrence.
 LONG_CASES = [
     (4096, 16, "mild", ()),
     (4096, 32, "model", (0, 63, 64, 127, 4095)),
@@ -449,17 +458,16 @@ LONG_CASES = [
 @pytest.mark.parametrize("S,H,gate,resets", LONG_CASES)
 def test_long_against_chunked_reference(S: int, H: int, gate: str, resets) -> None:
     """
-    Forward and backward at long and ragged T against the fp64 chunked recurrence: calc_diff below
-    1e-4 (output) and 1e-3 (gradients) plus a max absolute error within 2e-2 of the reference's
-    largest magnitude, as test_against_naive_recurrence.
+    Forward and backward at long and ragged T against the fp64 chunked recurrence, with the bounds
+    of test_against_naive_recurrence (BOUNDS, MAX_ABS).
     """
     q, k, v, g, beta, do = make_inputs(S, H=H, gate=gate, seed=S + H, resets=resets)
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
     ref, ref_grads = chunked_reference(q, k, v, g, beta, do)
-    assert_close_to(o, ref, "o", 1e-4)
+    assert_close_to(o, ref, "o")
     for name, got in zip(GRADS, grads):
-        assert_close_to(got, ref_grads[name], name, 1e-3)
+        assert_close_to(got, ref_grads[name], name)
 
 
 COLD_RUN = """
