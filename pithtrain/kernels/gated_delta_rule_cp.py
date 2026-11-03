@@ -163,7 +163,7 @@ def chunk_gdr_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
     Whether the chunk_gdr_cp_* entry points apply to this rank's call: on SM100, at the geometry the
     kernels were evolved and verified at: q, k, v bf16 (1, S, 32, 128) with S >= 1 (q / k given per
     value head, so already repeated to the 32 value heads where fewer key heads serve them), g fp32
-    (1, S, 32), beta bf16 (1, S, 32). Otherwise the caller uses FLA's CP path. Depends only on
+    (1, S, 32), beta bf16 (1, S, 32); otherwise False. Depends only on
     shapes, dtypes and the device, so it gives the same answer on every rank of a CP group and for
     a forward and its backward (whose g is the forward's g_cum).
     """
