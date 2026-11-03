@@ -56,7 +56,7 @@ def check(counts, H, dtype, out_dtype, seed=0):
     # Same bits as each group summed alone (the other internal path when there are many groups).
     start = 0
     for group_idx, count in enumerate(counts):
-        # A fresh copy, since a sliced base pointer can change Triton's specialization.
+        # A fresh copy, since a sliced base pointer can change the kernel's alignment path.
         alone = segment_sum(x[start : start + count].clone(), offsets([count]), torch.float32)  # fmt: skip
         assert torch.equal(alone[0], got32[group_idx]), f"group {group_idx} differs when summed alone"  # fmt: skip
         start += count
@@ -186,8 +186,9 @@ def documented_order(x, counts, out_dtype, block_rows=16):
 
 def has_block_order():
     """
-    Whether this device sums inside a tile in the 16-row-block order (SM90's; SM100's is Triton's
-    tl.sum, which plain PyTorch does not reproduce), read from an output as the layout checks do.
+    Whether this device sums inside a tile in the 16-row-block order (SM90's; SM100's is the TIRx
+    kernel's own order, which plain PyTorch does not reproduce), read from an output as the layout
+    checks do.
     """
     gen = torch.Generator(device="cuda").manual_seed(18)
     x = (torch.randn(128, 512, generator=gen, device="cuda") * 3).to(torch.bfloat16)
@@ -204,7 +205,7 @@ EXPECT_BLOCK_ORDER = (
 )
 
 
-@pytest.mark.skipif(not EXPECT_BLOCK_ORDER, reason="the in-tile order is Triton's tl.sum here")
+@pytest.mark.skipif(not EXPECT_BLOCK_ORDER, reason="another in-tile order here")
 @pytest.mark.parametrize(
     "counts",
     [
@@ -231,7 +232,7 @@ def test_exact_documented_order(counts, dtype, out_dtype):
     assert torch.equal(got, documented_order(x, counts, out_dtype))
 
 
-@pytest.mark.skipif(not EXPECT_BLOCK_ORDER, reason="the in-tile order is Triton's tl.sum here")
+@pytest.mark.skipif(not EXPECT_BLOCK_ORDER, reason="another in-tile order here")
 def test_exact_order_tells_orders_apart():
     """
     A different order inside the tile (128 rows one at a time) gives other bits on random data, so
@@ -404,7 +405,7 @@ def gamma_tolerance(x, counts):
     ) + 1e-30
 
 
-@pytest.mark.skipif(not EXPECT_BLOCK_ORDER, reason="the in-tile order is Triton's tl.sum here")
+@pytest.mark.skipif(not EXPECT_BLOCK_ORDER, reason="another in-tile order here")
 def test_adversarial_rounding_within_gamma_bound():
     """
     Each block is 1.0 then fifteen 2^-24: every add rounds back to 1.0, so the documented order

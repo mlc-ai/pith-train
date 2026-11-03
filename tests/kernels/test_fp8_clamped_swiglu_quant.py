@@ -8,7 +8,7 @@ ceil(C / 256) * 256 channels (C = N forward, 2N backward) where the fused SM90 k
 elsewhere; the extra channels are unwritten. The backward also returns the per-group bias gradient: fp32 sums of
 each 128-row block of the bf16 gradient, added in block order and rounded once to the bias dtype.
 
-Reference: the kernels' sigmoid (Triton's 1 / (1 + ex2.approx(...))) cannot be reproduced bit for
+Reference: the kernels' sigmoid (1 / (1 + ex2.approx(...)) with div.full.f32) cannot be reproduced bit for
 bit in PyTorch. So the FP8 bytes and scale values must equal exactly a PyTorch quantization of the
 plain kernels' bf16 output on the PyTorch-biased input, and those bf16 activations must lie within
 one bf16 rounding (plus fp32 noise) of a float64 evaluation of the formula. The bias add is
