@@ -567,7 +567,7 @@ def launched(fn) -> list[str]:
 @SM90
 def test_only_cute_kernels(T: int) -> None:
     """
-    No Triton or other kernel besides the CuTe ones (and memset / copies of torch's allocations).
+    No kernel besides the CuTe ones (and memset / copies of torch's allocations).
     """
     slices = [make_inputs(T, 1, "mild", seed=s) for s in range(3)]
     run_chain(slices, 1)

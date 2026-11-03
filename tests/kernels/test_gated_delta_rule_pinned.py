@@ -539,8 +539,8 @@ def runs_cute_kernels() -> bool:
 @pytest.mark.parametrize("S", [1, 63, 65, 1000, 4096, 4097, 8192])
 def test_only_cute_kernels(S: int) -> None:
     """
-    Each direction launches exactly its CuTe kernels, once each, and nothing else (no Triton or
-    other kernel), at aligned and ragged T.
+    Each direction launches exactly its CuTe kernels, once each, and nothing else, at aligned and
+    ragged T.
     """
     if not runs_cute_kernels():
         pytest.skip("the pinned kernels here are not the CuTe ones")
