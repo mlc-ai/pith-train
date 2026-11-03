@@ -609,10 +609,10 @@ def test_fp8_quant_grouped_side_stream() -> None:
         assert same_output(g, w)
 
 
-def test_fp8_quant_grouped_no_triton() -> None:
+def test_fp8_quant_grouped_one_launch() -> None:
     """
-    No input class launches a Triton kernel or a scale-layout copy on SM90: inside the profiler
-    every CUDA kernel is a CuTe (Staged)RowwiseKmajor launch, except exactly one copy per call whose
+    Every input class is one CuTe launch on SM90 and no scale-layout copy: inside the profiler every
+    CUDA kernel is a CuTe (Staged)RowwiseKmajor launch, except exactly one copy per call whose
     offsets are converted to contiguous int32.
     """
     needs_sm90_inputs()
@@ -644,7 +644,7 @@ def test_fp8_quant_grouped_no_triton() -> None:
     cute = [n for n in names if "RowwiseKmajor" in n]
     others = [n for n in names if "RowwiseKmajor" not in n]
     assert len(cute) == len(calls) + len(converted), names
-    assert not [n for n in names if "fp8cast_rowwise_colwise" in n or "triton" in n.lower()], names
+    assert not [n for n in names if "fp8cast_rowwise_colwise" in n], names
     assert len(others) == len(converted) and all("copy" in n.lower() for n in others), others
 
 

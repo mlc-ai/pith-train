@@ -7,7 +7,7 @@ Sender side, where a token routed to several experts of one EP rank is sent to i
 - tokens_per_ep_rank, dedup_tokens_per_gpu and send_meta carry no order and are compared exactly.
 - idxs, expand_idx and dispatch_token_idxs carry an order. On the H200 every input takes the CuTe
   kernel, which places tokens in order within each bucket, and they are compared exactly with a
-  stable reference (argsort(stable=True), nonzero). SM100 (Triton) places atomically, where they
+  stable reference (argsort(stable=True), nonzero). SM100 places atomically, where they
   are compared as per-bucket sets plus the invariant dispatch_token_idxs[rank_start + expand_idx]
   == idxs // k.
 
@@ -16,7 +16,7 @@ emulate the operator's all-to-alls in one process and check that every received 
 its token and expert.
 
 Inputs only the H200 path takes (any integer dtype and stride, more than 1024 bins or 2048
-segments with Triton compiles of minutes, its limits and their ValueErrors) skip elsewhere on
+segments, its limits and their ValueErrors) skip elsewhere on
 cute_kernels(). The ValueError tests use zero-stride views, so they allocate nothing.
 
 The routing contract: a token's top-k experts are distinct, as torch.topk returns them.
@@ -359,7 +359,7 @@ def requires_cute() -> None:
         pytest.skip("an input only the H200 (CuTe) path takes")
 
 
-# dtypes the Triton path reads too; the unsigned 16/32/64-bit ones only the H200 path
+# dtypes the SM100 path reads too; the unsigned 16/32/64-bit ones only the H200 path
 DTYPES = [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8]
 WIDE_UNSIGNED = [torch.uint16, torch.uint32, torch.uint64]
 
@@ -392,7 +392,7 @@ def column_major(topk_ids: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("ep,epr,k", [(4, 32, 8), (8, 8, 6), (1, 64, 6), (8, 32, 8), (4, 8, 4)])
 def test_dispatch_column_major(ep: int, epr: int, k: int, kind: str, dtype: torch.dtype) -> None:
     """
-    A transposed view (inner stride m), which the Triton path reads as row-major (wrong ids).
+    A transposed view (inner stride m), which the SM100 path reads as row-major (wrong ids).
     """
     requires_cute()
     for m in (1, 511, 4133):
@@ -446,8 +446,7 @@ def test_dispatch_stability_is_enforced_strided() -> None:
 def test_dispatch_many_bins(epr: int) -> None:
     """
     More than 1024 bins, ep_size * (experts_per_rank + 1), at EP 32 up to the largest experts per
-    rank the H200's shared memory holds (162: 5216 bins). The Triton path compiles for minutes past
-    epr 32, so only that one runs elsewhere.
+    rank the H200's shared memory holds (162: 5216 bins). Elsewhere only epr 32 runs.
     """
     if epr > 32:
         requires_cute()
@@ -491,33 +490,6 @@ def test_dispatch_rejects() -> None:
             ep_dispatch_send_idx(topk_ids, ep * epr, ep, epr)
 
 
-def test_dispatch_no_triton(monkeypatch) -> None:
-    """
-    The H200 path runs no Triton kernel on any input class, formerly-uncovered ones included.
-    """
-    requires_cute()
-    import triton
-
-    def no_triton(*args, **kwargs):
-        raise AssertionError("a Triton kernel ran on the H200 path")
-
-    monkeypatch.setattr(triton.runtime.jit.JITFunction, "run", no_triton)
-    ep, epr, k = 4, 32, 8
-    ids = routing(4133, k, ep * epr, epr, seed=1)
-    for topk_ids in (ids, ids.int(), column_major(ids), ids.to(torch.uint8)):
-        run_dispatch(topk_ids, ep, epr)
-    run_dispatch(routing(513, 8, 32 * 32, 32, seed=2), 32, 32)
-    meta, received = recv_case(4, 32, 3000, 0)
-    for received_expand_idx in (
-        received,
-        received.int(),
-        torch.stack([received, received], 1)[:, 0],
-    ):
-        ep_dispatch_recv_idx(meta, received_expand_idx, 4, 32)
-    ep_dispatch_recv_idx(*recv_case(32, 128, 3000, 1), 32, 128)
-    ep_dispatch_recv_idx(*recv_case(64, 2, 3000, 2), 64, 2)
-
-
 def expand_reference(meta: torch.Tensor, received_expand_idx: torch.Tensor, ep: int, epr: int):
     """
     Each slot's local expert, and its sender-local expand_idx plus the dedup tokens of the preceding
@@ -550,8 +522,7 @@ def check_expand(meta, received_expand_idx, ep, epr, ref_expand_idx=None) -> Non
 
 
 # (ep_size, experts_per_rank): up to 2048 segments and 32 senders everywhere; past that only on
-# the H200 (the Triton kernel unrolls every segment and compiles for minutes), up to its
-# shared-memory limit, ceil4(segments) + ceil4(ep_size) <= 57600.
+# the H200, up to its shared-memory limit, ceil4(segments) + ceil4(ep_size) <= 57600.
 EXPAND_GEOMETRIES = [
     (ep, epr)
     for ep in (1, 2, 4, 8, 16, 32)

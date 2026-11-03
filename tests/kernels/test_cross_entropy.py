@@ -400,14 +400,6 @@ def test_extra_memory_is_linear_in_rows():
     assert torch.cuda.max_memory_allocated() - live <= 64 * 2048 + 2**20
 
 
-def test_does_not_load_the_triton_kernel():
-    import subprocess
-    import sys
-
-    code = "import sys, torch\nfrom pithtrain.kernels import cross_entropy_fwd_bwd\nfrom pithtrain.kernels.arch import ARCH_MAJOR\nbefore = 'triton' in sys.modules\ncross_entropy_fwd_bwd(torch.randn(8, 1000, device='cuda').to(torch.bfloat16), torch.zeros(8, dtype=torch.long, device='cuda'), -100)\nif ARCH_MAJOR == 9:\n    assert 'pithtrain.kernels.cross_entropy_sm100' not in sys.modules\n    assert before or 'triton' not in sys.modules\n"
-    subprocess.run([sys.executable, "-c", code], check=True)
-
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_non_finite_logits(dtype):
     gen = torch.Generator(device="cuda").manual_seed(17)
@@ -489,7 +481,7 @@ def test_correctly_rounded_scale(vocab):
     # Equal logits make every exp exactly 1 and the row sum exactly vocab, so the fp32 gradient is
     # (1 * rcp(vocab)) * rcp(n), minus rcp(n) at the target: each step rounded once. Compared with
     # torch's correctly rounded reciprocals over n = 1..256. The SM90 kernel matches them bit for
-    # bit (an approximate reciprocal, rcp.approx, which equals Triton's div.full.f32, differs for
+    # bit (an approximate reciprocal, rcp.approx, which equals div.full.f32 here, differs for
     # some n at every one of these vocabs); the contract is fp32 rounding, so every entry must lie
     # within 4 fp32 ulps (the SM100 kernel is within 3).
     rcp = lambda value: torch.reciprocal(torch.tensor(float(value), device="cuda"))
