@@ -1339,6 +1339,14 @@ def aligned(*ts):
     return all(t.data_ptr() % 16 == 0 for t in ts)
 
 
+def realigned(t):
+    """
+    t itself if its data starts on a 16-byte boundary, else a fresh copy in the same layout (every
+    path reads 16-byte vectors from the base, so a misaligned base would fault).
+    """
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
 def covered_weight(w):
     """
     w flattened in a dtype the kernels read: other float dtypes are read as fp32, as the Triton path
@@ -1353,7 +1361,7 @@ def causal_conv1d_fwd_sm100(x: torch.Tensor, w: torch.Tensor, offset: int) -> to
     The forward of the picker's causal_conv1d_fwd: a fresh bf16 (B, S, C) in the layout of
     causal_conv1d_empty, bit-identical to ATen's depthwise conv1d.
     """
-    x = x.contiguous()
+    x = realigned(x.contiguous())
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset
@@ -1361,7 +1369,7 @@ def causal_conv1d_fwd_sm100(x: torch.Tensor, w: torch.Tensor, offset: int) -> to
     if S > 0 and B > 0 and C > 0:
         wf = covered_weight(w)
         wdt = WDT[wf.dtype]
-        if C % 8 == 0 and S % 8 == 0 and K <= 8 and aligned(x, y):
+        if C % 8 == 0 and S % 8 == 0 and 2 <= K <= 8 and aligned(x, y):
             fwd_tma(C, K, wdt, S >= 8192)(x.view(-1), wf, y.view(-1), L, S, offset, B)
         else:
             fwd_plain(C, K, wdt)(x.view(-1), wf, y.view(-1), L, S, offset, B)
@@ -1373,7 +1381,7 @@ def causal_conv1d_bwd_sm100(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, o
     The backward of the picker's causal_conv1d_bwd: dx bit-identical to ATen's depthwise conv
     backward, dw in one fixed fp32 order whatever g's strides.
     """
-    x = x.contiguous()
+    x, g = realigned(x.contiguous()), realigned(g)
     B, L, C = x.shape
     K = w.shape[-1]
     S = L - offset
@@ -1388,7 +1396,7 @@ def causal_conv1d_bwd_sm100(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, o
     nrt = B * cdiv(L, T)
     cl = g.is_contiguous()
     cf = (not cl) and S > 0 and g.stride(1) == 1 and g.stride(2) == S and g.stride(0) == C * S
-    tma_ok = C % 8 == 0 and K <= 8 and S > 0 and nrt > 0 and aligned(g, x, dx)
+    tma_ok = C % 8 == 0 and 2 <= K <= 8 and S > 0 and nrt > 0 and aligned(g, x, dx)
     if tma_ok and (cl or (cf and S % 8 == 0)):
         gv = g.view(-1) if cl else g.as_strided((B * C * S,), (1,))
         bwd_tma(C, K, wdt, not cl)(gv, x.view(-1), wf, dx.view(-1), dwf, L, S, offset, B)
