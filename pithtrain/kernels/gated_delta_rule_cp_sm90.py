@@ -68,8 +68,7 @@ def tf32_product(mma_tf32: cute.TiledMma, thr: cute.ThrMma, acc: cute.Tensor, s_
     truncated to TF32. K8 blocks in increasing order, each instruction's K slots per order.
     """
     a_k, b_k = k_layout(order, HEAD_DIM, 1), k_layout(order, HEAD_DIM, cols + F32_PAD)
-    s_a_k = cute.make_tensor(s_a.iterator, cute.make_layout((rows, a_k.shape), stride=(HEAD_DIM + F32_PAD, a_k.stride)))
-    s_b_k = cute.make_tensor(s_b.iterator, cute.make_layout((cols, b_k.shape), stride=(1, b_k.stride)))
+    s_a_k, s_b_k = cute.make_tensor(s_a.iterator, cute.make_layout((rows, a_k.shape), stride=(HEAD_DIM + F32_PAD, a_k.stride))), cute.make_tensor(s_b.iterator, cute.make_layout((cols, b_k.shape), stride=(1, b_k.stride)))
     t_a, t_b = thr.partition_A(s_a_k), thr.partition_B(s_b_k)
     tf32 = lambda r: cute.make_tensor(cute.recast_ptr(r.iterator, dtype=cutlass.TFloat32), r.layout)
     # registers in the atom's fragment order (partition_shape), one K8 block at a time
@@ -99,8 +98,7 @@ class TransitionChain:
 
     @cute.jit
     def __call__(self, mK: cute.Tensor, mW: cute.Tensor, mGcum: cute.Tensor, mOut: cute.Tensor, stream):
-        mma = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16))
-        mma_tf32 = cute.make_tiled_mma(warp.MmaTF32Op((16, 8, 8)), (4, 1, 1), permutation_mnk=(64, 8, 8))
+        mma, mma_tf32 = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16)), cute.make_tiled_mma(warp.MmaTF32Op((16, 8, 8)), (4, 1, 1), permutation_mnk=(64, 8, 8))
         ring_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, CHAIN_STAGES), (0, 1, 2))
         self.kernel(mK, mW, mGcum, mOut, mma, mma_tf32, ring_layout).launch(grid=[HEAD_DIM // CHAIN_BV, self.HV, 1], block=[CHAIN_THREADS, 1, 1], stream=stream)
 
@@ -110,18 +108,13 @@ class TransitionChain:
         col_tile, head_idx, _ = cute.arch.block_idx()
         key_head_idx = head_idx // (self.HV // self.H)
         smem = cutlass.utils.SmemAllocator()
-        s_k, s_w = smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, ring_layout, 1024)
-        s_gcum = smem.allocate_tensor(Float32, cute.make_layout((BT, CHAIN_STAGES), stride=(1, BT)), 16)
-        s_mc = smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, HEAD_DIM), stride=(HEAD_DIM + F32_PAD, 1)), 16)
-        s_m = smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, CHAIN_BV), stride=(CHAIN_BV + F32_PAD, 1)), 16)
+        s_k, s_w, s_gcum, s_mc, s_m = smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(Float32, cute.make_layout((BT, CHAIN_STAGES), stride=(1, BT)), 16), smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, HEAD_DIM), stride=(HEAD_DIM + F32_PAD, 1)), 16), smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, CHAIN_BV), stride=(CHAIN_BV + F32_PAD, 1)), 16)
         num_chunks = (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT
         threads = CHAIN_THREADS
         atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
         load = cute.make_tiled_copy_tv(atom_load, cute.make_ordered_layout((threads // 16, 16), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
         load_gate = cute.make_tiled_copy_tv(cute.make_copy_atom(cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32), cute.make_layout(BT), cute.make_layout(1)).get_slice(tidx % BT)
-        gK = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0))
-        gW = cute.local_tile(mW[None, head_idx, None], (BT, HEAD_DIM), (None, 0))
-        gGcum = cute.local_tile(mGcum[None, head_idx], (BT,), (None,))
+        gK, gW, gGcum = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0)), cute.local_tile(mW[None, head_idx, None], (BT, HEAD_DIM), (None, 0)), cute.local_tile(mGcum[None, head_idx], (BT,), (None,))
         t_k_src, t_w_src, t_g_src = load.partition_S(gK), load.partition_S(gW), load_gate.partition_S(gGcum)
         t_k_dst, t_w_dst, t_g_dst = load.partition_D(s_k), load.partition_D(s_w), load_gate.partition_D(s_gcum)
         rows_wide = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM)))
@@ -164,8 +157,7 @@ class TransitionChain:
             # M_c = diag(2^g_last) - P, P = left^T right over the chunk's rows, by column halves
             decay = cute.math.exp2(gate_last, fastmath=True)
             s_left, s_right = (s_w_n, s_k_n) if const_expr(self.reverse) else (s_k_n, s_w_n)
-            s_left_t = cute.composition(s_left, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0)))
-            s_right_t = cute.composition(s_right, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0)))
+            s_left_t, s_right_t = cute.composition(s_left, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0))), cute.composition(s_right, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0)))
             for half in cutlass.range_constexpr(2):
                 s_right_half = cute.local_tile(s_right_t, (HEAD_DIM // 2, BT), (half, 0))
                 acc_p = cute.make_rmem_tensor(thr.partition_shape_C((HEAD_DIM, HEAD_DIM // 2)), Float32)
@@ -241,8 +233,7 @@ class StateMerge:
         col_tile, head_idx, _ = cute.arch.block_idx()
         threads = MERGE_THREADS
         smem = cutlass.utils.SmemAllocator()
-        s_m = smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, HEAD_DIM, 2), stride=(HEAD_DIM + F32_PAD, 1, HEAD_DIM * (HEAD_DIM + F32_PAD))), 16)
-        s_h = smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, MERGE_BV), stride=(MERGE_BV + F32_PAD, 1)), 16)
+        s_m, s_h = smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, HEAD_DIM, 2), stride=(HEAD_DIM + F32_PAD, 1, HEAD_DIM * (HEAD_DIM + F32_PAD))), 16), smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, MERGE_BV), stride=(MERGE_BV + F32_PAD, 1)), 16)
         atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), Float32, num_bits_per_copy=128)
         load = cute.make_tiled_copy_tv(atom, cute.make_ordered_layout((threads // 32, 32), order=(1, 0)), cute.make_layout((1, 4))).get_slice(tidx)
         t_m_dst = load.partition_D(s_m)
@@ -304,10 +295,7 @@ def chain_kernel(H: int, HV: int, reverse: bool, device: int, ragged: bool, orde
     key = ("transition_chain", H, HV, device, (reverse, order), ragged)
     if key not in COMPILED:
         T = cute.sym_int()
-        keys = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1))
-        values = fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1))
-        gate = fake(Float32, (T, HV), (HV, 1), 4)
-        out = fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1))
+        keys, values, gate, out = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1)), fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1)), fake(Float32, (T, HV), (HV, 1), 4), fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1))
         COMPILED[key] = cute.compile(TransitionChain(H, HV, reverse, ragged, order), keys, values, gate, out, fake_stream(), options="--enable-tvm-ffi")
     return COMPILED[key]
 
@@ -320,8 +308,7 @@ def merge_kernel(HV: int, reverse: bool, device: int, order: str) -> object:
     key = ("state_merge", 0, HV, device, (reverse, order), False)
     if key not in COMPILED:
         W = cute.sym_int()
-        ag = fake(Float32, (W, HV, HEAD_DIM, 2 * HEAD_DIM), (HV * 2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1))
-        out = fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
+        ag, out = fake(Float32, (W, HV, HEAD_DIM, 2 * HEAD_DIM), (HV * 2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1)), fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
         COMPILED[key] = cute.compile(StateMerge(HV, reverse, order), ag, out, Int32(0), Int32(0), fake_stream(), options="--enable-tvm-ffi")
     return COMPILED[key]
 

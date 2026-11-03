@@ -53,8 +53,7 @@ def block_product(thr: cute.ThrMma, mma_tf32: cute.TiledMma, acc: cute.Tensor, s
     stride = TF32_STRIDE
     k_left = cute.make_layout(((4, 2), 2), stride=((2, 8), 1)) if const_expr(even_odd_k) else cute.make_layout(16, stride=1)
     k_right = cute.make_layout(((4, 2), 2), stride=((2 * stride, 8 * stride), stride)) if const_expr(even_odd_k) else cute.make_layout(16, stride=stride)
-    s_left_k = cute.make_tensor(s_left.iterator, cute.make_layout((16, k_left.shape), stride=(stride, k_left.stride)))
-    s_right_t = cute.make_tensor(s_right.iterator, cute.make_layout((16, k_right.shape), stride=(1, k_right.stride)))
+    s_left_k, s_right_t = cute.make_tensor(s_left.iterator, cute.make_layout((16, k_left.shape), stride=(stride, k_left.stride))), cute.make_tensor(s_right.iterator, cute.make_layout((16, k_right.shape), stride=(1, k_right.stride)))
     t_left, t_right = thr.partition_A(s_left_k), thr.partition_B(s_right_t)
     r_left, r_right = cute.make_rmem_tensor(thr.partition_shape_A((16, 16)), Float32), cute.make_rmem_tensor(thr.partition_shape_B((16, 16)), Float32)
     cute.autovec_copy(t_left, r_left)
@@ -67,8 +66,7 @@ def chunk_copies(threads: int, tidx) -> tuple:
     """
     The 16-byte cp.async load and the 16-byte stores of bf16 (rows, 128) and (rows, 64) tiles.
     """
-    atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
-    atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
+    atom_load, atom_store = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128), cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
     load = cute.make_tiled_copy_tv(atom_load, cute.make_ordered_layout((threads // 16, 16), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
     store_128 = cute.make_tiled_copy_tv(atom_store, cute.make_ordered_layout((threads // 16, 16), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
     store_64 = cute.make_tiled_copy_tv(atom_store, cute.make_ordered_layout((threads // 8, 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
@@ -79,8 +77,7 @@ def operand_copies(mma: cute.TiledMma, tidx) -> tuple:
     """
     ldmatrix copies of the A / B operands (plain and transposed) and stmatrix / ldmatrix of C tiles.
     """
-    plain = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), BFloat16)
-    transposed = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), BFloat16)
+    plain, transposed = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), BFloat16), cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), BFloat16)
     ld_A, ld_B = cute.make_tiled_copy_A(plain, mma).get_slice(tidx), cute.make_tiled_copy_B(plain, mma).get_slice(tidx)
     ldt_A, ldt_B = cute.make_tiled_copy_A(transposed, mma).get_slice(tidx), cute.make_tiled_copy_B(transposed, mma).get_slice(tidx)
     st_C = cute.make_tiled_copy_C(cute.make_copy_atom(warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), BFloat16), mma).get_slice(tidx)
@@ -117,8 +114,7 @@ def scale_kv(load: cute.TiledCopy, s_k: cute.Tensor, s_v: cute.Tensor, s_gcum: c
     key_rounding (FLA's recompute_w_u: its k * beta is a bf16 x bf16 product, rounded to bf16) or
     bf16(k beta 2^g) without it (one rounding; k beta is exact in fp32).
     """
-    t_k, t_v = load.partition_D(s_k), load.partition_D(s_v)
-    coords = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM)))
+    t_k, t_v, coords = load.partition_D(s_k), load.partition_D(s_v), load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM)))
     for i in cutlass.range_constexpr(cute.size(t_k, mode=[1])):
         for j in cutlass.range_constexpr(cute.size(t_k, mode=[2])):
             row = coords[0, i, j][0]
@@ -165,10 +161,8 @@ class WyRepresentation:
 
     @cute.jit
     def __call__(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, stream):
-        mma_bf16 = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16))
-        mma_tf32 = cute.make_tiled_mma(warp.MmaTF32Op((16, 8, 8)), (1, 1, 1), permutation_mnk=(16, 16, 8))
-        chunk_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM), (0, 1))
-        a_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT), (0, 1))
+        mma_bf16, mma_tf32 = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16)), cute.make_tiled_mma(warp.MmaTF32Op((16, 8, 8)), (1, 1, 1), permutation_mnk=(16, 16, 8))
+        chunk_layout, a_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM), (0, 1)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT), (0, 1))
         num_chunks = (mG.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mG.shape[0] // BT
         self.kernel(mK, mV, mG, mBeta, mGcum, mA, mW, mU, mma_bf16, mma_tf32, chunk_layout, a_layout).launch(grid=[num_chunks, self.HV, 1], block=[WY_THREADS, 1, 1], stream=stream)
 
@@ -182,17 +176,12 @@ class WyRepresentation:
         s_inverse = smem.allocate_tensor(Float32, fp32_layout, 1024)  # holds k first
         s_v_region = smem.allocate_tensor(Float32, cute.make_layout(BT * TF32_STRIDE), 1024)
         s_l = smem.allocate_tensor(Float32, fp32_layout, 1024)  # holds k again after the inverse
-        s_gcum, s_beta = smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(Float32, cute.make_layout(BT), 16)
-        s_a = smem.allocate_tensor(BFloat16, a_layout, 1024)
-        s_k = cute.make_tensor(cute.recast_ptr(s_inverse.iterator, dtype=BFloat16), chunk_layout)
-        s_k_again = cute.make_tensor(cute.recast_ptr(s_l.iterator, dtype=BFloat16), chunk_layout)
-        s_v = cute.make_tensor(cute.recast_ptr(s_v_region.iterator, dtype=BFloat16), chunk_layout)
+        s_gcum, s_beta, s_a = smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(BFloat16, a_layout, 1024)
+        s_k, s_k_again, s_v = cute.make_tensor(cute.recast_ptr(s_inverse.iterator, dtype=BFloat16), chunk_layout), cute.make_tensor(cute.recast_ptr(s_l.iterator, dtype=BFloat16), chunk_layout), cute.make_tensor(cute.recast_ptr(s_v_region.iterator, dtype=BFloat16), chunk_layout)
         load, store_128, store_64 = chunk_copies(WY_THREADS, tidx)
         ld_A, ld_B, _, ldt_B, _, _, _ = operand_copies(mma_bf16, tidx)
         thr = mma_bf16.get_slice(tidx)
-        gK = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))
-        gV = cute.local_tile(mV[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))
-        gA = cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))
+        gK, gV, gA = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0)), cute.local_tile(mV[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0)), cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))
 
         if const_expr(self.ragged):
             valid = mG.shape[0] - chunk_idx * BT
@@ -391,14 +380,7 @@ class ChunkStateOutput:
     @cute.jit
     def __call__(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mO: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, stream):
         mma = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16))
-        layouts = (
-            cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, STATE_STAGES), (0, 1, 2)),
-            cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, 2), (0, 1, 2)),
-            cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV, STATE_STAGES), (0, 1, 2)),
-            cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (STATE_BV, HEAD_DIM, 2), (0, 1, 2)),
-            cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (STATE_BV, BT, 2), (0, 1, 2)),
-            cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV), (0, 1)),
-        )
+        layouts = (cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, STATE_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, 2), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV, STATE_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (STATE_BV, HEAD_DIM, 2), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (STATE_BV, BT, 2), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV), (0, 1)))
         self.kernel(mQ, mK, mW, mU, mGcum, mO, mH0, mHt, mma, *layouts).launch(grid=[HEAD_DIM // STATE_BV, self.HV, 1], block=[self.recurrence_threads + self.output_threads, 1, 1], stream=stream)
 
     @cute.kernel
@@ -406,11 +388,7 @@ class ChunkStateOutput:
         tid, _, _ = cute.arch.thread_idx()
         col_tile, head_idx, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
-        s_k, s_w = smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, ring_layout, 1024)
-        s_q, s_u = smem.allocate_tensor(BFloat16, q_layout, 1024), smem.allocate_tensor(BFloat16, u_layout, 1024)
-        s_h, s_vnew = smem.allocate_tensor(BFloat16, h_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024)
-        s_vscaled, s_o = smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, o_layout, 1024)
-        s_gcum = smem.allocate_tensor(Float32, cute.make_layout((BT, STATE_STAGES), stride=(1, BT)), 16)
+        s_k, s_w, s_q, s_u, s_h, s_vnew, s_vscaled, s_o, s_gcum = smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, q_layout, 1024), smem.allocate_tensor(BFloat16, u_layout, 1024), smem.allocate_tensor(BFloat16, h_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, o_layout, 1024), smem.allocate_tensor(Float32, cute.make_layout((BT, STATE_STAGES), stride=(1, BT)), 16)
         buffers = (s_k, s_w, s_q, s_u, s_h, s_vnew, s_vscaled, s_o, s_gcum)
         if tid < self.recurrence_threads:
             self.recurrence_loop(mK, mW, mU, mGcum, mH0, mHt, mma, buffers, tid, col_tile, head_idx)
@@ -455,10 +433,7 @@ class ChunkStateOutput:
         atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
         load_u = cute.make_tiled_copy_tv(atom_load, cute.make_ordered_layout((threads // (STATE_BV // 8), STATE_BV // 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
         load_gate = cute.make_tiled_copy_tv(cute.make_copy_atom(cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32), cute.make_layout(BT), cute.make_layout(1)).get_slice(tidx % BT)
-        gK = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0))
-        gW = cute.local_tile(mW[None, head_idx, None], (BT, HEAD_DIM), (None, 0))
-        gU = cute.local_tile(mU[None, head_idx, None], (BT, STATE_BV), (None, col_tile))
-        gGcum = cute.local_tile(mGcum[None, head_idx], (BT,), (None,))
+        gK, gW, gU, gGcum = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0)), cute.local_tile(mW[None, head_idx, None], (BT, HEAD_DIM), (None, 0)), cute.local_tile(mU[None, head_idx, None], (BT, STATE_BV), (None, col_tile)), cute.local_tile(mGcum[None, head_idx], (BT,), (None,))
         sources = (load.partition_S(gK), load.partition_S(gW), load_u.partition_S(gU), load_gate.partition_S(gGcum))
         targets = (load.partition_D(s_k), load.partition_D(s_w), load_u.partition_D(s_u), load_gate.partition_D(s_gcum))
         tail = (load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM))), load_u.partition_D(cute.make_identity_tensor((BT, STATE_BV))), mGcum, head_idx, s_gcum) if const_expr(self.ragged) else None
@@ -533,11 +508,9 @@ class ChunkStateOutput:
         store_o = cute.make_tiled_copy_tv(atom_store, cute.make_ordered_layout((threads // (STATE_BV // 8), STATE_BV // 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
         thr = mma.get_slice(tidx)
         ld_A, ld_B, _, _, st_C, _, _ = operand_copies(mma, tidx)
-        gQ = cute.local_tile(mQ[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0))
-        gO = cute.local_tile(mO[None, head_idx, None], (BT, STATE_BV), (None, col_tile))
+        gQ, gO = cute.local_tile(mQ[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0)), cute.local_tile(mO[None, head_idx, None], (BT, STATE_BV), (None, col_tile))
         t_q_src, t_q_dst = load.partition_S(gQ), load.partition_D(s_q)
-        s_coords = thr.partition_C(cute.make_identity_tensor((BT, BT)))
-        o_coords = thr.partition_C(cute.make_identity_tensor((BT, STATE_BV)))
+        s_coords, o_coords = thr.partition_C(cute.make_identity_tensor((BT, BT))), thr.partition_C(cute.make_identity_tensor((BT, STATE_BV)))
         if const_expr(self.ragged):
             T = mQ.shape[0]
             rows_q, rows_o = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM))), store_o.partition_D(cute.make_identity_tensor((BT, STATE_BV)))
@@ -595,18 +568,13 @@ def compile_wy(H: int, HV: int, ragged: bool = False) -> object:
     T = cute.sym_int()
     key_shape, value_shape, gate_shape = (T, H, HEAD_DIM), (T, HV, HEAD_DIM), (T, HV)
     key_stride, value_stride, gate_stride = (H * HEAD_DIM, HEAD_DIM, 1), (HV * HEAD_DIM, HEAD_DIM, 1), (HV, 1)
-    keys, values = fake(BFloat16, key_shape, key_stride), fake(BFloat16, value_shape, value_stride)
-    gate, beta = fake(Float32, gate_shape, gate_stride, 4), fake(BFloat16, gate_shape, gate_stride, 2)
-    a = fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1))
+    keys, values, gate, beta, a = fake(BFloat16, key_shape, key_stride), fake(BFloat16, value_shape, value_stride), fake(Float32, gate_shape, gate_stride, 4), fake(BFloat16, gate_shape, gate_stride, 2), fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1))
     return cute.compile(WyRepresentation(H, HV, ragged), keys, values, gate, beta, gate, a, values, values, fake_stream(), options="--enable-tvm-ffi")
 
 
 def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bool = False) -> object:
     T = cute.sym_int()
-    keys = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1))
-    values = fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1))
-    gate = fake(Float32, (T, HV), (HV, 1), 4)
-    state = fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
+    keys, values, gate, state = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1)), fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1)), fake(Float32, (T, HV), (HV, 1), 4), fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
     return cute.compile(ChunkStateOutput(H, HV, has_h0, has_ht, ragged), keys, keys, values, values, gate, values, state if has_h0 else None, state if has_ht else None, fake_stream(), options="--enable-tvm-ffi")
 
 
@@ -618,8 +586,7 @@ def wy_representation(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: t
     _, T, H, _ = k.shape
     HV = v.shape[2]
     ragged = T % BT != 0
-    g_cum = torch.empty(1, T, HV, device=k.device, dtype=torch.float32)
-    A = torch.empty(1, T, HV, BT, device=k.device, dtype=k.dtype)
+    g_cum, A = torch.empty(1, T, HV, device=k.device, dtype=torch.float32), torch.empty(1, T, HV, BT, device=k.device, dtype=k.dtype)
     w, u = k.new_empty(1, T, HV, HEAD_DIM), torch.empty_like(v)
     key = ("wy_representation", H, HV, k.device.index, ragged)
     if key not in COMPILED:
