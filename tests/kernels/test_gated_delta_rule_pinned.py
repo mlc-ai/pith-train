@@ -33,6 +33,7 @@ Checked, each test on its own (none skips on the H200):
   fail them.
 """
 
+import functools
 import os
 import subprocess
 import sys
@@ -500,12 +501,26 @@ def kernel_names(fn) -> list[str]:
     ]
 
 
+@functools.cache
+def runs_cute_kernels() -> bool:
+    """
+    Whether the pinned forward launches the CuTe kernels (the H200's implementation); the kernel-set
+    and compile-count checks below are about those kernels, and skip where another implementation
+    (the B200's TIRx kernels) runs.
+    """
+    q, k, v, g, beta, _ = make_inputs(64, H=16)
+    names = kernel_names(lambda: chunk_gdr_fwd_pinned(q, k, v, g, beta))
+    return any(cute in name for name in names for cute in CUTE_KERNELS)
+
+
 @pytest.mark.parametrize("S", [1, 63, 65, 1000, 4096, 4097, 8192])
 def test_only_cute_kernels(S: int) -> None:
     """
     Each direction launches exactly its CuTe kernels, once each, and nothing else (no Triton or
     other kernel), at aligned and ragged T.
     """
+    if not runs_cute_kernels():
+        pytest.skip("the pinned kernels here are not the CuTe ones")
     q, k, v, g, beta, do = make_inputs(S, H=16)
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
@@ -565,6 +580,8 @@ def test_one_compile_per_kernel_variant() -> None:
     A sweep of T = 1 .. 200 in a fresh process compiles each of the six kernels twice, the aligned
     and the ragged variant, and nothing per length (T stays a runtime argument).
     """
+    if not runs_cute_kernels():
+        pytest.skip("the pinned kernels here are not the CuTe ones")
     code = COMPILE_COUNT.format(tests=os.path.dirname(__file__))
     out = subprocess.run(
         [sys.executable, "-c", code],

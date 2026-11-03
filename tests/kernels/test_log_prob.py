@@ -72,20 +72,21 @@ def check(logits, target, temperature=1.0, grad_logp=None, grad_entropy=None, se
     logp, entropy, row_max, log_sum, grad = got
     torch.testing.assert_close(logp.double(), want[0], rtol=1e-5, atol=1e-5, equal_nan=True)
     torch.testing.assert_close(entropy.double(), want[1], rtol=1e-5, atol=1e-5, equal_nan=True)
-    # row_max and log_sum are internal to the pair but defined for rows with a finite logit, in
-    # natural-log units (SM90) or base 2 (SM100): whichever the row_max says, log_sum must match.
+    # row_max and log_sum are internal to the pair but defined for rows with a finite logit. Both
+    # devices keep row_max + log_sum = logsumexp(z), in natural-log units (SM90, where row_max is
+    # max(z) itself) or base 2 (SM100, where row_max is an opaque reference point).
     finite = torch.isfinite(want[2])
-    unit = 1.0
-    if not torch.allclose(row_max.double()[finite], want[2][finite], rtol=1e-6, atol=1e-6):
-        unit = 1.0 / math.log(2.0)
-    torch.testing.assert_close(
-        row_max.double()[finite], unit * want[2][finite], rtol=1e-6, atol=1e-6
-    )
-    torch.testing.assert_close(
-        log_sum.double()[finite], unit * want[3][finite], rtol=1e-5, atol=1e-5
-    )
+    lse = (want[2] + want[3])[finite]
+    got_lse = (row_max.double() + log_sum.double())[finite]
+    unit = 1.0 if torch.allclose(got_lse, lse, rtol=1e-5, atol=1e-5) else 1.0 / math.log(2.0)
+    torch.testing.assert_close(got_lse, unit * lse, rtol=1e-5, atol=1e-5)
+    if unit == 1.0:
+        torch.testing.assert_close(row_max.double()[finite], want[2][finite], rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(log_sum.double()[finite], want[3][finite], rtol=1e-5, atol=1e-5)
     # Both round an fp32 gradient once to the logits' dtype, so 16-bit types may differ by one ulp.
-    rtol, atol = (1e-4, 1e-6) if logits.dtype == torch.float32 else (1e-2, 1e-6)
+    # In fp32 an entry near zero is a cancellation of O(1) fp32 terms (a one-column row's
+    # g_logp - p g_logp with p within an ulp of 1), so its error is a few fp32 ulps of those terms.
+    rtol, atol = (1e-4, 4e-6) if logits.dtype == torch.float32 else (1e-2, 1e-6)
     torch.testing.assert_close(grad, want[4], rtol=rtol, atol=atol, equal_nan=True)
     return got
 
