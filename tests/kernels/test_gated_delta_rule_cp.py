@@ -213,10 +213,15 @@ def merge_float64(ag, sources) -> torch.Tensor:
 def assert_near(got: torch.Tensor, ref: torch.Tensor, name: str, diff: float) -> None:
     """
     calc_diff below diff and the largest absolute error within 2e-2 of the reference's largest
-    magnitude (the dense verifier's bounds), every value finite.
+    magnitude (the dense verifier's bounds), every value finite. Entries of either below fp32's
+    smallest normal count as zero: the kernels' fp32 chain underflows where the float64 reference
+    keeps values such as 1e-80 (after a reset, or a long product of decays), and calc_diff of an
+    all-zero tensor against those reads 1.
     """
     assert got.shape == ref.shape, name
     assert torch.isfinite(got).all(), name
+    tiny = torch.finfo(torch.float32).tiny
+    got, ref = (x.double().where(x.abs() >= tiny, 0.0) for x in (got, ref))
     assert calc_diff(got, ref) < diff, f"{name}: calc_diff {calc_diff(got, ref):.2e}"
     bound = 2e-2 * float(ref.abs().max())
     assert max_abs(got, ref) <= bound, f"{name}: max abs err {max_abs(got, ref):.3e} > {bound:.3e}"
