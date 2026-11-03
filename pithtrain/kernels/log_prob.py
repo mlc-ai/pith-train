@@ -75,11 +75,12 @@ def log_prob_fwd(inp: torch.Tensor, target: torch.Tensor, inv_temperature: float
     Outputs, each (N,) fp32: logp = z[target] - row_max - log_sum, and 0 for a target outside [0, V)
     (-100, -1, V, 2^40, ...), which is never dereferenced; entropy = log_sum - sum(e (z - row_max))
     / sum(e), e = exp(z - row_max), where -inf logits add 0 (0 log 0 = 0); row_max = max(z); log_sum
-    = log(sum(e)) on SM90, and on SM100 the same statistics in base 2 (max(z) log2(e) and
-    log2(sum(e))): only log_prob_bwd reads them. A row with a finite logit has finite outputs however
-    many -inf logits it holds; a row of only -inf logits gives NaN logp (for a valid target) and NaN
-    entropy, as log_softmax does. fp32 arithmetic; deterministic; O(N) extra memory. N = 0 launches
-    nothing.
+    = log(sum(e)) on SM90; on SM100 base-2 statistics around an opaque reference point m (row_max
+    = m, log_sum = log2(sum(exp2(z log2(e) - m)))), so that row_max + log_sum is logsumexp(z) in
+    each device's unit; only log_prob_bwd reads them. A row with a finite logit has finite outputs
+    however many -inf logits it holds; a row of only -inf logits gives NaN logp (for a valid target)
+    and NaN entropy, as log_softmax does. fp32 arithmetic; deterministic; O(N) extra memory. N = 0
+    launches nothing.
     """
     check_inv_temperature(inv_temperature)
     match ARCH_MAJOR:
@@ -122,8 +123,10 @@ def log_prob_bwd(inp: torch.Tensor, target: torch.Tensor, row_max: torch.Tensor,
             if torch.compiler.is_compiling():
                 return log_prob_bwd_op(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, inv_temperature)
             from pithtrain.kernels.log_prob_sm100 import log_prob_bwd_sm100
+            version = inp._version
             log_prob_bwd_sm100(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, inv_temperature)
-            torch.autograd.graph.increment_version(inp)
+            if inp._version == version:  # a kernel write; the fp32-copy path's copy_ already bumped it
+                torch.autograd.graph.increment_version(inp)
             return None
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
