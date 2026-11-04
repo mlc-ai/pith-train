@@ -18,15 +18,16 @@ from pithtrain.kernels.row_slice_sm90 import RowAccess, RowSlice, lds_f32, pack_
 
 __all__ = ["log_prob_bwd_sm90", "log_prob_fwd_sm90"]
 
-FLT_MAX, STATS_BYTES = 3.4028234663852886e38, 16
-# Forward: one CTA per row up to FWD_SLICE_BYTES, else a cluster of 2, each CTA's slice streamed through
-# a two-slot shared-memory ring in chunks of about FWD_CHUNK_BYTES, so a CTA needs two chunks of shared
-# memory whatever the row's length and many CTAs share an SM. Backward: slices of about BWD_SLICE_BYTES,
-# so many CTAs per SM keep their loads in flight.
+FLT_MAX = 3.4028234663852886e38
+STATS_BYTES = 16
+# Forward: one CTA per row up to FWD_SLICE_BYTES, else a cluster of 2, each CTA's slice streamed
+# through a two-slot shared-memory ring in chunks of about FWD_CHUNK_BYTES, so a CTA needs two chunks
+# of shared memory whatever the row's length and many CTAs share an SM. Backward: slices of about
+# BWD_SLICE_BYTES, so many CTAs per SM keep their loads in flight.
 FWD_SLICE_BYTES, FWD_CHUNK_BYTES, BWD_SLICE_BYTES = 80 * 1024, 16 * 1024, 12 * 1024
 # With few rows the GPU has far more CTA slots than the grid fills, so a row is cut finer: up to
-# SMALL_FWD_ROWS rows the forward uses slices of at most TINY_FWD_SLICE_BYTES (up to TINY_FWD_ROWS rows
-# landing whole in one copy), up to TINY_BWD_ROWS rows the backward slices of about
+# SMALL_FWD_ROWS rows the forward uses slices of at most TINY_FWD_SLICE_BYTES (up to TINY_FWD_ROWS
+# rows landing whole in one copy), up to TINY_BWD_ROWS rows the backward slices of about
 # TINY_BWD_SLICE_BYTES with 128 threads.
 TINY_FWD_ROWS, SMALL_FWD_ROWS, TINY_BWD_ROWS = 8, 64, 16
 TINY_FWD_SLICE_BYTES, TINY_BWD_SLICE_BYTES = 40 * 1024, 2 * 1024
@@ -34,8 +35,8 @@ TINY_FWD_SLICE_BYTES, TINY_BWD_SLICE_BYTES = 40 * 1024, 2 * 1024
 
 def exp_approx(value: Float32, use_ftz: bool) -> Float32:
     """
-    exp(value) as multiply by log2(e), then ex2.approx. The ftz form differs
-    from the full-range ex2 only for results below 2^-126.
+    exp(value) as multiply by log2(e), then ex2.approx. The ftz form differs from the full-range ex2
+    only for results below 2^-126.
     """
     ex2_op = "ex2.approx.ftz.f32" if use_ftz else "ex2.approx.f32"
     return Float32(asm(T.f32(), [to_ir(value, Float32)], "{\n.reg .f32 t;\nmul.rn.f32 t, $1, 0f3FB8AA3B;\n" + ex2_op + " $0, t;\n}", "=f,f"))
@@ -82,8 +83,8 @@ def combine_row_stats(max_a: Float32, sum_a: Float32, ent_a: Float32, max_b: Flo
 def checked_target(target_idx: Int64, num_cols: int) -> tuple:
     """
     (index, is_valid): a target outside [0, num_cols) is replaced by num_cols before any address is
-    formed, so RowSlice puts it at the row's end, which no element and no unit holds, and rank 0
-    owns it.
+    formed, so RowSlice puts it at the row's end, which no element and no unit holds, and which
+    rank 0 owns.
     """
     is_valid = (target_idx >= Int64(0)) & (target_idx < Int64(num_cols))
     return cutlass.select_(is_valid, target_idx, Int64(num_cols)), is_valid
@@ -114,7 +115,6 @@ class LogProbFwd:
         self.dtype, self.num_cols, self.cluster_size = dtype, num_cols, cluster_size
         self.chunks, self.threads, self.warps = chunks, threads, threads // 32
         self.element_bytes = dtype.width // 8
-        self.unit_elements = 16 // self.element_bytes
         self.slice_units, self.chunk_units = line_aligned_units(num_cols * self.element_bytes // 16, cluster_size, chunks)
         self.slots = min(chunks, 2)
         self.access = RowAccess(dtype, chunks, self.chunk_units)
@@ -135,8 +135,8 @@ class LogProbFwd:
 
         # The slice's geometry does not depend on the target: start its copy before the target's load.
         geometry = RowSlice(mX.iterator.toint(), row_idx, cta_rank, Int64(self.num_cols), self.num_cols, self.element_bytes, self.slice_units)
-        for k in cutlass.range_constexpr(self.slots):
-            self.issue_chunk(geometry, s_slice, s_barriers, Int32(k), tidx)
+        for chunk_idx in cutlass.range_constexpr(self.slots):
+            self.issue_chunk(geometry, s_slice, s_barriers, Int32(chunk_idx), tidx)
         target_idx, is_target_valid = checked_target(Int64(mTarget[row_idx]), self.num_cols)
         row = RowSlice(mX.iterator.toint(), row_idx, cta_rank, target_idx, self.num_cols, self.element_bytes, self.slice_units)
         acc_max, acc_sum, acc_ent = self.reduce_slice(row, s_slice, s_barriers, s_target, tidx, cta_rank, inv_temperature)
@@ -165,25 +165,25 @@ class LogProbFwd:
         slot is refilled only after every thread has finished it.
         """
         acc_max, acc_sum, acc_ent = -Float32.inf, Float32(0.0), Float32(0.0)
-        for k in cutlass.range(self.chunks, unroll=1):
-            slot = k % self.slots
-            chunk_start = k * self.chunk_units
-            chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_start, Int32(self.chunk_units)), Int32(0))
+        for chunk_idx in cutlass.range(self.chunks, unroll=1):
+            slot = chunk_idx % self.slots
+            chunk_start = chunk_idx * self.chunk_units
+            num_chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_start, Int32(self.chunk_units)), Int32(0))
             s_chunk = s_slice + slot * (self.chunk_units * 16)
-            barrier_wait(s_barriers + slot * 8, (k // self.slots) % 2)
-            chunk_max = self.thread_chunk_max(s_chunk, Int32(0), chunk_units, tidx)
+            barrier_wait(s_barriers + slot * 8, (chunk_idx // self.slots) % 2)
+            chunk_max = self.thread_chunk_max(s_chunk, Int32(0), num_chunk_units, tidx)
             acc_max, shift, acc_sum, acc_ent = self.rescale(chunk_max, acc_max, acc_sum, acc_ent, inv_temperature)
-            # The chunk's sums start from 0 and join the running sums once, so a thread's rounding error
-            # grows with its chunks plus its units per chunk, not with all its units.
+            # The chunk's sums start from 0 and join the running sums once, so a thread's rounding
+            # error grows with its chunks plus its units per chunk, not with all its units.
             chunk_sum, chunk_ent = Float32(0.0), Float32(0.0)
-            for unit_idx in cutlass.range(tidx, chunk_units, self.threads, unroll=1):
+            for unit_idx in cutlass.range(tidx, num_chunk_units, self.threads, unroll=1):
                 unit_sum, unit_ent = self.sum_terms(unpack_unit(lds_v4(s_chunk + unit_idx * 16), self.dtype), shift, inv_temperature)
                 chunk_sum, chunk_ent = chunk_sum + unit_sum, chunk_ent + unit_ent
             acc_sum, acc_ent = acc_sum + chunk_sum, acc_ent + chunk_ent
-            self.keep_target(row, s_chunk, s_target, chunk_start, chunk_units, tidx)
-            if k + self.slots < self.chunks:
+            self.keep_target(row, s_chunk, s_target, chunk_start, num_chunk_units, tidx)
+            if chunk_idx + self.slots < self.chunks:
                 cute.arch.sync_threads()
-                self.issue_chunk(row, s_slice, s_barriers, k + self.slots, tidx)
+                self.issue_chunk(row, s_slice, s_barriers, chunk_idx + self.slots, tidx)
         if cta_rank == 0:
             edge_addr, edge_ok = self.access.edge_element(row, tidx)
             edge_value = self.access.load_element(edge_addr, edge_ok)
@@ -201,19 +201,18 @@ class LogProbFwd:
         """
         if tidx == 0:
             slot = chunk_idx % self.slots
-            chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_idx * self.chunk_units, Int32(self.chunk_units)), Int32(0))
+            num_chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_idx * self.chunk_units, Int32(self.chunk_units)), Int32(0))
             asm(None, [], "fence.proxy.async.shared::cta;", "", side_effects=True)
-            barrier_expect_tx(s_barriers + slot * 8, chunk_units * 16)
-            if chunk_units > 0:
-                asm(None, [to_ir(s_slice + slot * (self.chunk_units * 16), Int32), to_ir(row.slice_start + Int64(chunk_idx) * Int64(self.chunk_units * 16), Int64), to_ir(chunk_units * 16, Int32), to_ir(s_barriers + slot * 8, Int32)], "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r", side_effects=True)
+            barrier_expect_tx(s_barriers + slot * 8, num_chunk_units * 16)
+            if num_chunk_units > 0:
+                asm(None, [to_ir(s_slice + slot * (self.chunk_units * 16), Int32), to_ir(row.slice_start + Int64(chunk_idx) * Int64(self.chunk_units * 16), Int64), to_ir(num_chunk_units * 16, Int32), to_ir(s_barriers + slot * 8, Int32)], "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r", side_effects=True)
 
     @cute.jit
-    def keep_target(self, row: RowSlice, s_chunk: Int32, s_target: Int32, chunk_start: Int32, chunk_units: Int32, tidx: Int32) -> None:
+    def keep_target(self, row: RowSlice, s_chunk: Int32, s_target: Int32, chunk_start: Int32, num_chunk_units: Int32, tidx: Int32) -> None:
         """
-        Thread 0 copies x[target] to s_target while its chunk is in the ring, before the slot is
-        reused.
+        Thread 0 copies x[target] to s_target while its chunk is still in the ring slot.
         """
-        if (tidx == 0) & (row.target_unit >= chunk_start) & (row.target_unit < chunk_start + chunk_units):
+        if (tidx == 0) & (row.target_unit >= chunk_start) & (row.target_unit < chunk_start + num_chunk_units):
             elements_per_word = 4 // self.element_bytes
             word = lds_b32(s_chunk + (row.target_unit - chunk_start) * 16 + (row.target_element // elements_per_word) * 4)
             halves = unpack_unit((word,), self.dtype)
@@ -223,25 +222,25 @@ class LogProbFwd:
             sts_f32(s_target, value)
 
     @cute.jit
-    def thread_chunk_max(self, s_slice: Int32, chunk_start: Int32, chunk_units: Int32, tidx: Int32) -> Float32:
+    def thread_chunk_max(self, s_chunk: Int32, chunk_start: Int32, num_chunk_units: Int32, tidx: Int32) -> Float32:
         """
         The largest logit of the thread's units of a landed chunk (-inf for none); 16-bit pairs stay
         packed while scanning, so a unit costs its load and three packed max.
         """
-        best = -Float32.inf
+        acc_max = -Float32.inf
         if const_expr(self.dtype is cutlass.Float32):
-            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + chunk_units, self.threads, unroll=1):
-                for value in unpack_unit(lds_v4(s_slice + unit_idx * 16), self.dtype):
-                    best = cute.arch.fmax(best, value)
+            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + num_chunk_units, self.threads, unroll=1):
+                for value in unpack_unit(lds_v4(s_chunk + unit_idx * 16), self.dtype):
+                    acc_max = cute.arch.fmax(acc_max, value)
         else:
             max_op = "max.bf16x2" if const_expr(self.dtype is cutlass.BFloat16) else "max.f16x2"
-            packed = Uint32(0xFF80FF80 if const_expr(self.dtype is cutlass.BFloat16) else 0xFC00FC00)
-            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + chunk_units, self.threads, unroll=1):
-                words = lds_v4(s_slice + unit_idx * 16)
-                packed = packed_op(max_op, packed, packed_op(max_op, packed_op(max_op, words[0], words[1]), packed_op(max_op, words[2], words[3])))
-            pair = unpack_unit((packed,), self.dtype)
-            best = cute.arch.fmax(pair[0], pair[1])
-        return best
+            acc_packed_max = Uint32(0xFF80FF80 if const_expr(self.dtype is cutlass.BFloat16) else 0xFC00FC00)
+            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + num_chunk_units, self.threads, unroll=1):
+                words = lds_v4(s_chunk + unit_idx * 16)
+                acc_packed_max = packed_op(max_op, acc_packed_max, packed_op(max_op, packed_op(max_op, words[0], words[1]), packed_op(max_op, words[2], words[3])))
+            max_pair = unpack_unit((acc_packed_max,), self.dtype)
+            acc_max = cute.arch.fmax(max_pair[0], max_pair[1])
+        return acc_max
 
     @cute.jit
     def rescale(self, values_max: Float32, acc_max: Float32, acc_sum: Float32, acc_ent: Float32, inv_temperature: Float32) -> tuple:
@@ -432,11 +431,11 @@ class LogProbBwd:
         As each chunk lands, 16-byte gradient stores over the thread's units; the thread holding the
         target's unit then rewrites the target element with the target_add term.
         """
-        for k in cutlass.range_constexpr(self.chunks):
-            chunk_start = k * self.chunk_units
-            chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_start, Int32(self.chunk_units)), Int32(0))
-            barrier_wait(s_barriers + k * 8, Int32(0))
-            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + chunk_units, self.threads, unroll=1):
+        for chunk_idx in cutlass.range_constexpr(self.chunks):
+            chunk_start = chunk_idx * self.chunk_units
+            num_chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_start, Int32(self.chunk_units)), Int32(0))
+            barrier_wait(s_barriers + chunk_idx * 8, Int32(0))
+            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + num_chunk_units, self.threads, unroll=1):
                 values = unpack_unit(lds_v4(s_slice + unit_idx * 16), self.dtype)
                 grads = [self.grad_of(value, terms) for value in values]
                 st_v4(row.slice_start + Int64(unit_idx) * Int64(16), pack_unit(grads, self.dtype), Int32(1))

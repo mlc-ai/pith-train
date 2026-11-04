@@ -43,8 +43,8 @@ def log_prob_fwd_op(inp: torch.Tensor, target: torch.Tensor, inv_temperature: fl
 
 @log_prob_fwd_op.register_fake
 def log_prob_fwd_fake(inp: torch.Tensor, target: torch.Tensor, inv_temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n_rows = inp.shape[0]
-    return tuple(inp.new_empty((n_rows,), dtype=torch.float32) for _ in range(4))
+    N = inp.shape[0]
+    return tuple(inp.new_empty((N,), dtype=torch.float32) for _ in range(4))
 
 
 @torch.library.custom_op("pithtrain::log_prob_bwd_sm100", mutates_args=("inp",))
@@ -69,8 +69,8 @@ def log_prob_fwd(inp: torch.Tensor, target: torch.Tensor, inv_temperature: float
     inp: (N, V) bf16, fp16 or fp32 logits, row-contiguous (stride (V, 1)). target: (N,) integer, any
     stride (int32 or int64 natively; other integer dtypes are converted). inv_temperature: a Python
     float, cast to fp32 inside the kernel, so eager and torch.compile calls agree bit for bit; it
-    must be positive and finite in fp32 (1e-50 and 1e100 are not), else ValueError before anything
-    launches.
+    must be positive and finite in fp32 (1e-50 and 1e100 are not), else ValueError
+    before anything launches.
 
     Outputs, each (N,) fp32: logp = z[target] - row_max - log_sum, and 0 for a target outside [0, V)
     (-100, -1, V, 2^40, ...), which is never dereferenced; entropy = log_sum - sum(e (z - row_max))
@@ -79,8 +79,8 @@ def log_prob_fwd(inp: torch.Tensor, target: torch.Tensor, inv_temperature: float
     = m, log_sum = log2(sum(exp2(z log2(e) - m)))), so that row_max + log_sum is logsumexp(z) in
     each device's unit; only log_prob_bwd reads them. A row with a finite logit has finite outputs
     however many -inf logits it holds; a row of only -inf logits gives NaN logp (for a valid target)
-    and NaN entropy, as log_softmax does. fp32 arithmetic; deterministic; O(N) extra memory. N = 0
-    launches nothing.
+    and NaN entropy, as log_softmax does. fp32 arithmetic; deterministic; O(N) extra memory.
+    N = 0 launches nothing.
     """
     check_inv_temperature(inv_temperature)
     match ARCH_MAJOR:
@@ -106,7 +106,8 @@ def log_prob_bwd(inp: torch.Tensor, target: torch.Tensor, row_max: torch.Tensor,
 
     With log p_i = z_i - row_max - log_sum and p_i = exp(log p_i), row i of inp becomes
 
-        (grad_logp [i == target] - p_i (grad_logp + grad_entropy (log p_i + entropy))) * inv_temperature
+        (grad_logp [i == target] - p_i (grad_logp + grad_entropy (log p_i + entropy)))
+            * inv_temperature
 
     computed in fp32 and rounded once to inp's dtype. A target outside [0, V) drops grad_logp. A
     -inf logit gets gradient 0, never NaN, unless it is a valid target, which keeps its grad_logp *
