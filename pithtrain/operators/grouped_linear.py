@@ -49,7 +49,7 @@ class GroupedLinearFunc(torch.autograd.Function):
         dgrad = F.grouped_mm(dy, weight, offs=offs)
         main_grad, ks, ks_tensor = ctx.main_grad, ctx.ks, ctx.ks_tensor
 
-        if main_grad is None and not WeightGradStore.enabled:
+        if main_grad is None and (not WeightGradStore.enabled or not weight.is_leaf):
             # Return through autograd so casts/views reach their master leaves and hooks.
             wgrad = F.grouped_mm(dy.transpose(0, 1), input, offs=offs)
             return dgrad, wgrad, None, None, None, None
