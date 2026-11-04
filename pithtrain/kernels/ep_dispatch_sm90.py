@@ -1,10 +1,9 @@
 """
 CuTe-DSL kernels of the ep_dispatch feature (SM90), launched through TVM-FFI: dispatch_index, the
 sender side in one cooperative launch with stable (token-order) placement, and expand_index, the
-receiver side. Every input takes one of their compile-time variants, chosen from the input (element
-width, unit or runtime strides, the size of the bin and segment tables); validate_index and
-validate_expand reject, before anything is allocated, the inputs past the limits the picker's
-docstrings state.
+receiver side. Each has compile-time variants chosen from the input (element width, unit or
+runtime strides, the size of the bin and segment tables). validate_index and validate_expand
+reject inputs past the limits the picker's docstrings state, before anything is allocated.
 """
 
 from typing import Callable
@@ -117,7 +116,8 @@ def scan_tile(s_values: Int32, num_values: int, tile_base: Int32, carry: Int32, 
         values.append(value)
         thread_sum = scan_add(thread_sum, value, cap)
     src_half = scan_thread_sums(thread_sum, s_scan, tidx, cap)
-    lower_sum, tile_sum = Int32(lds_b32(s_scan + (src_half * THREADS + cutlass.max(tidx, 1) - 1) * 4)) * Int32(tidx > 0), Int32(lds_b32(s_scan + (src_half * THREADS + THREADS - 1) * 4))
+    lower_sum = Int32(lds_b32(s_scan + (src_half * THREADS + cutlass.max(tidx, 1) - 1) * 4)) * Int32(tidx > 0)
+    tile_sum = Int32(lds_b32(s_scan + (src_half * THREADS + THREADS - 1) * 4))
     acc_prefix = scan_add(carry, lower_sum, cap)
     for i in range(SCAN_VALUES):
         value_idx = tile_base + tidx * SCAN_VALUES + i
@@ -159,8 +159,8 @@ class DispatchIndex:
     The tables live in dynamic shared memory (index_smem_bytes), which bounds num_bins by MAX_BINS.
 
     topk_ids is read with its own element width (dtype, an integer type: ids are below 2^31, so the
-    low 32 bits of a wider element hold them) and row stride, and with a runtime inner stride
-    unless unit_inner.
+    low 32 bits of a wider element hold them) and row stride, and its inner stride is a runtime
+    value unless unit_inner.
 
     The grid barrier needs every CTA resident: the launch is cooperative and the grid capped at the
     SM count. Its counter is epoch << 32 | arrivals; the last arrival moves it to the next epoch, so
@@ -212,6 +212,7 @@ class DispatchIndex:
         self.scan_totals(buffers, tidx, num_chunks)
         if cta_idx == 0:
             self.store_counts(mCounts, buffers, tidx, M)
+
         lt_mask = lanemask_lt()
         lane_bit = Uint32(1) << Uint32(lane)
         rank_bins_start = Int32(lds_b32(s_starts + self.num_experts * 4))
@@ -383,15 +384,16 @@ class DispatchIndex:
         s_lane_masks, s_next_pos, s_starts = buffers.s_lane_masks, buffers.s_next_pos, buffers.s_starts
         for j in range(K):
             expert_idx = token_experts[j]
-            expert_masks, rank_masks = expert_idx * WARPS, (num_experts + expert_idx // experts_per_rank) * WARPS
+            expert_mask_idx, rank_mask_idx = expert_idx * WARPS, (num_experts + expert_idx // experts_per_rank) * WARPS
             expert_offset, dedup_offset = Int32(0), Int32(0)
             for i in range(WARPS):
                 is_lower_warp = Int32(i < warp)
-                expert_offset = expert_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (expert_masks + i) * 4))) * is_lower_warp
-                dedup_offset = dedup_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (rank_masks + i) * 4))) * is_lower_warp
-            expert_offset = expert_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (expert_masks + warp) * 4) & lt_mask))
-            dedup_offset = dedup_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (rank_masks + warp) * 4) & lt_mask))
-            slot_pos, dedup_pos = Int32(lds_b32(s_next_pos + expert_idx * 4)) + expert_offset, Int32(lds_b32(s_next_pos + (num_experts + expert_idx // experts_per_rank) * 4)) + dedup_offset
+                expert_offset = expert_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (expert_mask_idx + i) * 4))) * is_lower_warp
+                dedup_offset = dedup_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (rank_mask_idx + i) * 4))) * is_lower_warp
+            expert_offset = expert_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (expert_mask_idx + warp) * 4) & lt_mask))
+            dedup_offset = dedup_offset + Int32(cute.arch.popc(lds_b32(s_lane_masks + (rank_mask_idx + warp) * 4) & lt_mask))
+            slot_pos = Int32(lds_b32(s_next_pos + expert_idx * 4)) + expert_offset
+            dedup_pos = Int32(lds_b32(s_next_pos + (num_experts + expert_idx // experts_per_rank) * 4)) + dedup_offset
             rank_dispatch_start = Int32(lds_b32(s_starts + (num_experts + expert_idx // experts_per_rank) * 4)) - rank_bins_start
             flat_idx = Int64(token_idx) * K + j
             st_b64(buffers.idxs_base + Int64(slot_pos) * 8, flat_idx, token_ok)
@@ -427,11 +429,10 @@ class ExpertAndExpandIdx:
     """
 
     def __init__(self, ep_size: int, experts_per_rank: int, dtype: type = Int64, unit_stride: bool = True, bounded: bool = True) -> None:
-        self.ep_size = ep_size
-        self.experts_per_rank = experts_per_rank
+        self.ep_size, self.experts_per_rank = ep_size, experts_per_rank
         self.num_segments = ep_size * experts_per_rank
         self.elem_bytes, self.unit_stride = dtype.width // 8, unit_stride
-        self.tiled = self.num_segments > SCAN_VALUES * THREADS or ep_size > 32  # past 32 senders the serial dedup sums cost more than a scan
+        self.use_tiled_scan = self.num_segments > SCAN_VALUES * THREADS or ep_size > 32  # past 32 senders the serial dedup sums cost more than a scan
         self.bounded = bounded
         assert 0 < self.num_segments and expand_smem_bytes(self.num_segments, ep_size) <= SMEM_SM90
 
@@ -450,7 +451,7 @@ class ExpertAndExpandIdx:
         s_dedup_starts = smem.allocate(self.ep_size * 4, byte_alignment=16).toint()  # exclusive dedup starts per sender
         s_scan = smem.allocate(2 * THREADS * 4, byte_alignment=16).toint()
         num_slots = Int32(mRecv.shape[0])
-        if const_expr(self.tiled):
+        if const_expr(self.use_tiled_scan):
             self.scan_segments_tiled(mMeta.iterator.toint(), num_slots, s_seg_starts, s_dedup_starts, s_scan, tidx)
         else:
             self.scan_segments(mMeta.iterator.toint(), num_slots, s_seg_starts, s_dedup_starts, s_scan, tidx)
@@ -547,7 +548,8 @@ def get_scratch(device: torch.device, num_chunks: int, num_bins: int) -> Scratch
     key = (device.index, torch._C._cuda_getCurrentStream(device.index)[0])
     cached = SCRATCH.get(key)
     if cached is None or cached.num_chunks < num_chunks or cached.num_bins < num_bins:
-        num_chunks, num_bins = max(num_chunks, cached.num_chunks if cached is not None else 0, 64), max(num_bins, cached.num_bins if cached is not None else 0)
+        num_chunks = max(num_chunks, cached.num_chunks if cached is not None else 0, 64)
+        num_bins = max(num_bins, cached.num_bins if cached is not None else 0)
         cached = SCRATCH[key] = Scratch(device, num_chunks, num_bins)
     return cached
 
@@ -639,18 +641,18 @@ def expand_index(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_
     validate_expand's ValueError first; a recv_meta that is not contiguous int64 is copied to one.
     """
     validate_expand(recv_meta, received_expand_idx, ep_size, experts_per_rank)
-    total = received_expand_idx.shape[0]
-    out = torch.empty(2 * total, dtype=torch.int64, device=received_expand_idx.device)
-    if total == 0:
+    num_slots = received_expand_idx.shape[0]
+    out = torch.empty(2 * num_slots, dtype=torch.int64, device=received_expand_idx.device)
+    if num_slots == 0:
         return out[:0], out[0:0]
     if recv_meta.dtype != torch.int64 or recv_meta.stride(0) != 1:
         recv_meta = recv_meta.contiguous().to(torch.int64)
-    key = (ep_size, experts_per_rank, received_expand_idx.dtype, received_expand_idx.stride(0) == 1, total * ep_size * experts_per_rank < 2**31)
+    key = (ep_size, experts_per_rank, received_expand_idx.dtype, received_expand_idx.stride(0) == 1, num_slots * ep_size * experts_per_rank < 2**31)
     fn = EXPAND.get(key)
     if fn is None:
         fn = EXPAND[key] = compile_expand(*key)
     fn(recv_meta, received_expand_idx, out)
-    return out[:total], out[total:]
+    return out[:num_slots], out[num_slots:]
 
 
 def ep_dispatch_send_idx_sm90(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:

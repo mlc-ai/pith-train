@@ -33,10 +33,10 @@ def ep_dispatch_send_idx(topk_ids: torch.Tensor, num_experts: int, ep_size: int,
     order on SM90 (deterministic, every input) and atomic order on SM100 (TIRx). Counts and
     per-bucket sets are identical on both. m == 0 gives zero counts and empty index outputs.
 
-    SM90 limits, checked before anything is allocated (ValueError): ep_size * (experts_per_rank +
-    1) <= 5236 (shared-memory bin tables; at ep_size 32, experts_per_rank <= 162) and m * (k +
-    min(k, ep_size)) < 2^31 (32-bit slot positions); also a topk_ids that is not a 2-D integer
-    tensor.
+    SM90 limits, checked before anything is allocated (ValueError): ep_size *
+    (experts_per_rank + 1) <= 5236 (shared-memory bin tables; at ep_size 32, experts_per_rank
+    <= 162) and m * (k + min(k, ep_size)) < 2^31 (32-bit slot positions); also a topk_ids
+    that is not a 2-D integer tensor.
     """
     match ARCH_MAJOR:
         case 9:
