@@ -5,9 +5,9 @@ in CuTe-DSL for SM90.
 The forward reads the raw gate_up GEMM output and the bias and writes the four outputs of
 fp8cast_rowwise_kmajor of h; the backward reads dh, gate_up and the bias and writes the four outputs
 for d(gate_up) plus fp32 per-128-row-block column sums that block_segment_sum_sm90 turns into the
-bias gradient. Neither materializes the bf16 biased gate_up, h or d(gate_up). The FP8 bytes and scales
-are bit-identical to the unfused sequence: the bias add is one fp32 add rounded to bf16, and the
-activation is clamped_swiglu_sm90's PTX. Both scales come back MN-major.
+bias gradient. Neither materializes the bf16 biased gate_up, h or d(gate_up). The FP8 bytes and
+scales are bit-identical to the unfused sequence: the bias add is one fp32 add rounded to bf16, and
+the activation is clamped_swiglu_sm90's PTX. Both scales come back MN-major.
 
 Only N % 8 == 0 with 1 to 1024 groups and a bf16 bias runs fused; anything else takes the unfused
 sequence (biased_gate_up, the clamped_swiglu kernels and fp8cast_rowwise_kmajor_sm90).
@@ -49,11 +49,12 @@ def biased_gate_up(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: t
 
 def clamped_swiglu_bwd_biased(dh: torch.Tensor, gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
-    bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does (and
-    made contiguous).
+    bf16 d(gate_up) of clamped_swiglu_bwd at gate_up + bias, dh cast to its dtype as autograd does
+    and made contiguous.
     """
     x = biased_gate_up(gate_up, bias, grouped_mm_offs)
     return clamped_swiglu_bwd_sm90(dh.to(x.dtype).contiguous(), x, alpha, limit)
+
 
 BLOCK = 128  # rows per quantization group and output columns per CTA tile
 THREADS = 512
@@ -147,7 +148,7 @@ class ClampedSwiGLUQuant:
         tidx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         num_ctas, _, _ = cute.arch.grid_dim()
-        coords = self.coords(tidx)
+        coords = self.thread_coords(tidx)
         M = mGU.shape[0]
         num_tiles = (M // BLOCK) * self.num_col_blocks
         G = mOffs.shape[0]
@@ -191,7 +192,7 @@ class ClampedSwiGLUQuant:
 
         cute.arch.cp_async_wait_group(0)
 
-    def coords(self, tidx):
+    def thread_coords(self, tidx):
         return tidx, tidx % 32, tidx // 32, tidx % 16, tidx // 16
 
     def allocate_smem(self):
@@ -329,8 +330,7 @@ class ClampedSwiGLUQuant:
             sum_lo = ((bf16_lo(out_words[0][j]) + bf16_lo(out_words[1][j])) + bf16_lo(out_words[2][j])) + bf16_lo(out_words[3][j])
             sum_hi = ((bf16_hi(out_words[0][j]) + bf16_hi(out_words[1][j])) + bf16_hi(out_words[2][j])) + bf16_hi(out_words[3][j])
             sum_lo, sum_hi = sum_lo + cute.arch.shuffle_sync_bfly(sum_lo, offset=16), sum_hi + cute.arch.shuffle_sync_bfly(sum_hi, offset=16)
-            sum_bits[2 * j] = f32_as_u32(sum_lo)
-            sum_bits[2 * j + 1] = f32_as_u32(sum_hi)
+            sum_bits[2 * j], sum_bits[2 * j + 1] = f32_as_u32(sum_lo), f32_as_u32(sum_hi)
         if lane < 16:
             sum_addr = s_col_sum + (warp * BLOCK + col_vec_idx * VEC) * 4
             sts_v4(sum_addr, tuple(sum_bits[0:4]))
@@ -461,8 +461,8 @@ def get_kernel(N: int, backward: bool, alpha: float, limit: float, device: torch
 
 def allocate_outputs(M: int, N: int, device: torch.device, KP: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    The four outputs of fp8cast_rowwise_kmajor for an (M, N) input, the K-major pair with KP
-    >= N channels.
+    The four outputs of fp8cast_rowwise_kmajor for an (M, N) input, the K-major pair with KP >= N
+    channels.
     """
     num_col_blocks = (N + BLOCK - 1) // BLOCK
     KP = N if KP is None else KP
@@ -470,6 +470,9 @@ def allocate_outputs(M: int, N: int, device: torch.device, KP: int | None = None
 
 
 def clamped_swiglu_quant_fusable(gate_up: torch.Tensor, bias: torch.Tensor, grouped_mm_offs: torch.Tensor) -> bool:
+    """
+    Whether the fused kernel takes these inputs; otherwise the unfused sequence runs.
+    """
     N = gate_up.shape[1] // 2
     return (gate_up.dtype == torch.bfloat16 and gate_up.is_contiguous() and gate_up.data_ptr() % 16 == 0 and bias.dtype == torch.bfloat16 and bias.is_contiguous() and bias.data_ptr() % 16 == 0 and N % VEC == 0 and grouped_mm_offs.dtype == torch.int32 and grouped_mm_offs.is_contiguous() and 0 < grouped_mm_offs.shape[0] <= G_CAP)
 
@@ -478,8 +481,8 @@ def clamped_swiglu_quant_fwd_sm90(gate_up: torch.Tensor, bias: torch.Tensor, gro
     """
     grouped_mm_offs is int32 (G,) cumulative row counts, multiples of 128, last entry M. If set
     (fused path only), kmajor_channels >= N lays the K-major pair out for that many channels: group
-    g's block is (kmajor_channels, rows of g) and the scale (kmajor_channels, M / 128); channels >=
-    N are left unwritten.
+    g's block is (kmajor_channels, rows of g) and the scale (kmajor_channels, M / 128); channels
+    >= N are left unwritten.
     """
     assert gate_up.ndim == 2 and gate_up.shape[1] % 2 == 0 and gate_up.shape[0] % BLOCK == 0
     M, N = gate_up.shape[0], gate_up.shape[1] // 2

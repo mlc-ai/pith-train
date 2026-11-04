@@ -69,8 +69,7 @@ def fp8_clamped_swiglu_kmajor(gate_up: torch.Tensor, bias: torch.Tensor, grouped
     With padded, the fused SM90 kernel lays it out with N rounded up to a multiple of 256 channels,
     which k_grouped_fp8_gemm takes without a copy; the extra channels are left unwritten. Inputs the
     fused kernel does not cover (N % 8 != 0, more than 1024 groups, a non-bf16 bias) and SM100
-    return N channels. Scale strides are
-    unspecified. Deterministic.
+    return N channels. Scale strides are unspecified. Deterministic.
     """
     kmajor_channels = k_grouped_safe_size(gate_up.shape[1] // 2) if padded else None
     match ARCH_MAJOR:
