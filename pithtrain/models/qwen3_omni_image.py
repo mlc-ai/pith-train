@@ -50,6 +50,21 @@ class Qwen3OmniMoeThinkerImageDecoderLayer(Qwen3OmniMoeThinkerMediaDecoderLayer)
             hidden, lanes, self.idx, self.text_hidden_size, self.deepstack_count
         )
 
+    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
+    def forward_stage5_with_metadata(
+        self, moe_outs, moe_local_idxs, topk_weight, residual, *, stage5_metadata
+    ):
+        hidden, lanes = (
+            residual[..., : self.text_hidden_size],
+            residual[..., self.text_hidden_size :],
+        )
+        hidden = Qwen3OmniMoeThinkerTextDecoderLayer._forward_stage5(
+            self, moe_outs, moe_local_idxs, topk_weight, hidden, stage5_metadata=stage5_metadata
+        )
+        return inject_deepstack(
+            hidden, lanes, self.idx, self.text_hidden_size, self.deepstack_count
+        )
+
     def reference_forward_with_hidden(
         self, payload, rotary_posemb, cu_seqlens=None, *, hidden_states=None
     ):

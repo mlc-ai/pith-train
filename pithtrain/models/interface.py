@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
@@ -15,6 +16,62 @@ class RoutingInfo(NamedTuple):
     expand_idx: Optional[torch.Tensor] = None
     dispatch_splits: Optional[AllToAllSplits] = None
     combine_splits: Optional[AllToAllSplits] = None
+
+
+class Stage5RouteMetadata(NamedTuple):
+    """Owned global router IDs and per-token expert argsort; never mutate tensors."""
+
+    global_expert_ids: torch.Tensor
+    expert_order: torch.Tensor
+
+    @classmethod
+    def from_expert_ids(cls, expert_ids: torch.Tensor):
+        if expert_ids.ndim != 2 or expert_ids.dtype != torch.int64:
+            raise ValueError("Stage5 expert IDs must be int64 router slots [N,K]")
+        ids = expert_ids.detach().clone()
+        return cls(ids, ids.argsort(dim=-1))
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Stage5RoutingInfo:
+    """Optional-only metadata owner; ordinary RoutingInfo's six-field ABI is unchanged.
+
+    Delegate legacy attributes and tuple adapters to the original route. After
+    aggregation, gather autograd owns the integer permutation required by VJPs;
+    no extra Stage5Args lane or mutable layer route cache is needed.
+    """
+
+    routing: RoutingInfo
+    stage5_metadata: Stage5RouteMetadata
+
+    def __getattr__(self, name):
+        return getattr(self.routing, name)
+
+    def __iter__(self):
+        return iter(self.routing)
+
+    def __len__(self):
+        return len(self.routing)
+
+    def __getitem__(self, key):
+        return self.routing[key]
+
+    def _replace(self, **kwargs):
+        return type(self)(self.routing._replace(**kwargs), self.stage5_metadata)
+
+
+class MetadataStage5Protocol(Protocol):
+    """Optional capability selected only for metadata-bearing Thinker routes."""
+
+    def forward_stage5_with_metadata(
+        self,
+        moe_outs,
+        moe_local_idxs,
+        topk_weight,
+        residual,
+        *,
+        stage5_metadata: Stage5RouteMetadata,
+    ) -> torch.Tensor: ...
 
 
 class MLPProtocol(Protocol):
@@ -52,7 +109,7 @@ class LayerProtocol(Protocol):
         hidden_states: torch.Tensor,
         rotary_posemb: Tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[RoutingInfo]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[RoutingInfo | Stage5RoutingInfo]]:
         """
         Stage 1, the pre-dispatch compute (runs before the stage-2 dispatch).
         Run the attention sublayer and shared experts, then route tokens to experts and prepare the dispatch (MoE layers).

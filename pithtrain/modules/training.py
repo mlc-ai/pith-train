@@ -35,6 +35,10 @@ from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.model_config import resolve_text_model_config
+from pithtrain.modules.omni_stage5_policy import (
+    OmniStage5Aggregation,
+    validate_omni_stage5_aggregation,
+)
 from pithtrain.modules.optimizer import Muon, is_muon_param
 from pithtrain.modules.reproducibility import configure_deterministic_training
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
@@ -229,6 +233,15 @@ class TrainingCfg(SlottedDefault):
     Summed CE uses PyTorch FP32 arithmetic with extra temporary vocabulary
     memory; ordinary training keeps the in-place fused CE kernel.
     CUDA launches require CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before Python.
+    """
+
+    omni_stage5_aggregation: OmniStage5Aggregation = "grouped_sum"
+    """Thinker aggregation policy, independent of expert projection backends.
+
+    grouped_sum preserves the ordinary path without route-ID copies or sorts.
+    hf_eager_expert_id_serial preserves original dispatch/GEMM layout and orders
+    only Stage5 output/weight accumulation by global expert ID. It is not an HF
+    projection backend selector or a claim of full native/HF equivalence.
     """
 
     strict_resume: bool = False
@@ -488,6 +501,7 @@ def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
 ) -> None:
+    stage5_aggregation = validate_omni_stage5_aggregation(cfg.omni_stage5_aggregation)
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
@@ -498,6 +512,9 @@ def setup_model(
     modules = []
     source_config = AutoConfig.from_pretrained(cfg.model)
     module_config = resolve_text_model_config(source_config)
+    if stage5_aggregation != "grouped_sum" and module_config.model_type != "qwen3_omni_moe_text":
+        raise ValueError("hf_eager_expert_id_serial aggregation requires an Omni Thinker model")
+    training.omni_stage5_aggregation = stage5_aggregation
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")

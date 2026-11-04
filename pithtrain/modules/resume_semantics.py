@@ -234,6 +234,7 @@ _NUMERICAL_ATTRIBUTES = (
     "num_experts_per_tok",
     "norm_topk_prob",
     "deterministic_token_layout",
+    "omni_stage5_aggregation",
     "num_experts",
     "num_code_groups",
     "num_quantizers",

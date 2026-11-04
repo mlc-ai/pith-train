@@ -26,7 +26,13 @@ import torch.distributed
 from torch.autograd import Variable
 
 from pithtrain.contexts import distributed
-from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
+from pithtrain.models.interface import (
+    AllToAllSplits,
+    LayerProtocol,
+    ModelProtocol,
+    RoutingInfo,
+    Stage5RoutingInfo,
+)
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 # fmt: off
@@ -375,6 +381,17 @@ class Stage5Args(NamedTuple):
     residual: torch.Tensor
 
 
+def _call_stage5(layer, moe_outs, moe_local_idxs, topk_weight, residual, routing):
+    if not isinstance(routing, Stage5RoutingInfo):
+        return layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    call = getattr(layer, "forward_stage5_with_metadata", None)
+    if call is None:
+        raise TypeError("Metadata-bearing routes require the metadata Stage5 capability")
+    return call(
+        moe_outs, moe_local_idxs, topk_weight, residual, stage5_metadata=routing.stage5_metadata
+    )
+
+
 class Stage5Outs(NamedTuple):
     hidden_states: torch.Tensor
 
@@ -403,7 +420,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
     _drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
-    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = _call_stage5(layer, moe_outs, moe_local_idxs, topk_weight, residual, routing)
     record.outs = Stage5Outs(hidden_states)
 
     nvtx.range_pop()
@@ -450,7 +467,7 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     _drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
-    hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = _call_stage5(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, routing)
 
     dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
     ctx.comp_stream.record_event(ctx.fwd_event)
@@ -718,7 +735,7 @@ def layer_forward(
     if has_experts and fwd_comm_work is not None:
         layer_record.stage3.outs.moe_outs.untyped_storage().resize_(0)
     moe_local_idxs = routing.moe_local_idxs if has_experts else None
-    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = _call_stage5(layer, moe_outs, moe_local_idxs, topk_weight, residual, routing)
 
     record.outs = Stage5Outs(hidden_states)
     layer_record.stage5 = record
