@@ -20,9 +20,8 @@ from torch.distributed.checkpoint import FileSystemReader
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import logging
+from pithtrain.modules.hf_converters._registry import CONVERTERS
 from pithtrain.modules.logging import LoggingCfg, setup_logging
-
-from ._registry import CONVERTERS
 
 
 @dataclass(init=False, slots=True)

@@ -5,17 +5,19 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.13.0,<2.14",
+    "apache-tvm-ffi==0.1.15.post2",
+    "apache-tvm-tirx==0.1.0a6",
     "deep-gemm",
     "flash-attn-4[cu13]==4.0.0b28",
-    "flash-linear-attention==0.5.2",
     "quack-kernels==0.6.5",
+    "tirx-kernels",
     "transformers",
     "wandb",
     "zstandard",
+    "pre-commit",
+    "pytest",
+    "ruff",
 ]
-
-[dependency-groups]
-dev = ["pre-commit", "pytest", "ruff"]
 
 [build-system]
 build-backend = "setuptools.build_meta"
@@ -34,6 +36,7 @@ explicit = true
 
 [tool.uv.sources]
 deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "559d79fb6994a58b8a15b4b93bf13ccc16edf247" }
+tirx-kernels = { git = "https://github.com/mlc-ai/TIRx-kernels", rev = "716d8a3cfc8cb5810f79f2515a39d400c1264340" }  # the tvm_tirx tirx-lite API (PyPI 0.1.2.post1 is the apache-tvm one)
 torch = { index = "torch-cu130" }
 
 [tool.uv.extra-build-dependencies]

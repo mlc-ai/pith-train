@@ -1,7 +1,7 @@
 """
 CuTe-DSL (SM90) rowwise FP8 quantization of x and 128x128 blockwise FP8 quantization of x.T from one
-read of x, bit-identical to the Triton kernel in fp8_rowwise_blockwise_transpose_sm100. Covers every
-input, so there is no fallback.
+read of x, the recipe's bytes and scales (the same as fp8_rowwise_blockwise_transpose_sm100). Covers
+every input, so there is no fallback.
 
 One CTA of 1024 / R threads per 128x128 tile, R = 8 (large grids) or 4 (small grids); each thread
 owns R consecutive rows of 16 columns, so the transposed store needs no smem transpose: it writes
@@ -72,8 +72,8 @@ def quantize4_words(words: list, elem_picks: list, kind: str, rcp: Float32, *, l
     """
     Quantize 4 elements to 4 packed e4m3 bytes (element 0 in the lowest byte). elem_picks[k] =
     (j, half) picks element k from words[j] (half 0 = low 16 bits); rcp is an exact power of 2.
-    The cvt is the one Triton emits for .to(tl.float8e4nv) on SM90; its first source lands in
-    the upper byte.
+    The cvt is the recipe's e4m3 cast (cvt.rn.satfinite.e4m3x2.f32); its first source lands in the
+    upper byte.
     """
     num_words = len(words)
     rcp_operand = f"${num_words + 1}"
@@ -92,7 +92,9 @@ def quantize4_words(words: list, elem_picks: list, kind: str, rcp: Float32, *, l
             ptx_lines.append(f"mov.b32 f{k}, {word_operand};")
         ptx_lines.append(f"mul.rn.f32 f{k}, f{k}, {rcp_operand};")
     ptx_lines += ["cvt.rn.satfinite.e4m3x2.f32 q0, f1, f0;", "cvt.rn.satfinite.e4m3x2.f32 q1, f3, f2;", "mov.b32 $0, {q0, q1};"]
-    ptx, constraints, operands = "{\n\t" + "\n\t".join(ptx_lines) + "\n\t}", "=r," + ",".join(["r"] * num_words) + ",f", [Uint32(word) for word in words] + [Float32(rcp)]
+    ptx = "{\n\t" + "\n\t".join(ptx_lines) + "\n\t}"
+    constraints = "=r," + ",".join(["r"] * num_words) + ",f"
+    operands = [Uint32(word) for word in words] + [Float32(rcp)]
     return asm_u32(operands, ptx, constraints, loc, ip)
 
 
@@ -107,7 +109,8 @@ class SubBlock:
     """
 
     def __init__(self, tidx, m_tile_idx, k_tile_idx, M, K, rows: int) -> None:
-        self.tidx, self.m_tile_idx, self.k_tile_idx, self.M, self.K = tidx, m_tile_idx, k_tile_idx, M, K
+        self.tidx, self.m_tile_idx, self.k_tile_idx = tidx, m_tile_idx, k_tile_idx
+        self.M, self.K = M, K
         self.warp, self.lane = tidx // 32, tidx % 32
         # each warp covers 4 x rows rows and 8 x 16 columns
         self.row_group_idx, self.col_group_idx = self.lane // 8, self.lane % 8
@@ -121,33 +124,30 @@ class RowwiseBlockwiseTranspose:
     """
 
     def __init__(self, dtype: type, vec_k: int, vec_m: int, rows: int = 8) -> None:
-        self.dtype = dtype
-        self.rows = rows
-        self.threads = 1024 // rows
-        self.num_warps = 32 // rows
+        self.dtype, self.rows = dtype, rows
+        self.threads, self.num_warps = 1024 // rows, 32 // rows
         self.kind = {cutlass.BFloat16: "bf16", cutlass.Float16: "f16", Float32: "f32"}[dtype]
         self.elem_bytes = dtype.width // 8
         self.elems_per_word = 32 // dtype.width
-        self.vec_k = vec_k
-        self.vec_m = vec_m
+        self.vec_k, self.vec_m = vec_k, vec_m
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor, stream) -> None:
+    def __call__(self, mX: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mBlkT: cute.Tensor, mBlkTScale: cute.Tensor, stream) -> None:
         M, K = mX.shape[0], mX.shape[1]
         grid_m, grid_k = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-        self.kernel(mX, mQ, mS, mQT, mST).launch(grid=[grid_m, grid_k, 1], block=[self.threads, 1, 1], stream=stream)
+        self.kernel(mX, mTok, mTokScale, mBlkT, mBlkTScale).launch(grid=[grid_m, grid_k, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mX: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, mQT: cute.Tensor, mST: cute.Tensor) -> None:
+    def kernel(self, mX: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mBlkT: cute.Tensor, mBlkTScale: cute.Tensor) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         m_tile_idx, k_tile_idx, _ = cute.arch.block_idx()
         sub_block = SubBlock(tidx, m_tile_idx, k_tile_idx, Int32(mX.shape[0]), Int32(mX.shape[1]), self.rows)
         x_words = self.load_block(mX, sub_block)
         row_amax = self.reduce_row_amax(x_words)
-        q_bytes = cute.make_rmem_tensor(cute.make_layout(8), Uint8)
-        self.store_rowwise(x_words, row_amax, q_bytes, mQ, mS, sub_block)
-        tile_rcp = self.reduce_tile_amax(row_amax, mST, sub_block)
-        self.store_transposed(x_words, tile_rcp, q_bytes, mQT, sub_block)
+        quant_bytes = cute.make_rmem_tensor(cute.make_layout(8), Uint8)
+        self.store_rowwise(x_words, row_amax, quant_bytes, mTok, mTokScale, sub_block)
+        tile_rcp = self.reduce_tile_amax(row_amax, mBlkTScale, sub_block)
+        self.store_transposed(x_words, tile_rcp, quant_bytes, mBlkT, sub_block)
 
     @cute.jit
     def load_block(self, mX: cute.Tensor, sub_block: SubBlock) -> cute.Tensor:
@@ -190,42 +190,42 @@ class RowwiseBlockwiseTranspose:
         return row_amax
 
     @cute.jit
-    def store_rowwise(self, x_words: cute.Tensor, row_amax: cute.Tensor, q_bytes: cute.Tensor, mQ: cute.Tensor, mS: cute.Tensor, sub_block: SubBlock) -> None:
+    def store_rowwise(self, x_words: cute.Tensor, row_amax: cute.Tensor, quant_bytes: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, sub_block: SubBlock) -> None:
         """
         Quantize the register block by its row scales into tok and store the row scales.
         """
         row0, col0, col_group_idx, k_tile_idx, M, K = sub_block.row0, sub_block.col0, sub_block.col_group_idx, sub_block.k_tile_idx, sub_block.M, sub_block.K
         VEC_K = self.vec_k
-        # mS is the MN-major tok_scale: scale[row, k_tile_idx] at k_tile_idx * tok_scale_stride + row.
-        tok_scale_stride = Int64(mS.stride[1])
-        q_words = cute.recast_tensor(q_bytes, Uint32)
+        # mTokScale is MN-major: scale[row, k_tile_idx] at k_tile_idx * tok_scale_stride + row.
+        tok_scale_stride = Int64(mTokScale.stride[1])
+        quant_words = cute.recast_tensor(quant_bytes, Uint32)
         for i in cutlass.range_constexpr(self.rows):
             row = row0 + i
             scale = e8m0_scale(row_amax[i])
             rcp = exact_rcp(scale)
             if row < M:
                 if col_group_idx == i:
-                    scale_tile = cute.make_tensor(global_ptr(mS.iterator, Int64(k_tile_idx) * tok_scale_stride + Int64(row), 4, Float32, 4), cute.make_layout(1))
-                    scale_tile[0] = scale
+                    tok_scale_entry = cute.make_tensor(global_ptr(mTokScale.iterator, Int64(k_tile_idx) * tok_scale_stride + Int64(row), 4, Float32, 4), cute.make_layout(1))
+                    tok_scale_entry[0] = scale
                 for half in cutlass.range_constexpr(2):
                     for quad in cutlass.range_constexpr(2):
-                        elems = [i * 16 + half * 8 + 4 * quad + k for k in range(4)]
-                        q_words[quad] = self.quantize4(x_words, elems, rcp)
+                        elem_idxs = [i * 16 + half * 8 + 4 * quad + k for k in range(4)]
+                        quant_words[quad] = self.quantize4(x_words, elem_idxs, rcp)
                     for vec_idx in cutlass.range_constexpr(8 // VEC_K):
                         col = col0 + half * 64 + vec_idx * VEC_K
                         if col < K:
-                            dst = cute.make_tensor(global_ptr(mQ.iterator, Int64(row) * Int64(K) + Int64(col), 1, Uint8, VEC_K), cute.make_layout(VEC_K))
-                            src = cute.make_tensor(q_bytes.iterator + vec_idx * VEC_K, cute.make_layout(VEC_K))
+                            dst = cute.make_tensor(global_ptr(mTok.iterator, Int64(row) * Int64(K) + Int64(col), 1, Uint8, VEC_K), cute.make_layout(VEC_K))
+                            src = cute.make_tensor(quant_bytes.iterator + vec_idx * VEC_K, cute.make_layout(VEC_K))
                             cute.autovec_copy(src, dst)
 
     @cute.jit
-    def reduce_tile_amax(self, row_amax: cute.Tensor, mST: cute.Tensor, sub_block: SubBlock) -> Float32:
+    def reduce_tile_amax(self, row_amax: cute.Tensor, mBlkTScale: cute.Tensor, sub_block: SubBlock) -> Float32:
         """
         Reduce the row amaxes over the CTA's tile, store the tile's blk_t scale (thread 0) and
         return its reciprocal.
         """
         tidx, warp, lane, m_tile_idx, k_tile_idx = sub_block.tidx, sub_block.warp, sub_block.lane, sub_block.m_tile_idx, sub_block.k_tile_idx
-        num_m_tiles = Int32(mST.shape[1])
+        num_m_tiles = Int32(mBlkTScale.shape[1])
         tile_amax = row_amax[0]
         for i in cutlass.range_constexpr(1, self.rows):
             tile_amax = cute.arch.fmax(tile_amax, row_amax[i])
@@ -242,37 +242,40 @@ class RowwiseBlockwiseTranspose:
         tile_scale = e8m0_scale(tile_amax)
         tile_rcp = exact_rcp(tile_scale)
         if tidx == 0:
-            scale_t_tile = cute.make_tensor(global_ptr(mST.iterator, Int64(k_tile_idx) * Int64(num_m_tiles) + Int64(m_tile_idx), 4, Float32, 4), cute.make_layout(1))
-            scale_t_tile[0] = tile_scale
+            blk_t_scale_entry = cute.make_tensor(global_ptr(mBlkTScale.iterator, Int64(k_tile_idx) * Int64(num_m_tiles) + Int64(m_tile_idx), 4, Float32, 4), cute.make_layout(1))
+            blk_t_scale_entry[0] = tile_scale
         return tile_rcp
 
     @cute.jit
-    def store_transposed(self, x_words: cute.Tensor, tile_rcp: Float32, q_bytes: cute.Tensor, mQT: cute.Tensor, sub_block: SubBlock) -> None:
+    def store_transposed(self, x_words: cute.Tensor, tile_rcp: Float32, quant_bytes: cute.Tensor, mBlkT: cute.Tensor, sub_block: SubBlock) -> None:
         """
         Quantize the register block by the tile scale into blk_t, each column's rows as one vector.
         """
         row0, col0, M, K = sub_block.row0, sub_block.col0, sub_block.M, sub_block.K
         VEC_M = self.vec_m
-        q_words = cute.recast_tensor(q_bytes, Uint32)
+        quant_words = cute.recast_tensor(quant_bytes, Uint32)
         if row0 < M:
             for half in cutlass.range_constexpr(2):
                 for col_in_half in cutlass.range_constexpr(8):
                     col = col0 + half * 64 + col_in_half
                     if col < K:
                         for quad in cutlass.range_constexpr(self.rows // 4):
-                            q_words[quad] = self.quantize4(x_words, [(4 * quad + k) * 16 + half * 8 + col_in_half for k in range(4)], tile_rcp)
+                            quant_words[quad] = self.quantize4(x_words, [(4 * quad + k) * 16 + half * 8 + col_in_half for k in range(4)], tile_rcp)
                         for vec_idx in cutlass.range_constexpr(self.rows // VEC_M):
                             row = row0 + vec_idx * VEC_M
                             if row < M:
                                 offset = Int64(col) * Int64(M) + Int64(row)
-                                dst = cute.make_tensor(global_ptr(mQT.iterator, offset, 1, Uint8, VEC_M), cute.make_layout(VEC_M))
-                                src = cute.make_tensor(q_bytes.iterator + vec_idx * VEC_M, cute.make_layout(VEC_M))
+                                dst = cute.make_tensor(global_ptr(mBlkT.iterator, offset, 1, Uint8, VEC_M), cute.make_layout(VEC_M))
+                                src = cute.make_tensor(quant_bytes.iterator + vec_idx * VEC_M, cute.make_layout(VEC_M))
                                 cute.autovec_copy(src, dst)
 
-    def quantize4(self, x_words: cute.Tensor, elems: list, rcp: Float32) -> Uint32:
+    def quantize4(self, x_words: cute.Tensor, elem_idxs: list, rcp: Float32) -> Uint32:
+        """
+        Quantize the 4 block elements at elem_idxs by rcp to 4 packed e4m3 bytes.
+        """
         word_idxs: list = []
         elem_picks: list = []
-        for elem_idx in elems:
+        for elem_idx in elem_idxs:
             word_idx = elem_idx // self.elems_per_word
             if word_idx not in word_idxs:
                 word_idxs.append(word_idx)
@@ -310,7 +313,7 @@ DISPATCH: dict[tuple, tuple] = {}
 
 def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) -> tuple:
     """
-    (compiled kernel or None for an empty input, ceil(K/128), ceil(M/128)).
+    Return (compiled kernel, or None for an empty input; ceil(K / 128); ceil(M / 128)).
     """
     num_k_tiles, num_m_tiles = (K + BLOCK - 1) // BLOCK, (M + BLOCK - 1) // BLOCK
     if M == 0 or K == 0:
@@ -333,6 +336,9 @@ def resolve(dtype: torch.dtype, M: int, K: int, x_row_stride: int, x_addr: int) 
 
 
 def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    SM90 implementation of fp8_quant_act.
+    """
     assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
     M, K = x.shape
     x_row_stride, x_col_stride = x.stride()
@@ -348,9 +354,10 @@ def fp8_quant_act_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, tor
         entry = DISPATCH[key] = resolve(dtype, M, K, x_row_stride, x.data_ptr())
     fn, num_k_tiles, num_m_tiles = entry
     device = x.device
-    out_tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=device)
-    scale_tok = mn_major_scale(M, num_k_tiles, device)
-    out_blk_t, scale_blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=device), torch.empty((num_k_tiles, num_m_tiles), dtype=torch.float32, device=device)
+    tok = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=device)
+    tok_scale = mn_major_scale(M, num_k_tiles, device)
+    blk_t = torch.empty((K, M), dtype=torch.float8_e4m3fn, device=device)
+    blk_t_scale = torch.empty((num_k_tiles, num_m_tiles), dtype=torch.float32, device=device)
     if fn is not None:
-        fn(x, out_tok, scale_tok, out_blk_t, scale_blk_t)
-    return out_tok, scale_tok, out_blk_t, scale_blk_t
+        fn(x, tok, tok_scale, blk_t, blk_t_scale)
+    return tok, tok_scale, blk_t, blk_t_scale
