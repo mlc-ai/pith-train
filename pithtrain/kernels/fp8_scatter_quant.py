@@ -20,11 +20,11 @@ def scatter_quant(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups:
     - padding_alignment must be 128. group_counts: the true per-expert slot counts on the host, if
       known; it must match expert_idxs and saves the device-to-host copy (and host sync) of the
       padded group sizes.
-    - The 4-tuple is fp8_quant_grouped's layout over the M = sum(ks) grouped rows
-      (each group padded with zero rows to a multiple of 128). reverse_shuffle_idxs: int64 (m,), the
-      grouped row of each slot. grouped_mm_offs: int32 (G,) cumulative padded group ends. ks: host
-      list of the padded group sizes; ks_tensor: the same as int32 (G,) on the device. With m == 0
-      every output is empty, grouped_mm_offs and ks_tensor of shape (0,).
+    - The 4-tuple is fp8_quant_grouped's layout over the M = sum(ks) grouped rows (each group padded
+      with zero rows to a multiple of 128). reverse_shuffle_idxs: int64 (m,), the grouped row of
+      each slot. grouped_mm_offs: int32 (G,) cumulative padded group ends. ks: host list of the
+      padded group sizes; ks_tensor: the same as int32 (G,) on the device. With m == 0 every output
+      is empty, grouped_mm_offs and ks_tensor of shape (0,).
 
     Row placement within a group: stable (slot order, fully deterministic) where the fused SM90
     kernels cover the input; atomic_add order otherwise on SM90 (m or N zero, more than 512 groups,

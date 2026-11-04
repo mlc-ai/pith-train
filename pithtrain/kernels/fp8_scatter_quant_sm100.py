@@ -1099,4 +1099,3 @@ def scatter_quant_sm100(gathered, expert_idxs, num_groups, expand_idx=None, padd
     ] + group_counts + [0] * (gb - g)
     fused_kernel(n, gb, wide, gathered.numel() // 2 >= 2**31 - 1)(*args)
     return (x_fp8, x_scale, x_ch, x_ch_scale), reverse, offs, ks, ks_t
-
