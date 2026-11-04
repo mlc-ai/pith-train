@@ -80,7 +80,7 @@ Use the **`add-new-model`** skill — it covers the full scope below and runs th
 
 1. **Model file** — `pithtrain/models/<model>.py`, self-contained, implementing `ModelProtocol` and `LayerProtocol` from [`models/interface.py`](pithtrain/models/interface.py). The decoder layer must expose `forward_stage1` (stage 1), `forward_stage3` (stage 3), `forward_stage5` (stage 5), and `reference_forward` (a plain forward for correctness validation). Build linears via `training.Linear` / `training.GroupedLinear` so the model is FP8/BF16 agnostic. Copy an existing model (e.g. `qwen3_moe.py`) as a template rather than abstracting a shared base — this is the no-indirection principle in action.
 2. **Wiring** — register the model where models are constructed (`setup_model`), add FSDP wrapping (`apply_fsdp`), and a config under `examples/pretrain_lm/<model>/` (`script.py` + `config.json`).
-3. **Checkpoint conversion** (optional) — a converter under `tasks/convert_checkpoint/` if you want HuggingFace import/export.
+3. **Checkpoint conversion** (optional) — a converter under `modules/hf_converters/` if you want HuggingFace import/export.
 4. **Tests** — add the model to `tests/test_dualpipev.sh` and bring it up from pp=1/ep=1 to pp=2/ep=2, plus a single-GPU inference test.
 
 ### Add a new operator / kernel
