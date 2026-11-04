@@ -47,7 +47,9 @@ def _empty(store):
 @pytest.fixture
 def production(request, record_property):
     """Load whole modules with reversible, function-local import isolation."""
-    assert str(torch.__version__).split("+")[0].startswith("2.13."), "Requires project-supported PyTorch 2.13"
+    assert str(torch.__version__).split("+")[0].startswith("2.13."), (
+        "Requires project-supported PyTorch 2.13"
+    )
     torch.set_num_threads(1)
     if torch.get_num_interop_threads() != 1:
         torch.set_num_interop_threads(1)
@@ -161,7 +163,10 @@ def production(request, record_property):
         native_source = Path(native_grouped_mm.__code__.co_filename).resolve()
         assert fsdp_source.is_relative_to(torch_root)
         sources = {
-            name: {"path": str(Path(module.__file__).resolve()), "sha256": _sha(Path(module.__file__))}
+            name: {
+                "path": str(Path(module.__file__).resolve()),
+                "sha256": _sha(Path(module.__file__)),
+            }
             for name, module in (
                 ("grouped_linear", grouped),
                 ("execution", execution),
@@ -180,12 +185,22 @@ def production(request, record_property):
                     "torch": str(torch.__version__),
                     "torch_path": torch.__file__,
                     "torch_git_version": getattr(torch.version, "git_version", None),
-                    "native_functional_source": {"path": str(native_source), "sha256": _sha(native_source)},
-                    "installed_FSDPParam_source": {"path": str(fsdp_source), "sha256": _sha(fsdp_source)},
+                    "native_functional_source": {
+                        "path": str(native_source),
+                        "sha256": _sha(native_source),
+                    },
+                    "installed_FSDPParam_source": {
+                        "path": str(fsdp_source),
+                        "sha256": _sha(fsdp_source),
+                    },
                     "threads": torch.get_num_threads(),
                     "interop_threads": torch.get_num_interop_threads(),
                     "pipeline_package_init_bypassed": True,
-                    "GPU_dependency_shims": [deep_gemm.__name__, quantize.__name__, linear.__name__],
+                    "GPU_dependency_shims": [
+                        deep_gemm.__name__,
+                        quantize.__name__,
+                        linear.__name__,
+                    ],
                 },
                 sort_keys=True,
             ),
@@ -218,7 +233,7 @@ def _owner(dtype=torch.bfloat16, requires_grad=True):
     # Use the existing CPU grouped_mm tests' 16-wide layout. Zero padding leaves
     # the original 2x2 active values, coefficients, pullback and exact oracle intact.
     values = torch.zeros((1, WIDTH, WIDTH), dtype=dtype, device="cpu")
-    values[0, :2, :2] = torch.tensor([[1., 2.], [3., 4.]], dtype=dtype, device="cpu")
+    values[0, :2, :2] = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=dtype, device="cpu")
     owner = nn.Module()
     owner.weight = nn.Parameter(values, requires_grad=requires_grad)
     return owner
@@ -326,9 +341,9 @@ def test_saved_nonleaf_lifecycle(production, kind):
         owner.zero_grad(set_to_none=True)
         observer.reset()
         _empty(api.store)
-        scale = 1. if epoch == 0 else .5
+        scale = 1.0 if epoch == 0 else 0.5
         shared = owner.weight.square().bfloat16()
-        coefficients = [2.] if kind == "consumed" else [2., 3.]
+        coefficients = [2.0] if kind == "consumed" else [2.0, 3.0]
         calls = [
             (owner.weight.square().bfloat16() if kind == "fresh" else shared, 0, 0, c * scale)
             for c in coefficients
@@ -356,8 +371,8 @@ def test_raw_leaf_deferred_queue_and_fp32_sum(production, ambient, no_grad_w):
             owner.zero_grad(set_to_none=True)
             observer.reset()
             _empty(api.store)
-            scale = 1. if epoch == 0 else .5
-            calls = [(owner.weight, 0, 0, c * scale) for c in (128., .5, -128.)]
+            scale = 1.0 if epoch == 0 else 0.5
+            calls = [(owner.weight, 0, 0, c * scale) for c in (128.0, 0.5, -128.0)]
             loss, inputs = _graph(api, calls)
             assert _backward_and_flush(api, loss, inputs, observer) == 3
             assert owner.weight.grad is None and not observer.sink.any()
@@ -367,9 +382,12 @@ def test_raw_leaf_deferred_queue_and_fp32_sum(production, ambient, no_grad_w):
                 api.store.pop()
             _empty(api.store)
             observer.assert_counts(b_defined=0, b_none=1, w_defined=3)
-            assert all(e["multithreading"] == (False if e["phase"] == "B" else ambient) for e in observer.events)
+            assert all(
+                e["multithreading"] == (False if e["phase"] == "B" else ambient)
+                for e in observer.events
+            )
             assert torch.autograd.is_multithreading_enabled() == ambient
-            _same(observer.sink, _basis(0, 0, .5 * scale))
+            _same(observer.sink, _basis(0, 0, 0.5 * scale))
             assert owner.weight.grad is None
 
 
@@ -382,16 +400,20 @@ def test_shared_nonleaf_exact_two_round_oracle(production, kind):
         owner.zero_grad(set_to_none=True)
         observer.reset()
         _empty(api.store)
-        scale = 1. if epoch == 0 else .5
+        scale = 1.0 if epoch == 0 else 0.5
         if kind == "cast":
             shared = owner.weight.bfloat16()
-            calls = [(shared, 0, 0, c * scale) for c in (128., .5, -128.)]
-            expected = _basis(0, 0, .5 * scale)
+            calls = [(shared, 0, 0, c * scale) for c in (128.0, 0.5, -128.0)]
+            expected = _basis(0, 0, 0.5 * scale)
         else:
             shared, transposed = owner.weight.view_as(owner.weight), owner.weight.transpose(1, 2)
-            calls = [(shared, 0, 0, 128. * scale), (shared, 0, 0, -128. * scale),
-                     (transposed, 1, 0, .5 * scale), (transposed, 1, 0, .25 * scale)]
-            expected = _basis(0, 1, .75 * scale)
+            calls = [
+                (shared, 0, 0, 128.0 * scale),
+                (shared, 0, 0, -128.0 * scale),
+                (transposed, 1, 0, 0.5 * scale),
+                (transposed, 1, 0, 0.25 * scale),
+            ]
+            expected = _basis(0, 1, 0.75 * scale)
         loss, inputs = _graph(api, calls)
         queued = _backward_and_flush(api, loss, inputs, observer)
         api.store.pop()
@@ -408,8 +430,8 @@ def test_frozen_alias_stays_without_gradient(production):
     for epoch in range(2):
         owner.zero_grad(set_to_none=True)
         alias = owner.weight.view_as(owner.weight)
-        scale = 1. if epoch == 0 else .5
-        loss, inputs = _graph(api, [(alias, 0, 0, c * scale) for c in (128., .5, -128.)])
+        scale = 1.0 if epoch == 0 else 0.5
+        loss, inputs = _graph(api, [(alias, 0, 0, c * scale) for c in (128.0, 0.5, -128.0)])
         _backward_and_flush(api, loss, inputs)
         api.store.pop()
         _empty(api.store)
@@ -420,7 +442,7 @@ def test_w_hook_error_preserves_partial_state(production):
     api = production
     owner = _owner()
     observer = _Observer(owner.weight, fault=True)
-    loss, inputs = _graph(api, [(owner.weight, 0, 0, c) for c in (128., .5, -128.)])
+    loss, inputs = _graph(api, [(owner.weight, 0, 0, c) for c in (128.0, 0.5, -128.0)])
     assert _backward_and_flush(api, loss, inputs, observer) == 3
     with pytest.raises(_InjectedHookError, match="second defined W hook"):
         api.store.pop()
@@ -453,13 +475,27 @@ def test_deferred_w_uses_real_fsdp_accumulation_methods(production):
     parameter._unsharded_param = owner.weight
     parameter.unsharded_accumulated_grad = None
     parameter.reduce_dtype = torch.float32
-    assert parameter.accumulate_unsharded_grad_if_needed.__func__ is FSDPParam.accumulate_unsharded_grad_if_needed
-    assert parameter.to_accumulated_grad_if_needed.__func__ is FSDPParam.to_accumulated_grad_if_needed
+    assert (
+        parameter.accumulate_unsharded_grad_if_needed.__func__
+        is FSDPParam.accumulate_unsharded_grad_if_needed
+    )
+    assert (
+        parameter.to_accumulated_grad_if_needed.__func__ is FSDPParam.to_accumulated_grad_if_needed
+    )
     fsdp_source = Path(importlib.import_module(FSDPParam.__module__).__file__).resolve()
-    assert Path(parameter.accumulate_unsharded_grad_if_needed.__func__.__code__.co_filename).resolve() == fsdp_source
-    assert Path(parameter.to_accumulated_grad_if_needed.__func__.__code__.co_filename).resolve() == fsdp_source
+    assert (
+        Path(parameter.accumulate_unsharded_grad_if_needed.__func__.__code__.co_filename).resolve()
+        == fsdp_source
+    )
+    assert (
+        Path(parameter.to_accumulated_grad_if_needed.__func__.__code__.co_filename).resolve()
+        == fsdp_source
+    )
     group = SimpleNamespace(
-        fsdp_params=[parameter], reduce_grads=False, pre_backward=lambda: None, post_backward=lambda: None
+        fsdp_params=[parameter],
+        reduce_grads=False,
+        pre_backward=lambda: None,
+        post_backward=lambda: None,
     )
     api.accumulation._attach_main_grads(group, [])
     for epoch in range(2):
@@ -469,12 +505,12 @@ def test_deferred_w_uses_real_fsdp_accumulation_methods(production):
         hook_count = len(owner.weight._post_accumulate_grad_hooks)
         group.pre_backward()
         assert len(owner.weight._post_accumulate_grad_hooks) == hook_count == 1
-        scale = 1. if epoch == 0 else .5
-        loss, inputs = _graph(api, [(owner.weight, 0, 0, c * scale) for c in (128., .5, -128.)])
+        scale = 1.0 if epoch == 0 else 0.5
+        loss, inputs = _graph(api, [(owner.weight, 0, 0, c * scale) for c in (128.0, 0.5, -128.0)])
         assert _backward_and_flush(api, loss, inputs) == 3
         assert owner.weight.grad is None and parameter.unsharded_accumulated_grad is None
         api.store.pop()
         _empty(api.store)
         assert owner.weight.grad is None
         assert parameter.unsharded_accumulated_grad.dtype == torch.float32
-        _same(parameter.unsharded_accumulated_grad, _basis(0, 0, .5 * scale))
+        _same(parameter.unsharded_accumulated_grad, _basis(0, 0, 0.5 * scale))
