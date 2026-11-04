@@ -141,17 +141,23 @@ class RowAccess:
 
     @cute.jit
     def load_element(self, addr: Int64, ok) -> Float32:
+        """
+        The element at addr widened to fp32, or -inf where ok is false.
+        """
         value = -Float32.inf
         if ok:
             if const_expr(self.element_bytes == 4):
                 value = Float32(asm(T.f32(), [to_ir(addr, Int64)], "ld.global.f32 $0, [$1];", "=f,l", side_effects=True))
             else:
-                bits = Uint32(asm(T.i32(), [to_ir(addr, Int64)], "{\n.reg .b16 h;\nld.global.b16 h, [$1];\ncvt.u32.u16 $0, h;\n}", "=r,l", side_effects=True))
-                value = unpack_unit((bits,), self.dtype)[0]
+                element_bits = Uint32(asm(T.i32(), [to_ir(addr, Int64)], "{\n.reg .b16 h;\nld.global.b16 h, [$1];\ncvt.u32.u16 $0, h;\n}", "=r,l", side_effects=True))
+                value = unpack_unit((element_bits,), self.dtype)[0]
         return value
 
     @cute.jit
     def store_element(self, addr: Int64, value: Float32, ok) -> None:
+        """
+        Round value once to dtype and store it at addr where ok is true.
+        """
         if ok:
             if const_expr(self.element_bytes == 4):
                 asm(None, [to_ir(addr, Int64), to_ir(value, Float32)], "st.global.f32 [$0], $1;", "l,f", side_effects=True)

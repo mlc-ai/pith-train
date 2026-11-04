@@ -1,7 +1,7 @@
 """
 Inline-PTX E8M0 scale math for the SM90 CuTe-DSL quantization kernels: the recipe's SM90 E8M0
-scale (the power of two at or above max(amax, 1e-4) / 448, at least 2^-126) bit for bit, and the
-RN-satfinite e4m3 cast (cvt.rn.satfinite.e4m3x2.f32).
+scale (the power of two at or above max(amax, 1e-4) / 448, at least 2^-126) bit for bit, from an
+fp32 or a packed bf16 amax, its exact reciprocal, and the RN-satfinite e4m3 cast.
 """
 
 import struct
@@ -17,6 +17,9 @@ __all__ = ["AMAX_MIN", "FP8_MAX_RCP", "e8m0_scale", "e8m0_scale_bf16x2", "e8m0_s
 
 
 def ptx_f32(x: float) -> str:
+    """
+    The PTX fp32 immediate (0fXXXXXXXX) holding x.
+    """
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 
@@ -72,8 +75,7 @@ def quant4_e4m3(x0: Float32, x1: Float32, x2: Float32, x3: Float32, r: tuple, *,
     )
 
 
-AMAX_MIN_BITS = f32_hex(1e-4)
-FP8_MAX_RCP_BITS = f32_hex(1.0 / 448.0)
+AMAX_MIN_BITS, FP8_MAX_RCP_BITS = f32_hex(1e-4), f32_hex(1.0 / 448.0)
 
 
 @dsl_user_op

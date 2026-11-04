@@ -85,7 +85,7 @@ __all__.append("segment_sum")
 __all__.append("silu_mul_bwd")
 __all__.append("silu_mul_fwd")
 
-# log-probability
+# Log-probability
 __all__.append("log_prob_bwd")
 __all__.append("log_prob_fwd")
 
@@ -129,7 +129,6 @@ __all__.append("gdr_cp_bwd_states")
 __all__.append("gdr_cp_fwd_local")
 __all__.append("gdr_cp_fwd_output")
 __all__.append("gdr_cp_merge")
-
 
 # Launch-config tuning
 __all__.append("tune_kernels")

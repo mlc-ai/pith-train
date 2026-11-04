@@ -1,7 +1,6 @@
 """
 Inductor options the models merge into the torch.compile options of their compiled stages, chosen
-per architecture by the kernel library like its capability queries. Not a kernel: like
-tune_kernels, it has no PyTorch verifier (tests/kernels/test_compile_options.py checks the options).
+per architecture by the kernel library like its capability queries.
 """
 
 from pithtrain.kernels.arch import ARCH_MAJOR

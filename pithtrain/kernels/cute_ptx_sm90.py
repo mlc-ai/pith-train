@@ -1,15 +1,15 @@
 """
-Inline-PTX helpers shared by the SM90 CuTe-DSL kernels, each a dsl_user_op emitting one short PTX
-sequence. Two calling conventions: asm(res_type, args, ptx, constraints), whose stores return
-nothing, and asm_args_last(res_type, ptx, constraints, args), whose stores return a dummy register.
-An asm_args_last helper that shares a name with an asm helper carries a suffix: _args_last when only
-the emission differs, otherwise one naming the difference (ld_b32_coherent is a coherent ld.global,
-not .nc; lds_b32_pred is predicated; sts_b32_nopred is not).
+Inline-PTX helpers shared by the SM90 CuTe-DSL kernels: dsl_user_op wrappers that each emit one
+short PTX sequence, plus the emission helpers they are built from (asm, asm_args_last, to_ir,
+unpack, f32_hex). Two calling conventions: asm(res_type, args, ptx, constraints), whose stores
+return nothing, and asm_args_last(res_type, ptx, constraints, args), whose stores return a dummy
+register. An asm_args_last helper that shares a name with an asm helper carries a suffix:
+_args_last when only the emission differs, otherwise one naming the difference (ld_b32_coherent is
+a coherent ld.global, not .nc; lds_b32_pred is predicated; sts_b32_nopred is not).
 """
 
 import struct
 
-import cutlass
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -19,11 +19,33 @@ __all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "barrier_expect_tx", 
 
 
 def f32_hex(value: float) -> str:
+    """
+    The fp32 bit pattern of value as a PTX hex literal (0xXXXXXXXX).
+    """
     return f"0x{struct.unpack('<I', struct.pack('<f', value))[0]:08X}"
 
 
 def asm(res_type, args, ptx: str, constraints: str, side_effects: bool = False):
     return llvm.inline_asm(res_type, args, ptx, constraints, has_side_effects=side_effects, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+def asm_args_last(res_type, ptx: str, constraints: str, args: list, side_effects: bool = False):
+    return asm(res_type, args, ptx, constraints, side_effects)
+
+
+def to_ir(x, value_type, loc=None, ip=None):
+    """
+    The MLIR value of x converted to value_type (Int32, Uint32, Int64 or Float32).
+    """
+    return value_type(x).ir_value(loc=loc, ip=ip)
+
+
+def unpack(struct_value, num_values: int, value_type, loc=None, ip=None) -> tuple:
+    """
+    The first num_values fields of an asm struct result, as value_type (Float32 or a 32-bit int).
+    """
+    element_type = T.f32() if value_type is Float32 else T.i32()
+    return tuple(value_type(llvm.extractvalue(element_type, struct_value, [i], loc=loc, ip=ip)) for i in range(num_values))
 
 
 @dsl_user_op
@@ -147,30 +169,17 @@ def red_or_shared(addr: Int32, value: Uint32, pred: Int32, *, loc=None, ip=None)
 def bf16x2_to_f32(x: Uint32, *, loc=None, ip=None) -> tuple:
     x_lo = asm(T.f32(), [Uint32(x).ir_value(loc=loc, ip=ip)], "shl.b32 $0, $1, 16;", "=f,r")
     x_hi = asm(T.f32(), [Uint32(x).ir_value(loc=loc, ip=ip)], "and.b32 $0, $1, 0xFFFF0000;", "=f,r")
-    return cutlass.Float32(x_lo), cutlass.Float32(x_hi)
+    return Float32(x_lo), Float32(x_hi)
 
 
 @dsl_user_op
 def f32x2_to_bf16x2(x_lo, x_hi, *, loc=None, ip=None) -> Uint32:
-    return Uint32(asm(T.i32(), [cutlass.Float32(x_hi).ir_value(loc=loc, ip=ip), cutlass.Float32(x_lo).ir_value(loc=loc, ip=ip)], "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f"))
+    return Uint32(asm(T.i32(), [Float32(x_hi).ir_value(loc=loc, ip=ip), Float32(x_lo).ir_value(loc=loc, ip=ip)], "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f"))
 
 
 @dsl_user_op
 def st_v4(addr: Int64, words: tuple, pred: Int32, *, loc=None, ip=None) -> None:
     asm(None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Uint32(word).ir_value(loc=loc, ip=ip) for word in words] + [Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $5, 0;\n\t@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n\t}", "l,r,r,r,r,r", side_effects=True)
-
-
-def asm_args_last(res_type, ptx: str, constraints: str, args: list, side_effects: bool = False):
-    return asm(res_type, args, ptx, constraints, side_effects)
-
-
-def to_ir(x, value_type, loc=None, ip=None):
-    return value_type(x).ir_value(loc=loc, ip=ip)
-
-
-def unpack(struct_value, num_values: int, value_type, loc=None, ip=None) -> tuple:
-    element_type = T.f32() if value_type is Float32 else T.i32()
-    return tuple(value_type(llvm.extractvalue(element_type, struct_value, [i], loc=loc, ip=ip)) for i in range(num_values))
 
 
 @dsl_user_op
