@@ -20,8 +20,8 @@ whole row. u = (x * c - m2) - log2 d = log2 p, dx = p * (A + B * u) + [i == y] g
 adds g_logp / T to that lane before the single rounding.
 
 The kernels read bf16 or fp32 logits and int64 targets. Other float logits run them on an fp32 copy
-(the gradient is computed in fp32 and rounded once into inp), other integer
-targets on an int64 copy.
+(the gradient is computed in fp32 and rounded once into inp), other integer targets on an int64
+copy.
 """
 
 import functools
@@ -35,39 +35,39 @@ TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_con
 
 __all__ = ["log_prob_bwd_sm100", "log_prob_fwd_sm100"]
 
-def old_max(a, b):
+
+def max_drop_nan(a, b):
     """
-    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN operand
-    (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
+    CUDA fmaxf for float32 operands, which drops a NaN operand (txl.max emits a NaN-propagating
+    select); txl.max otherwise.
     """
-    return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_f32(a, b) else txl.max(a, b)
+    return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_any_f32(a, b) else txl.max(a, b)
 
 
-def old_min(a, b):
+def min_drop_nan(a, b):
     """
-    txl.min as apache-tvm 0.27 emitted it: CUDA fminf for float32 operands, txl.min otherwise.
+    CUDA fminf for float32 operands, txl.min otherwise.
     """
-    return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_f32(a, b) else txl.min(a, b)
+    return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_any_f32(a, b) else txl.min(a, b)
 
 
-def is_f32(*xs):
+def is_any_f32(*operands):
     """
     Whether any operand is a float32 expression (the other may be a Python float).
     """
-    return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
-
+    return any(str(getattr(getattr(operand, "ty", None), "dtype", "")) == "float32" for operand in operands)
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
-    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
-    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on
+    every call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
 LOG2E = 1.4426950408889634
@@ -75,346 +75,384 @@ LN2 = 0.6931471805599453
 MARGIN = 0.0  # reference = first-vector max; 2^u overflow (u > ~117) falls back
 REDO_LOG2 = 20.0
 WARPS = 8
-NT = WARPS * 32
+THREADS = WARPS * 32
 UNROLL = 4
-FULL = 0xFFFFFFFF
+FULL_MASK = 0xFFFFFFFF
 
 
-def f32(v):
-    return txl.float32(v)
+def f32(value):
+    return txl.float32(value)
 
 
-def i64(v):
-    return txl.Cast("int64", v)
+def i64(value):
+    return txl.Cast("int64", value)
 
 
-def load(x, dtype, vec, idx, f, off):
+def load_vector(x, dtype, vec, elem_idx, dst, dst_offset):
     """
-    Load `vec` consecutive elements at element index `idx` (int64) into f[off:off+vec] (f32).
-    """
-    if dtype == "bfloat16":
-        if vec == 8:
-            w = txl.alloc_local([4], "uint32")
-            txl.ptx["ld.global.nc.L1::no_allocate.v4.b32"](w[0], w[1], w[2], w[3], x.ptr_to([idx]))
-            for i in range(4):
-                txl.assign(f[off + 2 * i], txl.reinterpret(w[i] << txl.uint32(16), ty="float32"))
-                txl.assign(f[off + 2 * i + 1], txl.reinterpret(w[i] & txl.uint32(0xFFFF0000), ty="float32"))
-        else:
-            h = txl.alloc_local([1], "uint16")
-            txl.ptx["ld.global.nc.b16"](h[0], x.ptr_to([idx]))
-            txl.assign(f[off], txl.reinterpret(txl.Cast("uint32", h[0]) << txl.uint32(16), ty="float32"))
-    else:
-        if vec == 4:
-            txl.ptx["ld.global.nc.L1::no_allocate.v4.f32"](f[off], f[off + 1], f[off + 2], f[off + 3], x.ptr_to([idx]))
-        else:
-            txl.ptx["ld.global.nc.f32"](f[off], x.ptr_to([idx]))
-
-
-def store(x, dtype, vec, idx, g, off):
-    """
-    Round g[off:off+vec] once to x's dtype and store at element index `idx`.
+    Load vec consecutive elements at element index elem_idx (int64) as f32 into
+    dst[dst_offset:][:vec].
     """
     if dtype == "bfloat16":
         if vec == 8:
-            w = txl.alloc_local([4], "uint32")
+            words = txl.alloc_local([4], "uint32")
+            txl.ptx["ld.global.nc.L1::no_allocate.v4.b32"](words[0], words[1], words[2], words[3], x.ptr_to([elem_idx]))
             for i in range(4):
-                txl.ptx["cvt.rn.bf16x2.f32"](w[i], g[off + 2 * i + 1], g[off + 2 * i])
-            txl.ptx["st.global.L1::no_allocate.v4.b32"](x.ptr_to([idx]), w[0], w[1], w[2], w[3])
+                txl.assign(dst[dst_offset + 2 * i], txl.reinterpret(words[i] << txl.uint32(16), ty="float32"))
+                txl.assign(dst[dst_offset + 2 * i + 1], txl.reinterpret(words[i] & txl.uint32(0xFFFF0000), ty="float32"))
         else:
-            h = txl.alloc_local([1], "uint16")
-            txl.ptx["cvt.rn.bf16.f32"](h[0], g[off])
-            txl.ptx["st.global.b16"](x.ptr_to([idx]), h[0])
+            half = txl.alloc_local([1], "uint16")
+            txl.ptx["ld.global.nc.b16"](half[0], x.ptr_to([elem_idx]))
+            txl.assign(dst[dst_offset], txl.reinterpret(txl.Cast("uint32", half[0]) << txl.uint32(16), ty="float32"))
     else:
         if vec == 4:
-            txl.ptx["st.global.L1::no_allocate.v4.f32"](x.ptr_to([idx]), g[off], g[off + 1], g[off + 2], g[off + 3])
+            txl.ptx["ld.global.nc.L1::no_allocate.v4.f32"](dst[dst_offset], dst[dst_offset + 1], dst[dst_offset + 2], dst[dst_offset + 3], x.ptr_to([elem_idx]))
         else:
-            txl.ptx["st.global.f32"](x.ptr_to([idx]), g[off])
+            txl.ptx["ld.global.nc.f32"](dst[dst_offset], x.ptr_to([elem_idx]))
 
 
-def finite(v):
-    return (txl.reinterpret(v, ty="uint32") & txl.uint32(0x7F800000)) != txl.uint32(0x7F800000)
+def store_vector(x, dtype, vec, elem_idx, src, src_offset):
+    """
+    Round src[src_offset:][:vec] once to x's dtype and store it at element index elem_idx.
+    """
+    if dtype == "bfloat16":
+        if vec == 8:
+            words = txl.alloc_local([4], "uint32")
+            for i in range(4):
+                txl.ptx["cvt.rn.bf16x2.f32"](words[i], src[src_offset + 2 * i + 1], src[src_offset + 2 * i])
+            txl.ptx["st.global.L1::no_allocate.v4.b32"](x.ptr_to([elem_idx]), words[0], words[1], words[2], words[3])
+        else:
+            half = txl.alloc_local([1], "uint16")
+            txl.ptx["cvt.rn.bf16.f32"](half[0], src[src_offset])
+            txl.ptx["st.global.b16"](x.ptr_to([elem_idx]), half[0])
+    else:
+        if vec == 4:
+            txl.ptx["st.global.L1::no_allocate.v4.f32"](x.ptr_to([elem_idx]), src[src_offset], src[src_offset + 1], src[src_offset + 2], src[src_offset + 3])
+        else:
+            txl.ptx["st.global.f32"](x.ptr_to([elem_idx]), src[src_offset])
+
+
+def is_finite(value):
+    return (txl.reinterpret(value, ty="uint32") & txl.uint32(0x7F800000)) != txl.uint32(0x7F800000)
 
 
 def ex2(dst, src):
     txl.ptx.ex2.approx.ftz.f32(dst, src)
 
 
-def shfl(dst, v, delta):
+def shfl_bfly(dst, value, delta):
     peer = txl.alloc_local([1], "uint32")
-    txl.ptx.shfl_sync.bfly.b32(peer[0], txl.reinterpret(v, ty="uint32"), txl.uint32(delta), txl.uint32(31), txl.uint32(FULL))
+    txl.ptx.shfl_sync.bfly.b32(peer[0], txl.reinterpret(value, ty="uint32"), txl.uint32(delta), txl.uint32(31), txl.uint32(FULL_MASK))
     txl.assign(dst, txl.reinterpret(peer[0], ty="float32"))
 
 
-def warp_merge(st, rounds):
+def merge_warp_state(state, rounds):
+    """
+    Merge the lanes' (m2, d, s) into every lane, butterfly-summing over the given shuffle deltas.
+    """
     # Blackwell provides a native fp32 warp max. Once every lane is expressed relative to the
     # same maximum, d and s are ordinary sums; there is no need to rescale at every tree level.
-    m = txl.local_scalar("float32")
-    txl.ptx.redux_sync.max.f32(m, st[0], txl.uint32(FULL))
+    warp_max = txl.local_scalar("float32")
+    txl.ptx.redux_sync.max.f32(warp_max, state[0], txl.uint32(FULL_MASK))
     scale = txl.local_scalar("float32")
-    ex2(scale, st[0] - m)
-    txl.assign(st[2], (st[2] + (st[0] - m) * st[1]) * scale)
-    txl.assign(st[1], st[1] * scale)
-    txl.assign(st[0], m)
-    o = txl.alloc_local([2], "float32")
+    ex2(scale, state[0] - warp_max)
+    txl.assign(state[2], (state[2] + (state[0] - warp_max) * state[1]) * scale)
+    txl.assign(state[1], state[1] * scale)
+    txl.assign(state[0], warp_max)
+    peer_sums = txl.alloc_local([2], "float32")
     for delta in rounds:
-        shfl(o[0], st[1], delta)
-        shfl(o[1], st[2], delta)
-        txl.assign(st[1], st[1] + o[0])
-        txl.assign(st[2], st[2] + o[1])
+        shfl_bfly(peer_sums[0], state[1], delta)
+        shfl_bfly(peer_sums[1], state[2], delta)
+        txl.assign(state[1], state[1] + peer_sums[0])
+        txl.assign(state[2], state[2] + peer_sums[1])
 
 
-def sweep(x, dtype, vec, base, nvec, tid, f, body, j0=0, nt=NT):
+def sweep(x, dtype, vec, row_offset, num_vecs, tidx, vals, visit, vec_start=0, num_threads=THREADS):
     """
-    Visit this thread's vectors j = j0 + tid + k * nt below j0 + nvec: UNROLL loads in flight,
-    then a guarded tail.
+    Visit this thread's vectors vec_idx = vec_start + tidx + k * num_threads below vec_start +
+    num_vecs: UNROLL loads in flight, then a guarded tail.
     """
-    n_main = nvec // (UNROLL * nt)
-    tail0 = n_main * (UNROLL * nt)
-    with txl.serial(n_main) as it:
-        for q in range(UNROLL):
-            j = j0 + it * (UNROLL * nt) + q * nt + tid
-            load(x, dtype, vec, base + i64(j) * vec, f, q * vec)
-        for q in range(UNROLL):
-            body(q * vec, j0 + it * (UNROLL * nt) + q * nt + tid)
-    with txl.serial((nvec - tail0 + nt - 1) // nt) as it:
-        j = tail0 + it * nt + tid
-        with txl.if_(j < nvec), txl.then_():
-            load(x, dtype, vec, base + i64(j0 + j) * vec, f, 0)
-            body(0, j0 + j)
+    num_main_iters = num_vecs // (UNROLL * num_threads)
+    tail_start = num_main_iters * (UNROLL * num_threads)
+    with txl.serial(num_main_iters) as iter_idx:
+        for slot in range(UNROLL):
+            vec_idx = vec_start + iter_idx * (UNROLL * num_threads) + slot * num_threads + tidx
+            load_vector(x, dtype, vec, row_offset + i64(vec_idx) * vec, vals, slot * vec)
+        for slot in range(UNROLL):
+            visit(slot * vec, vec_start + iter_idx * (UNROLL * num_threads) + slot * num_threads + tidx)
+    with txl.serial((num_vecs - tail_start + num_threads - 1) // num_threads) as iter_idx:
+        vec_idx = tail_start + iter_idx * num_threads + tidx
+        with txl.if_(vec_idx < num_vecs), txl.then_():
+            load_vector(x, dtype, vec, row_offset + i64(vec_start + vec_idx) * vec, vals, 0)
+            visit(0, vec_start + vec_idx)
 
 
 @functools.cache
-def fwd_kernel(dtype, vec):
+def build_log_prob_fwd(dtype, vec):
     @txl.kernel()
-    def log_prob_fwd(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), tgt: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), logp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), ent: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), rmax: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), lsum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), n_rows: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, inv_t: txl.float32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_rows, block=(WARPS) * 32))
-        tid = txl.thread_id()
+    def log_prob_fwd(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), target: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), logp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), entropy: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), row_max: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), log_sum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), num_rows: txl.int32, num_cols: txl.int32, x_stride: txl.int64, target_stride: txl.int64, inv_temperature: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_rows, block=WARPS * 32))
+        tidx = txl.thread_id()
         lane = txl.lane_id()
         warp = txl.warp_id()
         # Reverse row order: the rows a preceding pass touched last are still in L2.
-        row = txl.local_scalar("int32", init=n_rows - 1 - txl.cta_id())
-        base = txl.local_scalar("int64", init=i64(row) * x_stride)
-        c = txl.local_scalar("float32", init=inv_t * f32(LOG2E))
-        nvec = n_cols // vec
+        row_idx = txl.local_scalar("int32", init=num_rows - 1 - txl.cta_id())
+        row_offset = txl.local_scalar("int64", init=i64(row_idx) * x_stride)
+        log2e_over_t = txl.local_scalar("float32", init=inv_temperature * f32(LOG2E))
+        num_vecs = num_cols // vec
 
         smem = txl.smem_pool()
-        red = smem.alloc([WARPS * 3], txl.f32)
+        s_warp_states = smem.alloc([WARPS * 3], txl.f32)
 
-        st = txl.alloc_local([3], "float32")  # m2, d, s
-        dd = txl.alloc_local([UNROLL], "float32")
-        ss = txl.alloc_local([UNROLL], "float32")
-        ev = txl.alloc_local([vec], "float32")
-        sv = txl.alloc_local([vec], "float32")
-        f = txl.alloc_local([UNROLL * vec], "float32")
-        u = txl.alloc_local([1], "float32")
+        state = txl.alloc_local([3], "float32")  # m2, d, s
+        acc_d, acc_s = txl.alloc_local([UNROLL], "float32"), txl.alloc_local([UNROLL], "float32")
+        exp_vals, exp_u_vals = txl.alloc_local([vec], "float32"), txl.alloc_local([vec], "float32")
+        vals, u = txl.alloc_local([UNROLL * vec], "float32"), txl.alloc_local([1], "float32")
 
-        # Target logit (thread 0), loaded early.
-        y = txl.local_scalar("int64", init=txl.int64(-1))
-        xy = txl.alloc_local([1], "float32")
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx["ld.global.nc.b64"](y, tgt.ptr_to([i64(row) * t_stride]))
-            txl.assign(xy[0], f32(0.0))
-            with txl.if_(txl.And(y >= txl.int64(0), y < i64(n_cols))), txl.then_():
-                load(x, dtype, 1, base + y, xy, 0)
+        def load_target_logit():
+            """
+            Thread 0 loads the target index and, when it is in range, the target logit, early.
+            """
+            target_idx = txl.local_scalar("int64", init=txl.int64(-1))
+            target_logit = txl.alloc_local([1], "float32")
+            with txl.if_(tidx == 0), txl.then_():
+                txl.ptx["ld.global.nc.b64"](target_idx, target.ptr_to([i64(row_idx) * target_stride]))
+                txl.assign(target_logit[0], f32(0.0))
+                with txl.if_(txl.And(target_idx >= txl.int64(0), target_idx < i64(num_cols))), txl.then_():
+                    load_vector(x, dtype, 1, row_offset + target_idx, target_logit, 0)
+            return target_idx, target_logit
 
-        # ---- fast path: one fixed reference per thread ----
-        txl.assign(st[0], f32(-1e30))
-        with txl.if_(tid < nvec), txl.then_():
-            load(x, dtype, vec, base + i64(tid) * vec, f, 0)
-            cm = txl.local_scalar("float32", init=f[0])
-            for k in range(1, vec):
-                txl.assign(cm, old_max(cm, f[k]))
-            txl.assign(st[0], cm * c + f32(MARGIN))
-        for q in range(UNROLL):
-            txl.assign(dd[q], f32(0.0))
-            txl.assign(ss[q], f32(0.0))
+        def set_thread_reference():
+            """
+            Fix the fast path's reference m2 from the thread's first vector.
+            """
+            txl.assign(state[0], f32(-1e30))
+            with txl.if_(tidx < num_vecs), txl.then_():
+                load_vector(x, dtype, vec, row_offset + i64(tidx) * vec, vals, 0)
+                vec_max = txl.local_scalar("float32", init=vals[0])
+                for k in range(1, vec):
+                    txl.assign(vec_max, max_drop_nan(vec_max, vals[k]))
+                txl.assign(state[0], vec_max * log2e_over_t + f32(MARGIN))
 
-        def accumulate(off):
+        def reset_accumulators():
+            for slot in range(UNROLL):
+                txl.assign(acc_d[slot], f32(0.0))
+                txl.assign(acc_s[slot], f32(0.0))
+
+        def sum_slots():
+            txl.assign(state[1], (acc_d[0] + acc_d[1]) + (acc_d[2] + acc_d[3]))
+            txl.assign(state[2], (acc_s[0] + acc_s[1]) + (acc_s[2] + acc_s[3]))
+
+        def accumulate_vector(slot_offset):
             """
             Tree-sum the vector's (e, e * u) and add it to the slot's accumulators.
             """
-            q = off // vec
-            w = vec
-            while w > 1:
-                w //= 2
-                for k in range(w):
-                    txl.assign(ev[k], ev[k] + ev[k + w])
-                    txl.assign(sv[k], sv[k] + sv[k + w])
-            txl.assign(dd[q], dd[q] + ev[0])
-            txl.assign(ss[q], ss[q] + sv[0])
+            slot = slot_offset // vec
+            width = vec
+            while width > 1:
+                width //= 2
+                for k in range(width):
+                    txl.assign(exp_vals[k], exp_vals[k] + exp_vals[k + width])
+                    txl.assign(exp_u_vals[k], exp_u_vals[k] + exp_u_vals[k + width])
+            txl.assign(acc_d[slot], acc_d[slot] + exp_vals[0])
+            txl.assign(acc_s[slot], acc_s[slot] + exp_u_vals[0])
 
-        def fast(off, j):
+        def visit_fast(slot_offset, vec_idx):
             for k in range(vec):
-                txl.assign(u[0], f[off + k] * c - st[0])
-                ex2(ev[k], u[0])
-                txl.assign(sv[k], ev[k] * u[0])
-            accumulate(off)
+                txl.assign(u[0], vals[slot_offset + k] * log2e_over_t - state[0])
+                ex2(exp_vals[k], u[0])
+                txl.assign(exp_u_vals[k], exp_vals[k] * u[0])
+            accumulate_vector(slot_offset)
 
-        def slow(off, j):
-            cm = txl.local_scalar("float32", init=f[off])
+        def visit_exact(slot_offset, vec_idx):
+            vec_max = txl.local_scalar("float32", init=vals[slot_offset])
             for k in range(1, vec):
-                txl.assign(cm, old_max(cm, f[off + k]))
-            nm = txl.local_scalar("float32", init=old_max(st[0], cm * c))
-            with txl.if_(nm > st[0]), txl.then_():
-                sc = txl.local_scalar("float32")
-                ex2(sc, st[0] - nm)
-                for q in range(UNROLL):
-                    txl.assign(ss[q], (ss[q] + (st[0] - nm) * dd[q]) * sc)
-                    txl.assign(dd[q], dd[q] * sc)
-                txl.assign(st[0], nm)
+                txl.assign(vec_max, max_drop_nan(vec_max, vals[slot_offset + k]))
+            new_max = txl.local_scalar("float32", init=max_drop_nan(state[0], vec_max * log2e_over_t))
+            with txl.if_(new_max > state[0]), txl.then_():
+                rescale = txl.local_scalar("float32")
+                ex2(rescale, state[0] - new_max)
+                for slot in range(UNROLL):
+                    txl.assign(acc_s[slot], (acc_s[slot] + (state[0] - new_max) * acc_d[slot]) * rescale)
+                    txl.assign(acc_d[slot], acc_d[slot] * rescale)
+                txl.assign(state[0], new_max)
             for k in range(vec):
-                txl.assign(u[0], old_max(f[off + k] * c - st[0], f32(-3.0e38)))
-                ex2(ev[k], u[0])
-                txl.assign(sv[k], ev[k] * u[0])
-            accumulate(off)
+                txl.assign(u[0], max_drop_nan(vals[slot_offset + k] * log2e_over_t - state[0], f32(-3.0e38)))
+                ex2(exp_vals[k], u[0])
+                txl.assign(exp_u_vals[k], exp_vals[k] * u[0])
+            accumulate_vector(slot_offset)
 
-        sweep(x, dtype, vec, base, nvec, tid, f, fast)
-        txl.assign(st[1], (dd[0] + dd[1]) + (dd[2] + dd[3]))
-        txl.assign(st[2], (ss[0] + ss[1]) + (ss[2] + ss[3]))
-        # ---- exact fallback for this thread's elements: overflow, -inf or NaN, or a reference
-        # far below the thread's mass (log2 d > REDO_LOG2), which would cost fp32 accuracy in
-        # the entropy's log2 d - s / d cancellation and in the backward's log2 p ----
-        l2t = txl.local_scalar("float32")
-        txl.ptx.lg2.approx.ftz.f32(l2t, st[1])
-        bad = txl.Or(txl.Not(txl.And(finite(st[1]), finite(st[2]))), l2t > f32(REDO_LOG2))
-        with txl.if_(bad), txl.then_():
-            txl.assign(st[0], f32(-1e30))
-            for q in range(UNROLL):
-                txl.assign(dd[q], f32(0.0))
-                txl.assign(ss[q], f32(0.0))
-            sweep(x, dtype, vec, base, nvec, tid, f, slow)
-            txl.assign(st[1], (dd[0] + dd[1]) + (dd[2] + dd[3]))
-            txl.assign(st[2], (ss[0] + ss[1]) + (ss[2] + ss[3]))
+        def redo_exact_if_needed():
+            """
+            Redo the thread's elements with the exact online max on overflow, -inf or NaN, or when
+            the reference sits far below the thread's mass (log2 d > REDO_LOG2), which would cost
+            fp32 accuracy in the entropy's log2 d - s / d cancellation and in the backward's log2 p.
+            """
+            thread_log2_d = txl.local_scalar("float32")
+            txl.ptx.lg2.approx.ftz.f32(thread_log2_d, state[1])
+            needs_redo = txl.Or(txl.Not(txl.And(is_finite(state[1]), is_finite(state[2]))), thread_log2_d > f32(REDO_LOG2))
+            with txl.if_(needs_redo), txl.then_():
+                txl.assign(state[0], f32(-1e30))
+                reset_accumulators()
+                sweep(x, dtype, vec, row_offset, num_vecs, tidx, vals, visit_exact)
+                sum_slots()
 
-        # ---- CTA merge ----
-        warp_merge(st, (16, 8, 4, 2, 1))
-        with txl.if_(lane == 0), txl.then_():
-            for q in range(3):
-                txl.ptx["st.shared.f32"](red.ptr_to([warp * 3 + q]), st[q])
-        txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NT))
-        with txl.if_(warp == 0), txl.then_():
+        def share_warp_states():
+            """
+            Merge each warp, then publish its state to shared memory for warp 0.
+            """
+            merge_warp_state(state, (16, 8, 4, 2, 1))
+            with txl.if_(lane == 0), txl.then_():
+                for k in range(3):
+                    txl.ptx["st.shared.f32"](s_warp_states.ptr_to([warp * 3 + k]), state[k])
+            txl.ptx.bar.sync(txl.uint32(0), txl.uint32(THREADS))
+
+        def merge_warp_states():
+            """
+            Warp 0: merge the warps' states published in shared memory.
+            """
             with txl.if_(lane < WARPS):
                 with txl.then_():
-                    for q in range(3):
-                        txl.ptx["ld.shared.f32"](st[q], red.ptr_to([lane * 3 + q]))
+                    for k in range(3):
+                        txl.ptx["ld.shared.f32"](state[k], s_warp_states.ptr_to([lane * 3 + k]))
                 with txl.else_():
-                    txl.assign(st[0], f32(-1e30))
-                    txl.assign(st[1], f32(0.0))
-                    txl.assign(st[2], f32(0.0))
-            warp_merge(st, tuple(1 << i for i in reversed(range(WARPS.bit_length() - 1))))
-            with txl.if_(tid == 0), txl.then_():
-                l2d = txl.local_scalar("float32")
-                txl.ptx.lg2.approx.ftz.f32(l2d, st[1])
-                lp = txl.local_scalar("float32", init=f32(0.0))
-                with txl.if_(txl.And(y >= txl.int64(0), y < i64(n_cols))), txl.then_():
-                    txl.assign(lp, ((xy[0] * c - st[0]) - l2d) * f32(LN2))
-                r = i64(row)
-                txl.ptx["st.global.f32"](logp.ptr_to([r]), lp)
-                txl.ptx["st.global.f32"](ent.ptr_to([r]), (l2d - st[2] / st[1]) * f32(LN2))
-                txl.ptx["st.global.f32"](rmax.ptr_to([r]), st[0])
-                txl.ptx["st.global.f32"](lsum.ptr_to([r]), l2d)
+                    txl.assign(state[0], f32(-1e30))
+                    txl.assign(state[1], f32(0.0))
+                    txl.assign(state[2], f32(0.0))
+            merge_warp_state(state, tuple(1 << i for i in reversed(range(WARPS.bit_length() - 1))))
+
+        def store_row_stats(target_idx, target_logit):
+            log2_d = txl.local_scalar("float32")
+            txl.ptx.lg2.approx.ftz.f32(log2_d, state[1])
+            target_logp = txl.local_scalar("float32", init=f32(0.0))
+            with txl.if_(txl.And(target_idx >= txl.int64(0), target_idx < i64(num_cols))), txl.then_():
+                txl.assign(target_logp, ((target_logit[0] * log2e_over_t - state[0]) - log2_d) * f32(LN2))
+            row_idx64 = i64(row_idx)
+            txl.ptx["st.global.f32"](logp.ptr_to([row_idx64]), target_logp)
+            txl.ptx["st.global.f32"](entropy.ptr_to([row_idx64]), (log2_d - state[2] / state[1]) * f32(LN2))
+            txl.ptx["st.global.f32"](row_max.ptr_to([row_idx64]), state[0])
+            txl.ptx["st.global.f32"](log_sum.ptr_to([row_idx64]), log2_d)
+
+        target_idx, target_logit = load_target_logit()
+
+        set_thread_reference()
+        reset_accumulators()
+        sweep(x, dtype, vec, row_offset, num_vecs, tidx, vals, visit_fast)
+        sum_slots()
+
+        redo_exact_if_needed()
+
+        share_warp_states()
+        with txl.if_(warp == 0), txl.then_():
+            merge_warp_states()
+            with txl.if_(tidx == 0), txl.then_():
+                store_row_stats(target_idx, target_logit)
 
     return log_prob_fwd
 
 
 CHUNK = 2048  # vectors per backward CTA (16384 bf16 elements)
-BWARPS = 8
-BNT = BWARPS * 32
+BWD_WARPS = 8
+BWD_THREADS = BWD_WARPS * 32
 
 
 @functools.cache
-def bwd_kernel(dtype, vec):
+def build_log_prob_bwd(dtype, vec):
     @txl.kernel()
-    def log_prob_bwd(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), tgt: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), rmax: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), lsum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), ent: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), glogp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), gent: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), n_ctas: txl.int32, n_chunks: txl.int32, n_cols: txl.int32, x_stride: txl.int64, t_stride: txl.int64, gl_stride: txl.int64, ge_stride: txl.int64, inv_t: txl.float32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=n_ctas, block=(BWARPS) * 32))
-        tid = txl.thread_id()
-        cta = txl.cta_id()
-        row = txl.local_scalar("int32", init=cta // n_chunks)
-        j0 = txl.local_scalar("int32", init=(cta % n_chunks) * CHUNK)
-        r = i64(row)
-        base = txl.local_scalar("int64", init=r * x_stride)
-        c = txl.local_scalar("float32", init=inv_t * f32(LOG2E))
-        nvec = n_cols // vec
-        cnt = txl.local_scalar("int32", init=old_min(nvec - j0, CHUNK))
+    def log_prob_bwd(x: txl.Tensor((txl.int64(),), dtype, data_alignment=1), target: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), row_max: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), log_sum: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), entropy: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), grad_logp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), grad_entropy: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), num_ctas: txl.int32, num_chunks: txl.int32, num_cols: txl.int32, x_stride: txl.int64, target_stride: txl.int64, grad_logp_stride: txl.int64, grad_entropy_stride: txl.int64, inv_temperature: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=BWD_WARPS * 32))
+        tidx = txl.thread_id()
+        cta_idx = txl.cta_id()
+        row_idx = txl.local_scalar("int32", init=cta_idx // num_chunks)
+        vec_start = txl.local_scalar("int32", init=(cta_idx % num_chunks) * CHUNK)
+        row_idx64 = i64(row_idx)
+        row_offset = txl.local_scalar("int64", init=row_idx64 * x_stride)
+        log2e_over_t = txl.local_scalar("float32", init=inv_temperature * f32(LOG2E))
+        num_vecs = num_cols // vec
+        num_chunk_vecs = txl.local_scalar("int32", init=min_drop_nan(num_vecs - vec_start, CHUNK))
 
-        y = txl.local_scalar("int64")
-        txl.ptx["ld.global.nc.b64"](y, tgt.ptr_to([r * t_stride]))
-        sc = txl.alloc_local([5], "float32")  # m2, log2 d, H, g_logp, g_entropy
-        txl.ptx["ld.global.nc.f32"](sc[0], rmax.ptr_to([r]))
-        txl.ptx["ld.global.nc.f32"](sc[1], lsum.ptr_to([r]))
-        txl.ptx["ld.global.nc.f32"](sc[2], ent.ptr_to([r]))
-        txl.ptx["ld.global.nc.f32"](sc[3], glogp.ptr_to([r * gl_stride]))
-        txl.ptx["ld.global.nc.f32"](sc[4], gent.ptr_to([r * ge_stride]))
-        valid = txl.And(y >= txl.int64(0), y < i64(n_cols))
-        gl = txl.local_scalar("float32", init=txl.Select(valid, sc[3], f32(0.0)))
+        target_idx = txl.local_scalar("int64")
+        txl.ptx["ld.global.nc.b64"](target_idx, target.ptr_to([row_idx64 * target_stride]))
+        row_stats = txl.alloc_local([5], "float32")  # m2, log2 d, H, g_logp, g_entropy
+        txl.ptx["ld.global.nc.f32"](row_stats[0], row_max.ptr_to([row_idx64]))
+        txl.ptx["ld.global.nc.f32"](row_stats[1], log_sum.ptr_to([row_idx64]))
+        txl.ptx["ld.global.nc.f32"](row_stats[2], entropy.ptr_to([row_idx64]))
+        txl.ptx["ld.global.nc.f32"](row_stats[3], grad_logp.ptr_to([row_idx64 * grad_logp_stride]))
+        txl.ptx["ld.global.nc.f32"](row_stats[4], grad_entropy.ptr_to([row_idx64 * grad_entropy_stride]))
+        has_target = txl.And(target_idx >= txl.int64(0), target_idx < i64(num_cols))
+        target_grad_logp = txl.local_scalar("float32", init=txl.Select(has_target, row_stats[3], f32(0.0)))
 
-        aa = txl.local_scalar("float32", init=-(gl + sc[4] * sc[2]) * inv_t)
-        bb = txl.local_scalar("float32", init=-(sc[4] * f32(LN2)) * inv_t)
-        ga = txl.local_scalar("float32", init=gl * inv_t)
-        yv = txl.local_scalar("int32", init=txl.Select(valid, txl.Cast("int32", y // vec), -1))
-        yr = txl.local_scalar("int32", init=txl.Cast("int32", y % vec))
+        coef_a = txl.local_scalar("float32", init=-(target_grad_logp + row_stats[4] * row_stats[2]) * inv_temperature)
+        coef_b = txl.local_scalar("float32", init=-(row_stats[4] * f32(LN2)) * inv_temperature)
+        target_grad = txl.local_scalar("float32", init=target_grad_logp * inv_temperature)
+        target_vec = txl.local_scalar("int32", init=txl.Select(has_target, txl.Cast("int32", target_idx // vec), -1))
+        target_elem = txl.local_scalar("int32", init=txl.Cast("int32", target_idx % vec))
 
-        f = txl.alloc_local([UNROLL * vec], "float32")
-        u = txl.alloc_local([1], "float32")
-        p = txl.alloc_local([1], "float32")
+        vals, u, p = txl.alloc_local([UNROLL * vec], "float32"), txl.alloc_local([1], "float32"), txl.alloc_local([1], "float32")
 
-        def body(off, j):
+        def store_grad_vector(slot_offset, vec_idx):
             for k in range(vec):
-                txl.assign(u[0], old_max((f[off + k] * c - sc[0]) - sc[1], f32(-256.0)))
+                txl.assign(u[0], max_drop_nan((vals[slot_offset + k] * log2e_over_t - row_stats[0]) - row_stats[1], f32(-256.0)))
                 ex2(p[0], u[0])
-                txl.assign(f[off + k], p[0] * (aa + bb * u[0]))
+                txl.assign(vals[slot_offset + k], p[0] * (coef_a + coef_b * u[0]))
             # The target's own lane takes + g_logp / T before the single rounding.
-            with txl.if_(j == yv), txl.then_():
+            with txl.if_(vec_idx == target_vec), txl.then_():
                 for k in range(vec):
-                    txl.assign(f[off + k], f[off + k] + txl.Select(yr == k, ga, f32(0.0)))
-            store(x, dtype, vec, base + i64(j) * vec, f, off)
+                    txl.assign(vals[slot_offset + k], vals[slot_offset + k] + txl.Select(target_elem == k, target_grad, f32(0.0)))
+            store_vector(x, dtype, vec, row_offset + i64(vec_idx) * vec, vals, slot_offset)
 
-        sweep(x, dtype, vec, base, cnt, tid, f, body, j0, BNT)
+        sweep(x, dtype, vec, row_offset, num_chunk_vecs, tidx, vals, store_grad_vector, vec_start, BWD_THREADS)
 
     return log_prob_bwd
 
 
-def flat(t):
+def flat_view(tensor):
     """
-    A 1-D view over the storage that `t`'s (possibly strided or stride-0) elements span.
+    A 1-D view over the storage that tensor's (possibly strided or stride-0) elements span.
     """
-    if t.dim() == 1 and t.stride(0) == 1:
-        return t
-    n = t.shape[0]
-    stride = t.stride(0) if n > 1 else 1
-    span = (n - 1) * stride + 1 if stride > 0 else 1
-    return t.as_strided((span,), (1,))
+    if tensor.dim() == 1 and tensor.stride(0) == 1:
+        return tensor
+    length = tensor.shape[0]
+    stride = tensor.stride(0) if length > 1 else 1
+    span = (length - 1) * stride + 1 if stride > 0 else 1
+    return tensor.as_strided((span,), (1,))
 
 
-def vec_for(inp):
+def pick_vec(inp):
+    """
+    Elements per 16-byte vector, or 1 when the rows are not 16-byte aligned.
+    """
     vec = 8 if inp.dtype == torch.bfloat16 else 4
-    n_cols = inp.shape[1]
-    ok = n_cols % vec == 0 and inp.stride(0) % vec == 0 and inp.data_ptr() % 16 == 0
-    return vec if ok else 1
+    num_cols = inp.shape[1]
+    is_aligned = num_cols % vec == 0 and inp.stride(0) % vec == 0 and inp.data_ptr() % 16 == 0
+    return vec if is_aligned else 1
 
 
-def x_view(inp):
-    n_rows, n_cols = inp.shape
+def flat_logits(inp):
+    """
+    A 1-D view over the storage the rows of inp span.
+    """
+    num_rows, num_cols = inp.shape
     if inp.is_contiguous():
         return inp.view(-1)
-    return inp.as_strided(((n_rows - 1) * inp.stride(0) + n_cols,), (1,))
+    return inp.as_strided(((num_rows - 1) * inp.stride(0) + num_cols,), (1,))
 
 
 @functools.cache
-def compiled(kind, dtype, vec):
-    k = (fwd_kernel if kind == "fwd" else bwd_kernel)(dtype, vec)
-    return entry_function(k.compile(TARGET))
+def compile_kernel(kind, dtype, vec):
+    kernel = (build_log_prob_fwd if kind == "fwd" else build_log_prob_bwd)(dtype, vec)
+    return entry_function(kernel.compile(TARGET))
 
 
-DT = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+KERNEL_DTYPE = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
 
-def covered(inp, target):
+def cast_to_kernel_dtypes(inp, target):
     """
     inp and target in dtypes the kernels read: other float logits as an fp32 copy, other integer
     targets as an int64 copy.
     """
-    return (inp if inp.dtype in DT else inp.float()), (target if target.dtype == torch.int64 else target.long())
+    return (inp if inp.dtype in KERNEL_DTYPE else inp.float()), (target if target.dtype == torch.int64 else target.long())
 
 
 def log_prob_fwd_sm100(inp: torch.Tensor, target: torch.Tensor, inv_temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -422,19 +460,19 @@ def log_prob_fwd_sm100(inp: torch.Tensor, target: torch.Tensor, inv_temperature:
     (logp, entropy, row_max, log_sum), each fp32 (N,); inp is left unchanged. row_max and log_sum
     are the base-2 row statistics log_prob_bwd_sm100 reads.
     """
-    n_rows, n_cols = inp.shape
-    logp = torch.empty(n_rows, dtype=torch.float32, device=inp.device)
+    num_rows, num_cols = inp.shape
+    logp = torch.empty(num_rows, dtype=torch.float32, device=inp.device)
     entropy, row_max, log_sum = torch.empty_like(logp), torch.empty_like(logp), torch.empty_like(logp)
-    if n_rows == 0:
+    if num_rows == 0:
         return logp, entropy, row_max, log_sum
-    if n_cols == 0:
+    if num_cols == 0:
         # an empty distribution: no target is valid, and the entropy is an empty sum
         return logp.zero_(), entropy.zero_(), row_max.zero_(), log_sum.zero_()
-    inp, target = covered(inp, target)
-    vec = vec_for(inp)
-    fn = compiled("fwd", DT[inp.dtype], vec)
-    t_stride = target.stride(0) if n_rows > 1 else 1
-    fn(x_view(inp), flat(target), logp, entropy, row_max, log_sum, n_rows, n_cols, inp.stride(0), t_stride, float(inv_temperature))
+    inp, target = cast_to_kernel_dtypes(inp, target)
+    vec = pick_vec(inp)
+    fn = compile_kernel("fwd", KERNEL_DTYPE[inp.dtype], vec)
+    target_stride = target.stride(0) if num_rows > 1 else 1
+    fn(flat_logits(inp), flat_view(target), logp, entropy, row_max, log_sum, num_rows, num_cols, inp.stride(0), target_stride, float(inv_temperature))
     return logp, entropy, row_max, log_sum
 
 
@@ -442,17 +480,17 @@ def log_prob_bwd_sm100(inp: torch.Tensor, target: torch.Tensor, row_max: torch.T
     """
     Overwrite inp with dL/dx, from the statistics of log_prob_fwd_sm100.
     """
-    n_rows, n_cols = inp.shape
-    if n_rows == 0 or n_cols == 0:
+    num_rows, num_cols = inp.shape
+    if num_rows == 0 or num_cols == 0:
         return
     out = inp
-    inp, target = covered(inp, target)
-    vec = vec_for(inp)
-    fn = compiled("bwd", DT[inp.dtype], vec)
-    t_stride = target.stride(0) if n_rows > 1 else 1
-    gl_stride = grad_logp.stride(0) if n_rows > 1 else 1
-    ge_stride = grad_entropy.stride(0) if n_rows > 1 else 1
-    n_chunks = (n_cols // vec + CHUNK - 1) // CHUNK
-    fn(x_view(inp), flat(target), row_max, log_sum, entropy, flat(grad_logp), flat(grad_entropy), n_rows * n_chunks, n_chunks, n_cols, inp.stride(0), t_stride, gl_stride, ge_stride, float(inv_temperature))
+    inp, target = cast_to_kernel_dtypes(inp, target)
+    vec = pick_vec(inp)
+    fn = compile_kernel("bwd", KERNEL_DTYPE[inp.dtype], vec)
+    target_stride = target.stride(0) if num_rows > 1 else 1
+    grad_logp_stride = grad_logp.stride(0) if num_rows > 1 else 1
+    grad_entropy_stride = grad_entropy.stride(0) if num_rows > 1 else 1
+    num_chunks = (num_cols // vec + CHUNK - 1) // CHUNK
+    fn(flat_logits(inp), flat_view(target), row_max, log_sum, entropy, flat_view(grad_logp), flat_view(grad_entropy), num_rows * num_chunks, num_chunks, num_cols, inp.stride(0), target_stride, grad_logp_stride, grad_entropy_stride, float(inv_temperature))
     if inp is not out:
         out.copy_(inp)  # the fp32 gradient, rounded once to the logits' dtype
