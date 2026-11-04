@@ -2,15 +2,15 @@
 silu_mul_sm100: the SwiGLU product silu(gate) * up and its two gradients on SM100, TIRx-lite
 kernels, the same bits as silu_mul_sm90.
 
-Flat elementwise kernels: each thread moves VPT 16-byte vectors per tensor. Exact-tile BF16
-launches use Blackwell packed-f32x2 add/mul/FMA for two independent FP32 lanes at once, while
-ex2/rcp remain scalar. The fp32 math: sigmoid(x) = div.full(1, ex2.approx(x * -log2e) + 1),
-computed with ex2.approx.ftz and rcp.approx.ftz(d / 4) / 4, which is identical on all 2^32 fp32
-inputs and drops div.full's range check; every product is a separate mul.rn.f32 (no product feeds
-an add, so nothing can contract), and the backward's (1 + g - silu) is a single fma.rn. bf16, fp16
-and fp32 run natively; any other float dtype (or a backward with mixed dtypes) is widened to fp32,
-run through the fp32 kernels and rounded once back. Bases not 16-byte aligned take a scalar
-kernel.
+Flat elementwise kernels: each thread moves VECTORS_PER_THREAD 16-byte vectors per tensor.
+Exact-tile BF16 launches use Blackwell packed-f32x2 add/mul/FMA for two independent FP32 lanes at
+once, while ex2/rcp remain scalar. The fp32 math: sigmoid(x) = div.full(1, ex2.approx(x * -log2e)
++ 1), computed with ex2.approx.ftz and rcp.approx.ftz(d / 4) / 4, which is identical on all 2^32
+fp32 inputs and drops div.full's range check; every product is a separate mul.rn.f32 (no product
+feeds an add, so nothing can contract), and the backward's (1 + gate - silu) is a single fma.rn.
+bf16, fp16 and fp32 run natively; any other float dtype (or a backward with mixed dtypes) is
+widened to fp32, run through the fp32 kernels and rounded once back. Bases not 16-byte aligned
+take a scalar kernel.
 """
 
 import functools
@@ -28,66 +28,66 @@ __all__ = ["silu_mul_bwd_sm100", "silu_mul_fwd_sm100"]
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
-    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
-    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on
+    every call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
-DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
+DTYPE_NAME = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 NEG_LOG2E = -1.4426950408889634  # rounds to 0xBFB8AA3B
-VBYTES = 16  # bytes per vector load / store
-POLICY = {"first": 0x12F0000000000000, "normal": 0x1000000000000000, "last": 0x14F0000000000000}
+VECTOR_BYTES = 16  # bytes per vector load / store
+L2_POLICY = {"first": 0x12F0000000000000, "normal": 0x1000000000000000, "last": 0x14F0000000000000}
 
 
-def f32c(v):
-    return txl.float32(v)
+def f32_const(value):
+    return txl.float32(value)
 
 
 def sigmoid(x):
-    t, e, d, s = txl.local_scalar("float32"), txl.local_scalar("float32"), txl.local_scalar("float32"), txl.local_scalar("float32")
-    txl.ptx.mul.f32(t, x, f32c(NEG_LOG2E))
-    # ex2 results below 2^-126 only occur where 1 + e rounds to 1, so .ftz is bit-identical.
-    txl.ptx.ex2.approx.ftz.f32(e, t)
-    txl.ptx.add.f32(d, e, f32c(1.0))
+    scaled, exp2, denom, sig = txl.local_scalar("float32"), txl.local_scalar("float32"), txl.local_scalar("float32"), txl.local_scalar("float32")
+    txl.ptx.mul.f32(scaled, x, f32_const(NEG_LOG2E))
+    # ex2 results below 2^-126 only occur where 1 + exp2 rounds to 1, so .ftz is bit-identical.
+    txl.ptx.ex2.approx.ftz.f32(exp2, scaled)
+    txl.ptx.add.f32(denom, exp2, f32_const(1.0))
     # div.full(1, d) for d >= 1 is rcp(d) when d <= 2^126 and rcp(d / 4) / 4 above; MUFU.RCP is
     # exponent-invariant, so the scaled form is bit-identical everywhere (checked over all 2^32 x).
-    q, r = txl.local_scalar("float32"), txl.local_scalar("float32")
-    txl.ptx.mul.f32(q, d, f32c(0.25))
-    txl.ptx.rcp.approx.ftz.f32(r, q)
-    txl.ptx.mul.f32(s, r, f32c(0.25))
-    return s
+    denom_quarter, rcp_quarter = txl.local_scalar("float32"), txl.local_scalar("float32")
+    txl.ptx.mul.f32(denom_quarter, denom, f32_const(0.25))
+    txl.ptx.rcp.approx.ftz.f32(rcp_quarter, denom_quarter)
+    txl.ptx.mul.f32(sig, rcp_quarter, f32_const(0.25))
+    return sig
 
 
-def mul(a, b):
-    r = txl.local_scalar("float32")
-    txl.ptx.mul.f32(r, a, b)
-    return r
+def mul(lhs, rhs):
+    product = txl.local_scalar("float32")
+    txl.ptx.mul.f32(product, lhs, rhs)
+    return product
 
 
-def fwd_math(g, u):
-    return [mul(mul(sigmoid(g), g), u)]
+def fwd_math(gate, up):
+    return [mul(mul(sigmoid(gate), gate), up)]
 
 
-def bwd_math(do, g, u):
-    s = sigmoid(g)
-    silu = mul(s, g)
-    grad_up = mul(do, silu)
-    a = mul(mul(do, u), s)
-    gp1 = txl.local_scalar("float32")
-    txl.ptx.add.f32(gp1, g, f32c(1.0))
-    ns = txl.local_scalar("float32")
-    txl.ptx.neg.f32(ns, s)
-    h = txl.local_scalar("float32")
-    txl.ptx.fma.rn.f32(h, ns, g, gp1)
-    return [mul(a, h), grad_up]
+def bwd_math(grad_output, gate, up):
+    sig = sigmoid(gate)
+    silu = mul(sig, gate)
+    grad_up = mul(grad_output, silu)
+    grad_silu_sig = mul(mul(grad_output, up), sig)
+    gate_plus_one = txl.local_scalar("float32")
+    txl.ptx.add.f32(gate_plus_one, gate, f32_const(1.0))
+    neg_sig = txl.local_scalar("float32")
+    txl.ptx.neg.f32(neg_sig, sig)
+    one_plus_gate_minus_silu = txl.local_scalar("float32")
+    txl.ptx.fma.rn.f32(one_plus_gate_minus_silu, neg_sig, gate, gate_plus_one)
+    return [mul(grad_silu_sig, one_plus_gate_minus_silu), grad_up]
 
 
-def pair(a, b):
-    return txl.cuda.make_float2(a, b)
+def pair(lo, hi):
+    return txl.cuda.make_float2(lo, hi)
 
 
 def unpair(value):
@@ -96,48 +96,48 @@ def unpair(value):
     return lo, hi
 
 
-def pair_mul(a, b):
+def pair_mul(lhs, rhs):
     out = txl.local_scalar("uint64")
-    txl.ptx.mul.f32x2(out, a, b)
+    txl.ptx.mul.f32x2(out, lhs, rhs)
     return out
 
 
-def pair_add(a, b):
+def pair_add(lhs, rhs):
     out = txl.local_scalar("uint64")
-    txl.ptx.add.f32x2(out, a, b)
+    txl.ptx.add.f32x2(out, lhs, rhs)
     return out
 
 
-def pair_fma(a, b, c):
+def pair_fma(lhs, rhs, addend):
     out = txl.local_scalar("uint64")
-    txl.ptx.fma.rn.f32x2(out, a, b, c)
+    txl.ptx.fma.rn.f32x2(out, lhs, rhs, addend)
     return out
 
 
-def sigmoid_pair(g0, g1):
-    g = pair(g0, g1)
-    log2e = pair(f32c(NEG_LOG2E), f32c(NEG_LOG2E))
-    t0, t1 = unpair(pair_mul(g, log2e))
-    e0, e1 = txl.local_scalar("float32"), txl.local_scalar("float32")
-    txl.ptx.ex2.approx.ftz.f32(e0, t0)
-    txl.ptx.ex2.approx.ftz.f32(e1, t1)
-    ones = pair(f32c(1.0), f32c(1.0))
-    d = pair_add(pair(e0, e1), ones)
-    quarter = pair(f32c(0.25), f32c(0.25))
-    q0, q1 = unpair(pair_mul(d, quarter))
-    r0, r1 = txl.local_scalar("float32"), txl.local_scalar("float32")
-    txl.ptx.rcp.approx.ftz.f32(r0, q0)
-    txl.ptx.rcp.approx.ftz.f32(r1, q1)
-    return pair_mul(pair(r0, r1), quarter)
+def sigmoid_pair(gate_lo, gate_hi):
+    gate_pair = pair(gate_lo, gate_hi)
+    neg_log2e = pair(f32_const(NEG_LOG2E), f32_const(NEG_LOG2E))
+    scaled_lo, scaled_hi = unpair(pair_mul(gate_pair, neg_log2e))
+    exp2_lo, exp2_hi = txl.local_scalar("float32"), txl.local_scalar("float32")
+    txl.ptx.ex2.approx.ftz.f32(exp2_lo, scaled_lo)
+    txl.ptx.ex2.approx.ftz.f32(exp2_hi, scaled_hi)
+    ones = pair(f32_const(1.0), f32_const(1.0))
+    denom = pair_add(pair(exp2_lo, exp2_hi), ones)
+    quarter = pair(f32_const(0.25), f32_const(0.25))
+    denom_quarter_lo, denom_quarter_hi = unpair(pair_mul(denom, quarter))
+    rcp_lo, rcp_hi = txl.local_scalar("float32"), txl.local_scalar("float32")
+    txl.ptx.rcp.approx.ftz.f32(rcp_lo, denom_quarter_lo)
+    txl.ptx.rcp.approx.ftz.f32(rcp_hi, denom_quarter_hi)
+    return pair_mul(pair(rcp_lo, rcp_hi), quarter)
 
 
 def fwd_math_packed(inputs):
     gate, up = inputs
     out = []
     for i in range(0, len(gate), 2):
-        g = pair(gate[i], gate[i + 1])
-        s = sigmoid_pair(gate[i], gate[i + 1])
-        out.extend(unpair(pair_mul(pair_mul(s, g), pair(up[i], up[i + 1]))))
+        gate_pair = pair(gate[i], gate[i + 1])
+        sig = sigmoid_pair(gate[i], gate[i + 1])
+        out.extend(unpair(pair_mul(pair_mul(sig, gate_pair), pair(up[i], up[i + 1]))))
     return [out]
 
 
@@ -145,17 +145,17 @@ def bwd_math_packed(inputs):
     grad_output, gate, up = inputs
     grad_gate, grad_up = [], []
     for i in range(0, len(gate), 2):
-        do, g, u = pair(grad_output[i], grad_output[i + 1]), pair(gate[i], gate[i + 1]), pair(up[i], up[i + 1])
-        s = sigmoid_pair(gate[i], gate[i + 1])
-        silu = pair_mul(s, g)
-        grad_up.extend(unpair(pair_mul(do, silu)))
-        a = pair_mul(pair_mul(do, u), s)
-        gp1 = pair_add(g, pair(f32c(1.0), f32c(1.0)))
+        grad_output_pair, gate_pair, up_pair = pair(grad_output[i], grad_output[i + 1]), pair(gate[i], gate[i + 1]), pair(up[i], up[i + 1])
+        sig = sigmoid_pair(gate[i], gate[i + 1])
+        silu = pair_mul(sig, gate_pair)
+        grad_up.extend(unpair(pair_mul(grad_output_pair, silu)))
+        grad_silu_sig = pair_mul(pair_mul(grad_output_pair, up_pair), sig)
+        gate_plus_one = pair_add(gate_pair, pair(f32_const(1.0), f32_const(1.0)))
         sign_bits = txl.local_scalar("uint64")
         txl.ptx.mov.b64(sign_bits, txl.uint32(0x80000000), txl.uint32(0x80000000))
-        neg_s = txl.bitwise_xor(s, sign_bits)
-        h = pair_fma(neg_s, g, gp1)
-        grad_gate.extend(unpair(pair_mul(a, h)))
+        neg_sig = txl.bitwise_xor(sig, sign_bits)
+        one_plus_gate_minus_silu = pair_fma(neg_sig, gate_pair, gate_plus_one)
+        grad_gate.extend(unpair(pair_mul(grad_silu_sig, one_plus_gate_minus_silu)))
     return [grad_gate, grad_up]
 
 
@@ -178,227 +178,213 @@ def unpack(word, dtype):
     return [lo, hi]
 
 
-def pack(dst, vals, dtype):
+def pack(dst, values, dtype):
     """
     fp32 values -> b32 words in dst (one RNE rounding).
     """
     if dtype == "float32":
-        for i, v in enumerate(vals):
-            txl.ptx.mov.b32(dst[i], txl.reinterpret(v, ty="uint32"))
+        for i, value in enumerate(values):
+            txl.ptx.mov.b32(dst[i], txl.reinterpret(value, ty="uint32"))
         return
-    for p in range(len(vals) // 2):
+    for pair_idx in range(len(values) // 2):
         if dtype == "float16":
-            txl.ptx.cvt.rn.f16x2.f32(dst[p], vals[2 * p + 1], vals[2 * p])
+            txl.ptx.cvt.rn.f16x2.f32(dst[pair_idx], values[2 * pair_idx + 1], values[2 * pair_idx])
         else:
-            txl.ptx.cvt.rn.bf16x2.f32(dst[p], vals[2 * p + 1], vals[2 * p])
+            txl.ptx.cvt.rn.bf16x2.f32(dst[pair_idx], values[2 * pair_idx + 1], values[2 * pair_idx])
+
+
+def process_element(inputs, outputs, idx, dtype, scalar_math, num_outputs, half_type):
+    """
+    Load element idx of every input with scalar loads, apply scalar_math and store every output.
+    """
+    values = []
+    for src in inputs:
+        if dtype == "float32":
+            word = txl.local_scalar("uint32")
+            txl.ptx.ld.global_.nc.b32(word, txl.address_of(src[idx]))
+            values.append(txl.reinterpret(word, ty="float32"))
+        else:
+            half = txl.local_scalar("uint16")
+            txl.ptx.ld.global_.nc.b16(half, txl.address_of(src[idx]))
+            if dtype == "bfloat16":
+                values.append(txl.reinterpret(txl.shift_left(txl.cast(half, "uint32"), txl.uint32(16)), ty="float32"))
+            else:
+                values.append(to_f32(half, dtype))
+    results = scalar_math(*values)
+    for output_idx in range(num_outputs):
+        if dtype == "float32":
+            txl.ptx.st.global_.b32(txl.address_of(outputs[output_idx][idx]), txl.reinterpret(results[output_idx], ty="uint32"))
+        else:
+            half = txl.local_scalar("uint16")
+            getattr(txl.ptx.cvt.rn, half_type).f32(half, results[output_idx])
+            txl.ptx.st.global_.b16(txl.address_of(outputs[output_idx][idx]), half)
 
 
 def compile_kernel(kernel):
     return entry_function(kernel.compile(TARGET))
 
 
-SMALL = 1 << 22  # elements; at or below, the whole problem is one latency-bound wave
+SMALL_NUMEL = 1 << 22  # elements; at or below, the whole problem is one latency-bound wave
 
 
-def pick_kernel(dtype: str, n_in: int, n: int):
+def pick_kernel(dtype: str, num_inputs: int, numel: int):
     """
-    Shape-aware choice over the one kernel family (measured on B200, cold L2).
+    Shape-aware launch config of the vector kernel.
 
     Inputs stream with L2 evict_first (read once). Outputs use the default policy: evict_last
     stores survive a cold-L2 flush and pin lines that later kernels (and benchmark iterations)
     then hit, which games cold-L2 timing and pollutes L2 in training.
     """
-    if n_in == 2:  # forward: 3 streams; small = more CTAs, large = 32 B in flight per stream
-        warps, vpt = (4, 1) if n <= SMALL else (8, 2)
+    if num_inputs == 2:  # forward: 3 streams; small = more CTAs, large = 32 B in flight per stream
+        warps, vectors_per_thread = (4, 1) if numel <= SMALL_NUMEL else (8, 2)
     else:  # backward: 5 streams; one 16 B vector per stream keeps registers / occupancy up
-        warps, vpt = 8, 1
-    vec = 4 if dtype == "float32" else 8
-    full_tiles = n % (warps * 32 * vpt * vec) == 0
-    return kernel_cfg(dtype, n_in, warps, vpt, 16, "", "", "first", "", full_tiles)
+        warps, vectors_per_thread = 8, 1
+    num_elems = 4 if dtype == "float32" else 8
+    full_tiles = numel % (warps * 32 * vectors_per_thread * num_elems) == 0
+    return build_vector_kernel(dtype, num_inputs, warps, vectors_per_thread, 16, "", "", "first", "", full_tiles)
 
 
 @functools.cache
-def scalar_kernel(dtype: str, n_in: int):
+def build_scalar_kernel(dtype: str, num_inputs: int):
     """
-    Unaligned-safe contract fallback; timed allocations take the vector path.
+    Unaligned-safe fallback, one element per thread.
     """
-    n_out = 1 if n_in == 2 else 2
-    math = fwd_math if n_in == 2 else bwd_math
-    threads = 256
-    store16 = {"float32": None, "float16": "f16", "bfloat16": "bf16"}[dtype]
+    num_outputs = 1 if num_inputs == 2 else 2
+    scalar_math = fwd_math if num_inputs == 2 else bwd_math
+    THREADS = 256
+    half_type = {"float32": None, "float16": "f16", "bfloat16": "bf16"}[dtype]
 
-    def body(ptrs, n):
-        ins, outs = ptrs[:n_in], ptrs[n_in:]
-        idx = txl.cast(txl.cta_id(), "int64") * threads + txl.cast(txl.thread_id(), "int64")
-        with txl.if_(idx < n):
+    def body(ptrs, numel):
+        inputs, outputs = ptrs[:num_inputs], ptrs[num_inputs:]
+        idx = txl.cast(txl.cta_id(), "int64") * THREADS + txl.cast(txl.thread_id(), "int64")
+        with txl.if_(idx < numel):
             with txl.then_():
-                vals = []
-                for src in ins:
-                    if dtype == "float32":
-                        w = txl.local_scalar("uint32")
-                        txl.ptx.ld.global_.nc.b32(w, txl.address_of(src[idx]))
-                        vals.append(txl.reinterpret(w, ty="float32"))
-                    else:
-                        h = txl.local_scalar("uint16")
-                        txl.ptx.ld.global_.nc.b16(h, txl.address_of(src[idx]))
-                        if dtype == "bfloat16":
-                            vals.append(txl.reinterpret(txl.shift_left(txl.cast(h, "uint32"), txl.uint32(16)), ty="float32"))
-                        else:
-                            vals.append(to_f32(h, dtype))
-                res = math(*vals)
-                for o in range(n_out):
-                    if dtype == "float32":
-                        txl.ptx.st.global_.b32(txl.address_of(outs[o][idx]), txl.reinterpret(res[o], ty="uint32"))
-                    else:
-                        h = txl.local_scalar("uint16")
-                        getattr(txl.ptx.cvt.rn, store16).f32(h, res[o])
-                        txl.ptx.st.global_.b16(txl.address_of(outs[o][idx]), h)
+                process_element(inputs, outputs, idx, dtype, scalar_math, num_outputs, half_type)
 
-    grid = lambda n: txl.cast((n + threads - 1) // threads, "int32")  # noqa: E731
-    if n_in == 2:
-
+    grid_size = lambda numel: txl.cast((numel + THREADS - 1) // THREADS, "int32")
+    if num_inputs == 2:
         @txl.kernel()
         def silu_mul_fwd_scalar(gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
-            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=256))
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_size(n), block=256))
             body([gate, up, out], n)
 
         return compile_kernel(silu_mul_fwd_scalar)
 
     @txl.kernel()
     def silu_mul_bwd_scalar(do: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=256))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_size(n), block=256))
         body([do, gate, up, grad_gate, grad_up], n)
 
     return compile_kernel(silu_mul_bwd_scalar)
 
 
-def hinted(op, hint):
-    for h in hint.split(".") if hint else []:
-        op = getattr(op, h)
+def apply_hints(op, hints):
+    """
+    op.<part> for each part of the dotted hints string, op itself when hints is empty.
+    """
+    for part in hints.split(".") if hints else []:
+        op = getattr(op, part)
     return op
 
 
 @functools.cache
-def kernel_cfg(dtype: str, n_in: int, WARPS: int, VPT: int, VBYTES: int, LD_HINT: str, ST_HINT: str, LD_POL: str = "", ST_POL: str = "", FULL_TILES: bool = False):
+def build_vector_kernel(dtype: str, num_inputs: int, WARPS: int, VECTORS_PER_THREAD: int, VECTOR_BYTES: int, LOAD_HINT: str, STORE_HINT: str, LOAD_POLICY: str = "", STORE_POLICY: str = "", FULL_TILES: bool = False):
     """
-    n_in = 2 (fwd: gate, up -> out) or 3 (bwd: do, gate, up -> grad_gate, grad_up).
+    num_inputs = 2 (fwd: gate, up -> out) or 3 (bwd: grad_output, gate, up -> grad_gate, grad_up).
     """
-    n_out = 1 if n_in == 2 else 2
-    math = fwd_math if n_in == 2 else bwd_math
+    num_outputs = 1 if num_inputs == 2 else 2
+    scalar_math = fwd_math if num_inputs == 2 else bwd_math
     THREADS = WARPS * 32
-    nw = VBYTES // 4  # b32 words per vector
-    vec = nw if dtype == "float32" else 2 * nw  # elements per vector
-    ld_op, st_op = hinted(txl.ptx.ld.global_.nc, LD_HINT), hinted(txl.ptx.st.global_, ST_HINT)
-    if LD_POL:
-        ld_raw = getattr(getattr(ld_op, "L2::cache_hint"), f"v{nw}").b32
-        ld = lambda *a: ld_raw(*a, txl.uint64(POLICY[LD_POL]))  # noqa: E731
+    num_words = VECTOR_BYTES // 4  # b32 words per vector
+    num_elems = num_words if dtype == "float32" else 2 * num_words  # elements per vector
+    load_op, store_op = apply_hints(txl.ptx.ld.global_.nc, LOAD_HINT), apply_hints(txl.ptx.st.global_, STORE_HINT)
+    if LOAD_POLICY:
+        load_with_policy = getattr(getattr(load_op, "L2::cache_hint"), f"v{num_words}").b32
+        load_vector = lambda *operands: load_with_policy(*operands, txl.uint64(L2_POLICY[LOAD_POLICY]))
     else:
-        ld = getattr(ld_op, f"v{nw}").b32
-    if ST_POL:
-        st_raw = getattr(getattr(st_op, "L2::cache_hint"), f"v{nw}").b32
-        st = lambda *a: st_raw(*a, txl.uint64(POLICY[ST_POL]))  # noqa: E731
+        load_vector = getattr(load_op, f"v{num_words}").b32
+    if STORE_POLICY:
+        store_with_policy = getattr(getattr(store_op, "L2::cache_hint"), f"v{num_words}").b32
+        store_vector = lambda *operands: store_with_policy(*operands, txl.uint64(L2_POLICY[STORE_POLICY]))
     else:
-        st = getattr(st_op, f"v{nw}").b32
-    per_cta = THREADS * VPT * vec
-    store16 = {"float32": None, "float16": "f16", "bfloat16": "bf16"}[dtype]
+        store_vector = getattr(store_op, f"v{num_words}").b32
+    elems_per_cta = THREADS * VECTORS_PER_THREAD * num_elems
+    half_type = {"float32": None, "float16": "f16", "bfloat16": "bf16"}[dtype]
 
-    def body(ptrs, n):
-        ins, outs = ptrs[:n_in], ptrs[n_in:]
-        cta, tid = txl.cast(txl.cta_id(), "int64"), txl.cast(txl.thread_id(), "int64")
-        base = cta * per_cta
-        words = [[txl.alloc_local([nw], "uint32") for _ in range(n_in)] for _ in range(VPT)]
-        owords = [txl.alloc_local([nw], "uint32") for _ in range(n_out)]
+    def body(ptrs, numel):
+        inputs, outputs = ptrs[:num_inputs], ptrs[num_inputs:]
+        cta_idx, tidx = txl.cast(txl.cta_id(), "int64"), txl.cast(txl.thread_id(), "int64")
+        cta_start = cta_idx * elems_per_cta
+        in_words = [[txl.alloc_local([num_words], "uint32") for _ in range(num_inputs)] for _ in range(VECTORS_PER_THREAD)]
+        out_words = [txl.alloc_local([num_words], "uint32") for _ in range(num_outputs)]
 
-        def offset(j):
-            return base + (j * THREADS + tid) * vec
+        def vector_start(vector_idx):
+            return cta_start + (vector_idx * THREADS + tidx) * num_elems
 
-        def load(j):
-            for t in range(n_in):
-                w = words[j][t]
-                ld(*[w[i] for i in range(nw)], txl.address_of(ins[t][offset(j)]))
+        def load_inputs(vector_idx):
+            for input_idx in range(num_inputs):
+                words = in_words[vector_idx][input_idx]
+                load_vector(*[words[i] for i in range(num_words)], txl.address_of(inputs[input_idx][vector_start(vector_idx)]))
 
-        def compute_store(j):
-            unpacked = [[x for w in range(nw) for x in unpack(words[j][t][w], dtype)] for t in range(n_in)]
+        def compute_store(vector_idx):
+            unpacked = [[value for word_idx in range(num_words) for value in unpack(in_words[vector_idx][input_idx][word_idx], dtype)] for input_idx in range(num_inputs)]
             if FULL_TILES and dtype == "bfloat16":
-                res_by_out = fwd_math_packed(unpacked) if n_in == 2 else bwd_math_packed(unpacked)
+                results_by_output = fwd_math_packed(unpacked) if num_inputs == 2 else bwd_math_packed(unpacked)
             else:
-                res = [math(*[unpacked[t][e] for t in range(n_in)]) for e in range(vec)]
-                res_by_out = [[res[e][o] for e in range(vec)] for o in range(n_out)]
-            for o in range(n_out):
-                pack(owords[o], res_by_out[o], dtype)
-                st(txl.address_of(outs[o][offset(j)]), *[owords[o][i] for i in range(nw)])
+                results = [scalar_math(*[unpacked[input_idx][elem_idx] for input_idx in range(num_inputs)]) for elem_idx in range(num_elems)]
+                results_by_output = [[results[elem_idx][output_idx] for elem_idx in range(num_elems)] for output_idx in range(num_outputs)]
+            for output_idx in range(num_outputs):
+                pack(out_words[output_idx], results_by_output[output_idx], dtype)
+                store_vector(txl.address_of(outputs[output_idx][vector_start(vector_idx)]), *[out_words[output_idx][i] for i in range(num_words)])
 
-        def vector(j):
-            load(j)
-            compute_store(j)
+        def process_vector(vector_idx):
+            load_inputs(vector_idx)
+            compute_store(vector_idx)
 
-        def scalar(idx):
-            vals = []
-            for t in range(n_in):
-                if dtype == "float32":
-                    w = txl.local_scalar("uint32")
-                    txl.ptx.ld.global_.nc.b32(w, txl.address_of(ins[t][idx]))
-                    vals.append(txl.reinterpret(w, ty="float32"))
-                else:
-                    h = txl.local_scalar("uint16")
-                    txl.ptx.ld.global_.nc.b16(h, txl.address_of(ins[t][idx]))
-                    if dtype == "bfloat16":
-                        vals.append(txl.reinterpret(txl.shift_left(txl.cast(h, "uint32"), txl.uint32(16)), ty="float32"))
-                    else:
-                        vals.append(to_f32(h, dtype))
-            res = math(*vals)
-            for o in range(n_out):
-                if dtype == "float32":
-                    txl.ptx.st.global_.b32(txl.address_of(outs[o][idx]), txl.reinterpret(res[o], ty="uint32"))
-                else:
-                    h = txl.local_scalar("uint16")
-                    getattr(txl.ptx.cvt.rn, store16).f32(h, res[o])
-                    txl.ptx.st.global_.b16(txl.address_of(outs[o][idx]), h)
-
+        # All loads are issued before any math so the vectors of a thread are in flight together.
         if FULL_TILES:
-            for j in range(VPT):
-                load(j)
-            for j in range(VPT):
-                compute_store(j)
+            for vector_idx in range(VECTORS_PER_THREAD):
+                load_inputs(vector_idx)
+            for vector_idx in range(VECTORS_PER_THREAD):
+                compute_store(vector_idx)
         else:
-            with txl.if_(base + per_cta <= n):
+            with txl.if_(cta_start + elems_per_cta <= numel):
                 with txl.then_():
-                    for j in range(VPT):
-                        load(j)
-                    for j in range(VPT):
-                        compute_store(j)
+                    for vector_idx in range(VECTORS_PER_THREAD):
+                        load_inputs(vector_idx)
+                    for vector_idx in range(VECTORS_PER_THREAD):
+                        compute_store(vector_idx)
                 with txl.else_():
-                    for j in range(VPT):
-                        off = offset(j)
-                        with txl.if_(off + vec <= n):
+                    for vector_idx in range(VECTORS_PER_THREAD):
+                        elem_start = vector_start(vector_idx)
+                        with txl.if_(elem_start + num_elems <= numel):
                             with txl.then_():
-                                vector(j)
+                                process_vector(vector_idx)
                             with txl.else_():
-                                for e in range(vec):
-                                    with txl.if_(off + e < n):
+                                for elem_idx in range(num_elems):
+                                    with txl.if_(elem_start + elem_idx < numel):
                                         with txl.then_():
-                                            scalar(off + e)
+                                            process_element(inputs, outputs, elem_start + elem_idx, dtype, scalar_math, num_outputs, half_type)
 
-    grid = lambda n: txl.cast((n + (per_cta - 1)) // per_cta, "int32")  # noqa: E731
-    if n_in == 2:
-
+    grid_size = lambda numel: txl.cast((numel + (elems_per_cta - 1)) // elems_per_cta, "int32")
+    if num_inputs == 2:
         @txl.kernel()
         def silu_mul_fwd(gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
-            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=(WARPS) * 32))
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_size(n), block=WARPS * 32))
             body([gate, up, out], n)
 
         return compile_kernel(silu_mul_fwd)
 
     @txl.kernel()
     def silu_mul_bwd(do: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid(n), block=(WARPS) * 32))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_size(n), block=WARPS * 32))
         body([do, gate, up, grad_gate, grad_up], n)
 
     return compile_kernel(silu_mul_bwd)
 
 
-def aligned(*ts):
-    return all(t.data_ptr() % VBYTES == 0 for t in ts)
+def is_vector_aligned(*tensors):
+    return all(tensor.data_ptr() % VECTOR_BYTES == 0 for tensor in tensors)
 
 
 def silu_mul_fwd_sm100(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -410,14 +396,14 @@ def silu_mul_fwd_sm100(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     assert gate.dtype == up.dtype, f"dtype mismatch: {gate.dtype} vs {up.dtype}"
     assert gate.is_contiguous(), "gate must be contiguous"
     assert up.is_contiguous(), "up must be contiguous"
-    if gate.dtype not in DT:  # other float dtypes: the fp32 kernel, rounded once back
+    if gate.dtype not in DTYPE_NAME:  # other float dtypes: the fp32 kernel, rounded once back
         return silu_mul_fwd_sm100(gate.float(), up.float()).to(gate.dtype)
     out = torch.empty_like(gate)
-    n = gate.numel()
-    if n == 0:
+    numel = gate.numel()
+    if numel == 0:
         return out
-    kernel = pick_kernel(DT[gate.dtype], 2, n) if aligned(gate, up, out) else scalar_kernel(DT[gate.dtype], 2)
-    kernel(gate.view(-1), up.view(-1), out.view(-1), n)
+    kernel = pick_kernel(DTYPE_NAME[gate.dtype], 2, numel) if is_vector_aligned(gate, up, out) else build_scalar_kernel(DTYPE_NAME[gate.dtype], 2)
+    kernel(gate.view(-1), up.view(-1), out.view(-1), numel)
     return out
 
 
@@ -429,14 +415,14 @@ def silu_mul_bwd_sm100(grad_output: torch.Tensor, gate: torch.Tensor, up: torch.
     assert grad_output.shape == gate.shape, f"grad_output shape {grad_output.shape} != gate shape {gate.shape}"
     assert grad_output.dtype == gate.dtype, f"grad_output dtype {grad_output.dtype} != gate dtype {gate.dtype}"
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
-    if gate.dtype not in DT or up.dtype != gate.dtype:  # the fp32 kernel, each rounded once back
+    if gate.dtype not in DTYPE_NAME or up.dtype != gate.dtype:  # the fp32 kernel, each rounded once back
         grad_gate, grad_up = silu_mul_bwd_sm100(grad_output.float(), gate.float(), up.float())
         return grad_gate.to(gate.dtype), grad_up.to(up.dtype)
     gate, up = gate.contiguous(), up.contiguous()
     grad_gate, grad_up = torch.empty_like(gate), torch.empty_like(up)
-    n = gate.numel()
-    if n == 0:
+    numel = gate.numel()
+    if numel == 0:
         return grad_gate, grad_up
-    kernel = pick_kernel(DT[gate.dtype], 3, n) if aligned(grad_output, gate, up, grad_gate, grad_up) else scalar_kernel(DT[gate.dtype], 3)
-    kernel(grad_output.view(-1), gate.view(-1), up.view(-1), grad_gate.view(-1), grad_up.view(-1), n)
+    kernel = pick_kernel(DTYPE_NAME[gate.dtype], 3, numel) if is_vector_aligned(grad_output, gate, up, grad_gate, grad_up) else build_scalar_kernel(DTYPE_NAME[gate.dtype], 3)
+    kernel(grad_output.view(-1), gate.view(-1), up.view(-1), grad_gate.view(-1), grad_up.view(-1), numel)
     return grad_gate, grad_up
