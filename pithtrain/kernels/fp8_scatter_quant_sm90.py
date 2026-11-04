@@ -30,7 +30,7 @@ from pithtrain.kernels.cute_ptx_sm90 import asm, atom_add_u64, fence_gpu, lanema
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import THREADS, TILE, RowwiseKmajor, fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
 from pithtrain.kernels.host_transfer import get_pinned_buffer
-from pithtrain.kernels.token_scatter import scatter_by_expert
+from pithtrain.kernels.token_scatter_sm90 import scatter_by_expert_sm90
 
 __all__ = ["Prep", "ScatterQuant", "scatter_quant_sm90", "supports_scatter_quant"]
 
@@ -48,20 +48,20 @@ class Prep:
         self.has_expand = has_expand
 
     @cute.jit
-    def __call__(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor, stream) -> None:
-        num_chunks = (mE.shape[0] + PREP_CHUNK - 1) // PREP_CHUNK
-        args = (mE, mExp, mInv, mRank, mOffs, mKs, mCnt, mFlags, mHist, mCtr)
+    def __call__(self, mExperts: cute.Tensor, mExpand: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCounts: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCounter: cute.Tensor, stream) -> None:
+        num_chunks = (mExperts.shape[0] + PREP_CHUNK - 1) // PREP_CHUNK
+        args = (mExperts, mExpand, mInv, mRank, mOffs, mKs, mCounts, mFlags, mHist, mCounter)
         self.kernel(*args).launch(grid=[num_chunks, 1, 1], block=[PREP_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mE: cute.Tensor, mExp: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCnt: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCtr: cute.Tensor) -> None:
+    def kernel(self, mExperts: cute.Tensor, mExpand: cute.Tensor, mInv: cute.Tensor, mRank: cute.Tensor, mOffs: cute.Tensor, mKs: cute.Tensor, mCounts: cute.Tensor, mFlags: cute.Tensor, mHist: cute.Tensor, mCounter: cute.Tensor) -> None:
         G = self.G
         tidx, _, _ = cute.arch.thread_idx()
         warp = tidx // 32
-        T = mE.shape[0]
+        T = mExperts.shape[0]
         num_chunks = (T + PREP_CHUNK - 1) // PREP_CHUNK
-        experts_base, inv_base, flags_base = mE.iterator.toint(), mInv.iterator.toint(), mFlags.iterator.toint()
-        hist_base, counter_base = mHist.iterator.toint(), mCtr.iterator.toint()
+        experts_base, inv_base, flags_base = mExperts.iterator.toint(), mInv.iterator.toint(), mFlags.iterator.toint()
+        hist_base, counter_base = mHist.iterator.toint(), mCounter.iterator.toint()
 
         smem = cutlass.memory.SmemAllocator()
         s_chunk_count = smem.allocate(G * 4, byte_alignment=16).toint()  # per-expert count in this chunk, running while ranking
@@ -73,14 +73,14 @@ class Prep:
 
         self.clear_counts(tidx, s_chunk_count, s_lower_count, s_warp_count)
         chunk_idx, epoch = self.take_ticket(tidx, counter_base, s_ticket)
-        expert_idxs, src_rows, token_idxs, token_oks = self.load_chunk(experts_base, mExp, chunk_idx, tidx, T)
+        expert_idxs, src_rows, token_idxs, token_oks = self.load_chunk(experts_base, mExpand, chunk_idx, tidx, T)
         safe_expert_idxs, chunk_ranks = self.rank_in_chunk(expert_idxs, token_oks, tidx, warp, s_chunk_count, s_warp_count, s_warp_base)
         self.publish_histogram(hist_base, flags_base, chunk_idx, epoch, tidx, s_chunk_count)
         self.wait_lower_chunks(flags_base, chunk_idx, epoch, tidx)
         self.sum_lower_chunks(hist_base, chunk_idx, tidx, s_lower_count)
         self.store_ranks(inv_base, mRank.iterator.toint(), T, src_rows, token_idxs, token_oks, safe_expert_idxs, chunk_ranks, s_lower_count)
         if chunk_idx == num_chunks - 1:
-            self.store_group_offsets(mOffs.iterator.toint(), mKs.iterator.toint(), mCnt.iterator.toint(), counter_base, num_chunks, tidx, s_chunk_count, s_lower_count)
+            self.store_group_offsets(mOffs.iterator.toint(), mKs.iterator.toint(), mCounts.iterator.toint(), counter_base, num_chunks, tidx, s_chunk_count, s_lower_count)
 
     @cute.jit
     def clear_counts(self, tidx, s_chunk_count, s_lower_count, s_warp_count) -> None:
@@ -103,7 +103,7 @@ class Prep:
         return chunk_idx, epoch
 
     @cute.jit
-    def load_chunk(self, experts_base, mExp, chunk_idx, tidx, T):
+    def load_chunk(self, experts_base, mExpand, chunk_idx, tidx, T):
         """
         All loads are issued before any is used.
         """
@@ -114,7 +114,7 @@ class Prep:
             expert_idx = ld_b32(experts_base + Int64(token_idx) * 8, token_ok, Int32(-1))
             src_row = token_idx
             if cutlass.const_expr(self.has_expand):
-                src_row = ld_b32(mExp.iterator.toint() + Int64(token_idx) * 8, token_ok, Int32(0))
+                src_row = ld_b32(mExpand.iterator.toint() + Int64(token_idx) * 8, token_ok, Int32(0))
             expert_idxs.append(expert_idx)
             src_rows.append(src_row)
             token_idxs.append(token_idx)
@@ -244,19 +244,19 @@ class ScatterQuant(RowwiseKmajor):
         self.pdl = pdl
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mE: cute.Tensor, mRank: cute.Tensor, mInv: cute.Tensor, mCnt: cute.Tensor, mOffs: cute.Tensor, mRsi: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKm: cute.Tensor, mKmScale: cute.Tensor, stream) -> None:
+    def __call__(self, mX: cute.Tensor, mExperts: cute.Tensor, mRank: cute.Tensor, mInv: cute.Tensor, mCounts: cute.Tensor, mOffs: cute.Tensor, mReverseShuffle: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKmajor: cute.Tensor, mKmajorScale: cute.Tensor, stream) -> None:
         num_row_tiles = mTok.shape[0] // TILE
-        args = (mX, mE, mRank, mInv, mCnt, mOffs, mRsi, mTok, mTokScale, mKm, mKmScale)
+        args = (mX, mExperts, mRank, mInv, mCounts, mOffs, mReverseShuffle, mTok, mTokScale, mKmajor, mKmajorScale)
         self.kernel(*args).launch(grid=[self.num_col_tiles, num_row_tiles, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=self.pdl)
 
     @cute.kernel
-    def kernel(self, mX: cute.Tensor, mE: cute.Tensor, mRank: cute.Tensor, mInv: cute.Tensor, mCnt: cute.Tensor, mOffs: cute.Tensor, mRsi: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKm: cute.Tensor, mKmScale: cute.Tensor) -> None:
+    def kernel(self, mX: cute.Tensor, mExperts: cute.Tensor, mRank: cute.Tensor, mInv: cute.Tensor, mCounts: cute.Tensor, mOffs: cute.Tensor, mReverseShuffle: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKmajor: cute.Tensor, mKmajorScale: cute.Tensor) -> None:
         G = self.num_groups
         tidx, _, _ = cute.arch.thread_idx()
         pid_col, pid_row, _ = cute.arch.block_idx()
-        T = mRsi.shape[0]
+        T = mReverseShuffle.shape[0]
         x_base, offs_base = mX.iterator.toint(), mOffs.iterator.toint()
-        bases = (x_base, offs_base, mTok.iterator.toint(), mTokScale.iterator.toint(), mKm.iterator.toint(), mKmScale.iterator.toint())
+        bases = (x_base, offs_base, mTok.iterator.toint(), mTokScale.iterator.toint(), mKmajor.iterator.toint(), mKmajorScale.iterator.toint())
         smem = cutlass.memory.SmemAllocator()
         s_red = smem.allocate_tensor(Uint32, cute.make_layout(self.RED_WORDS), 16)
         if cutlass.const_expr(self.pdl):
@@ -266,8 +266,8 @@ class ScatterQuant(RowwiseKmajor):
         M = Int64(ld_b32(offs_base + (G - 1) * 4, Int32(1), Int32(0)))
         row_start = Int64(pid_row) * TILE
         if row_start < M:
-            rows = self.gather_rows(x_base, offs_base, mInv.iterator.toint(), mCnt.iterator.toint(), T, row_start, pid_col, tidx)
-            self.store_reverse_shuffle(mE.iterator.toint(), mRank.iterator.toint(), offs_base, mRsi.iterator.toint(), T, pid_row, pid_col, tidx)
+            rows = self.gather_rows(x_base, offs_base, mInv.iterator.toint(), mCounts.iterator.toint(), T, row_start, pid_col, tidx)
+            self.store_reverse_shuffle(mExperts.iterator.toint(), mRank.iterator.toint(), offs_base, mReverseShuffle.iterator.toint(), T, pid_row, pid_col, tidx)
             self.quantize_tile(rows, pid_row, pid_col, tidx, M, bases, s_red.iterator.toint())
 
     @cute.jit
@@ -293,7 +293,7 @@ class ScatterQuant(RowwiseKmajor):
         return rows
 
     @cute.jit
-    def store_reverse_shuffle(self, experts_base, rank_base, offs_base, rsi_base, T, pid_row, pid_col, tidx) -> None:
+    def store_reverse_shuffle(self, experts_base, rank_base, offs_base, reverse_shuffle_base, T, pid_row, pid_col, tidx) -> None:
         """
         reverse_shuffle_idxs[t] = start of expert(t) + rank(t) for the tile's token slots.
         """
@@ -301,11 +301,10 @@ class ScatterQuant(RowwiseKmajor):
         token_ok = Int32(pid_col == 0) & Int32(tidx < TILE) & Int32(token_idx < T)
         expert_idx, rank = ld_b32(experts_base + token_idx * 8, token_ok, Int32(0)), ld_b32(rank_base + token_idx * 4, token_ok, Int32(0))
         expert_start = ld_b32(offs_base + Int64(expert_idx - 1) * 4, token_ok & Int32(expert_idx > 0), Int32(0))
-        st_b64(rsi_base + token_idx * 8, Int64(expert_start) + Int64(rank), token_ok)
+        st_b64(reverse_shuffle_base + token_idx * 8, Int64(expert_start) + Int64(rank), token_ok)
 
 
-PREP: dict = {}
-MAIN: dict = {}
+COMPILED: dict = {}
 
 
 class Scratch:
@@ -341,7 +340,7 @@ def compile_prep(G: int, has_expand: bool) -> Callable:
     return cute.compile(Prep(G, has_expand), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int64, (cute.sym_int(),), (1,), 8), fake_int32_vector(), fake_int32_vector(), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake_int32_vector(), fake_int32_vector(), fake(Int64, (1,), (1,), 8), fake_stream(), options="--enable-tvm-ffi")
 
 
-def compile_main(N: int, G: int, pdl: bool) -> Callable:
+def compile_scatter_quant(N: int, G: int, pdl: bool) -> Callable:
     M = cute.sym_int()
     num_col_tiles = (N + TILE - 1) // TILE
     return cute.compile(ScatterQuant(N, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), N), (N, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(cutlass.Float8E4M3FN, (M, N), (N, 1)), fake(cutlass.Float32, (cute.sym_int(), num_col_tiles), (1, cute.sym_int64())), fake(cutlass.Float8E4M3FN, (cute.sym_int(),), (1,)), fake(cutlass.Float32, (N, cute.sym_int()), (1, mn_pad(N))), fake_stream(), options="--enable-tvm-ffi")
@@ -349,10 +348,11 @@ def compile_main(N: int, G: int, pdl: bool) -> Callable:
 
 def run_unfused(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:
     """
-    The unfused path for inputs the fused kernels do not cover (rows in atomic_add order).
+    The unfused path for inputs the fused kernels do not cover (rows in token order, as
+    scatter_by_expert places them on SM90).
     """
     x = gathered if expand_idx is None else gathered[expand_idx]
-    out, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, num_groups, group_counts=group_counts)
+    out, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert_sm90(x, expert_idxs, num_groups, group_counts=group_counts)
     return fp8cast_rowwise_kmajor_sm90(out, grouped_mm_offs), reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor
 
 
@@ -398,10 +398,11 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
     num_chunks = (T + PREP_CHUNK - 1) // PREP_CHUNK
     scratch = get_scratch(device, num_chunks, G)
     has_expand = expand_idx is not None
-    prep_fn = PREP.get((G, has_expand))
+    prep_key = ("prep", G, has_expand)
+    prep_fn = COMPILED.get(prep_key)
     if prep_fn is None:
-        prep_fn = PREP[(G, has_expand)] = compile_prep(G, has_expand)
-    # without expand_idx the kernel never reads mExp, so any int64 vector fills the slot
+        prep_fn = COMPILED[prep_key] = compile_prep(G, has_expand)
+    # without expand_idx the kernel never reads mExpand, so any int64 vector fills the slot
     expand_arg = expand_idx if has_expand else expert_idxs
     prep_fn(expert_idxs, expand_arg, inv, rank, grouped_mm_offs, ks_tensor, group_token_counts, scratch.flags, scratch.hist, scratch.counter)
 
@@ -411,10 +412,10 @@ def scatter_quant_sm90(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_gr
             copy_event = torch.cuda.Event()
         copy_event.record()
 
-    key = (N, G, pdl)
-    fn = MAIN.get(key)
+    key = ("scatter_quant", N, G, pdl)
+    fn = COMPILED.get(key)
     if fn is None:
-        fn = MAIN[key] = compile_main(N, G, pdl)
+        fn = COMPILED[key] = compile_scatter_quant(N, G, pdl)
     fn(gathered, expert_idxs, rank, inv, group_token_counts, grouped_mm_offs, reverse_shuffle_idxs, x_fp8, x_scale, x_ch_fp8, x_ch_scale)
 
     if ks is None:

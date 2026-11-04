@@ -1,7 +1,8 @@
 """
-Verifies bf16_experts_supported: true only on SM90, with the exact quack-kernels version the fused
-BF16 CuTe experts were validated against, and for at most 64 local experts; otherwise false, with
-at most one warning per device. The query never imports QuACK or cutlass.
+Verifies bf16_experts_supported: true on SM100 (the TIRx kernels), and on SM90 with the exact
+quack-kernels version the fused BF16 CuTe experts were validated against, for at most 64 local
+experts; otherwise false, with at most one warning per device. The query never imports QuACK,
+cutlass or tvm.
 
 The version and architecture cases run in a subprocess that patches the probes the query reads
 (importlib.metadata.version and torch.cuda.get_device_capability) before importing the library,
@@ -14,8 +15,9 @@ import sys
 import textwrap
 
 import pytest
+import torch
 
-from pithtrain.kernels import bf16_experts_supported, fp8_fused_experts_supported
+from pithtrain.kernels import bf16_experts_supported, fp8_group_indices
 
 VALIDATED_QUACK = "0.6.5"
 
@@ -29,9 +31,11 @@ def quack_version() -> str | None:
 
 def h200() -> bool:
     """
-    The H200 (SM90) path, told by a capability query rather than an architecture probe.
+    The H200 (SM90) path, told by the library rather than an architecture probe: only SM90's grouped
+    GEMM takes the fp8_group_indices hint (None elsewhere).
     """
-    return fp8_fused_experts_supported()
+    offs = torch.tensor([128], dtype=torch.int32, device="cuda")
+    return fp8_group_indices(offs, 128) is not None
 
 
 def run(code: str) -> None:
@@ -47,23 +51,22 @@ def test_supported_on_h200():
         assert bf16_experts_supported(num_groups)
 
 
-@pytest.mark.skipif(not h200(), reason="needs SM90")
 @pytest.mark.parametrize("num_groups", [65, 128, 256])
 def test_too_many_groups(num_groups):
     assert not bf16_experts_supported(num_groups)
 
 
-def test_query_imports_neither_quack_nor_cutlass():
+def test_query_imports_no_kernel_compiler():
     run(
         """
         import sys
         import pithtrain.kernels
-        assert not any(m.split(".")[0] in ("quack", "cutlass") for m in sys.modules)
+        assert not any(m.split(".")[0] in ("quack", "cutlass", "tvm", "tvm_tirx", "tirx_kernels") for m in sys.modules)
         from pithtrain.kernels import bf16_experts_supported
         bf16_experts_supported()
         bf16_experts_supported(16)
         bf16_experts_supported(128)
-        bad = sorted(m for m in sys.modules if m.split(".")[0] in ("quack", "cutlass"))
+        bad = sorted(m for m in sys.modules if m.split(".")[0] in ("quack", "cutlass", "tvm", "tvm_tirx", "tirx_kernels"))
         assert not bad, bad
         """
     )
@@ -95,18 +98,41 @@ def test_other_quack_version_disables_and_warns_once(version):
     )
 
 
-def test_non_sm90_disables_and_warns_once():
+def test_sm100_supported_without_quack():
+    run(
+        """
+        import importlib.metadata, warnings
+        import torch
+        torch.cuda.get_device_capability = lambda *a, **k: (10, 0)
+        real = importlib.metadata.version
+        def fake(name):
+            if name == "quack-kernels":
+                raise importlib.metadata.PackageNotFoundError(name)
+            return real(name)
+        importlib.metadata.version = fake
+        from pithtrain.kernels import bf16_experts_supported
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert bf16_experts_supported()
+            assert bf16_experts_supported(64)
+            assert not bf16_experts_supported(65)
+        assert not w, [str(x.message) for x in w]
+        """
+    )
+
+
+def test_other_architecture_disables_and_warns_once():
     run(
         """
         import warnings
         import torch
-        torch.cuda.get_device_capability = lambda *a, **k: (10, 0)
+        torch.cuda.get_device_capability = lambda *a, **k: (12, 0)
         from pithtrain.kernels import bf16_experts_supported
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             assert not bf16_experts_supported()
             assert not bf16_experts_supported(8)
         msgs = [str(x.message) for x in w]
-        assert len(msgs) == 1 and "SM90" in msgs[0], msgs
+        assert len(msgs) == 1 and "SM90 or SM100" in msgs[0], msgs
         """
     )

@@ -14,9 +14,9 @@ The codebase is organized into three layers:
 |---|---|---|
 | Application | `pithtrain/tasks` | End-to-end workflows: pretraining, corpus tokenization, checkpoint conversion. |
 | Engine | `pithtrain/{pipeline,models,modules,contexts}` | The bulk of PithTrain: pipeline scheduler, model implementations, and distributed/training infrastructure. |
-| Operator | `pithtrain/{operators,kernels}` | Autograd ops, layers and collectives (`operators`) over fused Triton / CuTe-DSL / library-backed kernels (`kernels`) for compute- and communication-critical paths. |
+| Operator | `pithtrain/{operators,kernels}` | Autograd ops, layers and collectives (`operators`) over fused CuTe-DSL / TIRx-lite / library-backed kernels (`kernels`) for compute- and communication-critical paths. |
 
-Everything sits on top of PyTorch (NCCL, FSDP2, DCP, `torch.compile`), with external kernel libraries (DeepGEMM, FlashAttention) and a Python kernel DSL (Triton) at the operator layer.
+Everything sits on top of PyTorch (NCCL, FSDP2, DCP, `torch.compile`), with external kernel libraries (DeepGEMM, FlashAttention) and Python kernel DSLs (CuTe-DSL, TIRx-lite) at the operator layer.
 
 ### Directory map
 
@@ -30,7 +30,7 @@ pithtrain/
 ├── modules/   # ENGINE: distributed + training infra (distributed.py, training.py)
 ├── contexts/  # ENGINE: runtime state (distributed.pp_group, training.model)
 ├── operators/ # OPERATOR: autograd ops, layers and collectives over the kernels
-└── kernels/   # KERNEL: Triton / CuTe-DSL kernels and launchers, _sm90 / _sm100 per feature
+└── kernels/   # KERNEL: CuTe-DSL (SM90) / TIRx-lite (SM100) kernels and launchers, per feature
 ```
 
 The sections below drill into the parts that carry the most architecture: the model contract, the pipeline engine, and the parallelism mesh.

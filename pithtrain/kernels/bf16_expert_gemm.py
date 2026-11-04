@@ -1,8 +1,11 @@
 """
 The six grouped GEMMs of the fused BF16 experts (fused SwiGLU epilogues, scattered stores, fp32
-main_grad wgrads). SM90 only: callers check bf16_experts_supported first. Each function imports its
-SM90 implementation (cutlass, QuACK) on first call, so importing this module loads neither.
+main_grad wgrads): the CuTe-DSL kernels on SM90, the TIRx kernels on SM100. Callers check
+bf16_experts_supported first. Each function imports its implementation (cutlass and QuACK, or tvm)
+on first call, so importing this module loads none of them.
 """
+
+from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["bf16_expert_down_dgrad", "bf16_expert_gate_up_dgrad", "bf16_expert_down_fwd", "bf16_expert_gate_up_fwd", "bf16_expert_down_wgrad", "bf16_expert_gate_up_wgrad"]
 
@@ -25,8 +28,15 @@ def bf16_expert_gate_up_fwd(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
 
     M == 0 launches nothing. Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gate_up_fwd_sm90
-    return bf16_expert_gate_up_fwd_sm90(x, w_gate, w_up, cu, a_idx, bias, act)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gate_up_fwd_sm90
+            return bf16_expert_gate_up_fwd_sm90(x, w_gate, w_up, cu, a_idx, bias, act)
+        case 10:
+            from pithtrain.kernels.bf16_expert_gemm_sm100 import bf16_expert_gate_up_fwd_sm100
+            return bf16_expert_gate_up_fwd_sm100(x, w_gate, w_up, cu, a_idx, bias, act)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_down_fwd(h, w_down, cu, slot_of, bias=None):
@@ -41,35 +51,51 @@ def bf16_expert_down_fwd(h, w_down, cu, slot_of, bias=None):
 
     M == 0 launches nothing. Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_fwd_sm90
-    return bf16_expert_down_fwd_sm90(h, w_down, cu, slot_of, bias)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_fwd_sm90
+            return bf16_expert_down_fwd_sm90(h, w_down, cu, slot_of, bias)
+        case 10:
+            from pithtrain.kernels.bf16_expert_gemm_sm100 import bf16_expert_down_fwd_sm100
+            return bf16_expert_down_fwd_sm100(h, w_down, cu, slot_of, bias)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_down_dgrad(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
     """
     Down-projection dgrad with the SwiGLU backward fused in the epilogue. Returns
-    (dpre, h, swapped).
+    (dpre, h, dpre_swapped).
 
-    - dy: bf16 (M, H) row-major in received-slot order. w_down: bf16 (G, H, I). preact: the bf16 (M,
-      2I) of bf16_expert_gate_up_fwd. cu, slot_of: as in bf16_expert_down_fwd.
+    - dy: bf16 (M, H) row-major in received-slot order. w_down: bf16 (G, H, I).
+    - preact: the bf16 (M, 2I) of bf16_expert_gate_up_fwd. cu, slot_of: as in bf16_expert_down_fwd.
       w_gate / w_up are read only for their address order.
     - Per grouped row r of expert g: dh = dy[slot_of[r]] @ w_down[g] in fp32, then dswiglu (or the
       clamped dswiglu_oai with act = (alpha, limit), which requires w_gate at the lower address) of
       the saved gate / up gives dg, du and h.
     - dpre: fresh bf16 (M, 2I), pairs in the weights' address order: (dg, du), or (du, dg) when
-      swapped (w_up below w_gate); bf16_expert_gate_up_dgrad and bf16_expert_gate_up_wgrad read that order.
+      dpre_swapped (w_up below w_gate); bf16_expert_gate_up_dgrad and bf16_expert_gate_up_wgrad
+      read that order.
     - h: fresh bf16 (M, I), bit-identical to the forward's h.
 
     M == 0 launches nothing. Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_dgrad_sm90
-    return bf16_expert_down_dgrad_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_dgrad_sm90
+            return bf16_expert_down_dgrad_sm90(dy, w_down, preact, cu, slot_of, w_gate, w_up, act)
+        case 10:
+            from pithtrain.kernels.bf16_expert_gemm_sm100 import bf16_expert_down_dgrad_sm100
+            return bf16_expert_down_dgrad_sm100(dy, w_down, preact, cu, slot_of, w_gate, w_up, act)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_gate_up_dgrad(dpre, w_gate, w_up, cu, dpre_swapped):
     """
-    Gate/up dgrad: a fresh bf16 (M, H) dx in grouped-row order, dx[r] = dg[r] @ w_gate[g] + du[r] @
-    w_up[g] for each row r of expert g, one fp32 accumulation over K = 2I rounded once.
+    Gate/up dgrad: a fresh bf16 (M, H) dx in grouped-row order,
+    dx[r] = dg[r] @ w_gate[g] + du[r] @ w_up[g] for each row r of expert g, one fp32 accumulation
+    over K = 2I rounded once.
 
     - dpre, dpre_swapped: as returned by bf16_expert_down_dgrad; the weights must still be in
       the address order it saw (asserted). w_gate, w_up: bf16 (G, I, H), paired as in
@@ -77,8 +103,15 @@ def bf16_expert_gate_up_dgrad(dpre, w_gate, w_up, cu, dpre_swapped):
 
     M == 0 launches nothing. Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gate_up_dgrad_sm90
-    return bf16_expert_gate_up_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gate_up_dgrad_sm90
+            return bf16_expert_gate_up_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped)
+        case 10:
+            from pithtrain.kernels.bf16_expert_gemm_sm100 import bf16_expert_gate_up_dgrad_sm100
+            return bf16_expert_gate_up_dgrad_sm100(dpre, w_gate, w_up, cu, dpre_swapped)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_gate_up_wgrad(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
@@ -93,8 +126,15 @@ def bf16_expert_gate_up_wgrad(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
 
     M == 0 is a no-op. Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gate_up_wgrad_sm90
-    return bf16_expert_gate_up_wgrad_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_gate_up_wgrad_sm90
+            return bf16_expert_gate_up_wgrad_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx)
+        case 10:
+            from pithtrain.kernels.bf16_expert_gemm_sm100 import bf16_expert_gate_up_wgrad_sm100
+            return bf16_expert_gate_up_wgrad_sm100(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
 def bf16_expert_down_wgrad(dy, h, mg_down, cu, slot_of):
@@ -108,5 +148,12 @@ def bf16_expert_down_wgrad(dy, h, mg_down, cu, slot_of):
 
     M == 0 is a no-op. Deterministic.
     """
-    from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_wgrad_sm90
-    return bf16_expert_down_wgrad_sm90(dy, h, mg_down, cu, slot_of)
+    match ARCH_MAJOR:
+        case 9:
+            from pithtrain.kernels.bf16_expert_gemm_sm90 import bf16_expert_down_wgrad_sm90
+            return bf16_expert_down_wgrad_sm90(dy, h, mg_down, cu, slot_of)
+        case 10:
+            from pithtrain.kernels.bf16_expert_gemm_sm100 import bf16_expert_down_wgrad_sm100
+            return bf16_expert_down_wgrad_sm100(dy, h, mg_down, cu, slot_of)
+        case _:
+            raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

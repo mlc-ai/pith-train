@@ -166,8 +166,8 @@ Run the ladder in that order. After each step, stop and diagnose before continui
 
 **Load `reference/checkpoint.md` before starting this phase.**
 
-1. Create `pithtrain/tasks/convert_checkpoint/<model>.py` with a `<Model>Converter` class (see `gpt_oss.py` for the pattern). Implement `detect_hf` / `detect_dcp` probes, `hf2dcp`, and `postprocess_canonical`.
-2. Register the converter instance in `pithtrain/tasks/convert_checkpoint/_registry.py` (append to `CONVERTERS`).
+1. Create `pithtrain/modules/hf_converters/<model>.py` with a `<Model>Converter` class (see `gpt_oss.py` for the pattern). Implement `detect_hf` / `detect_dcp` probes, `hf2dcp`, and `postprocess_canonical`.
+2. Register the converter instance in `pithtrain/modules/hf_converters/_registry.py` (append to `CONVERTERS`).
 3. Write an `examples/convert_checkpoint/<model>/script.py` that downloads + converts. Mirror `examples/convert_checkpoint/gpt-oss-20b/script.py`.
 4. Run the round-trip: hf -> dcp -> hf -> `transformers.AutoModelForCausalLM.from_pretrained`. Compare `state_dict()` element-wise against HF's own BF16 dequant. Expected `max_abs_diff == 0`.
 

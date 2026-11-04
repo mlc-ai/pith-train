@@ -14,7 +14,7 @@ and their speed unchanged (section 9). Rules marked **(checked)** are enforced b
   in that sibling's `__all__`. **(checked)**
 - **No star imports, no module `__getattr__`, no export dicts.**
 - **Files are flat and named by feature, then architecture**: `<feature>.py` (the picker, or a
-  kernel both architectures run), `<feature>_sm90.py` (CuTe-DSL), `<feature>_sm100.py` (Triton).
+  kernel both architectures run), `<feature>_sm90.py` (CuTe-DSL), `<feature>_sm100.py` (TIRx-lite).
   Shared SM90-only helpers carry `_sm90`; arch-neutral shared leaves carry no suffix.
 - **Lazy heavy imports.** A module the package imports eagerly never imports cutlass, QuACK or FA4
   at module level; they are imported inside the function that runs them. **(checked)**
@@ -91,8 +91,6 @@ Names are built from these parts, so the same kind of value always reads the sam
 | `<thing>_addr` | a computed element address | `row_addr`, `scale_addr` |
 | `s_<buffer>` | a shared-memory buffer (CuTe tensor or address) | `s_amax`, `s_tile` |
 | `m<Name>` | a `cute.Tensor` argument of a CuTe `__call__` / kernel in global memory | `mX`, `mOut`, `mOffs` |
-| `<dim>_offs` | Triton offset vectors | `row_offs`, `col_offs` |
-| `<tensor>_ptrs`, `<what>_mask` | Triton pointer blocks and their masks | `out_ptrs`, `row_mask` |
 | `<value>_bits` | an integer holding a float's bit pattern | `scale_bits`, `amax_bits` |
 | `<value>_t`, `<value>_kmajor` | the transposed or K-major copy of a value (never a type: types are `<value>_type`) | `out_t`, `scale_t`, `tok_kmajor` |
 | `<value>_lo`, `<value>_hi` | the two halves of a packed value | `words_lo`, `words_hi` |
@@ -118,7 +116,7 @@ and buffers, then calls one function per phase; each phase is small enough to re
 
 ### 4.1 The kernel body
 
-- **The kernel entry is an outline.** A `@cute.kernel` method or `@triton.jit` kernel holds its
+- **The kernel entry is an outline.** A `@cute.kernel` method or `@txl.kernel` kernel holds its
   setup (thread / block coordinates, shared-memory allocation, base addresses) and then the calls
   that make up the algorithm, in order:
   ```python
@@ -135,14 +133,14 @@ and buffers, then calls one function per phase; each phase is small enough to re
   along the algorithm's phases (load, reduce, quantize, transpose, store, reduce across warps),
   not at arbitrary line counts. Do not split out a piece shorter than about 10 lines unless it is
   reused or names a step the reader would otherwise have to work out.
-- **Helpers are macros.** `@cute.jit` functions, `dsl_user_op` wrappers and `@triton.jit` helpers
+- **Helpers are macros.** `@cute.jit` functions, `dsl_user_op` wrappers and TIRx-lite helper functions
   are inlined when the kernel compiles: calling one costs nothing at runtime, so use them the way C
   code uses macros, to give every step a name. Three levels, each built from the one below:
   - **instruction wrappers**: one PTX instruction or a short fixed sequence, as a `dsl_user_op`
     (`ld_v4`, `prmt`, `max_u32`, `cast4`), only when the PTX is used from two or more places
     (section 5); PTX used once is written inline where it is used;
   - **building blocks**: a few lines of arithmetic or data movement over registers, as a
-    `@cute.jit` / `@triton.jit` function (`transpose4`, `swizzle`, `thread_coords`);
+    `@cute.jit` function or TIRx-lite helper (`transpose4`, `swizzle`, `thread_coords`);
   - **phases**: one step of the algorithm (`load_rows`, `reduce_block_amax`, `store_tile`).
   The kernel entry calls phases; phases call building blocks and wrappers; nothing calls upward.
   Section 9 confirms the speed is unchanged.
@@ -172,10 +170,8 @@ and buffers, then calls one function per phase; each phase is small enough to re
   disabled feature generates no code and the main path stays one function.
 - **Order is part of the behaviour.** Do not reorder loads, stores, barriers, fences or
   side-effecting `asm` while extracting a phase; the extracted function issues them in the same
-  order as before. In Triton the order of computations matters too: a helper that takes an
-  operand computed earlier than before (an fp32 copy widened up front instead of after the amax)
-  changed the schedule and cost 19% on `rowwise_transpose_sm100`. Extract a step only with its
-  inputs computed where they were.
+  order as before, and with its inputs computed where they were: the order of computations can
+  change the schedule.
 
 ### 4.3 Warp-specialized kernels
 
@@ -221,8 +217,8 @@ Code that appears in more than one file lives once, in the shared module for its
 | Inline-PTX `dsl_user_op`s used by two or more files: loads, stores, shuffles, conversions (`ld_v4`, `st_v4`, `prmt`, `max_u32`, ...) | `cute_ptx_sm90.py` |
 | E8M0 scale math and FP8 quantization steps (`e8m0_scale`, `quant4_e4m3`, the 4-way amax) | `fp8_e8m0_scale_sm90.py` |
 | Fake tensors and streams for `cute.compile` (`fake`, `fake_stream`, `TORCH2CUTE`) | `cute_compile_sm90.py` |
+| Row machinery of the cluster row kernels: a CTA's slice of a row, its bulk copy into shared memory, 16-byte unit unpack / pack, head and tail elements (`RowSlice`, `RowAccess`, `unpack_unit`) | `row_slice_sm90.py` |
 | Layout of FP8 scales | `fp8_scale_layout.py` |
-| The Triton E8M0 scale | `fp8_scale.py` |
 
 - **A PTX wrapper earns its place by reuse.** Where it lives follows how widely it is used:
   - **used from one place**: no wrapper. The `asm(...)` call is written inline in the building

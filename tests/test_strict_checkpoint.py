@@ -31,6 +31,7 @@ from pithtrain.modules.checkpoint import (
     to_localized_model,
 )
 from pithtrain.modules.dataset import MemmapDataset
+from pithtrain.modules.hf_converters.qwen3_omni_moe import load_canonical
 from pithtrain.modules.strict_checkpoint import (
     StrictResumeError,
     StrictResumeState,
@@ -38,7 +39,6 @@ from pithtrain.modules.strict_checkpoint import (
     save_strict_checkpoint,
 )
 from pithtrain.tasks.convert_checkpoint import hf2dcp
-from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import load_canonical
 from tests import test_qwen3_omni_checkpoint as converter
 
 

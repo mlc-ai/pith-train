@@ -12,6 +12,7 @@ from pithtrain.kernels import (
     bf16_experts_supported,
     fp8_fused_experts_supported,
     fp8_quant_grouped,
+    stage_compile_options,
 )
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
@@ -238,7 +239,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -293,7 +294,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         outs = self.forward_stage5_stage1_compute(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         return self.stage1_dispatch(*outs)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage5_stage1_compute(
         self,
         prev_layer: "Qwen3MoeDecoderLayer",
@@ -351,7 +352,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,

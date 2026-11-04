@@ -4,7 +4,7 @@
 
 ## When to add a model-specific converter
 
-Add a new `<Model>Converter` class in `pithtrain/tasks/convert_checkpoint/<model>.py` **only if** one of these applies:
+Add a new `<Model>Converter` class in `pithtrain/modules/hf_converters/<model>.py` **only if** one of these applies:
 
 1. **Quantized released weights** - MXFP4, GPTQ, AWQ, FP8, bitsandbytes, etc. Need to dequantize to BF16 before writing DCP.
 2. **Layout mismatch** - our in-memory layout (`[E, out, in]`) differs from HF's live Parameter layout (`[E, in, out]`). Need a `.transpose(-2, -1)` at the `dcp2hf` boundary to give downstream consumers HF's native layout.
@@ -62,7 +62,7 @@ Adapt from:
 - The model's release repo (OpenAI, Qwen, etc.)
 - TorchTitan if it has a reference
 
-See `_dequantize_mxfp4` in `pithtrain/tasks/convert_checkpoint/gpt_oss.py` for the MXFP4 reference.
+See `_dequantize_mxfp4` in `pithtrain/modules/hf_converters/gpt_oss.py` for the MXFP4 reference.
 
 ### Step 4 - Verify against HF's live dequant
 
@@ -93,12 +93,13 @@ Norms matching but element-wise differing means you have a transpose / interleav
 
 ## Where the code lives
 
-`pithtrain/tasks/convert_checkpoint/` is a package:
+`pithtrain/tasks/convert_checkpoint/` is the conversion task; the per-model converters live in `pithtrain/modules/hf_converters/`, where `pithtrain/modules/hf_loader.py` can use them too:
 
 ```
 pithtrain/tasks/convert_checkpoint/
     __init__.py     # public API: ConvertCheckpointCfg, launch
     _core.py        # generic hf2dcp / dcp2hf + dispatcher + launch
+pithtrain/modules/hf_converters/
     _registry.py    # ModelConverter Protocol + explicit CONVERTERS list
     gpt_oss.py      # GptOssConverter (MXFP4 dequant + stacked-expert transpose)
 ```
@@ -120,7 +121,7 @@ Generic `hf2dcp` delegates entirely to `converter.hf2dcp` when `detect_hf` match
 
 ## Adding a new converter
 
-1. Create `pithtrain/tasks/convert_checkpoint/<model>.py` with a `<Model>Converter` class implementing the four methods.
+1. Create `pithtrain/modules/hf_converters/<model>.py` with a `<Model>Converter` class implementing the four methods.
 2. Append an instance to `CONVERTERS` in `_registry.py`:
    ```python
    from .<model> import <Model>Converter

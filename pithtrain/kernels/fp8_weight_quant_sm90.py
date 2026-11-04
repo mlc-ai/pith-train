@@ -1,27 +1,38 @@
 """
-CuTe-DSL (SM90) kernels of the fp8_weight_quant feature, bit-identical to the Triton ones in
-fp8_weight_quant_sm100: the blockwise transposes, the FP8 parameter all-gather kernels, and
-one-launch variants of the shard amax and the scales over a fixed list of tensors. The picker does
-not use the blockwise transposes: their callers run inside torch.compile regions, which cannot trace
-the CuTe-DSL launchers.
+CuTe-DSL (SM90) kernels of the fp8_weight_quant feature: the blockwise transposes, the FP8
+parameter all-gather kernels, and one-launch variants of the shard amax and the scales over a fixed
+list of tensors. The blockwise transposes take bf16 or fp32 inputs of any shape and strides without
+a copy. Every call goes through opaque torch.library ops whose kernels are C++ (OPS_SOURCE, built
+with the host compiler at first import), so eager calls and torch.compile regions launch the CuTe
+kernel the same way, without re-entering Python.
 
-Numerics follow compute_fp8_scale (SM90 branch) exactly. The tile amax is an integer max over the
-magnitude bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders
-above inf where Triton's float max ignores it: NaN inputs are out of contract.
+Numerics follow the SM90 E8M0 recipe exactly. The tile amax is an integer max over the magnitude
+bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders above inf:
+NaN inputs are out of contract.
 """
 
+import fcntl
+import hashlib
+import os
+import socket
+import subprocess
+import sys
+import sysconfig
 from typing import Optional, Sequence
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+import tvm_ffi
+import tvm_ffi.libinfo
 from cutlass import Int32, Int64, Uint32, const_expr
+from torch.utils import cpp_extension
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.cute_compile_sm90 import TORCH2CUTE, fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import lds_v4, max_u16x2, prmt_args_last, st_v2, st_v4
+from pithtrain.kernels.cute_ptx_sm90 import lds_b32, lds_v4, max_u16x2, prmt_args_last, st_v2, st_v4
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import AMAX_MIN, FP8_MAX_RCP
 
 __all__ = ["fp8_quant_weight_sm90", "fp8_quant_weight_grouped_sm90", "fp8_shard_amax_sm90", "fp8_shard_cast_sm90", "fp8_scales_sm90", "fp8_pack_transpose_sm90", "fp8_shard_amax_multi_sm90", "fp8_scales_multi_sm90"]
@@ -129,7 +140,7 @@ def cast4(x0_bits: Uint32, x1_bits: Uint32, x2_bits: Uint32, x3_bits: Uint32, rc
 @dsl_user_op
 def compute_scale_bits(amax_bits: Uint32, *, loc=None, ip=None) -> Uint32:
     """
-    E8M0 scale bits from amax bits, exactly as compute_fp8_scale (SM90 branch).
+    E8M0 scale bits from amax bits, exactly as the recipe's SM90 E8M0 scale.
     """
     return Uint32(
         asm(
@@ -168,19 +179,19 @@ def thread_coords() -> tuple:
 
 
 @cute.jit
-def load_rows(x_base: Int64, row0: Int32, col0: Int32, num_rows: Int32, K: Int32, in_bytes: cutlass.Constexpr[int], round_bf16: cutlass.Constexpr[bool], is_aligned: cutlass.Constexpr[bool]) -> list:
+def load_rows(x_base: Int64, row0: Int32, col0: Int32, num_rows: Int32, K: Int32, row_stride: Int64, in_bytes: cutlass.Constexpr[int], round_bf16: cutlass.Constexpr[bool], is_aligned: cutlass.Constexpr[bool]) -> list:
     """
     Load the thread's 8x8 block, rows row0 + i valid when 0 <= row0 + i < num_rows.
 
-    x_base addresses element (0, 0) of a row-major (rows, K) matrix. Returns 8 rows of words: four
-    bf16x2 words per row for 2-byte (or bf16-rounded) data, eight fp32 words for 4-byte data, two
-    words of four bytes for 1-byte data.
+    x_base addresses element (0, 0) of a (rows, K) matrix with unit column stride and row_stride
+    elements between rows. Returns 8 rows of words: four bf16x2 words per row for 2-byte (or
+    bf16-rounded) data, eight fp32 words for 4-byte data, two words of four bytes for 1-byte data.
     """
     rows = []
     for i in cutlass.range_constexpr(8):
         row = row0 + i
         row_ok = Int32(row >= 0) & Int32(row < num_rows)
-        row_addr = x_base + (Int64(row) * Int64(K) + Int64(col0)) * in_bytes
+        row_addr = x_base + (Int64(row) * row_stride + Int64(col0)) * in_bytes
         words = []
         if const_expr(is_aligned):
             vec_ok = row_ok & Int32(col0 < K)
@@ -327,75 +338,145 @@ def write_smem_block(s_tile: Int32, quant: list, tile_row0: Int32, tile_col0: In
 
 
 @cute.jit
-def store_smem_tile(s_tile: Int32, out_tile_addr: Int64, num_rows: Int32, num_cols: Int32, row_stride: Int32, num_threads: cutlass.Constexpr[int] = NUM_THREADS) -> None:
+def store_smem_tile(s_tile: Int32, out_tile_addr: Int64, num_rows: Int32, num_cols: Int32, row_stride: Int32, num_threads: cutlass.Constexpr[int] = NUM_THREADS, width: cutlass.Constexpr[int] = 16) -> None:
     """
-    Store the staged tile with 16-byte stores to the row-major byte matrix whose tile row 0, col 0
-    is at out_tile_addr; tile row r is valid when r < num_rows, chunk c when 16 * c < num_cols.
+    Store the staged tile to the row-major byte matrix whose tile row 0, col 0 is at out_tile_addr,
+    with width-byte stores (16, 4 or 1; consecutive lanes on consecutive units of a row, row_stride
+    and the matrix base a multiple of width); tile row r is valid when r < num_rows, unit c when
+    width * c < num_cols.
     """
     tidx, _, _ = cute.arch.thread_idx()
-    for i in cutlass.range_constexpr(TILE_BYTES // 16 // num_threads):
-        chunk_idx = i * num_threads + tidx
-        row, chunk = chunk_idx >> 3, chunk_idx & 7
-        words = lds_v4(s_tile + swizzle(row, chunk))
-        chunk_ok = Int32(row >= 0) & Int32(row < num_rows) & Int32(chunk * 16 < num_cols)
-        st_v4(out_tile_addr + Int64(row) * Int64(row_stride) + Int64(chunk * 16), words, chunk_ok)
+    units_per_row = BLOCK // width
+    for i in cutlass.range_constexpr(TILE_BYTES // width // num_threads):
+        unit_idx = i * num_threads + tidx
+        row, unit = unit_idx // units_per_row, unit_idx % units_per_row
+        unit_ok = Int32(row < num_rows) & Int32(unit * width < num_cols)
+        out_addr = out_tile_addr + Int64(row) * Int64(row_stride) + Int64(unit * width)
+        if const_expr(width == 16):
+            st_v4(out_addr, lds_v4(s_tile + swizzle(row, unit)), unit_ok)
+        elif const_expr(width == 4):
+            st_scalar(out_addr, lds_b32(s_tile + swizzle(row, unit >> 2) + ((unit & 3) << 2)), unit_ok, 4)
+        else:
+            st_scalar(out_addr, lds_u8(s_tile + swizzle(row, unit >> 4) + (unit & 15)), unit_ok, 1)
+
+
+@dsl_user_op
+def lds_u8(addr: Int32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(asm(T.i32(), "ld.shared.u8 $0, [$1];", "=r,r", [Int32(addr)], side_effects=True))
+
+
+@dsl_user_op
+def sts_scalar(addr: Int32, value: Uint32, num_bytes: int, *, loc=None, ip=None) -> None:
+    ptx_type = {2: "b16", 4: "b32"}[num_bytes]
+    asm(None, f"st.shared.{ptx_type} [$0], $1;", "r,r", [Int32(addr), Uint32(value)], side_effects=True)
+
+
+# Element loads a thread keeps in flight before writing them to shared memory.
+STAGE_BATCH = 16
+
+
+@cute.jit
+def stage_tile(x_base: Int64, s_tile: Int32, tile_row_start: Int32, tile_col_start: Int32, M: Int32, K: Int32, row_stride: Int64, col_stride: Int64, in_bytes: cutlass.Constexpr[int]) -> None:
+    """
+    Copy the input tile into shared memory as 128 rows of 128 elements (zero outside the matrix),
+    with element loads at any strides: thread t loads column t % 128 of every other row, so
+    consecutive lanes read consecutive columns.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    col, row_phase = tidx % BLOCK, tidx // BLOCK
+    rows_per_pass = NUM_THREADS // BLOCK
+    col_ok = Int32(tile_col_start + col < K)
+    col_addr = x_base + Int64(tile_col_start + col) * col_stride * in_bytes
+    for batch in cutlass.range_constexpr(BLOCK // rows_per_pass // STAGE_BATCH):
+        values = []
+        for i in cutlass.range_constexpr(STAGE_BATCH):
+            row = (batch * STAGE_BATCH + i) * rows_per_pass + row_phase
+            values.append(ld_scalar_ordered(col_addr + Int64(tile_row_start + row) * row_stride * in_bytes, col_ok & Int32(tile_row_start + row < M), in_bytes))
+        for i in cutlass.range_constexpr(STAGE_BATCH):
+            row = (batch * STAGE_BATCH + i) * rows_per_pass + row_phase
+            sts_scalar(s_tile + (row * BLOCK + col) * in_bytes, values[i], in_bytes)
+
+
+@cute.jit
+def load_rows_smem(s_tile: Int32, block_row: Int32, block_col: Int32, in_bytes: cutlass.Constexpr[int]) -> list:
+    """
+    The thread's 8x8 block from the staged input tile, in the words of load_rows.
+    """
+    rows = []
+    for i in cutlass.range_constexpr(8):
+        row_addr = s_tile + ((block_row + i) * BLOCK + block_col) * in_bytes
+        words = list(lds_v4(row_addr))
+        if const_expr(in_bytes == 4):
+            words = words + list(lds_v4(row_addr + 16))
+        rows.append(words)
+    return rows
 
 
 class BlockwiseTranspose:
     """
-    One CTA per 128x128 tile. mode picks the store path: "smem" stages both FP8 tiles in shared
-    memory for 16-byte stores (dims % 16 == 0), "v8" stores each thread's 8-byte rows (dims % 8 ==
-    0), "scalar" stores bytes (any shape).
+    One CTA per 128x128 tile of a (G, M, K) (is_batched) or (M, K) input with any element strides.
+    load picks how the tile is read: "vec" loads each thread's 8x8 block with 16-byte loads (unit
+    column stride, K % 8 == 0, 16-byte aligned base, row and group strides), "staged" copies the
+    tile into shared memory with element loads (anything else). store picks how the FP8 tiles are
+    written: "regs" stores each thread's 8-byte rows (M, K % 8 == 0), "staged" stages both tiles in
+    shared memory and stores them with coalesced out_width / out_t_width byte stores.
     """
 
-    def __init__(self, in_bytes: int, mode: str, is_batched: bool) -> None:
-        self.in_bytes = in_bytes
-        self.mode = mode
-        self.is_batched = is_batched
+    def __init__(self, in_bytes: int, load: str, store: str, out_width: int, out_t_width: int, is_batched: bool) -> None:
+        self.in_bytes, self.load, self.store, self.is_batched = in_bytes, load, store, is_batched
+        self.out_width, self.out_t_width = out_width, out_t_width
+        self.smem_words = max(TILE_BYTES * in_bytes if load == "staged" else 0, 2 * TILE_BYTES if store == "staged" else 0) // 4
 
     @cute.jit
-    def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, stream: cuda.CUstream):
+    def __call__(self, mX: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, mOutT: cute.Tensor, mScaleT: cute.Tensor, group_stride: Int64, row_stride: Int64, col_stride: Int64, stream: cuda.CUstream):
         if const_expr(self.is_batched):
-            G, M, K = mX.shape[0], mX.shape[1], mX.shape[2]
+            G, M, K = mOut.shape[0], mOut.shape[1], mOut.shape[2]
         else:
-            G, M, K = 1, mX.shape[0], mX.shape[1]
+            G, M, K = 1, mOut.shape[0], mOut.shape[1]
         num_row_tiles, num_col_tiles = (M + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), mScale.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint(), Int32(M), Int32(K), Int32(num_row_tiles), Int32(num_col_tiles)).launch(grid=[num_row_tiles, num_col_tiles, G], block=[NUM_THREADS, 1, 1], stream=stream)
+        self.kernel(mX.iterator.toint(), mOut.iterator.toint(), mScale.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint(), Int32(M), Int32(K), group_stride, row_stride, col_stride, Int32(num_row_tiles), Int32(num_col_tiles)).launch(grid=[num_row_tiles, num_col_tiles, G], block=[NUM_THREADS, 1, 1], smem=self.smem_words * 4 + 128, stream=stream)
 
     @cute.kernel
-    def kernel(self, x_base: Int64, out_base: Int64, scale_base: Int64, out_t_base: Int64, scale_t_base: Int64, M: Int32, K: Int32, num_row_tiles: Int32, num_col_tiles: Int32):
+    def kernel(self, x_base: Int64, out_base: Int64, scale_base: Int64, out_t_base: Int64, scale_t_base: Int64, M: Int32, K: Int32, group_stride: Int64, row_stride: Int64, col_stride: Int64, num_row_tiles: Int32, num_col_tiles: Int32):
         bx, by, bz = cute.arch.block_idx()
         tidx, warp, lane, block_row, block_col = thread_coords()
         smem = cutlass.memory.SmemAllocator()
         s_amax = smem.allocate_tensor(Uint32, cute.make_layout(NUM_WARPS), byte_alignment=16)
-        is_aligned = const_expr(self.mode != "scalar")
 
         tile_row_start, tile_col_start = bx * BLOCK, by * BLOCK
-        row0, col0 = tile_row_start + block_row, tile_col_start + block_col
-        group_elems = Int64(M) * Int64(K)
-        x_group_base = x_base + Int64(bz) * group_elems * self.in_bytes
-        rows = load_rows(x_group_base, row0, col0, M, K, self.in_bytes, False, is_aligned)
+        x_group_base = x_base + Int64(bz) * group_stride * self.in_bytes
+        s_tile = Int32(0)
+        if const_expr(self.smem_words > 0):
+            s_tiles = smem.allocate_tensor(Uint32, cute.make_layout(self.smem_words), byte_alignment=128)
+            s_tile = s_tiles.iterator.toint()
+        if const_expr(self.load == "staged"):
+            stage_tile(x_group_base, s_tile, tile_row_start, tile_col_start, M, K, row_stride, col_stride, self.in_bytes)
+            cute.arch.sync_threads()
+            rows = load_rows_smem(s_tile, block_row, block_col, self.in_bytes)
+        else:
+            rows = load_rows(x_group_base, tile_row_start + block_row, tile_col_start + block_col, M, K, row_stride, self.in_bytes, False, True)
 
         is_packed_bf16 = const_expr(self.in_bytes == 2)
+        # The barrier inside also orders the staged input reads before the staged output writes.
         amax_bits = reduce_block_amax(reduce_thread_amax(rows, is_packed_bf16), warp, lane, s_amax)
         scale_bits = compute_scale_bits(amax_bits)
         quant = cast_rows(rows, Uint32(0x7F000000) - scale_bits, is_packed_bf16)
         # out_t is (K, M): the thread's column j is out_t row col0 + j, its rows are columns.
         quant_t = transpose8(quant)
+        group_elems = Int64(M) * Int64(K)
         out_group_base, out_t_group_base = out_base + Int64(bz) * group_elems, out_t_base + Int64(bz) * group_elems
-        if const_expr(self.mode == "smem"):
-            s_tiles = smem.allocate_tensor(Uint32, cute.make_layout(TILE_BYTES // 2), byte_alignment=128)
-            s_tile = s_tiles.iterator.toint()
+        if const_expr(self.store == "staged"):
             write_smem_block(s_tile, quant, block_row, block_col)
             write_smem_block(s_tile + TILE_BYTES, quant_t, block_col, block_row)
             cute.arch.sync_threads()
             out_tile_addr = out_group_base + Int64(tile_row_start) * Int64(K) + Int64(tile_col_start)
-            store_smem_tile(s_tile, out_tile_addr, M - tile_row_start, K - tile_col_start, K)
+            store_smem_tile(s_tile, out_tile_addr, M - tile_row_start, K - tile_col_start, K, NUM_THREADS, self.out_width)
             out_t_tile_addr = out_t_group_base + Int64(tile_col_start) * Int64(M) + Int64(tile_row_start)
-            store_smem_tile(s_tile + TILE_BYTES, out_t_tile_addr, K - tile_col_start, M - tile_row_start, M)
+            store_smem_tile(s_tile + TILE_BYTES, out_t_tile_addr, K - tile_col_start, M - tile_row_start, M, NUM_THREADS, self.out_t_width)
         else:
-            store_rows(out_group_base, quant, row0, col0, M, K, is_aligned)
-            store_rows(out_t_group_base, quant_t, col0, row0, K, M, is_aligned)
+            row0, col0 = tile_row_start + block_row, tile_col_start + block_col
+            store_rows(out_group_base, quant, row0, col0, M, K, True)
+            store_rows(out_t_group_base, quant_t, col0, row0, K, M, True)
 
         if tidx == 0:
             num_tiles = Int64(num_row_tiles) * Int64(num_col_tiles)
@@ -413,63 +494,268 @@ def fake_row_major(dtype, num_dims: int, align: int) -> cute.Tensor:
     return fake(dtype, shape, stride, align)
 
 
-def compile_blockwise(dtype: torch.dtype, mode: str, is_batched: bool):
-    key = ("bt", dtype, mode, is_batched)
+def fake_strided(dtype, num_dims: int, align: int) -> cute.Tensor:
+    return fake(dtype, tuple(cute.sym_int() for _ in range(num_dims)), tuple(cute.sym_int64() for _ in range(num_dims)), align)
+
+
+def compile_blockwise(dtype: torch.dtype, load: str, store: str, out_width: int, out_t_width: int, is_batched: bool):
+    key = (dtype, load, store, out_width, out_t_width, is_batched)
     fn = COMPILED.get(key)
     if fn is None:
-        num_dims = 3 if is_batched else 2
-        in_bytes = torch.tensor([], dtype=dtype).element_size()
-        fn = cute.compile(BlockwiseTranspose(in_bytes, mode, is_batched), fake_row_major(TORCH2CUTE[dtype], num_dims, in_bytes), fake_row_major(cutlass.Float8E4M3FN, num_dims, 1), fake_row_major(cutlass.Float32, num_dims, 4), fake_row_major(cutlass.Float8E4M3FN, num_dims, 1), fake_row_major(cutlass.Float32, num_dims, 4), fake_stream(), options="--enable-tvm-ffi")
+        in_bytes, num_dims = torch.tensor([], dtype=dtype).element_size(), 3 if is_batched else 2
+        fn = cute.compile(BlockwiseTranspose(in_bytes, load, store, out_width, out_t_width, is_batched), fake_strided(TORCH2CUTE[dtype], num_dims, in_bytes), fake_row_major(cutlass.Float8E4M3FN, num_dims, 1), fake_row_major(cutlass.Float32, num_dims, 4), fake_row_major(cutlass.Float8E4M3FN, num_dims, 1), fake_row_major(cutlass.Float32, num_dims, 4), Int64(0), Int64(0), Int64(0), fake_stream(), options="--enable-tvm-ffi")
         COMPILED[key] = fn
     return fn
 
 
-def store_mode(num_tiles: int, N: int, K: int, *tensors: torch.Tensor) -> str:
-    if any(tensor.data_ptr() % 16 for tensor in tensors):
-        mode = "scalar"
-    elif N % 16 == 0 and K % 16 == 0 and num_tiles >= SMEM_MIN_TILES:
-        mode = "smem"
-    else:
-        mode = "v8" if N % 8 == 0 and K % 8 == 0 else "scalar"
-    return mode
+def store_width(row_bytes: int) -> int:
+    return 16 if row_bytes % 16 == 0 else 4 if row_bytes % 4 == 0 else 1
 
 
-def fp8_quant_weight_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
-    if x.stride(1) != 1:
-        x = x.contiguous()
-    N, K = x.shape
-    num_row_tiles, num_col_tiles = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-    device = x.device
-    out = torch.empty((N, K), dtype=torch.float8_e4m3fn, device=device)
-    scale = torch.empty((num_row_tiles, num_col_tiles), dtype=torch.float32, device=device)
-    out_t = torch.empty((K, N), dtype=torch.float8_e4m3fn, device=device)
-    scale_t = torch.empty((num_col_tiles, num_row_tiles), dtype=torch.float32, device=device)
-    if N == 0 or K == 0:
-        return out, scale, out_t, scale_t
-    if x.stride(0) != K:
-        x = x.contiguous()
-    fn = compile_blockwise(x.dtype, store_mode(num_row_tiles * num_col_tiles, N, K, x, out, out_t), False)
-    fn(x, out, scale, out_t, scale_t)
-    return out, scale, out_t, scale_t
-
-
-def fp8_quant_weight_grouped_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
-    if not x.is_contiguous():
-        x = x.contiguous()
-    G, N, K = x.shape
-    num_row_tiles, num_col_tiles = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
-    device = x.device
-    out = torch.empty((G, N, K), dtype=torch.float8_e4m3fn, device=device)
-    scale = torch.empty((G, num_row_tiles, num_col_tiles), dtype=torch.float32, device=device)
-    out_t = torch.empty((G, K, N), dtype=torch.float8_e4m3fn, device=device)
-    scale_t = torch.empty((G, num_col_tiles, num_row_tiles), dtype=torch.float32, device=device)
+def resolve(dtype: torch.dtype, shape: tuple, stride: tuple, x_addr: int) -> tuple:
+    """
+    (compiled kernel or None for an empty input, whether the outputs are swapped, group / row /
+    column element strides) of an x of this dtype, shape, strides and address modulo 16.
+    """
+    is_batched = len(shape) == 3
+    G, N, K = shape[0] if is_batched else 1, shape[-2], shape[-1]
     if G == 0 or N == 0 or K == 0:
-        return out, scale, out_t, scale_t
-    fn = compile_blockwise(x.dtype, store_mode(G * num_row_tiles * num_col_tiles, N, K, x, out, out_t), True)
-    fn(x, out, scale, out_t, scale_t)
-    return out, scale, out_t, scale_t
+        return None, False, ()
+    group_stride, row_stride, col_stride = (stride[0] if G > 1 else 0) if is_batched else 0, stride[-2], stride[-1]
+    # a view whose transpose has unit column stride runs on that transpose with the outputs swapped
+    is_swapped = N > 1 and K > 1 and col_stride != 1 and row_stride == 1
+    if is_swapped:
+        N, K, row_stride, col_stride = K, N, col_stride, row_stride
+    # strides of size-1 dims never move the address: zero them so they do not affect alignment
+    row_stride, col_stride = row_stride if N > 1 else 0, col_stride if K > 1 else 1
+    in_bytes = dtype.itemsize
+    is_vec = col_stride == 1 and K % 8 == 0 and x_addr % 16 == 0 and group_stride * in_bytes % 16 == 0 and row_stride * in_bytes % 16 == 0
+    if N % 16 == 0 and K % 16 == 0 and G * ((N + BLOCK - 1) // BLOCK) * ((K + BLOCK - 1) // BLOCK) >= SMEM_MIN_TILES:
+        store, out_width, out_t_width = "staged", 16, 16
+    elif N % 8 == 0 and K % 8 == 0:
+        store, out_width, out_t_width = "regs", 8, 8
+    else:
+        store, out_width, out_t_width = "staged", store_width(K), store_width(N)
+    return compile_blockwise(dtype, "vec" if is_vec else "staged", store, out_width, out_t_width, is_batched), is_swapped, (group_stride, row_stride, col_stride)
+
+
+# fp8_quant_weight[_grouped] on SM90 as torch.library ops, used for every call (eager and inside
+# torch.compile regions, where they are opaque). Their kernels are C++ (OPS_SOURCE, built with the
+# host compiler at first import): a CUDA kernel checks the input, allocates the four outputs and
+# launches the CuTe kernel through a cache of (compiled kernel's tvm-ffi function, output swap,
+# strides) keyed by (dtype, sizes, strides, address mod 16), each entry resolved once by resolve()
+# through a tvm-ffi global function, on torch's current stream. The Autograd-key kernel runs that
+# launch directly for real tensors outside tracing and dispatch modes (the outputs never
+# carry gradients), which skips the autograd-not-implemented fallback, and redispatches below
+# autograd otherwise (fake or functional tensors, an active TorchDispatchMode), to the fake or
+# the CUDA kernel.
+OPS_SOURCE = r"""
+#include <Python.h>
+#include <ATen/ATen.h>
+#include <ATen/DLConvertor.h>
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <ATen/cuda/EmptyTensor.h>
+#include <c10/core/impl/LocalDispatchKeySet.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/library.h>
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/function.h>
+#include <cstring>
+#include <mutex>
+#include <tuple>
+#include <unordered_map>
+
+namespace {
+
+using Outputs = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+
+struct Key {
+  int64_t words[8];
+  bool operator==(const Key& other) const { return std::memcmp(words, other.words, sizeof(words)) == 0; }
+};
+
+struct KeyHash {
+  size_t operator()(const Key& key) const {
+    size_t hash = 1469598103934665603ull;
+    for (int64_t word : key.words) hash = (hash ^ static_cast<size_t>(word)) * 1099511628211ull;
+    return hash;
+  }
+};
+
+struct Entry {
+  tvm::ffi::Function fn;
+  bool swap = false, empty = true;
+  int64_t strides[3] = {0, 0, 0};
+};
+
+constexpr size_t max_entries = 4096;
+// Leaked on purpose: destroying them after the interpreter finalizes would crash.
+auto& cache = *new std::unordered_map<Key, Entry, KeyHash>();
+std::mutex cache_mutex;
+
+// Sets tvm-ffi's environment stream for a device and restores the previous one, also on exceptions.
+struct EnvStream {
+  int32_t device;
+  TVMFFIStreamHandle previous = nullptr;
+  EnvStream(int32_t device, cudaStream_t stream) : device(device) { TVMFFIEnvSetStream(kDLCUDA, device, stream, &previous); }
+  ~EnvStream() { TVMFFIEnvSetStream(kDLCUDA, device, previous, nullptr); }
+};
+
+DLTensor as_dl(const at::Tensor& t) {
+  DLTensor d;
+  d.data = t.data_ptr();
+  d.device = DLDevice{kDLCUDA, static_cast<int32_t>(t.device().index())};
+  d.ndim = static_cast<int32_t>(t.dim());
+  d.dtype = at::getDLDataType(t);
+  d.shape = const_cast<int64_t*>(t.sizes().data());
+  d.strides = const_cast<int64_t*>(t.strides().data());
+  d.byte_offset = 0;
+  return d;
+}
+
+Entry lookup(const at::Tensor& x) {
+  Key key;
+  std::memset(key.words, 0, sizeof(key.words));
+  int64_t ndim = x.dim();
+  key.words[0] = static_cast<int64_t>(x.scalar_type()) * 16 + ndim;
+  for (int64_t i = 0; i < ndim; ++i) key.words[1 + i] = x.size(i), key.words[4 + i] = x.stride(i);
+  key.words[7] = reinterpret_cast<int64_t>(x.data_ptr()) & 15;
+  std::lock_guard<std::mutex> guard(cache_mutex);
+  auto found = cache.find(key);
+  if (found != cache.end()) return found->second;
+  static tvm::ffi::Function& resolve = *new tvm::ffi::Function(tvm::ffi::Function::GetGlobalRequired("pithtrain.fp8_quant_weight_resolve_sm90"));
+  tvm::ffi::Array<int64_t> sizes(x.sizes().begin(), x.sizes().end()), strides(x.strides().begin(), x.strides().end());
+  // the dispatcher released the GIL, and the resolver is Python
+  PyGILState_STATE gil = PyGILState_Ensure();
+  auto result = resolve(static_cast<int64_t>(x.scalar_type()), sizes, strides, key.words[7]).cast<tvm::ffi::Array<tvm::ffi::Any>>();
+  PyGILState_Release(gil);
+  Entry entry;
+  // Function is a nullable reference, so an empty input's None is told apart by its type index
+  entry.empty = result[0].type_index() == tvm::ffi::TypeIndex::kTVMFFINone;
+  if (!entry.empty) {
+    entry.fn = result[0].cast<tvm::ffi::Function>();
+    entry.swap = result[1].cast<bool>();
+    for (int i = 0; i < 3; ++i) entry.strides[i] = result[2 + i].cast<int64_t>();
+  }
+  if (cache.size() >= max_entries) cache.clear();
+  cache.emplace(key, entry);
+  return entry;
+}
+
+template <int64_t ndim>
+Outputs quant(const at::Tensor& x) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == ndim, "fp8_quant_weight on SM90 takes a ", ndim, "-D CUDA tensor, got ", x.dim(), "-D on ", x.device());
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "fp8_quant_weight on SM90 takes bf16 or fp32, got ", x.scalar_type());
+  c10::cuda::CUDAGuard device_guard(x.device());
+  int64_t G = ndim == 3 ? x.size(0) : 1, N = x.size(-2), K = x.size(-1), rows = (N + 127) / 128, cols = (K + 127) / 128;
+  // the CUDA allocator directly, not at::empty through the dispatcher (host cost per call)
+  auto alloc = [&](int64_t a, int64_t b, at::ScalarType dtype) {
+    int64_t sizes[3] = {G, a, b};
+    return at::Tensor(at::detail::empty_cuda(at::IntArrayRef(sizes + (3 - ndim), ndim), dtype, x.device(), std::nullopt));
+  };
+  at::Tensor out = alloc(N, K, at::kFloat8_e4m3fn), scale = alloc(rows, cols, at::kFloat), out_t = alloc(K, N, at::kFloat8_e4m3fn), scale_t = alloc(cols, rows, at::kFloat);
+  Entry entry = lookup(x);
+  if (entry.empty) return {out, scale, out_t, scale_t};
+  DLTensor d_x = as_dl(x), d_out = as_dl(out), d_scale = as_dl(scale), d_out_t = as_dl(out_t), d_scale_t = as_dl(scale_t);
+  if (entry.swap) std::swap(d_out, d_out_t), std::swap(d_scale, d_scale_t);
+  int32_t device = static_cast<int32_t>(x.device().index());
+  EnvStream env(device, c10::cuda::getCurrentCUDAStream(device).stream());
+  entry.fn(&d_x, &d_out, &d_scale, &d_out_t, &d_scale_t, entry.strides[0], entry.strides[1], entry.strides[2]);
+  return {out, scale, out_t, scale_t};
+}
+
+template <int64_t ndim, const char* name>
+Outputs quant_autograd(const at::Tensor& x) {
+  constexpr c10::DispatchKeySet traced({c10::DispatchKey::Python, c10::DispatchKey::PythonTLSSnapshot, c10::DispatchKey::Functionalize});
+  if (!x.key_set().has_any(traced) && !c10::impl::tls_local_dispatch_key_set().included_.has_any(traced)) return quant<ndim>(x);
+  static auto op = c10::Dispatcher::singleton().findSchemaOrThrow(name, "").typed<Outputs(const at::Tensor&)>();
+  at::AutoDispatchBelowADInplaceOrView guard;
+  return op.call(x);
+}
+
+constexpr char quant_name[] = "pithtrain::fp8_quant_weight_sm90";
+constexpr char quant_grouped_name[] = "pithtrain::fp8_quant_weight_grouped_sm90";
+
+}  // namespace
+
+TORCH_LIBRARY_FRAGMENT(pithtrain, m) {
+  m.def("fp8_quant_weight_sm90(Tensor x) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.def("fp8_quant_weight_grouped_sm90(Tensor x) -> (Tensor, Tensor, Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(pithtrain, CUDA, m) {
+  m.impl("fp8_quant_weight_sm90", &quant<2>);
+  m.impl("fp8_quant_weight_grouped_sm90", &quant<3>);
+}
+
+TORCH_LIBRARY_IMPL(pithtrain, Autograd, m) {
+  m.impl("fp8_quant_weight_sm90", &quant_autograd<2, quant_name>);
+  m.impl("fp8_quant_weight_grouped_sm90", &quant_autograd<3, quant_grouped_name>);
+}
+"""
+
+
+@tvm_ffi.register_global_func("pithtrain.fp8_quant_weight_resolve_sm90")
+def resolve_for_ops(scalar_type: int, sizes: Sequence[int], strides: Sequence[int], align: int) -> list:
+    """
+    resolve() for the C++ kernels: [tvm-ffi function of the compiled kernel or None, output swap,
+    group / row / column strides] of an input of this torch ScalarType (bf16 or fp32), sizes,
+    strides and address modulo 16.
+    """
+    dtype = {15: torch.bfloat16, 6: torch.float32}[scalar_type]
+    fn, is_swapped, launch_strides = resolve(dtype, tuple(sizes), tuple(strides), align)
+    return [None, False, 0, 0, 0] if fn is None else [fn._tvm_ffi_function, is_swapped, *launch_strides]
+
+
+def build_ops() -> str:
+    """
+    The shared library of OPS_SOURCE, built with the host C++ compiler against this torch and
+    tvm-ffi once per source and version, cached in ~/.cache/pithtrain. Each builder writes its own
+    source and library under names unique to the host and process and publishes the library with
+    an atomic rename, so concurrent builders (ranks, nodes) never see a partial file; the file lock
+    only keeps them from building it more than once where it holds (a missed lock costs a
+    duplicate build).
+    """
+    digest = hashlib.sha256("\n".join([OPS_SOURCE, torch.__version__, tvm_ffi.__version__, sys.version]).encode()).hexdigest()[:16]
+    root = os.path.join(os.path.expanduser("~/.cache/pithtrain"), "fp8_weight_quant_ops_sm90", digest)
+    library = os.path.join(root, "ops.so")
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not os.path.exists(library):
+            unique = f"{socket.gethostname()}.{os.getpid()}"
+            source, partial = os.path.join(root, f"ops.{unique}.cpp"), f"{library}.{unique}.tmp"
+            with open(source, "w") as source_file:
+                source_file.write(OPS_SOURCE)
+            includes = cpp_extension.include_paths(device_type="cuda") + [sysconfig.get_paths()["include"], tvm_ffi.libinfo.find_include_path(), tvm_ffi.libinfo.find_dlpack_include_path()]
+            tvm_ffi_dir = os.path.dirname(tvm_ffi.libinfo.find_libtvm_ffi())
+            command = ["c++", "-O2", "-std=c++17", "-shared", "-fPIC", f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}", source, "-o", partial]
+            command += [f"-I{path}" for path in includes] + [f"-L{path}" for path in cpp_extension.library_paths(device_type="cuda")] + [f"-L{tvm_ffi_dir}", f"-Wl,-rpath,{tvm_ffi_dir}", "-lc10", "-lc10_cuda", "-ltorch_cpu", "-ltorch_cuda", "-ltorch", "-ltvm_ffi"]
+            subprocess.run(command, check=True)
+            os.replace(partial, library)
+            os.remove(source)
+    return library
+
+
+def quant_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    The four outputs of the ops for an input x (2-D (N, K) or 3-D (G, N, K)): e4m3 (.., N, K), fp32
+    (.., ceil(N / 128), ceil(K / 128)), e4m3 (.., K, N) and fp32 (.., ceil(K / 128), ceil(N / 128)).
+    """
+    *lead, N, K = x.shape
+    rows, cols = (N + BLOCK - 1) // BLOCK, (K + BLOCK - 1) // BLOCK
+    return x.new_empty((*lead, N, K), dtype=torch.float8_e4m3fn), x.new_empty((*lead, rows, cols), dtype=torch.float32), x.new_empty((*lead, K, N), dtype=torch.float8_e4m3fn), x.new_empty((*lead, cols, rows), dtype=torch.float32)
+
+
+torch.ops.load_library(build_ops())
+torch.library.register_fake("pithtrain::fp8_quant_weight_sm90", quant_fake)
+torch.library.register_fake("pithtrain::fp8_quant_weight_grouped_sm90", quant_fake)
+# fp8_quant_weight on SM90 (x 2-D) and fp8_quant_weight_grouped on SM90 (x 3-D): bf16 or fp32, any
+# shape and strides, outputs as the picker documents them.
+fp8_quant_weight_sm90, fp8_quant_weight_grouped_sm90 = torch.ops.pithtrain.fp8_quant_weight_sm90.default, torch.ops.pithtrain.fp8_quant_weight_grouped_sm90.default
 
 
 @cute.jit
@@ -483,10 +769,9 @@ def shard_tile(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_rows:
         return
     is_aligned = const_expr(mode != "scalar")
     tidx, warp, lane, block_row, block_col = thread_coords()
-    row0 = tile_row_idx * BLOCK + block_row - row_offset
-    col0 = tile_col_idx * BLOCK + block_col
+    row0, col0 = tile_row_idx * BLOCK + block_row - row_offset, tile_col_idx * BLOCK + block_col
     group_elem_start = Int64(group_idx) * Int64(local_rows) * Int64(K)
-    rows = load_rows(shard_base + group_elem_start * 4, row0, col0, local_rows, K, 4, True, is_aligned)
+    rows = load_rows(shard_base + group_elem_start * 4, row0, col0, local_rows, K, Int64(K), 4, True, is_aligned)
     if const_expr(is_cast):
         scale_bits = compute_scale_bits(ld_scalar_ordered(amax_addr, Int32(1), 4))
         quant = cast_rows(rows, Uint32(0x7F000000) - scale_bits, True)
@@ -503,8 +788,8 @@ def shard_tile(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_rows:
 def shard_tile_row(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_rows: Int32, K: Int32, tile_row_idx: Int32, tile_col_idx: Int32, group_idx: Int32, row_offset: Int32, is_cast: cutlass.Constexpr[bool]):
     """
     Row-major variant of shard_tile: a warp loads one 128-column tile row (16 bytes per lane), warps
-    take rows round-robin, so a shard holding a few rows of a tile still uses all 8 warps. Needs K %
-    4 == 0 and a 16-byte aligned shard.
+    take rows round-robin, so a shard holding a few rows of a tile still uses all 8 warps. Needs
+    K % 4 == 0 and a 16-byte aligned shard.
     """
     tidx, _, _ = cute.arch.thread_idx()
     warp, lane = tidx // 32, tidx % 32
@@ -564,8 +849,7 @@ def reduce_shard_rows_amax(words: list, warp: Int32, lane: Int32) -> Uint32:
 
 class ShardTile:
     def __init__(self, is_cast: bool, mode: str) -> None:
-        self.is_cast = is_cast
-        self.mode = mode
+        self.is_cast, self.mode = is_cast, mode
 
     @cute.jit
     def __call__(self, mShard: cute.Tensor, mAmax: cute.Tensor, mOut: cute.Tensor, row_offset: Int32, group_offset: Int32, stream: cuda.CUstream):
@@ -701,7 +985,7 @@ class PackTranspose:
         group_elems = Int64(N) * Int64(K)
         group_start = Int64(bz) * group_elems
         is_aligned = const_expr(self.mode != "scalar")
-        words = load_rows(x_base + group_start, row0, col0, N, K, 1, False, is_aligned)
+        words = load_rows(x_base + group_start, row0, col0, N, K, Int64(K), 1, False, is_aligned)
         words_t = transpose8(words)
         out_t_base = out_base + Int64(G) * group_elems + group_start
         store_rows(out_base + group_start, words, row0, col0, N, K, is_aligned)
@@ -709,7 +993,7 @@ class PackTranspose:
 
 
 def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
-    G, N, K = x.shape
+    _, N, K = x.shape
     if x.numel() == 0:
         return
     if N % 16 == 0 and K % 16 == 0 and x.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0:

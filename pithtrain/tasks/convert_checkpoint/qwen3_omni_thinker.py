@@ -17,7 +17,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
 )
 
-from . import qwen3_omni_moe as text
+from pithtrain.modules.hf_converters import qwen3_omni_moe as text
 
 SIDECAR = "qwen3_omni_thinker.json"
 SCOPE = "thinker_multimodal"

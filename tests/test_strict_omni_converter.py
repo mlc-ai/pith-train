@@ -23,13 +23,13 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from pithtrain.contexts import distributed, training
 from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
 from pithtrain.modules.distributed_checkpoint import _pack, _runtime
-from pithtrain.modules.resume_semantics import bind_scheduler_factory, seal
-from pithtrain.tasks.convert_checkpoint import dcp2hf, hf2dcp
-from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import (
+from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     ConversionError,
     canonical_to_hf,
     hf_to_canonical,
 )
+from pithtrain.modules.resume_semantics import bind_scheduler_factory, seal
+from pithtrain.tasks.convert_checkpoint import dcp2hf, hf2dcp
 from pithtrain.tasks.convert_checkpoint.strict_omni import (
     MANIFEST,
     RESUME_DIR,

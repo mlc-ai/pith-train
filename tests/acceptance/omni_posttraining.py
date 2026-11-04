@@ -171,7 +171,7 @@ def gather_native(model, config, *, gradients=False):
     from torch.distributed.tensor import DTensor
 
     from pithtrain.modules.checkpoint import to_canonical_model
-    from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import parameter_shapes
+    from pithtrain.modules.hf_converters.qwen3_omni_moe import parameter_shapes
 
     parameters = dict(model.named_parameters())
     errors = [name for name, value in parameters.items() if gradients and value.grad is None]
@@ -366,7 +366,7 @@ class HFPolicy(torch.nn.Module):
 
 class Reference:
     def __init__(self, config, initial):
-        from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import canonical_to_hf
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import canonical_to_hf
         from tests.acceptance.omni_reference_attention import MATCHED, configure_reference_attention
         from tests.acceptance.omni_reference_precision import FP32GradientReference
 
@@ -389,12 +389,12 @@ class Reference:
         self._convert = canonical_to_hf
 
     def install(self, canonical):
-        from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import canonical_to_hf
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import canonical_to_hf
 
         self.policy.load_state_dict(canonical_to_hf(canonical, self.config, prefix=""), strict=True)
 
     def gradient(self, canonical, records, task):
-        from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import hf_to_canonical
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import hf_to_canonical
 
         self.install(canonical)
         converted = self._convert(canonical, self.config, prefix="")
@@ -471,7 +471,7 @@ class Observer:
 
     def before_optimizer_step(self, optimizer, positional, keyword):
         from pithtrain.contexts import training
-        from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import parameter_shapes
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import parameter_shapes
 
         actual = gather_native(training.model, self.config, gradients=True)
 
@@ -498,7 +498,7 @@ class Observer:
 
     def before_clip(self):
         from pithtrain.contexts import training
-        from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import parameter_shapes
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import parameter_shapes
 
         actual = gather_native(training.model, self.config, gradients=True)
 
@@ -525,7 +525,7 @@ class Observer:
 
     def after_update(self):
         from pithtrain.contexts import training
-        from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import (
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import (
             hf_to_canonical,
             parameter_shapes,
         )

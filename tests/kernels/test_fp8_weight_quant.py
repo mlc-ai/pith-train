@@ -3,7 +3,11 @@ Verifier of the fp8_weight_quant feature against a PyTorch 128x128 blockwise FP8
 E8M0 scale per 128x128 tile, from the tile amax).
 
 - fp8_quant_weight and fp8_quant_weight_grouped: the blockwise FP8 of W and
-  of W.T (per expert for a (G, N, K) weight), with row-major scales.
+  of W.T (per expert for a (G, N, K) weight), with row-major scales, on bf16 and fp32 inputs of
+  any strides (transposed, row-padded, column-strided, expanded and misaligned views), with fresh
+  outputs, tiles holding inf (either E8M0 result of an infinite amax, as the other FP8 verifiers
+  accept), and called inside torch.compile(fullgraph=True, options={"cpp_wrapper": True}) as the
+  models call them.
 - The FP8 parameter all-gather kernels, driven as the FP8 parameter gather drives them. FSDP dim-0
   shards of an fp32 master (rows of a 2D weight, experts of a 3D one) each write the per-tile amax
   of the bf16-rounded shard into a zeroed grid (fp8_shard_amax). The grids are MAX-reduced, the
@@ -11,9 +15,11 @@ E8M0 scale per 128x128 tile, from the tile amax).
   weight is packed with its transpose (fp8_pack_transpose). The result must equal the blockwise
   quantization of the full bf16 weight.
 - fp8_shard_amax_multi and fp8_scales_multi return one launch for a list of weights (a callable on
-  the H200) whose results must equal the per-tensor calls.
+  the H200) whose results must equal the per-tensor calls, or None where the device has no such
+  launch, in which case the tests run the per-tensor loop callers fall back to.
 """
 
+import warnings
 import zlib
 
 import pytest
@@ -219,9 +225,10 @@ def test_blockwise_transpose_batched_fp32_and_zeros() -> None:
     check_blockwise_transpose_batched(torch.zeros(4, 128, 256, device="cuda", dtype=torch.bfloat16))
 
 
-def test_blockwise_transpose_empty() -> None:
-    for shape in [(0, 256), (256, 0)]:
-        x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_blockwise_transpose_empty(dtype: torch.dtype) -> None:
+    for shape in [(0, 256), (256, 0), (0, 0)]:
+        x = torch.empty(shape, device="cuda", dtype=dtype)
         w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(x)
         N, K = shape
         assert w_fp8.shape == (N, K) and wt_fp8.shape == (K, N)
@@ -229,14 +236,318 @@ def test_blockwise_transpose_empty() -> None:
         assert wt_scale.shape == (cdiv(K, BLOCK), cdiv(N, BLOCK))
 
 
-def test_blockwise_transpose_batched_empty() -> None:
-    for shape in [(0, 256, 128), (2, 0, 128), (2, 128, 0)]:
-        x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_blockwise_transpose_batched_empty(dtype: torch.dtype) -> None:
+    for shape in [(0, 256, 128), (2, 0, 128), (2, 128, 0), (0, 0, 0)]:
+        x = torch.empty(shape, device="cuda", dtype=dtype)
         w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight_grouped(x)
         G, N, K = shape
         assert w_fp8.shape == (G, N, K) and wt_fp8.shape == (G, K, N)
         assert w_scale.shape == (G, cdiv(N, BLOCK), cdiv(K, BLOCK))
         assert wt_scale.shape == (G, cdiv(K, BLOCK), cdiv(N, BLOCK))
+
+
+@pytest.mark.parametrize(
+    "shape", [(512, 384), (200, 136), (2048, 768), (7, 300), (130, 7), (1, 1), (4097, 2047)]
+)
+@pytest.mark.parametrize("kind", ["randn", "wide", "huge", "tiny"])
+def test_blockwise_transpose_fp32_partial(shape: tuple, kind: str) -> None:
+    check_blockwise_transpose(make_weight(shape, dtype=torch.float32, kind=kind))
+
+
+@pytest.mark.parametrize("shape", [(3, 260, 384), (4, 768, 2048), (2, 100, 300), (1, 129, 136)])
+@pytest.mark.parametrize("kind", ["randn", "wide", "huge"])
+def test_blockwise_transpose_batched_fp32(shape: tuple, kind: str) -> None:
+    check_blockwise_transpose_batched(make_weight(shape, dtype=torch.float32, kind=kind))
+
+
+def misaligned(shape: tuple, dtype: torch.dtype, kind: str) -> torch.Tensor:
+    """
+    A contiguous view one element past a fresh allocation (data_ptr % 16 == element size).
+    """
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return make_weight((numel + 1,), dtype=dtype, kind=kind)[1:].view(shape)
+
+
+def strided(shape: tuple, stride: tuple, dtype: torch.dtype, kind: str) -> torch.Tensor:
+    """
+    An as_strided view of shape and stride (in elements) into a fresh buffer.
+    """
+    span = 1 + sum((size - 1) * step for size, step in zip(shape, stride))
+    return make_weight((span + 3,), dtype=dtype, kind=kind).as_strided(shape, stride, 3)
+
+
+# 2-D views of every stride pattern the kernels take: transposed (unit stride along N, with and
+# without a storage offset), row-padded, column-strided, misaligned, expanded (zero strides),
+# singleton dims with arbitrary strides, odd shapes.
+VIEWS_2D = {
+    "transposed": lambda d: make_weight((2048, 4096), d, "outliers").T,
+    "transposed_partial": lambda d: make_weight((300, 130), d, "wide").T,
+    "transposed_offset": lambda d: make_weight((301, 384), d, "wide")[1:].T,
+    "transposed_misaligned": lambda d: misaligned((260, 300), d, "wide").T,
+    "rowstrided": lambda d: make_weight((640, 2304), d, "outliers")[:, :2048],
+    "rowstrided_partial": lambda d: make_weight((300, 400), d, "wide")[:, :260],
+    "colstrided": lambda d: make_weight((640, 4096), d, "wide")[:, ::2],
+    "colstrided_partial": lambda d: make_weight((300, 520), d, "wide")[:, ::2],
+    "both_strided": lambda d: strided((300, 260), (1000, 3), d, "wide"),
+    "misaligned": lambda d: misaligned((1024, 2048), d, "outliers"),
+    "misaligned_partial": lambda d: misaligned((300, 260), d, "wide"),
+    "expanded_rows": lambda d: make_weight((1, 384), d, "wide").expand(300, 384),
+    "expanded_cols": lambda d: make_weight((300, 1), d, "wide").expand(300, 260),
+    "row_singleton": lambda d: strided((1, 256), (7, 1), d, "wide"),
+    "col_singleton": lambda d: strided((300, 1), (3, 5), d, "wide"),
+    "odd": lambda d: make_weight((4097, 2047), d, "wide"),
+}
+# 3-D views: transposed experts, padded rows, every other expert, independent group / row / column
+# strides (including a permuted layout), misaligned, expanded experts, singleton dims, odd shapes.
+VIEWS_3D = {
+    "transposed": lambda d: make_weight((4, 2048, 768), d, "outliers").transpose(1, 2),
+    "transposed_partial": lambda d: make_weight((3, 300, 130), d, "wide").transpose(1, 2),
+    "transposed_offset": lambda d: make_weight((4, 301, 384), d, "wide")[:, 1:].transpose(1, 2),
+    "rowstrided": lambda d: make_weight((4, 768, 2304), d, "outliers")[:, :, :2048],
+    "every_other_expert": lambda d: make_weight((8, 300, 260), d, "wide")[::2],
+    "every_other_expert_aligned": lambda d: make_weight((8, 256, 512), d, "wide")[::2],
+    "independent_strides": lambda d: make_weight((6, 300, 528), d, "wide")[::2, :, ::2],
+    "permuted": lambda d: make_weight((260, 3, 200), d, "wide").permute(1, 0, 2),
+    "permuted_aligned": lambda d: make_weight((256, 4, 512), d, "wide").permute(1, 0, 2),
+    "misaligned": lambda d: misaligned((4, 384, 512), d, "outliers"),
+    "misaligned_partial": lambda d: misaligned((3, 260, 300), d, "wide"),
+    "expanded_experts": lambda d: make_weight((1, 256, 384), d, "wide").expand(4, 256, 384),
+    "singletons": lambda d: strided((1, 300, 1), (5, 7, 3), d, "wide"),
+    "odd": lambda d: make_weight((8, 1000, 1004), d, "wide"),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("view", list(VIEWS_2D))
+def test_blockwise_transpose_views(view: str, dtype: torch.dtype) -> None:
+    check_blockwise_transpose(VIEWS_2D[view](dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("view", list(VIEWS_3D))
+def test_blockwise_transpose_batched_views(view: str, dtype: torch.dtype) -> None:
+    check_blockwise_transpose_batched(VIEWS_3D[view](dtype))
+
+
+def e8m0_bits_scale(amax: torch.Tensor, native: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The recipe's scale of an fp32 amax with the E8M0 arithmetic of the device, and its exact
+    reciprocal (2^254 / scale as bits): the SM90 arithmetic gives an infinite amax the scale inf
+    (reciprocal -inf); native saturates it to 2^127 as SM100's cvt does. Both equal e8m0_scale on
+    every finite amax.
+    """
+    ratio = torch.maximum(amax, torch.full_like(amax, 1e-4)) * torch.full_like(amax, 1.0 / 448.0)
+    bits = ratio.view(torch.int32)
+    bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
+    scale = torch.maximum(bits.view(torch.float32), torch.full_like(amax, 2.0**-126))
+    if native:
+        scale = torch.minimum(scale, torch.full_like(scale, 2.0**127))
+    return scale, ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
+
+
+def inf_tile_refs(x: torch.Tensor) -> list:
+    """
+    (fp8 bytes (G, N, K) uint8, scale (G, R, C)) of a (G, N, K) x under both E8M0 results.
+    """
+    G, N, K = x.shape
+    refs = []
+    for native in (False, True):
+        scale, rcp = e8m0_bits_scale(ref_amax(x), native)
+        fp8 = (tiles(x) * rcp[:, :, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        fp8 = fp8.view(G, scale.shape[1] * BLOCK, scale.shape[2] * BLOCK)[:, :N, :K]
+        refs.append((fp8.contiguous().view(torch.uint8), scale))
+    return refs
+
+
+def assert_inf_tiles(name: str, out: torch.Tensor, scale: torch.Tensor, x: torch.Tensor) -> None:
+    """
+    out / scale of the (G, N, K) x: in a tile whose amax is infinite, either E8M0 result element by
+    element (NaN bytes of either sign are one value); every other tile exactly the recipe.
+    """
+    (sm90_fp8, sm90_scale), (native_fp8, native_scale) = inf_tile_refs(x)
+    got = out.reshape(sm90_fp8.shape).view(torch.uint8)
+    nan = (got & 0x7F) == 0x7F
+    ok = (got == sm90_fp8) | (got == native_fp8) | (nan & ((sm90_fp8 & 0x7F) == 0x7F))
+    inf_tile = torch.isinf(ref_amax(x))
+    exact = (got == sm90_fp8) & (sm90_fp8 == native_fp8)
+    per_elem_inf = inf_tile.repeat_interleave(BLOCK, 1).repeat_interleave(BLOCK, 2)
+    per_elem_inf = per_elem_inf[:, : x.shape[1], : x.shape[2]]
+    assert bool(torch.where(per_elem_inf, ok, exact).all()), f"{name}: bytes differ"
+    got_scale = scale.reshape(sm90_scale.shape)
+    assert torch.equal(got_scale[~inf_tile], sm90_scale[~inf_tile]), f"{name}: finite-tile scales"
+    in_inf = got_scale[inf_tile]
+    assert bool(((in_inf == sm90_scale[inf_tile]) | (in_inf == native_scale[inf_tile])).all())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("view", ["contiguous", "transposed"])
+def test_blockwise_transpose_inf_tiles(view: str, dtype: torch.dtype) -> None:
+    """
+    Tiles holding +inf or -inf (2-D and 3-D, a partial tile among them, a contiguous and a
+    transposed view): an infinite amax takes either E8M0 result, every other tile is exact.
+    """
+    w = make_weight((300, 260), dtype, "randn")
+    w[3, 5], w[200, 130], w[299, 259] = float("inf"), float("-inf"), float("inf")
+    w3 = make_weight((3, 260, 300), dtype, "randn")
+    w3[0, 1, 2], w3[2, 259, 299] = float("-inf"), float("inf")
+    if view == "transposed":
+        w, w3 = w.T.contiguous().T, w3.transpose(1, 2).contiguous().transpose(1, 2)
+    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(w)
+    assert_inf_tiles("w_fp8", w_fp8, w_scale, w.unsqueeze(0))
+    assert_inf_tiles("wt_fp8", wt_fp8, wt_scale, w.T.unsqueeze(0))
+    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight_grouped(w3)
+    assert_inf_tiles("grouped w_fp8", w_fp8, w_scale, w3)
+    assert_inf_tiles("grouped wt_fp8", wt_fp8, wt_scale, w3.transpose(1, 2))
+
+
+def assert_outputs_match(got: tuple, x: torch.Tensor) -> None:
+    """
+    got, the four outputs of fp8_quant_weight[_grouped] of the 3-D x (or 2-D squeezed), equal the
+    recipe of x and of its per-expert transpose.
+    """
+    x3 = x if x.dim() == 3 else x.unsqueeze(0)
+    want_fp8, want_scale = ref_blockwise(x3)
+    want_fp8_t, want_scale_t = ref_blockwise(x3.transpose(1, 2))
+    shape = (lambda t: t) if x.dim() == 3 else (lambda t: t[0])
+    for name, out, ref in zip(
+        ["w_fp8", "w_scale", "wt_fp8", "wt_scale"],
+        got,
+        [want_fp8, want_scale, want_fp8_t, want_scale_t],
+    ):
+        (assert_fp8_equal if out.dtype == torch.float8_e4m3fn else assert_f32_equal)(
+            name, out, shape(ref)
+        )
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_blockwise_transpose_side_stream(compiled: bool) -> None:
+    """
+    The entries launch on the current stream, eager and inside a torch.compile(fullgraph=True,
+    cpp_wrapper=True) region: on a fresh side stream, behind a long sleep, an input written there is
+    quantized correctly (a launch on the default stream would read the zeros it held before), and
+    the work is still queued on the side stream when the calls return.
+    """
+    src2, src3 = (
+        make_weight((1536, 2048), kind="outliers"),
+        make_weight((4, 768, 2048), kind="wide"),
+    )
+    x2, x3 = torch.zeros_like(src2), torch.zeros_like(src3)
+    entry2, entry3 = fp8_quant_weight, fp8_quant_weight_grouped
+    if compiled:
+        torch._dynamo.reset()
+        options = {"cpp_wrapper": True}
+        entry2 = torch.compile(lambda w: fp8_quant_weight(w), fullgraph=True, options=options)
+        entry3 = torch.compile(
+            lambda w: fp8_quant_weight_grouped(w), fullgraph=True, options=options
+        )
+    # warm both entries (first-call builds and compiles) so the sleep below outlasts the calls
+    entry2(torch.zeros_like(src2)), entry3(torch.zeros_like(src3))
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(100_000_000)
+        x2.copy_(src2)
+        x3.copy_(src3)
+        got2, got3 = entry2(x2), entry3(x3)
+        done = torch.cuda.Event()
+        done.record()
+    assert not done.query(), (
+        "the side stream finished before the sleep could: the sleep is too short"
+    )
+    side.synchronize()
+    assert_outputs_match(got2, src2)
+    assert_outputs_match(got3, src3)
+    if compiled:
+        torch._dynamo.reset()
+
+
+def storages(tensors) -> list:
+    return [t.untyped_storage() for t in tensors]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize(
+    "entry, shape",
+    [
+        (fp8_quant_weight, (300, 260)),
+        (fp8_quant_weight, (0, 256)),
+        (fp8_quant_weight, (256, 0)),
+        (fp8_quant_weight_grouped, (3, 260, 300)),
+        (fp8_quant_weight_grouped, (0, 128, 256)),
+        (fp8_quant_weight_grouped, (2, 0, 128)),
+    ],
+    ids=["2d", "2d_no_rows", "2d_no_cols", "3d", "3d_no_experts", "3d_no_rows"],
+)
+def test_blockwise_transpose_fresh_outputs(entry, shape: tuple, dtype: torch.dtype) -> None:
+    """
+    The four outputs are fresh: contiguous tensors that are not views, each with its own storage,
+    shared neither with x nor with each other nor with the outputs of an earlier call kept alive
+    (checked by storage object, so empty outputs count too).
+    """
+    x = (
+        make_weight(shape, dtype, "wide")
+        if 0 not in shape
+        else torch.empty(shape, device="cuda", dtype=dtype)
+    )
+    first, second = entry(x), entry(x)
+    for outputs in (first, second):
+        assert all(t.is_contiguous() and t._base is None for t in outputs)
+    owned = storages(first) + storages(second) + [x.untyped_storage()]
+    for i, a in enumerate(owned):
+        for b in owned[i + 1 :]:
+            assert a._cdata != b._cdata, "two tensors share a storage"
+            if a.nbytes() and b.nbytes():
+                assert a.data_ptr() != b.data_ptr(), "two storages share memory"
+
+
+def assert_same_outputs(got: tuple, want: tuple) -> None:
+    for name, out, ref in zip(["w_fp8", "w_scale", "wt_fp8", "wt_scale"], got, want):
+        assert out.is_contiguous(), name
+        if out.dtype == torch.float8_e4m3fn:
+            assert_fp8_equal(name, out, ref)
+        else:
+            assert_f32_equal(name, out, ref)
+
+
+# (entry, input, view applied inside the compiled region): contiguous, a strided slice and a
+# transposed view, bf16 and fp32, 2-D and 3-D.
+COMPILE_CASES = {
+    "2d": (fp8_quant_weight, (1536, 2048), lambda w: w),
+    "2d_rowstrided": (fp8_quant_weight, (640, 2304), lambda w: w[:, :2048]),
+    "2d_transposed": (fp8_quant_weight, (2048, 768), lambda w: w.T),
+    "3d": (fp8_quant_weight_grouped, (4, 768, 2048), lambda w: w),
+    "3d_rowstrided": (fp8_quant_weight_grouped, (4, 300, 400), lambda w: w[:, :, :260]),
+    "3d_transposed": (fp8_quant_weight_grouped, (4, 2048, 768), lambda w: w.transpose(1, 2)),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("case", list(COMPILE_CASES))
+def test_blockwise_transpose_compiled(case: str, dtype: torch.dtype) -> None:
+    """
+    The entries inside torch.compile with the models' options: the first call (the op first seen
+    inside the region) and a second, cached call on new values equal the eager outputs byte for
+    byte, with the weight requiring grad as a model's does.
+    """
+    entry, shape, view = COMPILE_CASES[case]
+    torch._dynamo.reset()
+
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    def region(w: torch.Tensor) -> tuple:
+        return entry(view(w))
+
+    for kind in ["outliers", "wide"]:
+        w = make_weight(shape, dtype, kind).requires_grad_(True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            got = region(w)
+        assert not [str(c.message) for c in caught if "autograd" in str(c.message)], caught
+        assert_same_outputs(got, entry(view(w)))
+        assert not any(out.requires_grad for out in got)
+    torch._dynamo.reset()
 
 
 def make_shards(weight: torch.Tensor, num_shards: int) -> list[tuple[torch.Tensor, int, int]]:
@@ -420,6 +731,31 @@ GROUP = [
 RANKS = 4
 
 
+def amax_multi_or_loop(shards, amaxes, row_offsets, group_offsets):
+    """
+    fp8_shard_amax_multi's one-launch callable, or, where it returns None (no such path on the
+    device), the per-shard loop over fp8_shard_amax its contract tells callers to run.
+    """
+    launch = fp8_shard_amax_multi(shards, amaxes, row_offsets, group_offsets)
+    if launch is None:
+        args = list(zip(shards, amaxes, row_offsets, group_offsets))
+        return lambda: [fp8_shard_amax(*arg) for arg in args]
+    assert callable(launch)
+    return launch
+
+
+def scales_multi_or_loop(amaxes, scales, scales_t):
+    """
+    fp8_scales_multi's one-launch callable, or the loop over fp8_scales where it returns None.
+    """
+    launch = fp8_scales_multi(amaxes, scales, scales_t)
+    if launch is None:
+        args = list(zip(amaxes, scales, scales_t))
+        return lambda: [fp8_scales(*arg) for arg in args]
+    assert callable(launch)
+    return launch
+
+
 def packed_grids(device: str = "cuda") -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
     Return one zeroed amax buffer holding every weight's grid back to back, as the FP8 parameter
@@ -443,13 +779,12 @@ def test_multi_launch_param_gather() -> None:
     for rank in range(RANKS):
         shards = per_rank[rank]
         buffer, amaxes = packed_grids()
-        launch = fp8_shard_amax_multi(
+        launch = amax_multi_or_loop(
             [shard[0] for shard in shards],
             amaxes,
             [shard[1] for shard in shards],
             [shard[2] for shard in shards],
         )
-        assert launch is not None and callable(launch), "H200 must have a one-launch amax"
         launch()
         for (local, row_offset, group_offset), amax, shape in zip(shards, amaxes, GROUP):
             single = torch.zeros_like(amax)
@@ -466,10 +801,7 @@ def test_multi_launch_param_gather() -> None:
         torch.full(grid_of(shape), -1.0, device="cuda").transpose(1, 2).contiguous()
         for shape in GROUP
     ]
-    scales_launch = fp8_scales_multi(reduced_views, scales, scales_t)
-    assert scales_launch is not None and callable(scales_launch), (
-        "H200 must have a one-launch scales"
-    )
+    scales_launch = scales_multi_or_loop(reduced_views, scales, scales_t)
     scales_launch()
     for master, amax, scale, scale_t, shape in zip(masters, reduced_views, scales, scales_t, GROUP):
         single, single_t = torch.empty_like(scale), torch.empty_like(scale_t)
@@ -518,8 +850,7 @@ def test_scales_multi(grid: tuple) -> None:
     G, R, C = grid
     grids = [amax, amax * 3, amax[:1].contiguous()]
     outs = [(torch.empty_like(grid_amax), torch.empty(grid_amax.shape[0], C, R, device="cuda")) for grid_amax in grids]  # fmt: skip
-    launch = fp8_scales_multi(grids, [out_pair[0] for out_pair in outs], [out_pair[1] for out_pair in outs])  # fmt: skip
-    assert launch is not None and callable(launch)
+    launch = scales_multi_or_loop(grids, [out_pair[0] for out_pair in outs], [out_pair[1] for out_pair in outs])  # fmt: skip
     launch()
     for grid_amax, (scale, scale_t) in zip(grids, outs):
         assert_f32_equal("scale", scale, e8m0_scale(grid_amax))

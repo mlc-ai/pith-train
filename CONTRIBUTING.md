@@ -10,7 +10,7 @@ PithTrain's value is that an agent *or* a human can read the whole codebase and 
 
 1. **Compact over comprehensive.** We do not aim for broad model/feature/hardware coverage. Prefer the smallest change that solves the problem. Adding a feature that only some users need? Consider whether it belongs here at all. Growth is fine; growth that respects the other three principles is the bar.
 
-2. **Python-native.** Keep the framework navigable in one language. Custom kernels go through a Python DSL (Triton) where possible; reach for external compiled libraries (DeepGEMM, FlashAttention) only when they are the right tool, and wrap them behind a thin Python operator. Avoid in-tree C++/CUDA build steps.
+2. **Python-native.** Keep the framework navigable in one language. Custom kernels go through a Python DSL (CuTe-DSL on SM90, TIRx-lite on SM100) where possible; reach for external compiled libraries (DeepGEMM, FlashAttention) only when they are the right tool, and wrap them behind a thin Python operator. Avoid in-tree C++/CUDA build steps.
 
 3. **Minimal implicit indirection.** Aim for code where what runs at a call site is discoverable by reading it. Avoid introducing plugin registries, string-keyed dispatch tables, or runtime "spec" objects that resolve which submodule to build; instantiate directly where you reasonably can. Each model being a self-contained file that builds its own layers is the pattern to follow — we accept a little duplication across model files in exchange for local readability.
 
@@ -36,7 +36,7 @@ Requires an NVIDIA Hopper (SM90) or Blackwell (SM100) GPU, CUDA >= 13.0, and Pyt
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
 uv venv
-uv sync                  # installs dev + runtime deps (contributors use this, not `uv pip install .`)
+uv sync                  # installs every dependency (contributors use this, not `uv pip install .`)
 pre-commit install       # optional but recommended: run hooks on commit
 ```
 
@@ -80,12 +80,12 @@ Use the **`add-new-model`** skill — it covers the full scope below and runs th
 
 1. **Model file** — `pithtrain/models/<model>.py`, self-contained, implementing `ModelProtocol` and `LayerProtocol` from [`models/interface.py`](pithtrain/models/interface.py). The decoder layer must expose `forward_stage1` (stage 1), `forward_stage3` (stage 3), `forward_stage5` (stage 5), and `reference_forward` (a plain forward for correctness validation). Build linears via `training.Linear` / `training.GroupedLinear` so the model is FP8/BF16 agnostic. Copy an existing model (e.g. `qwen3_moe.py`) as a template rather than abstracting a shared base — this is the no-indirection principle in action.
 2. **Wiring** — register the model where models are constructed (`setup_model`), add FSDP wrapping (`apply_fsdp`), and a config under `examples/pretrain_lm/<model>/` (`script.py` + `config.json`).
-3. **Checkpoint conversion** (optional) — a converter under `tasks/convert_checkpoint/` if you want HuggingFace import/export.
+3. **Checkpoint conversion** (optional) — a converter under `modules/hf_converters/` if you want HuggingFace import/export.
 4. **Tests** — add the model to `tests/test_dualpipev.sh` and bring it up from pp=1/ep=1 to pp=2/ep=2, plus a single-GPU inference test.
 
 ### Add a new operator / kernel
 
-1. Implement the kernel in `pithtrain/kernels/<feature>.py` (Triton preferred; an SM90-specific CuTe-DSL version goes in `<feature>_sm90.py` next to the Triton `<feature>_sm100.py`, behind a picker `<feature>.py`, see AGENTS.md "Kernels") and its autograd op or layer in `pithtrain/operators/<op>.py`.
+1. Implement the kernel in `pithtrain/kernels/` (a CuTe-DSL `<feature>_sm90.py` and a TIRx-lite `<feature>_sm100.py` behind a picker `<feature>.py`, or a plain `<feature>.py` both architectures run, see AGENTS.md "Kernels") and its autograd op or layer in `pithtrain/operators/<op>.py`.
 2. **Ship a PyTorch reference implementation in the same module** — this is the layer's contract and what the test compares against.
 3. Add `tests/test_<op>.py` comparing fused vs reference (use `calc_diff` and an appropriate tolerance for reduced precision; remember the `grouped_mm` padding gotcha).
 4. Optionally add a benchmark under `benchmarks/operators/`.

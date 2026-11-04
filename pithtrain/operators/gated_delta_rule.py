@@ -1,85 +1,183 @@
 """
 Chunked gated delta rule of the Qwen3.5 Gated DeltaNet as custom ops, so that the linear-attention
-region compiles as one graph (FLA's own entry point is excluded from torch.compile).
+region compiles as one graph.
 
-Under context parallelism it runs FLA's context-parallel path, which needs the contiguous layout
-and batch 1; the recurrence is independent per head, so the batch folds into the head axis.
+The recurrence is independent per head, so the batch folds into the head axis first (batch 1 at b
+times the heads); where the kernels take only one sample's heads the samples run one at a time.
+Without context parallelism it runs the pinned kernels where gated_delta_rule_pinned_supported says
+so. Under context parallelism (contiguous layout) it runs the library's CP kernels: where
+chunk_gdr_cp_supported says so (SM100 at Qwen3.5's geometry) the TIRx kernels, each direction as
+two stages around one all-gather of the ranks' state summaries over the CP group; where
+gated_delta_rule_cp_supported says so (SM90 at Qwen3.5's geometry, q and k with the unrepeated key
+heads) the CuTe kernels of FLA's context-parallel structure, each direction around one all-gather
+of the ranks' state maps. The all-gathers run here. Any other call raises ValueError naming the
+geometry the kernels cover: no other implementation is kept. On SM100 the dense path raises a beta
+below 2^-20 to 2^-20 in both directions (see dense_gated_delta_rule).
 """
 
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
-import fla.ops.common.chunk_o
 import torch
-from fla.ops.cp import build_cp_context
-from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd, chunk_gated_delta_rule_fwd
-from fla.ops.utils import prepare_chunk_indices
-from torch.distributed import ProcessGroup, get_world_size
+from torch.distributed import ProcessGroup, all_gather_into_tensor, get_rank, get_world_size
 from torch.distributed.distributed_c10d import _resolve_process_group
 
 from pithtrain.kernels import (
     chunk_gdr_bwd_pinned,
+    chunk_gdr_cp_bwd_post,
+    chunk_gdr_cp_bwd_pre,
+    chunk_gdr_cp_fwd_post,
+    chunk_gdr_cp_fwd_pre,
+    chunk_gdr_cp_supported,
     chunk_gdr_fwd_pinned,
+    gated_delta_rule_cp_plan,
+    gated_delta_rule_cp_supported,
     gated_delta_rule_pinned_supported,
+    gdr_cp_bwd_local,
+    gdr_cp_bwd_output,
+    gdr_cp_bwd_states,
+    gdr_cp_fwd_local,
+    gdr_cp_fwd_output,
+    gdr_cp_merge,
 )
 
 __all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
 
 # mypy: ignore-errors
 
-# Turn off FLA's issue 640 guard: the BK=64 backward miscompile it avoids does not occur at
-# head_k_dim=128.
-fla.ops.common.chunk_o.TRITON_ABOVE_3_4_0 = False
+CHUNK_SIZE = 64  # the kernels' chunk size (FLA's BT)
 
-CHUNK_SIZE = 64  # FLA's chunk size (BT)
+SUPPORTED_GEOMETRY = (
+    "Qwen3.5's Gated DeltaNet geometry: q, k [b, s, 16, 128] (or 32 key heads), v [b, s, 32, 128], "
+    "beta [b, s, 32] in bf16 and g [b, s, 32] in fp32, s > 0, on a device the kernels run on "
+    "(under context parallelism, 16 key heads)"
+)
+
+
+def unsupported(q, k, v, g, beta, cp: bool) -> ValueError:
+    shapes = ", ".join(f"{n} {tuple(t.shape)} {t.dtype}" for n, t in zip(("q", "k", "v", "g", "beta"), (q, k, v, g, beta)))  # fmt: skip
+    where = "under context parallelism" if cp else "without context parallelism"
+    return ValueError(f"gated_delta_rule has no kernel for {shapes} {where}; the kernels cover {SUPPORTED_GEOMETRY}")  # fmt: skip
 
 
 @lru_cache(maxsize=None)
-def cp_state(group_name: Optional[str], seq_len: int) -> Tuple:
+def cp_plan(group_name: str, seq_len: int) -> dict:
     """
-    FLA's context-parallel context and chunk indices for this rank. Cached because build_cp_context
-    reaches host memory.
+    The CP kernels' host-side plan for this rank: one sequence of seq_len * world_size tokens spans
+    the group in rank order, so the rank's shard is one local sequence that continues from every
+    preceding rank and on every following one (the context FLA's build_cp_context derives for that
+    layout). Cached because the plan reaches host memory.
     """
-    if group_name is None:
-        return None, None
     group = _resolve_process_group(group_name)
-    device = torch.cuda.current_device()
-    # One global sequence spanning the group, which is the shape FLA merges state over.
-    cu_seqlens = torch.tensor([0, seq_len * get_world_size(group)], dtype=torch.int32, device=device)  # fmt: skip
-    context = build_cp_context(cu_seqlens, group)
-    chunk_indices = prepare_chunk_indices(context.cu_seqlens, CHUNK_SIZE, cu_seqlens_cpu=context.cu_seqlens_cpu)  # fmt: skip
-    return context, chunk_indices
+    rank, world_size = get_rank(group), get_world_size(group)
+    cu_seqlens_cpu = torch.tensor([0, seq_len], dtype=torch.int32)
+    cu_seqlens = cu_seqlens_cpu.to(torch.cuda.current_device())
+    return gated_delta_rule_cp_plan(cu_seqlens, cu_seqlens_cpu, rank, rank == 0, rank == world_size - 1, rank, world_size - 1 - rank)  # fmt: skip
+
+
+def cp_all_gather(payload: torch.Tensor, group_name: str) -> torch.Tensor:
+    """
+    Every rank's payload stacked in rank order, (world_size, *payload.shape): the one collective of
+    each CP direction.
+    """
+    group = _resolve_process_group(group_name)
+    gathered = payload.new_empty(get_world_size(group), *payload.shape)
+    all_gather_into_tensor(gathered, payload, group=group)
+    return gathered
+
+
+@lru_cache(maxsize=None)
+def cp_layout(group_name: str) -> Tuple[int, int]:
+    """
+    (rank, size) of the CP group, read once per group (host values, no device sync).
+    """
+    group = _resolve_process_group(group_name)
+    return get_rank(group), get_world_size(group)
+
+
+def gather_maps(local: torch.Tensor, group_name: str, async_op: bool):
+    """
+    Every rank's CuTe state map stacked, (size, HV, K, V + K), and the collective's work handle
+    when async_op (its wait makes the current stream wait, no host sync), else None.
+    """
+    size = cp_layout(group_name)[1]
+    gathered = local.new_empty(size, *local.shape)
+    work = all_gather_into_tensor(gathered, local, group=_resolve_process_group(group_name), async_op=async_op)  # fmt: skip
+    return gathered, work
+
+
+def cute_cp_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
+    """
+    The CuTe context-parallel forward (gated_delta_rule_cp_supported): every rank but the last
+    computes its state map, every rank all-gathers the maps, every rank but the first folds its
+    predecessors' into its initial state h0, which the backward starts from again (zeros on the
+    first rank, as FLA saves).
+    """
+    rank, size = cp_layout(cp_group_name)
+    g_cum, A, w, u, hm = gdr_cp_fwd_local(k, v, g, beta, rank < size - 1)
+    gathered, _ = gather_maps(hm, cp_group_name, False)
+    h0 = gdr_cp_merge(gathered, rank, rank, False)
+    o = gdr_cp_fwd_output(q, k, w, u, g_cum, h0 if rank > 0 else None)
+    return o, g_cum, A, [h0.unsqueeze(0)]
+
+
+def cute_cp_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, h0: torch.Tensor, cp_group_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+    """
+    The CuTe context-parallel backward: every rank but the first computes its backward map, all
+    ranks all-gather the maps, then every rank but the last folds its successors' maps into the
+    gradient of its final state. The all-gather is synchronous: overlapping it with the state
+    recompute saved nothing measurable, since it mostly waits for the slowest rank's map. dq and
+    dk come back per value head and are summed over each group of value heads.
+    """
+    rank, size = cp_layout(cp_group_name)
+    w, u, dv_local, dhm = gdr_cp_bwd_local(q, k, v, g_cum, beta, A, do, rank > 0)
+    gathered, _ = gather_maps(dhm, cp_group_name, False)
+    h, v_new = gdr_cp_bwd_states(k, w, u, g_cum, h0[0] if rank > 0 else None)
+    dht = gdr_cp_merge(gathered, rank, size - 1 - rank, True) if rank < size - 1 else None
+    dq, dk, dv, dg, dbeta = gdr_cp_bwd_output(q, k, v, w, v_new, do, dv_local, h, g_cum, beta, A, u, dht)  # fmt: skip
+    T, H, K = k.shape[1:]
+    dq, dk = (x.view(1, T, H, -1, K).sum(3) for x in (dq, dk))
+    return dq, dk, dv, dg, dbeta
 
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_fwd", mutates_args=())
-def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
+def gdr_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:  # fmt: skip
+    """
+    The CP forward of one rank on the library's CP kernels (callers check chunk_gdr_cp_supported,
+    q and k repeated to the value heads, or gated_delta_rule_cp_supported, q and k with the key
+    heads): (o, g_cum, A, [initial_state]), the last three for the backward, which recomputes the
+    states from the merged initial state rather than paying a second all-gather.
+    """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
-    cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
-    g_out, o, A, _, initial_state, _ = chunk_gated_delta_rule_fwd(q=q, k=k, v=v, g=g, beta=beta, scale=q.shape[-1] ** -0.5, initial_state=None, output_final_state=False, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, A_log=None, dt_bias=None)  # fmt: skip
-    # Under CP initial_state is the merged predecessor state; the backward recomputes h from it
-    # rather than paying a second all-gather. Without CP it is None.
-    return o.to(q.dtype), g_out, A, [] if initial_state is None else [initial_state]
+    if gated_delta_rule_cp_supported(q, k, v, g, beta):
+        return cute_cp_fwd(q, k, v, g, beta, cp_group_name)
+    plan = cp_plan(cp_group_name, q.shape[1])
+    payload, saved = chunk_gdr_cp_fwd_pre(q, k, v, g, beta, plan)
+    o, g_out, A, initial_state = chunk_gdr_cp_fwd_post(cp_all_gather(payload, cp_group_name), saved, plan)  # fmt: skip
+    return o, g_out, A, [initial_state]
 
 
 @gdr_fwd.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: Optional[str]):  # fmt: skip
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group_name: str):  # fmt: skip
     b, s, hv, vd = v.shape
     o = torch.empty((b, s, hv, vd), dtype=q.dtype, device=q.device)
     A = torch.empty((b, s, hv, CHUNK_SIZE), dtype=q.dtype, device=q.device)
-    state = [] if cp_group_name is None else [torch.empty((1, hv, q.shape[-1], vd), dtype=torch.float32, device=q.device)]  # fmt: skip
+    state = [torch.empty((1, hv, q.shape[-1], vd), dtype=torch.float32, device=q.device)]
     return o, torch.empty_like(g, dtype=torch.float32), A, state
 
 
 @torch.library.custom_op("pithtrain::gated_delta_rule_bwd", mutates_args=())
-def gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+def gdr_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
     q, k, v, g_out, beta, A, do = (t.contiguous() for t in (q, k, v, g_out, beta, A, do))
-    cp_context, chunk_indices = cp_state(cp_group_name, q.shape[1])
-    dq, dk, dv, db, dg, _, _, _ = chunk_gated_delta_rule_bwd(q=q, k=k, v=v, g=g_out, beta=beta, A=A, scale=q.shape[-1] ** -0.5, initial_state=initial_state[0] if initial_state else None, do=do, dht=None, cu_seqlens=None if cp_context is None else cp_context.cu_seqlens, cp_context=cp_context, chunk_indices=chunk_indices, state_v_first=False, use_gate_in_kernel=False, g_input=None, A_log=None, dt_bias=None)  # fmt: skip
-    return dq.to(q.dtype).contiguous(), dk.to(k.dtype).contiguous(), dv.to(v.dtype).contiguous(), dg.to(g_out.dtype).contiguous(), db.to(beta.dtype).contiguous()  # fmt: skip
+    if gated_delta_rule_cp_supported(q, k, v, g_out, beta):
+        return cute_cp_bwd(q, k, v, g_out, beta, A, do, initial_state[0], cp_group_name)
+    plan = cp_plan(cp_group_name, q.shape[1])
+    payload, saved = chunk_gdr_cp_bwd_pre(q, k, v, g_out, beta, A, do, initial_state[0], plan)
+    return chunk_gdr_cp_bwd_post(cp_all_gather(payload, cp_group_name), saved, plan)
 
 
 @gdr_bwd.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: Optional[str]):  # fmt: skip
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, initial_state: List[torch.Tensor], cp_group_name: str):  # fmt: skip
     # Contiguous like the real gradients; plain empty_like would inherit the input strides.
     contiguous = torch.contiguous_format
     return torch.empty_like(q, memory_format=contiguous), torch.empty_like(k, memory_format=contiguous), torch.empty_like(v, memory_format=contiguous), torch.empty_like(g_out, memory_format=contiguous), torch.empty_like(beta, memory_format=contiguous)  # fmt: skip
@@ -159,8 +257,15 @@ dense_fwd.register_autograd(dense_backward, setup_context=dense_setup_context)
 
 def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:  # fmt: skip
     """
-    gated_delta_rule without context parallelism, through the pinned FLA launches; callers
-    check gated_delta_rule_pinned_supported first.
+    gated_delta_rule without context parallelism, through the pinned kernels; callers check
+    gated_delta_rule_pinned_supported first.
+
+    CuTe kernels on SM90 and TIRx kernels on SM100, on the chunk algorithm of FLA 0.5.2 at every
+    length (a length that is not a multiple of 64 runs as if zero-padded to one). The output and the
+    gradients match the fp32 recurrence to the bounds of the pinned verifier
+    (tests/kernels/test_gated_delta_rule_pinned.py). On SM100 a beta below 2^-20 runs as 2^-20 in both directions (see chunk_gdr_fwd_pinned): the
+    output differs from the recurrence only by such a beta's own term, and dbeta there is the
+    gradient at 2^-20.
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape
@@ -179,23 +284,52 @@ def fold_batch(t: torch.Tensor) -> torch.Tensor:
     return t.transpose(0, 1).reshape(1, t.shape[1], -1, *t.shape[3:])
 
 
+def unfold_batch(o: torch.Tensor, b: int) -> torch.Tensor:
+    """
+    fold_batch's inverse on the output, [1, s, b * heads, dim] -> [b, s, heads, dim].
+    """
+    return o if b == 1 else o.reshape(o.shape[1], b, -1, o.shape[-1]).transpose(0, 1)
+
+
 def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, cp_group: Optional[ProcessGroup] = None) -> torch.Tensor:  # fmt: skip
     """
     Chunked gated delta rule of q and k [b, s, heads, dim], v [b, s, value_heads, value_dim], g and
     beta [b, s, value_heads], returning [b, s, value_heads, value_dim]. value_heads is a multiple
     of heads, and each key head serves a group of consecutive value heads. With a cp_group the
     recurrence is sharded over it: s is the rank-local length, in the contiguous layout.
+
+    The recurrence is independent per head, so the batch folds into the head axis before anything
+    else: value head j = b * value_heads + h of the fold reads key head j // (value_heads / heads)
+    = b * heads + h // (value_heads / heads), the same grouping, and the kernels run batch b at b
+    times the heads where they take that geometry (SM90's pinned kernels); where they take only one
+    sample's heads (SM100) the samples run one at a time. Raises ValueError (before launching
+    anything) for a geometry, dtype or device no kernel covers; see SUPPORTED_GEOMETRY.
     """
-    if cp_group is None and gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        return dense_gated_delta_rule(q, k, v, g, beta)
-    repeats = v.shape[2] // q.shape[2]
-    if repeats > 1:
-        q = q.repeat_interleave(repeats, dim=2)
-        k = k.repeat_interleave(repeats, dim=2)
+    b = q.shape[0]
     if cp_group is None:
-        o, *_ = gdr_fwd(q, k, v, g, beta, None)
-        return o
-    b, s = q.shape[:2]
-    folded = (fold_batch(t) for t in (q, k, v, g, beta))
-    o, *_ = gdr_fwd(*folded, cp_group.group_name)
-    return o.reshape(s, b, -1, o.shape[-1]).transpose(0, 1)
+        # Contiguous before the check: the pinned kernels take contiguous tensors, and
+        # dense_gated_delta_rule copies anyway.
+        folded = tuple(fold_batch(t).contiguous() for t in (q, k, v, g, beta))
+        if gated_delta_rule_pinned_supported(*folded):
+            return unfold_batch(dense_gated_delta_rule(*folded), b)
+        if b > 1 and gated_delta_rule_pinned_supported(*(t[:1].contiguous() for t in (q, k, v, g, beta))):  # fmt: skip
+            # The kernels take one sample's heads but not the fold (SM100): one sample at a time.
+            return torch.cat([dense_gated_delta_rule(*(t[i : i + 1] for t in (q, k, v, g, beta))) for i in range(b)])  # fmt: skip
+        raise unsupported(q, k, v, g, beta, cp=False)
+    # Under CP the SM90 CuTe kernels take q and k with the key heads, folded.
+    folded = [fold_batch(t).contiguous() for t in (q, k, v, g, beta)]
+    if gated_delta_rule_cp_supported(*folded):
+        o, *_ = gdr_fwd(*folded, cp_group.group_name)
+        return unfold_batch(o, b)
+    # The SM100 TIRx kernels take q and k per value head: repeated, then folded.
+    repeats = v.shape[2] // q.shape[2] if q.dim() == v.dim() == 4 and q.shape[2] > 0 else 1
+    qr, kr = (t.repeat_interleave(repeats, dim=2) if repeats > 1 else t for t in (q, k))
+    folded = [fold_batch(t) for t in (qr, kr, v, g, beta)]
+    if chunk_gdr_cp_supported(*folded):
+        o, *_ = gdr_fwd(*folded, cp_group.group_name)
+        return unfold_batch(o, b)
+    if b > 1 and chunk_gdr_cp_supported(*(t[:1] for t in (qr, kr, v, g, beta))):
+        # The CP kernels take one sample's heads but not the fold: one sample at a time, each with
+        # its own pair of all-gathers (every rank of the group holds the same batch size).
+        return torch.cat([gdr_fwd(*(t[i : i + 1] for t in (qr, kr, v, g, beta)), cp_group.group_name)[0] for i in range(b)])  # fmt: skip
+    raise unsupported(q, k, v, g, beta, cp=True)

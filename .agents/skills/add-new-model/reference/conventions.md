@@ -111,7 +111,7 @@ out = F.grouped_mm(x, self.gate_up_proj.transpose(-2, -1), offs=offs)      # tra
 
 Both `GroupedLinear` (in `pithtrain/operators/grouped_linear.py`) and this raw-Parameter pattern match that convention.
 
-HF's live Parameter is often `[E, in, out]` - the transposed layout - because HF loads for `F.linear`-style usage. That's fine; the transpose between `[E, out, in]` (runtime/DCP) and `[E, in, out]` (HF BF16 safetensors) lives in **exactly one place**: a model-specific converter's `postprocess_canonical` (see `GptOssConverter` in `pithtrain/tasks/convert_checkpoint/gpt_oss.py`). See `checkpoint.md`.
+HF's live Parameter is often `[E, in, out]` - the transposed layout - because HF loads for `F.linear`-style usage. That's fine; the transpose between `[E, out, in]` (runtime/DCP) and `[E, in, out]` (HF BF16 safetensors) lives in **exactly one place**: a model-specific converter's `postprocess_canonical` (see `GptOssConverter` in `pithtrain/modules/hf_converters/gpt_oss.py`). See `checkpoint.md`.
 
 **Do not pick a different layout without evidence** (a microbench showing materially faster kernels on our target hardware). In the absence of evidence, deviating from the consensus is strictly worse: kernel authors tune for it, and quantized paths (MXFP4, FP8) are usually pre-packed in the consensus layout.
 

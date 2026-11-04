@@ -1,29 +1,51 @@
 """
-Inline-PTX helpers shared by the SM90 CuTe-DSL kernels, each a dsl_user_op emitting one short PTX
-sequence. Two calling conventions: asm(res_type, args, ptx, constraints), whose stores return
-nothing, and asm_args_last(res_type, ptx, constraints, args), whose stores return a dummy register.
-An asm_args_last helper that shares a name with an asm helper carries a suffix: _args_last when only
-the emission differs, otherwise one naming the difference (ld_b32_coherent is a coherent ld.global,
-not .nc; lds_b32_pred is predicated; sts_b32_nopred is not).
+Inline-PTX helpers shared by the SM90 CuTe-DSL kernels: dsl_user_op wrappers that each emit one
+short PTX sequence, plus the emission helpers they are built from (asm, asm_args_last, to_ir,
+unpack, f32_hex). Two calling conventions: asm(res_type, args, ptx, constraints), whose stores
+return nothing, and asm_args_last(res_type, ptx, constraints, args), whose stores return a dummy
+register. An asm_args_last helper that shares a name with an asm helper carries a suffix:
+_args_last when only the emission differs, otherwise one naming the difference (ld_b32_coherent is
+a coherent ld.global, not .nc; lds_b32_pred is predicated; sts_b32_nopred is not).
 """
 
 import struct
 
-import cutlass
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "cp_async16", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_relaxed", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "prmt", "prmt_args_last", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
+__all__ = ["abs2", "asm", "asm_args_last", "atom_add_u64", "barrier_expect_tx", "barrier_wait", "bf16_hi", "bf16_lo", "bf16_sel", "bf16x2_to_f32", "byte_sum", "cp_async16", "cvta_shared", "f32_as_u32", "f32_hex", "f32x2_to_bf16x2", "fence_gpu", "lanemask_lt", "ld_b32", "ld_b32_coherent", "ld_generic_b32", "ld_generic_v4", "ld_relaxed", "ld_u16", "ld_u8", "ld_v2", "ld_v4", "lds_b32", "lds_b32_pred", "lds_v4", "match_any", "max2", "max_u16x2", "pack_bf16", "packed_op", "prmt", "prmt_args_last", "red_add_generic", "red_add_shared", "red_or_shared", "selp", "selp_args_last", "st_b32", "st_b64", "st_f32", "st_generic_b32", "st_generic_u8", "st_generic_v4", "st_u16", "st_u8", "st_v2", "st_v2_args_last", "st_v4", "st_v4_args_last", "sts_b32", "sts_b32_nopred", "sts_v4", "to_ir", "u32_as_f32", "unpack"]
 
 
 def f32_hex(value: float) -> str:
+    """
+    The fp32 bit pattern of value as a PTX hex literal (0xXXXXXXXX).
+    """
     return f"0x{struct.unpack('<I', struct.pack('<f', value))[0]:08X}"
 
 
 def asm(res_type, args, ptx: str, constraints: str, side_effects: bool = False):
     return llvm.inline_asm(res_type, args, ptx, constraints, has_side_effects=side_effects, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+def asm_args_last(res_type, ptx: str, constraints: str, args: list, side_effects: bool = False):
+    return asm(res_type, args, ptx, constraints, side_effects)
+
+
+def to_ir(x, value_type, loc=None, ip=None):
+    """
+    The MLIR value of x converted to value_type (Int32, Uint32, Int64 or Float32).
+    """
+    return value_type(x).ir_value(loc=loc, ip=ip)
+
+
+def unpack(struct_value, num_values: int, value_type, loc=None, ip=None) -> tuple:
+    """
+    The first num_values fields of an asm struct result, as value_type (Float32 or a 32-bit int).
+    """
+    element_type = T.f32() if value_type is Float32 else T.i32()
+    return tuple(value_type(llvm.extractvalue(element_type, struct_value, [i], loc=loc, ip=ip)) for i in range(num_values))
 
 
 @dsl_user_op
@@ -147,30 +169,17 @@ def red_or_shared(addr: Int32, value: Uint32, pred: Int32, *, loc=None, ip=None)
 def bf16x2_to_f32(x: Uint32, *, loc=None, ip=None) -> tuple:
     x_lo = asm(T.f32(), [Uint32(x).ir_value(loc=loc, ip=ip)], "shl.b32 $0, $1, 16;", "=f,r")
     x_hi = asm(T.f32(), [Uint32(x).ir_value(loc=loc, ip=ip)], "and.b32 $0, $1, 0xFFFF0000;", "=f,r")
-    return cutlass.Float32(x_lo), cutlass.Float32(x_hi)
+    return Float32(x_lo), Float32(x_hi)
 
 
 @dsl_user_op
 def f32x2_to_bf16x2(x_lo, x_hi, *, loc=None, ip=None) -> Uint32:
-    return Uint32(asm(T.i32(), [cutlass.Float32(x_hi).ir_value(loc=loc, ip=ip), cutlass.Float32(x_lo).ir_value(loc=loc, ip=ip)], "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f"))
+    return Uint32(asm(T.i32(), [Float32(x_hi).ir_value(loc=loc, ip=ip), Float32(x_lo).ir_value(loc=loc, ip=ip)], "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f"))
 
 
 @dsl_user_op
 def st_v4(addr: Int64, words: tuple, pred: Int32, *, loc=None, ip=None) -> None:
     asm(None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Uint32(word).ir_value(loc=loc, ip=ip) for word in words] + [Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $5, 0;\n\t@p st.global.v4.b32 [$0], {$1, $2, $3, $4};\n\t}", "l,r,r,r,r,r", side_effects=True)
-
-
-def asm_args_last(res_type, ptx: str, constraints: str, args: list, side_effects: bool = False):
-    return asm(res_type, args, ptx, constraints, side_effects)
-
-
-def to_ir(x, value_type, loc=None, ip=None):
-    return value_type(x).ir_value(loc=loc, ip=ip)
-
-
-def unpack(struct_value, num_values: int, value_type, loc=None, ip=None) -> tuple:
-    element_type = T.f32() if value_type is Float32 else T.i32()
-    return tuple(value_type(llvm.extractvalue(element_type, struct_value, [i], loc=loc, ip=ip)) for i in range(num_values))
 
 
 @dsl_user_op
@@ -273,7 +282,7 @@ def bf16_hi(x: Uint32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def pack_bf16(x_lo: Float32, x_hi: Float32, *, loc=None, ip=None) -> Uint32:
     """
-    Round two fp32 to BF16 (RN, as Triton's .to(tl.bfloat16)) and pack {x_lo, x_hi}.
+    Round two fp32 to BF16 (round to nearest even) and pack {x_lo, x_hi}.
     """
     return Uint32(asm_args_last(T.i32(), "cvt.rn.bf16x2.f32 $0, $1, $2;", "=r,f,f", [to_ir(x_hi, Float32, loc, ip), to_ir(x_lo, Float32, loc, ip)]))
 
@@ -286,7 +295,7 @@ def abs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
 @dsl_user_op
 def max2(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
     """
-    NaN-ignoring, like Triton's max.f32.
+    NaN-ignoring (max.bf16x2 returns the other operand when one is NaN).
     """
     return Uint32(asm_args_last(T.i32(), "max.bf16x2 $0, $1, $2;", "=r,r,r", [to_ir(first, Uint32, loc, ip), to_ir(second, Uint32, loc, ip)]))
 
@@ -294,3 +303,117 @@ def max2(first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
 @dsl_user_op
 def prmt_args_last(word_lo: Uint32, word_hi: Uint32, selector: int, *, loc=None, ip=None) -> Uint32:
     return Uint32(asm_args_last(T.i32(), f"prmt.b32 $0, $1, $2, {selector:#x};", "=r,r,r", [to_ir(word_lo, Uint32, loc, ip), to_ir(word_hi, Uint32, loc, ip)]))
+
+
+@dsl_user_op
+def packed_op(op: str, first: Uint32, second: Uint32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(asm(T.i32(), [to_ir(first, Uint32, loc, ip), to_ir(second, Uint32, loc, ip)], op + " $0, $1, $2;", "=r,r,r"))
+
+
+@dsl_user_op
+def barrier_expect_tx(barrier: Int32, num_bytes: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [to_ir(barrier, Int32, loc, ip), to_ir(num_bytes, Int32, loc, ip)], "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;", "r,r", side_effects=True)
+
+
+@dsl_user_op
+def barrier_wait(barrier: Int32, parity: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [to_ir(barrier, Int32, loc, ip), to_ir(parity, Int32, loc, ip)], "{\n.reg .pred p;\nWAIT:\nmbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n@!p bra WAIT;\n}", "r,r", side_effects=True)
+
+
+@dsl_user_op
+def ld_v2(addr: Int64, pred: Int32, *, loc=None, ip=None) -> tuple:
+    """
+    8-byte global load; zeros where pred == 0.
+    """
+    struct_type = llvm.StructType.get_literal([T.i32(), T.i32()])
+    words = asm(struct_type, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $3, 0;\n\tmov.b32 $0, 0;\n\tmov.b32 $1, 0;\n\t@p ld.global.v2.b32 {$0, $1}, [$2];\n\t}", "=r,=r,l,r")
+    return tuple(Uint32(llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@dsl_user_op
+def ld_u16(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Uint32:
+    """
+    2-byte global load, zero-extended; 0 where pred == 0.
+    """
+    return Uint32(asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\tmov.b32 $0, 0;\n\t@p ld.global.u16 $0, [$1];\n\t}", "=r,l,r"))
+
+
+@dsl_user_op
+def ld_u8(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Uint32:
+    """
+    1-byte global load, zero-extended; 0 where pred == 0.
+    """
+    return Uint32(asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\tmov.b32 $0, 0;\n\t@p ld.global.u8 $0, [$1];\n\t}", "=r,l,r"))
+
+
+@dsl_user_op
+def st_u16(addr: Int64, value: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
+    """
+    Stores the low 2 bytes of value.
+    """
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p st.global.u16 [$0], $1;\n\t}", "l,r,r", side_effects=True)
+
+
+@dsl_user_op
+def st_u8(addr: Int64, value: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
+    """
+    Stores the low byte of value.
+    """
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p st.global.u8 [$0], $1;\n\t}", "l,r,r", side_effects=True)
+
+
+@dsl_user_op
+def cvta_shared(addr: Int32, *, loc=None, ip=None) -> Int64:
+    """
+    The generic address of a shared-memory address.
+    """
+    return Int64(asm(T.i64(), [Int32(addr).ir_value(loc=loc, ip=ip)], "{\n\t.reg .u64 t;\n\tcvt.u64.u32 t, $1;\n\tcvta.shared.u64 $0, t;\n\t}", "=l,r"))
+
+
+@dsl_user_op
+def ld_generic_b32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """
+    Generic-address load (shared or global); side_effects keeps it behind barriers.
+    """
+    return Int32(asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.b32 $0, [$1];", "=r,l", side_effects=True))
+
+
+@dsl_user_op
+def ld_generic_v4(addr: Int64, *, loc=None, ip=None) -> tuple:
+    """
+    16-byte generic-address load (shared or global); side_effects keeps it behind barriers.
+    """
+    struct_type = llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()])
+    words = asm(struct_type, [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,l", side_effects=True)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def st_generic_b32(addr: Int64, value: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p st.b32 [$0], $1;\n\t}", "l,r,r", side_effects=True)
+
+
+@dsl_user_op
+def st_generic_u8(addr: Int64, value: Uint32, pred: Int32, *, loc=None, ip=None) -> None:
+    """
+    Stores the low byte of value at a generic address.
+    """
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p st.u8 [$0], $1;\n\t}", "l,r,r", side_effects=True)
+
+
+@dsl_user_op
+def st_generic_v4(addr: Int64, words: tuple, pred: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Uint32(word).ir_value(loc=loc, ip=ip) for word in words] + [Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $5, 0;\n\t@p st.v4.b32 [$0], {$1, $2, $3, $4};\n\t}", "l,r,r,r,r,r", side_effects=True)
+
+
+@dsl_user_op
+def red_add_generic(addr: Int64, value: Int32, pred: Int32, *, loc=None, ip=None) -> None:
+    asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(value).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)], "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p red.add.u32 [$0], $1;\n\t}", "l,r,r", side_effects=True)
+
+
+@dsl_user_op
+def byte_sum(word: Uint32, *, loc=None, ip=None) -> Int32:
+    """
+    Sum of the four bytes of word, exact while it is below 256.
+    """
+    return Int32(asm(T.i32(), [Uint32(word).ir_value(loc=loc, ip=ip)], "{\n\t.reg .b32 t;\n\tmul.lo.u32 t, $1, 0x01010101;\n\tshr.u32 $0, t, 24;\n\t}", "=r,r"))

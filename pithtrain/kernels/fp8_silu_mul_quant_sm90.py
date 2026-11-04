@@ -13,77 +13,20 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass._mlir import ir
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from pithtrain.kernels.arch import SM_COUNT
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
-from pithtrain.kernels.cute_ptx_sm90 import abs2, asm_args_last, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, to_ir, u32_as_f32, unpack
+from pithtrain.kernels.cute_ptx_sm90 import abs2, bf16_hi, bf16_lo, bf16_sel, cp_async16, f32_as_u32, ld_b32_coherent, lds_b32_pred, lds_v4, max2, pack_bf16, prmt_args_last, selp_args_last, st_f32, st_v2_args_last, st_v4_args_last, sts_b32_nopred, sts_v4, u32_as_f32
 from pithtrain.kernels.fp8_e8m0_scale_sm90 import e8m0_scale_f32, quant4_e4m3
 from pithtrain.kernels.fp8_rowwise_kmajor_sm90 import fp8cast_rowwise_kmajor_sm90
 from pithtrain.kernels.fp8_scale_layout import mn_major_scale, mn_pad
-from pithtrain.kernels.silu_mul import silu_mul_bwd, silu_mul_fwd
+from pithtrain.kernels.silu_mul_sm90 import silu_mul_bwd_sm90, silu_mul_fwd_sm90, swiglu_bwd, swiglu_fwd
 
 __all__ = ["SiluMulQuant", "SiluMulQuantGU", "fp8_silu_mul_gu_bwd_sm90", "fp8_silu_mul_bwd_sm90", "silu_mul_quant_fusable", "fp8_silu_mul_fwd_sm90", "silu_mul_quant_gu_fusable", "fp8_silu_mul_gu_fwd_sm90"]
 
 BLOCK = 128  # rows per quantization group and columns per CTA tile
 THREADS = 512
 VEC = 8  # BF16 columns per thread (one 16-byte load)
-
-
-# sigmoid(x) = 1 / (1 + exp(-x)). Triton 3.7 emits, for fp32:
-#     sub.f32 t, 0, x;  mul.f32 t, t, log2e;  ex2.approx.f32 e, t;  add.f32 d, e, 1;
-#     div.full.f32 s, 1, d
-# This 5-instruction sequence gives the same bits for every bf16 gate value (checked exhaustively):
-# - x * -log2e == (0 - x) * log2e: negation is exact; ex2(+-0) = 1; NaN is canonical.
-# - ex2 non-ftz differs from ftz only when e is subnormal, and then 1 + e == 1 either way.
-# - div.full(1, d) == 0.25 * rcp(0.25 * d) for every fp32 d >= 1 (also checked exhaustively),
-#   and 0.25 * (1 + e) == fma(e, 0.25, 0.25) because scaling by 0.25 is exact here.
-# .rn pins every mul/add so ptxas cannot contract differently from the Triton kernels.
-SIGMOID_PTX = (
-    "mul.rn.f32 t, $G, 0fBFB8AA3B;\n"
-    "ex2.approx.ftz.f32 t, t;\n"
-    "fma.rn.f32 t, t, 0f3E800000, 0f3E800000;\n"
-    "rcp.approx.ftz.f32 s, t;\n"
-    "mul.rn.f32 s, s, 0f3E800000;\n"
-)
-
-
-@dsl_user_op
-def swiglu_fwd(gate: Float32, up: Float32, *, loc=None, ip=None) -> Float32:
-    """
-    silu(gate) * up in fp32 as (sigmoid(gate) * gate) * up, the Triton forward's exact op order.
-    """
-    return Float32(asm_args_last(T.f32(), "{\n.reg .f32 t, s;\n" + SIGMOID_PTX.replace("$G", "$1") + "mul.rn.f32 s, s, $1;\nmul.rn.f32 $0, s, $2;\n}", "=f,f,f", [to_ir(gate, Float32, loc, ip), to_ir(up, Float32, loc, ip)]))
-
-
-@dsl_user_op
-def swiglu_bwd(grad_h: Float32, gate: Float32, up: Float32, *, loc=None, ip=None) -> tuple:
-    """
-    (grad_gate, grad_up) in fp32, the Triton backward's ops after LLVM contraction:
-
-    grad_up   = grad_h * (s * gate)
-    grad_gate = ((grad_h * up) * s) * fma(-s, gate, 1 + gate)      with s = sigmoid(gate)
-    """
-    result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
-    packed = asm_args_last(
-        result_type,
-        "{\n.reg .f32 t, s, a, b;\n"
-        + SIGMOID_PTX.replace("$G", "$3")
-        + "mul.rn.f32 a, s, $3;\n"  # silu
-        "mul.rn.f32 $1, a, $2;\n"  # grad_up
-        "mul.rn.f32 b, $2, $4;\n"  # grad_h * up
-        "mul.rn.f32 b, b, s;\n"  # * sigmoid
-        "add.rn.f32 a, $3, 0f3F800000;\n"  # 1 + gate
-        "neg.f32 t, s;\n"
-        "fma.rn.f32 a, t, $3, a;\n"  # 1 + gate - s * gate, unrounded product
-        "mul.rn.f32 $0, b, a;\n}",
-        "=f,=f,f,f,f",
-        [to_ir(value, Float32, loc, ip) for value in (grad_h, gate, up)],
-    )
-    return unpack(packed, 2, Float32, loc, ip)
-
-
 G_CAP = 1024  # expert groups the shared-memory offset table holds
 STAGES = 2  # cp.async tiles in flight per CTA (backward cannot fit 3 in shared memory)
 
@@ -159,14 +102,14 @@ class SiluMulQuant:
         self.stage_bytes = self.num_inputs * 4 * THREADS * 16
 
     @cute.jit
-    def __call__(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok0: cute.Tensor, mTokS0: cute.Tensor, mKm0: cute.Tensor, mKmS0: cute.Tensor, mTok1: cute.Tensor, mTokS1: cute.Tensor, mKm1: cute.Tensor, mKmS1: cute.Tensor, stream):
+    def __call__(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok0: cute.Tensor, mTokScale0: cute.Tensor, mKmajor0: cute.Tensor, mKmajorScale0: cute.Tensor, mTok1: cute.Tensor, mTokScale1: cute.Tensor, mKmajor1: cute.Tensor, mKmajorScale1: cute.Tensor, stream):
         num_tiles = (mG.shape[0] // BLOCK) * self.num_col_blocks
-        self.kernel(mDh, mG, mU, mOffs, mTok0, mTokS0, mKm0, mKmS0, mTok1, mTokS1, mKm1, mKmS1).launch(grid=[cutlass.min(num_tiles, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
+        self.kernel(mDh, mG, mU, mOffs, mTok0, mTokScale0, mKmajor0, mKmajorScale0, mTok1, mTokScale1, mKmajor1, mKmajorScale1).launch(grid=[cutlass.min(num_tiles, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok0: cute.Tensor, mTokS0: cute.Tensor, mKm0: cute.Tensor, mKmS0: cute.Tensor, mTok1: cute.Tensor, mTokS1: cute.Tensor, mKm1: cute.Tensor, mKmS1: cute.Tensor):
+    def kernel(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok0: cute.Tensor, mTokScale0: cute.Tensor, mKmajor0: cute.Tensor, mKmajorScale0: cute.Tensor, mTok1: cute.Tensor, mTokScale1: cute.Tensor, mKmajor1: cute.Tensor, mKmajorScale1: cute.Tensor):
         M = mG.shape[0]
-        out_tensors = [(mTok0, mTokS0, mKm0, mKmS0), (mTok1, mTokS1, mKm1, mKmS1)]
+        out_tensors = [(mTok0, mTokScale0, mKmajor0, mKmajorScale0), (mTok1, mTokScale1, mKmajor1, mKmajorScale1)]
         outputs = [Output(out_tensors[i], M, self.N, 0, 0) for i in range(self.num_outputs)]
         self.process_tiles(self.input_bases(mDh, mG, mU), mOffs.iterator.toint(), outputs, M, mOffs.shape[0])
 
@@ -207,9 +150,11 @@ class SiluMulQuant:
         num_row_blocks = M // BLOCK
         num_tiles = num_row_blocks * self.num_col_blocks
         smem = SharedBuffers(self.stages * self.stage_bytes)
+
         for i in cutlass.range_constexpr(self.stages):
             self.issue_stage(bx + i * grid_size, smem.s_stages + i * self.stage_bytes, num_tiles, tidx, input_bases)
         self.load_group_offsets(offs_base, smem.s_offs, tidx, G)
+
         num_iters = (num_tiles - bx + grid_size - 1) // grid_size
         for iter_idx in cutlass.range(num_iters, unroll=1):
             tile_idx = bx + iter_idx * grid_size
@@ -222,6 +167,7 @@ class SiluMulQuant:
             group_start, num_group_rows = self.find_group(smem.s_offs, tile.row_start, thread.lane, G)
             for out_idx in cutlass.range_constexpr(self.num_outputs):
                 self.quantize_output(out_words[out_idx], outputs[out_idx], tile, thread, group_start, num_group_rows, smem)
+
         cute.arch.cp_async_wait_group(0)
 
     @cute.jit
@@ -314,8 +260,8 @@ class SiluMulQuant:
     def reduce_row_amax(self, abs_words: list) -> list:
         """
         Amax of the thread's 4 rows over the whole tile as packed bf16 bit patterns, reduced by
-        butterfly over the 16 lanes of the row group: row_amax[pair] packs rows 2 * pair and 2 *
-        pair + 1.
+        butterfly over the 16 lanes of the row group: row_amax[pair] packs rows 2 * pair and
+        2 * pair + 1.
         """
         row_amax_halves = [max2(max2(abs_words[k][0], abs_words[k][1]), max2(abs_words[k][2], abs_words[k][3])) for k in range(4)]
         row_amax = [None] * 2
@@ -414,14 +360,14 @@ class SiluMulQuantGU(SiluMulQuant):
         self.num_channels = self.num_outputs * N
 
     @cute.jit
-    def __call__(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokS: cute.Tensor, mKm: cute.Tensor, mKmS: cute.Tensor, stream):
+    def __call__(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKmajor: cute.Tensor, mKmajorScale: cute.Tensor, stream):
         num_tiles = (mG.shape[0] // BLOCK) * self.num_col_blocks
-        self.kernel(mDh, mG, mU, mOffs, mTok, mTokS, mKm, mKmS).launch(grid=[cutlass.min(num_tiles, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
+        self.kernel(mDh, mG, mU, mOffs, mTok, mTokScale, mKmajor, mKmajorScale).launch(grid=[cutlass.min(num_tiles, self.num_ctas), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokS: cute.Tensor, mKm: cute.Tensor, mKmS: cute.Tensor):
+    def kernel(self, mDh: cute.Tensor, mG: cute.Tensor, mU: cute.Tensor, mOffs: cute.Tensor, mTok: cute.Tensor, mTokScale: cute.Tensor, mKmajor: cute.Tensor, mKmajorScale: cute.Tensor):
         M = mG.shape[0]
-        outputs = [Output((mTok, mTokS, mKm, mKmS), M, self.num_channels, i * self.N, i * self.num_col_blocks) for i in range(self.num_outputs)]
+        outputs = [Output((mTok, mTokScale, mKmajor, mKmajorScale), M, self.num_channels, i * self.N, i * self.num_col_blocks) for i in range(self.num_outputs)]
         self.process_tiles(self.input_bases(mDh, mG, mU), mOffs.iterator.toint(), outputs, M, mOffs.shape[0])
 
     def issue_stage(self, tile_idx: Int32, stage_addr: Int32, num_tiles: Int32, tidx: Int32, input_bases: list):
@@ -463,7 +409,7 @@ def get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
         num_channels = 2 * N if backward else N
         gu_half = fake(cutlass.BFloat16, (M, N), (2 * N, 1))
         fp8_type = cutlass.Float8E4M3FN
-        out = (fake(fp8_type, (M, num_channels), (num_channels, 1)), fake(cutlass.Float32, (M, num_channels // BLOCK), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int(),), (1,)), fake(cutlass.Float32, (num_channels, cute.sym_int()), (1, mn_pad(num_channels)), 16))
+        out = (fake(fp8_type, (M, num_channels), (num_channels, 1)), fake(Float32, (M, num_channels // BLOCK), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int(),), (1,)), fake(Float32, (num_channels, cute.sym_int()), (1, mn_pad(num_channels)), 16))
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
         fn = cute.compile(SiluMulQuantGU(N, backward, SM_COUNT), fake(cutlass.BFloat16, (M, N), (N, 1)) if backward else None, gu_half, gu_half, offs, *out, fake_stream(), options="--enable-tvm-ffi")
         COMPILED[key] = fn
@@ -497,7 +443,7 @@ def silu_mul_quant_gu_fusable(N: int, M: int, grouped_mm_offs: torch.Tensor) -> 
 def fp8_silu_mul_fwd_sm90(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = g.shape
     if M != 0 and N != 0 and not silu_mul_quant_fusable(N, grouped_mm_offs):
-        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(g, u), grouped_mm_offs)
+        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd_sm90(g, u), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, N, g.device)
     if M == 0 or N == 0:
         return out
@@ -510,7 +456,7 @@ def fp8_silu_mul_bwd_sm90(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, gr
     if M == 0 or N == 0:
         return (alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device))
     if not silu_mul_quant_fusable(N, grouped_mm_offs):
-        grad_gate, grad_up = silu_mul_bwd(dh, g, u)
+        grad_gate, grad_up = silu_mul_bwd_sm90(dh, g, u)
         return fp8cast_rowwise_kmajor_sm90(grad_gate, grouped_mm_offs), fp8cast_rowwise_kmajor_sm90(grad_up, grouped_mm_offs)
     grad_gate_out, grad_up_out = alloc_rowwise_kmajor_outputs(M, N, g.device), alloc_rowwise_kmajor_outputs(M, N, g.device)
     get_kernel(N, True, g.device)(dh, g, u, grouped_mm_offs, *grad_gate_out, *grad_up_out)
@@ -523,7 +469,7 @@ def fp8_silu_mul_gu_fwd_sm90(gu: torch.Tensor, grouped_mm_offs: torch.Tensor) ->
         return alloc_rowwise_kmajor_outputs(0, N, gu.device)
     if not silu_mul_quant_gu_fusable(N, M, grouped_mm_offs):
         gate, up = gu[:, :N].contiguous(), gu[:, N:].contiguous()
-        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd(gate, up), grouped_mm_offs)
+        return fp8cast_rowwise_kmajor_sm90(silu_mul_fwd_sm90(gate, up), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, N, gu.device)
     get_kernel_gu(N, False, gu.device)(None, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)
     return out
@@ -535,7 +481,7 @@ def fp8_silu_mul_gu_bwd_sm90(dh: torch.Tensor, gu: torch.Tensor, grouped_mm_offs
         return alloc_rowwise_kmajor_outputs(0, 2 * N, gu.device)
     if not silu_mul_quant_gu_fusable(N, M, grouped_mm_offs):
         gate, up = gu[:, :N].contiguous(), gu[:, N:].contiguous()
-        grad_gate, grad_up = silu_mul_bwd(dh, gate, up)
+        grad_gate, grad_up = silu_mul_bwd_sm90(dh, gate, up)
         return fp8cast_rowwise_kmajor_sm90(torch.cat([grad_gate, grad_up], 1), grouped_mm_offs)
     out = alloc_rowwise_kmajor_outputs(M, 2 * N, gu.device)
     get_kernel_gu(N, True, gu.device)(dh, gu[:, :N], gu[:, N:], grouped_mm_offs, *out)

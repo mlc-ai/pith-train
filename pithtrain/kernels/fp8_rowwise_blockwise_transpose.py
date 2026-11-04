@@ -12,7 +12,7 @@ def fp8_quant_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Te
 
     x is 2-D (M, K) bf16 (fp16 / fp32 also accepted), any M and K, any strides; not modified. x_fp8
     is e4m3 (M, K) contiguous with fp32 x_scale of logical shape (M, ceil(K / 128)), strides
-    unspecified (MN-major on SM90, row-major on SM100). xt_fp8 is e4m3 (K, M) contiguous with one
+    unspecified (MN-major on SM90, column-major on SM100). xt_fp8 is e4m3 (K, M) contiguous with one
     scale per 128x128 tile: fp32 xt_scale (ceil(K / 128), ceil(M / 128)), row-major.
 
     Per block (a partial block uses its valid elements): scale = 2^ceil(log2(max(amax, 1e-4) / 448))

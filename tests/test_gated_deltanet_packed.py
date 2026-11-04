@@ -34,8 +34,9 @@ def verify_packed(req: PackedRequest) -> None:
     device = torch.cuda.current_device()
     config = Qwen3_5MoeTextConfig(
         hidden_size=512,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
+        # Qwen3.5's Gated DeltaNet heads, the geometry the gated delta rule kernels cover.
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
