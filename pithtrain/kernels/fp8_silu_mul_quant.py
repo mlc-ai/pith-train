@@ -25,12 +25,12 @@ def fp8_silu_mul_fwd(g: torch.Tensor, u: torch.Tensor, grouped_mm_offs: torch.Te
     """
     FP8 grouped-GEMM input of h = silu(g) * u without writing h: the 4-tuple (h_fp8, h_scale,
     h_ch_fp8, h_ch_scale) of fp8_quant_grouped(silu_mul_fwd(g, u), grouped_mm_offs), bit for bit,
-    in fp8_quant_grouped's layout (per-channel K-major per group on SM90, (M, N) with scale (M /
-    128, N) on SM100).
+    in fp8_quant_grouped's layout (per-channel K-major per group on SM90, (M, N) with scale
+    (M / 128, N) on SM100).
 
     g, u: bf16 (M, N), contiguous, same shape; rows grouped by expert. grouped_mm_offs: int32 (G,)
-    contiguous cumulative group ends, each a multiple of 128, last == M. Inputs are not modified; M
-    == 0 or N == 0 gives empty outputs. Callers use it where fp8_fused_experts_supported(). Scale
+    contiguous cumulative group ends, each a multiple of 128, last == M. Inputs are not modified;
+    M == 0 or N == 0 gives empty outputs. Callers use it where fp8_fused_experts_supported(). Scale
     strides are unspecified. Deterministic.
     """
     check_operands([g, u], grouped_mm_offs)
@@ -51,8 +51,8 @@ def fp8_silu_mul_bwd(dh: torch.Tensor, g: torch.Tensor, u: torch.Tensor, grouped
     of one gradient of silu_mul_bwd(dh, g, u), without writing the bf16 gradients.
 
     dh, g, u: bf16 (M, N), contiguous, same shape; dh the gradient of h, g / u the saved forward
-    inputs. grouped_mm_offs and layout as in fp8_silu_mul_fwd. Inputs are
-    not modified. Deterministic.
+    inputs. grouped_mm_offs and layout as in fp8_silu_mul_fwd.
+    Inputs are not modified. Deterministic.
     """
     check_operands([dh, g, u], grouped_mm_offs)
     match ARCH_MAJOR:
