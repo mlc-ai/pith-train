@@ -18,7 +18,9 @@ from pithtrain.kernels.row_slice_sm90 import RowAccess, RowSlice, lds_f32, pack_
 
 __all__ = ["cross_entropy_fwd_bwd_sm90"]
 
-COUNT_THREADS, STATS_BYTES, LN2 = 1024, 8, 0.6931471805599453
+COUNT_THREADS = 1024
+STATS_BYTES = 8
+LN2 = 0.6931471805599453
 # Largest row slice one CTA keeps in shared memory, and the slice size up to which a smaller cluster
 # is preferred: about 80 KB leaves room for 2-3 CTAs per SM.
 MAX_SLICE_BYTES, PREFERRED_SLICE_BYTES = 200 * 1024, 80 * 1024
@@ -27,8 +29,8 @@ MAX_SLICE_BYTES, PREFERRED_SLICE_BYTES = 200 * 1024, 80 * 1024
 @dsl_user_op
 def exp_shifted(x: Float32, shift: Float32, use_ftz: bool, *, loc=None, ip=None) -> Float32:
     """
-    exp(x - shift) as sub, multiply by log2(e), then ex2.approx. The ftz
-    form differs from the full-range ex2 only for results below 2^-126.
+    exp(x - shift) as sub, multiply by log2(e), then ex2.approx. The ftz form differs from the
+    full-range ex2 only for results below 2^-126.
     """
     ex2_op = "ex2.approx.ftz.f32" if use_ftz else "ex2.approx.f32"
     return Float32(asm(T.f32(), [to_ir(x, Float32, loc, ip), to_ir(shift, Float32, loc, ip)], "{\n.reg .f32 t;\nsub.rn.f32 t, $1, $2;\nmul.rn.f32 t, t, 0f3FB8AA3B;\n" + ex2_op + " $0, t;\n}", "=f,f,f"))
@@ -48,8 +50,8 @@ def combine_stats(max_a: Float32, sum_a: Float32, max_b: Float32, sum_b: Float32
 @cute.jit
 def block_sum(value, s_partial: Int32, lane: Int32, warp: Int32, num_warps: cutlass.Constexpr[int]):
     """
-    The CTA's sum of value (Int32 or Float32) in a fixed order, valid in thread 0: a butterfly within
-    each warp, then thread 0 adds the warps' sums in warp order.
+    The CTA's sum of value (Int32 or Float32) in a fixed order, valid in thread 0: a butterfly
+    within each warp, then thread 0 adds the warps' sums in warp order.
     """
     is_float = isinstance(value, Float32)
     for i in cutlass.range_constexpr(5):
@@ -84,7 +86,8 @@ class CrossEntropy:
 
     def __init__(self, dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int) -> None:
         self.dtype, self.num_cols, self.cluster_size = dtype, num_cols, cluster_size
-        self.chunks, self.is_resident, self.threads, self.warps = chunks, is_resident, threads, threads // 32
+        self.chunks, self.is_resident, self.threads = chunks, is_resident, threads
+        self.warps = threads // 32
         self.element_bytes = dtype.width // 8
         self.unit_elements = 16 // self.element_bytes
         self.slice_units = (num_cols * self.element_bytes // 16 + cluster_size - 1) // cluster_size
@@ -149,12 +152,12 @@ class CrossEntropy:
         0's head and tail elements; whoever holds x[target] copies it to s_target.
         """
         acc_max, acc_sum, acc_min = -Float32.inf, Float32(0.0), Float32.inf
-        for k in cutlass.range_constexpr(self.chunks):
-            chunk_start = k * self.chunk_units
-            chunk_units = cutlass.max(cutlass.min(row.cta_units - chunk_start, Int32(self.chunk_units)), Int32(0))
+        for chunk_idx in cutlass.range_constexpr(self.chunks):
+            chunk_start = chunk_idx * self.chunk_units
+            num_units = cutlass.max(cutlass.min(row.cta_units - chunk_start, Int32(self.chunk_units)), Int32(0))
             if const_expr(self.is_resident):
-                barrier_wait(s_barriers + k * 8, Int32(0))
-            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + chunk_units, self.threads, unroll=1):
+                barrier_wait(s_barriers + chunk_idx * 8, Int32(0))
+            for unit_idx in cutlass.range(chunk_start + tidx, chunk_start + num_units, self.threads, unroll=1):
                 words = self.load_unit(row, s_slice, unit_idx)
                 values = unpack_unit(words, self.dtype)
                 acc_max, acc_sum, acc_min = self.accumulate_unit(words, values, acc_max, acc_sum, acc_min)
@@ -382,7 +385,9 @@ def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_i
         target = target.contiguous()
     if num_rows == 0:
         return torch.zeros((), dtype=torch.float32, device=inp.device), inp
-    loss, row_loss, count = torch.empty((), dtype=torch.float32, device=inp.device), torch.empty(num_rows, dtype=torch.float32, device=inp.device), torch.empty(1, dtype=torch.int64, device=inp.device)
+    loss = torch.empty((), dtype=torch.float32, device=inp.device)
+    row_loss = torch.empty(num_rows, dtype=torch.float32, device=inp.device)
+    count = torch.empty(1, dtype=torch.int64, device=inp.device)
     layout = pick_layout(num_cols, inp.element_size())
     key = ("cross_entropy", inp.dtype, target.dtype, num_cols, *layout)
     fn = COMPILED.get(key)
