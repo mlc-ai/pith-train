@@ -42,6 +42,15 @@ configure_deterministic_training; each MoE captures the layout policy as a
 checkpoint-bound numerical attribute.
 """
 
+omni_stage5_aggregation: str = "grouped_sum"
+"""Thinker aggregation only; captured by modules once at construction.
+
+grouped_sum preserves ordinary grouped reduction with no route metadata work.
+hf_eager_expert_id_serial uses owned global IDs/argsort per microbatch and
+serial BF16 product/add boundaries. It does not select or qualify a native/HF
+expert projection backend. Talker retains its independent arithmetic policy.
+"""
+
 fp8: bool
 """
 Whether layers are built for FP8 compute, False for BF16.

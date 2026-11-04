@@ -10,12 +10,13 @@ from torch import nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.interface import RoutingInfo
+from pithtrain.models.interface import RoutingInfo, Stage5RouteMetadata, Stage5RoutingInfo
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
     replay_indices,
 )
+from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
@@ -124,7 +125,7 @@ class Qwen3OmniMoeThinkerTextTopKRouter(nn.Module):
         return indices, weights, lb_loss
 
 
-def _combine_expert_order(moe_outs, topk_weight, moe_local_idxs, output_dtype):
+def _combine_expert_order(moe_outs, topk_weight, moe_local_idxs, output_dtype, slot_order=None):
     """Combine slots already ordered by increasing expert ID, matching HF eager.
 
     The unique EP return indices restore token/slot order without a floating
@@ -135,7 +136,14 @@ def _combine_expert_order(moe_outs, topk_weight, moe_local_idxs, output_dtype):
     if moe_local_idxs is not None:
         slots = moe_outs.new_zeros(topk_weight.numel(), moe_outs.shape[-1])
         moe_outs = slots.index_copy(0, moe_local_idxs, moe_outs)
-    outputs = moe_outs.view(*topk_weight.shape, -1)
+    outputs = (
+        moe_outs.view(*topk_weight.shape, -1)
+        if slot_order is None
+        else moe_outs.reshape(*topk_weight.shape, moe_outs.shape[-1])
+    )
+    if slot_order is not None:
+        outputs = outputs.gather(1, slot_order[..., None].expand_as(outputs))
+        topk_weight = topk_weight.gather(1, slot_order)
     result = torch.zeros_like(outputs[:, 0], dtype=output_dtype)
     for slot in range(topk_weight.shape[1]):
         product = outputs[:, slot] * topk_weight[:, slot, None]
@@ -162,6 +170,9 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.omni_stage5_aggregation = validate_omni_stage5_aggregation(
+            training.omni_stage5_aggregation
+        )
         self.deterministic_token_layout = training.deterministic_token_layout
         if config.num_experts % distributed.ep_size:
             raise ValueError("num_experts must be divisible by expert_parallel_size")
@@ -171,6 +182,7 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
 
     def reference_forward(self, hidden_states):
         shape = hidden_states.shape
+        policy = getattr(self, "omni_stage5_aggregation", "grouped_sum")
         replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
         indices, weights, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
@@ -182,6 +194,12 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
             repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
         )
         outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
+        if policy == "hf_eager_expert_id_serial":
+            return _combine_expert_order(
+                outputs, weights, None, hidden_states.dtype, slot_order=indices.argsort(dim=-1)
+            ).view(shape)
+        if policy != "grouped_sum":
+            raise ValueError("Unknown Thinker aggregation policy")
         return _combine_expert_sum(outputs, weights, None, hidden_states.dtype).view(shape)
 
 
@@ -257,6 +275,9 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     def __init__(self, config, layer_id):
         super().__init__()
         self.idx = layer_id
+        self.omni_stage5_aggregation = validate_omni_stage5_aggregation(
+            training.omni_stage5_aggregation
+        )
         self.self_attn = Qwen3OmniMoeThinkerTextAttention(config, layer_id)
         self.is_moe = (
             layer_id not in config.mlp_only_layers
@@ -295,7 +316,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
 
     def forward_stage1(
         self, hidden_states, rotary_posemb, cu_seqlens=None
-    ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | Stage5RoutingInfo | None]:
         replay_idx = (
             replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
             if self.is_moe
@@ -319,6 +340,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             distributed.ep_group,
             deterministic=self.mlp.deterministic_token_layout,
         )
+        if getattr(self, "omni_stage5_aggregation", "grouped_sum") == "hf_eager_expert_id_serial":
+            routing = Stage5RoutingInfo(routing, Stage5RouteMetadata.from_expert_ids(indices))
         return tokens, residual, routing
 
     def forward_stage3(self, gathered_tokens, expert_idxs=None, expand_idx=None):
@@ -335,9 +358,34 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 
-    def _forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
+    def _forward_stage5(
+        self, moe_outs, moe_local_idxs, topk_weight, residual, *, stage5_metadata=None
+    ):
         if not self.is_moe:
+            if stage5_metadata is not None:
+                raise ValueError("Dense Stage5 cannot consume route metadata")
             return residual + moe_outs
+        policy = getattr(self, "omni_stage5_aggregation", "grouped_sum")
+        if policy == "hf_eager_expert_id_serial":
+            if stage5_metadata is None:
+                raise ValueError(
+                    "hf_eager_expert_id_serial requires per-microbatch global route metadata"
+                )
+            if (
+                stage5_metadata.global_expert_ids.shape != topk_weight.shape
+                or stage5_metadata.expert_order.shape != topk_weight.shape
+            ):
+                raise ValueError("Stage5 metadata must match original router slots")
+            combined = _combine_expert_order(
+                moe_outs,
+                topk_weight,
+                moe_local_idxs,
+                residual.dtype,
+                slot_order=stage5_metadata.expert_order,
+            )
+            return residual + combined.view_as(residual)
+        if policy != "grouped_sum" or stage5_metadata is not None:
+            raise ValueError("Stage5 policy and route metadata disagree")
         combined = _combine_expert_sum(
             moe_outs,
             topk_weight,
@@ -349,6 +397,14 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         return self._forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+
+    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
+    def forward_stage5_with_metadata(
+        self, moe_outs, moe_local_idxs, topk_weight, residual, *, stage5_metadata
+    ):
+        return self._forward_stage5(
+            moe_outs, moe_local_idxs, topk_weight, residual, stage5_metadata=stage5_metadata
+        )
 
     def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
         residual = hidden_states + self.self_attn(
