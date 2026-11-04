@@ -2,14 +2,14 @@
 clamped_swiglu_sm100: the clamped SwiGLU forward and backward of an interleaved gate_up on SM100,
 TIRx-lite kernels, the same bits as clamped_swiglu_sm90.
 
-Flat elementwise kernels over n = M * N outputs. Each thread owns UNROLL groups of VEC consecutive
-outputs (groups spaced one CTA-tile apart so every warp access stays coalesced); it issues all of
+Flat elementwise kernels over M * N outputs. Each thread owns UNROLL groups of VEC consecutive
+outputs (groups spaced one CTA tile apart so every warp access stays coalesced); it issues all of
 its wide loads before computing, then writes packed results. The fp32 sequence is sigmoid = 1 /
 (1 + ex2.approx(x * -log2 e)) with div.full.f32 semantics, the ex2 / division range fixups that
-cannot change the result removed (see sigmoid_parts), and the products
-issued two outputs at a time as packed f32x2 (same per-lane rn rounding). Shapes, alpha and limit
-are runtime arguments. bf16, fp16 and fp32 run natively; any other float dtype is widened to fp32,
-run through the fp32 kernel and rounded once back (the arithmetic is fp32 with one rounding).
+cannot change the result removed (see sigmoid_parts), and the products issued two outputs at a
+time as packed f32x2 (same per-lane rn rounding). Shapes, alpha and limit are runtime arguments.
+bf16, fp16 and fp32 run natively; any other float dtype is widened to fp32, run through the fp32
+kernel and rounded once back (the arithmetic is fp32 with one rounding).
 """
 
 import functools
@@ -27,282 +27,316 @@ __all__ = ["clamped_swiglu_bwd_sm100", "clamped_swiglu_fwd_sm100"]
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
     The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
     call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
-CFG = {"fwd": {"threads": 256, "vec": 16, "unroll": 1, "ld": "ld.global.v8.b32", "st": "st.global.v8.b32"}, "bwd": {"threads": 64, "vec": 16, "unroll": 1, "ld": "ld.global.v8.b32", "st": "st.global.v8.b32"}}  # per entry: threads, outputs per thread (vec), unroll, load / store instruction
+LAUNCH_CONFIG = {"fwd": {"threads": 256, "vec": 16, "unroll": 1, "ld": "ld.global.v8.b32", "st": "st.global.v8.b32"}, "bwd": {"threads": 64, "vec": 16, "unroll": 1, "ld": "ld.global.v8.b32", "st": "st.global.v8.b32"}}  # per entry: threads, outputs per thread (vec), unroll, load / store instruction
 NEG_LOG2E_BITS = 0xBFB8AA3B  # -log2(e) rounded to fp32
-DT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
+KERNEL_DTYPE = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 
 
-def f32_bits(bits):
+def f32_from_bits(bits):
+    """
+    The fp32 constant with bit pattern bits.
+    """
     return txl.reinterpret(txl.uint32(bits), ty="float32")
 
 
-def op(chain, *args, dtype="float32"):
+def emit_ptx(instruction, *args, dtype="float32"):
+    """
+    One PTX instruction into a new register of dtype, which is returned.
+    """
     out = txl.local_scalar(dtype)
-    txl.ptx[chain](out, *args)
+    txl.ptx[instruction](out, *args)
     return out
 
 
-def sigmoid_parts(g, alpha):
+def sigmoid_parts(gate, alpha):
     """
-    x = alpha * g and s = sigmoid(x), in the module's fp32 sequence.
+    x = alpha * gate and sigmoid(x), in the module's fp32 sequence.
     """
-    x = op("mul.rn.f32", alpha, g)
-    t = op("mul.rn.f32", x, f32_bits(NEG_LOG2E_BITS))
+    x = emit_ptx("mul.rn.f32", alpha, gate)
+    exponent = emit_ptx("mul.rn.f32", x, f32_from_bits(NEG_LOG2E_BITS))
     # ex2's denormal-range fixup cannot change e + 1 (both sides round to 1.0), so .ftz is exact here.
-    e = op("ex2.approx.ftz.f32", t)
+    exp2 = emit_ptx("ex2.approx.ftz.f32", exponent)
     # div.full.f32(1, d) for d = e + 1 >= 1 is rcp(d), or rcp(d / 4) / 4 when d > 2^126; MUFU.RCP is
     # exact under power-of-two scaling, so scaling by 1/4 unconditionally gives the same bits, and
-    # fma(e, 1/4, 1/4) == rn(e + 1) / 4 exactly. (Verified over all 2^32 t on the B200.)
-    r = op("rcp.approx.ftz.f32", op("fma.rn.f32", e, txl.float32(0.25), txl.float32(0.25)))
-    s = op("mul.rn.f32", r, txl.float32(0.25))
-    return x, s
+    # fma(e, 1/4, 1/4) == rn(e + 1) / 4 exactly. (Verified over all 2^32 exponents on the B200.)
+    rcp_quarter = emit_ptx("rcp.approx.ftz.f32", emit_ptx("fma.rn.f32", exp2, txl.float32(0.25), txl.float32(0.25)))
+    sigmoid = emit_ptx("mul.rn.f32", rcp_quarter, txl.float32(0.25))
+    return x, sigmoid
 
 
-def clamp(gate, up, limit, neg_limit):
-    g = op("min.f32", gate, limit)
-    u = op("min.f32", op("max.f32", up, neg_limit), limit)
-    return g, u
-
-
-def fwd_one(gate, up, alpha, limit, neg_limit):
-    g, u = clamp(gate, up, limit, neg_limit)
-    _, s = sigmoid_parts(g, alpha)
-    ag = op("mul.rn.f32", g, s)
-    u1 = op("add.rn.f32", u, txl.float32(1.0))
-    return op("mul.rn.f32", u1, ag)
-
-
-def bwd_one(go, gate, up, alpha, limit, neg_limit):
-    g, u = clamp(gate, up, limit, neg_limit)
-    x, s = sigmoid_parts(g, alpha)
-    ag = op("mul.rn.f32", g, s)
-    d_up = op("mul.rn.f32", go, ag)
-    u1 = op("add.rn.f32", u, txl.float32(1.0))
-    t = op("mul.rn.f32", op("mul.rn.f32", go, u1), s)
-    f = op("fma.rn.f32", x, op("sub.rn.f32", txl.float32(1.0), s), txl.float32(1.0))
-    d_gate = op("mul.rn.f32", t, f)
-    d_gate = txl.Select(gate <= limit, d_gate, txl.float32(0.0))
-    d_up = txl.Select(txl.And(up >= neg_limit, up <= limit), d_up, txl.float32(0.0))
-    return d_gate, d_up
-
-
-def pack2(a, b):
+def clamp_gate_up(gate, up, limit, neg_limit):
     """
-    f32 pair (a in the low lane) as one .b64 f32x2 operand.
+    gate clamped to at most limit, up to [-limit, limit].
     """
-    lo, hi = txl.cast(txl.reinterpret(a, ty="uint32"), "uint64"), txl.cast(txl.reinterpret(b, ty="uint32"), "uint64")
-    return (hi << txl.uint64(32)) | lo
+    clamped_gate = emit_ptx("min.f32", gate, limit)
+    clamped_up = emit_ptx("min.f32", emit_ptx("max.f32", up, neg_limit), limit)
+    return clamped_gate, clamped_up
 
 
-def lanes(p):
-    return txl.reinterpret(txl.cast(p, "uint32"), ty="float32"), txl.reinterpret(txl.cast(p >> txl.uint64(32), "uint32"), ty="float32")
+def swiglu_fwd_one(gate, up, alpha, limit, neg_limit):
+    """
+    One output: (up + 1) * gate * sigmoid(alpha * gate) on the clamped gate and up.
+    """
+    clamped_gate, clamped_up = clamp_gate_up(gate, up, limit, neg_limit)
+    _, sigmoid = sigmoid_parts(clamped_gate, alpha)
+    glu = emit_ptx("mul.rn.f32", clamped_gate, sigmoid)
+    up_plus_one = emit_ptx("add.rn.f32", clamped_up, txl.float32(1.0))
+    return emit_ptx("mul.rn.f32", up_plus_one, glu)
 
 
-def op2(chain, *args):
-    return op(chain, *args, dtype="uint64")
+def swiglu_bwd_one(grad_out, gate, up, alpha, limit, neg_limit):
+    """
+    One output's (grad_gate, grad_up), zero where the clamp cut the input.
+    """
+    clamped_gate, clamped_up = clamp_gate_up(gate, up, limit, neg_limit)
+    x, sigmoid = sigmoid_parts(clamped_gate, alpha)
+    glu = emit_ptx("mul.rn.f32", clamped_gate, sigmoid)
+    grad_up = emit_ptx("mul.rn.f32", grad_out, glu)
+    up_plus_one = emit_ptx("add.rn.f32", clamped_up, txl.float32(1.0))
+    grad_sigmoid = emit_ptx("mul.rn.f32", emit_ptx("mul.rn.f32", grad_out, up_plus_one), sigmoid)
+    silu_grad_factor = emit_ptx("fma.rn.f32", x, emit_ptx("sub.rn.f32", txl.float32(1.0), sigmoid), txl.float32(1.0))
+    grad_gate = emit_ptx("mul.rn.f32", grad_sigmoid, silu_grad_factor)
+    grad_gate = txl.Select(gate <= limit, grad_gate, txl.float32(0.0))
+    grad_up = txl.Select(txl.And(up >= neg_limit, up <= limit), grad_up, txl.float32(0.0))
+    return grad_gate, grad_up
 
 
-def splat_bits(bits):
-    return pack2(f32_bits(bits), f32_bits(bits))
+def pack_f32x2(value_lo, value_hi):
+    """
+    f32 pair (value_lo in the low lane) as one .b64 f32x2 operand.
+    """
+    bits_lo, bits_hi = txl.cast(txl.reinterpret(value_lo, ty="uint32"), "uint64"), txl.cast(txl.reinterpret(value_hi, ty="uint32"), "uint64")
+    return (bits_hi << txl.uint64(32)) | bits_lo
+
+
+def unpack_f32x2(packed):
+    """
+    The (low, high) f32 lanes of a .b64 f32x2 value.
+    """
+    return txl.reinterpret(txl.cast(packed, "uint32"), ty="float32"), txl.reinterpret(txl.cast(packed >> txl.uint64(32), "uint32"), ty="float32")
+
+
+def emit_ptx_x2(instruction, *args):
+    """
+    emit_ptx for an f32x2 instruction, into a .b64 register.
+    """
+    return emit_ptx(instruction, *args, dtype="uint64")
+
+
+def splat_bits_x2(bits):
+    """
+    The fp32 constant with bit pattern bits in both f32x2 lanes.
+    """
+    return pack_f32x2(f32_from_bits(bits), f32_from_bits(bits))
 
 
 ONE_BITS, QUARTER_BITS = 0x3F800000, 0x3E800000
 
 
-def sigmoid_parts2(G, A2):
+def sigmoid_parts_x2(gate_x2, alpha_x2):
     """
     sigmoid_parts on two lanes: the products in packed f32x2 (same rn rounding per lane).
     """
-    X = op2("mul.rn.f32x2", A2, G)
-    t0, t1 = lanes(op2("mul.rn.f32x2", X, splat_bits(NEG_LOG2E_BITS)))
-    E = pack2(op("ex2.approx.ftz.f32", t0), op("ex2.approx.ftz.f32", t1))
-    q0, q1 = lanes(op2("fma.rn.f32x2", E, splat_bits(QUARTER_BITS), splat_bits(QUARTER_BITS)))
-    R = pack2(op("rcp.approx.ftz.f32", q0), op("rcp.approx.ftz.f32", q1))
-    return X, op2("mul.rn.f32x2", R, splat_bits(QUARTER_BITS))
+    x_x2 = emit_ptx_x2("mul.rn.f32x2", alpha_x2, gate_x2)
+    exponent_lo, exponent_hi = unpack_f32x2(emit_ptx_x2("mul.rn.f32x2", x_x2, splat_bits_x2(NEG_LOG2E_BITS)))
+    exp2_x2 = pack_f32x2(emit_ptx("ex2.approx.ftz.f32", exponent_lo), emit_ptx("ex2.approx.ftz.f32", exponent_hi))
+    quarter_denom_lo, quarter_denom_hi = unpack_f32x2(emit_ptx_x2("fma.rn.f32x2", exp2_x2, splat_bits_x2(QUARTER_BITS), splat_bits_x2(QUARTER_BITS)))
+    rcp_quarter_x2 = pack_f32x2(emit_ptx("rcp.approx.ftz.f32", quarter_denom_lo), emit_ptx("rcp.approx.ftz.f32", quarter_denom_hi))
+    return x_x2, emit_ptx_x2("mul.rn.f32x2", rcp_quarter_x2, splat_bits_x2(QUARTER_BITS))
 
 
-def fwd_two(gates, ups, alpha, limit, neg_limit):
-    (g0, u0), (g1, u1) = (clamp(gates[k], ups[k], limit, neg_limit) for k in range(2))
-    G = pack2(g0, g1)
-    _, S = sigmoid_parts2(G, pack2(alpha, alpha))
-    AG = op2("mul.rn.f32x2", G, S)
-    U1 = op2("add.rn.f32x2", pack2(u0, u1), splat_bits(ONE_BITS))
-    return lanes(op2("mul.rn.f32x2", U1, AG))
+def swiglu_fwd_two(gates, ups, alpha, limit, neg_limit):
+    """
+    swiglu_fwd_one on two outputs, the products in packed f32x2.
+    """
+    (gate_lo, up_lo), (gate_hi, up_hi) = (clamp_gate_up(gates[k], ups[k], limit, neg_limit) for k in range(2))
+    gate_x2 = pack_f32x2(gate_lo, gate_hi)
+    _, sigmoid_x2 = sigmoid_parts_x2(gate_x2, pack_f32x2(alpha, alpha))
+    glu_x2 = emit_ptx_x2("mul.rn.f32x2", gate_x2, sigmoid_x2)
+    up_plus_one_x2 = emit_ptx_x2("add.rn.f32x2", pack_f32x2(up_lo, up_hi), splat_bits_x2(ONE_BITS))
+    return unpack_f32x2(emit_ptx_x2("mul.rn.f32x2", up_plus_one_x2, glu_x2))
 
 
-def bwd_two(gos, gates, ups, alpha, limit, neg_limit):
-    (g0, u0), (g1, u1) = (clamp(gates[k], ups[k], limit, neg_limit) for k in range(2))
-    G, GO = pack2(g0, g1), pack2(gos[0], gos[1])
-    X, S = sigmoid_parts2(G, pack2(alpha, alpha))
-    AG = op2("mul.rn.f32x2", G, S)
-    d_up = lanes(op2("mul.rn.f32x2", GO, AG))
-    U1 = op2("add.rn.f32x2", pack2(u0, u1), splat_bits(ONE_BITS))
-    T = op2("mul.rn.f32x2", op2("mul.rn.f32x2", GO, U1), S)
-    F = op2("fma.rn.f32x2", X, op2("sub.rn.f32x2", splat_bits(ONE_BITS), S), splat_bits(ONE_BITS))
-    d_gate = lanes(op2("mul.rn.f32x2", T, F))
-    res = []
+def swiglu_bwd_two(grad_outs, gates, ups, alpha, limit, neg_limit):
+    """
+    swiglu_bwd_one on two outputs, the products in packed f32x2, as [grad_gate, grad_up] for each
+    output in turn.
+    """
+    (gate_lo, up_lo), (gate_hi, up_hi) = (clamp_gate_up(gates[k], ups[k], limit, neg_limit) for k in range(2))
+    gate_x2, grad_out_x2 = pack_f32x2(gate_lo, gate_hi), pack_f32x2(grad_outs[0], grad_outs[1])
+    x_x2, sigmoid_x2 = sigmoid_parts_x2(gate_x2, pack_f32x2(alpha, alpha))
+    glu_x2 = emit_ptx_x2("mul.rn.f32x2", gate_x2, sigmoid_x2)
+    grad_up = unpack_f32x2(emit_ptx_x2("mul.rn.f32x2", grad_out_x2, glu_x2))
+    up_plus_one_x2 = emit_ptx_x2("add.rn.f32x2", pack_f32x2(up_lo, up_hi), splat_bits_x2(ONE_BITS))
+    grad_sigmoid_x2 = emit_ptx_x2("mul.rn.f32x2", emit_ptx_x2("mul.rn.f32x2", grad_out_x2, up_plus_one_x2), sigmoid_x2)
+    silu_grad_factor_x2 = emit_ptx_x2("fma.rn.f32x2", x_x2, emit_ptx_x2("sub.rn.f32x2", splat_bits_x2(ONE_BITS), sigmoid_x2), splat_bits_x2(ONE_BITS))
+    grad_gate = unpack_f32x2(emit_ptx_x2("mul.rn.f32x2", grad_sigmoid_x2, silu_grad_factor_x2))
+    grads = []
     for k in range(2):
-        dg, du = txl.Select(gates[k] <= limit, d_gate[k], txl.float32(0.0)), txl.Select(txl.And(ups[k] >= neg_limit, ups[k] <= limit), d_up[k], txl.float32(0.0))
-        res += [dg, du]
-    return res
+        masked_grad_gate, masked_grad_up = txl.Select(gates[k] <= limit, grad_gate[k], txl.float32(0.0)), txl.Select(txl.And(ups[k] >= neg_limit, ups[k] <= limit), grad_up[k], txl.float32(0.0))
+        grads += [masked_grad_gate, masked_grad_up]
+    return grads
 
 
-class IO:
+class StorageIO:
     """
     Load/convert helpers for one storage dtype, in 32-bit words.
     """
 
     def __init__(self, dtype):
         self.dtype = dtype
-        self.per_word = 1 if dtype == "float32" else 2
-        self.esize = 4 // self.per_word
-        self.cvt_in, self.cvt_out, self.cvt_out2 = {"bfloat16": "cvt.f32.bf16", "float16": "cvt.f32.f16"}.get(dtype), {"bfloat16": "cvt.rn.bf16.f32", "float16": "cvt.rn.f16.f32"}.get(dtype), {"bfloat16": "cvt.rn.bf16x2.f32", "float16": "cvt.rn.f16x2.f32"}.get(dtype)
+        self.elems_per_word = 1 if dtype == "float32" else 2
+        self.elem_bytes = 4 // self.elems_per_word
+        self.cvt_to_f32, self.cvt_from_f32, self.cvt_from_f32x2 = {"bfloat16": "cvt.f32.bf16", "float16": "cvt.f32.f16"}.get(dtype), {"bfloat16": "cvt.rn.bf16.f32", "float16": "cvt.rn.f16.f32"}.get(dtype), {"bfloat16": "cvt.rn.bf16x2.f32", "float16": "cvt.rn.f16x2.f32"}.get(dtype)
 
-    def unpack(self, words):
-        vals = []
+    def unpack_words(self, words):
+        values = []
         for word in words:
             if self.dtype == "float32":
-                vals.append(txl.reinterpret(word, ty="float32"))
+                values.append(txl.reinterpret(word, ty="float32"))
             elif self.dtype == "bfloat16":  # bf16 -> f32 is exact: the bits move to the high half
-                vals.append(txl.reinterpret(word << txl.uint32(16), ty="float32"))
-                vals.append(txl.reinterpret(word & txl.uint32(0xFFFF0000), ty="float32"))
+                values.append(txl.reinterpret(word << txl.uint32(16), ty="float32"))
+                values.append(txl.reinterpret(word & txl.uint32(0xFFFF0000), ty="float32"))
             else:
-                vals.append(op(self.cvt_in, txl.cast(word & txl.uint32(0xFFFF), "uint16")))
-                vals.append(op(self.cvt_in, txl.cast(word >> txl.uint32(16), "uint16")))
-        return vals
+                values.append(emit_ptx(self.cvt_to_f32, txl.cast(word & txl.uint32(0xFFFF), "uint16")))
+                values.append(emit_ptx(self.cvt_to_f32, txl.cast(word >> txl.uint32(16), "uint16")))
+        return values
 
-    def pack(self, vals):
+    def pack_words(self, values):
         if self.dtype == "float32":
-            return [txl.reinterpret(v, ty="uint32") for v in vals]
-        return [op(self.cvt_out2, vals[2 * i + 1], vals[2 * i], dtype="uint32") for i in range(len(vals) // 2)]
+            return [txl.reinterpret(value, ty="uint32") for value in values]
+        return [emit_ptx(self.cvt_from_f32x2, values[2 * i + 1], values[2 * i], dtype="uint32") for i in range(len(values) // 2)]
 
-    def scalar_load(self, buf, idx):
+    def load_scalar(self, tensor, elem_idx):
         if self.dtype == "float32":
-            v = txl.local_scalar("float32")
-            txl.ptx.ld.global_.f32(v, buf.ptr_to([idx]))
-            return v
-        b = txl.local_scalar("uint16")
-        txl.ptx.ld.global_.b16(b, buf.ptr_to([idx]))
-        return op(self.cvt_in, b)
+            value = txl.local_scalar("float32")
+            txl.ptx.ld.global_.f32(value, tensor.ptr_to([elem_idx]))
+            return value
+        value_bits = txl.local_scalar("uint16")
+        txl.ptx.ld.global_.b16(value_bits, tensor.ptr_to([elem_idx]))
+        return emit_ptx(self.cvt_to_f32, value_bits)
 
-    def scalar_store(self, buf, idx, v):
+    def store_scalar(self, tensor, elem_idx, value):
         if self.dtype == "float32":
-            txl.ptx.st.global_.f32(buf.ptr_to([idx]), v)
+            txl.ptx.st.global_.f32(tensor.ptr_to([elem_idx]), value)
         else:
-            txl.ptx.st.global_.b16(buf.ptr_to([idx]), op(self.cvt_out, v, dtype="uint16"))
+            txl.ptx.st.global_.b16(tensor.ptr_to([elem_idx]), emit_ptx(self.cvt_from_f32, value, dtype="uint16"))
 
-    def load_words(self, buf, idx, nwords, insn):
-        words = txl.alloc_local([nwords], "uint32")
-        w8 = ".v8." in insn
-        step = 8 if w8 and nwords % 8 == 0 else 4
-        if step == 4:
-            insn = insn.replace(".v8.", ".v4.")
-        for w in range(0, nwords, step):
-            txl.ptx[insn](*[words[w + j] for j in range(step)], buf.ptr_to([idx + w * 4 // self.esize]))
-        return [words[w] for w in range(nwords)]
+    def load_words(self, tensor, elem_idx, num_words, instruction):
+        words = txl.alloc_local([num_words], "uint32")
+        is_v8 = ".v8." in instruction
+        words_per_access = 8 if is_v8 and num_words % 8 == 0 else 4
+        if words_per_access == 4:
+            instruction = instruction.replace(".v8.", ".v4.")
+        for word_idx in range(0, num_words, words_per_access):
+            txl.ptx[instruction](*[words[word_idx + j] for j in range(words_per_access)], tensor.ptr_to([elem_idx + word_idx * 4 // self.elem_bytes]))
+        return [words[word_idx] for word_idx in range(num_words)]
 
-    def store_words(self, buf, idx, words, insn):
-        step = 8 if ".v8." in insn and len(words) % 8 == 0 else 4
-        if step == 4:
-            insn = insn.replace(".v8.", ".v4.")
-        for w in range(0, len(words), step):
-            txl.ptx[insn](buf.ptr_to([idx + w * 4 // self.esize]), *words[w : w + step])
+    def store_words(self, tensor, elem_idx, words, instruction):
+        words_per_access = 8 if ".v8." in instruction and len(words) % 8 == 0 else 4
+        if words_per_access == 4:
+            instruction = instruction.replace(".v8.", ".v4.")
+        for word_idx in range(0, len(words), words_per_access):
+            txl.ptx[instruction](tensor.ptr_to([elem_idx + word_idx * 4 // self.elem_bytes]), *words[word_idx : word_idx + words_per_access])
 
 
-def grid_of(threads, vec, unroll, n):
-    tile = vec * threads * unroll
-    return txl.cast((n + tile - 1) // tile, "int32")
+def compute_grid(THREADS, VEC, UNROLL, num_outputs):
+    """
+    CTAs covering num_outputs outputs, VEC * THREADS * UNROLL per CTA.
+    """
+    TILE = VEC * THREADS * UNROLL
+    return txl.cast((num_outputs + TILE - 1) // TILE, "int32")
 
 
 @functools.cache
-def fwd_kernel(dtype, threads, vec, unroll):
-    io, cfg = IO(dtype), CFG["fwd"]
-    tile = vec * threads
+def compile_fwd_kernel(dtype, THREADS, VEC, UNROLL):
+    storage, config = StorageIO(dtype), LAUNCH_CONFIG["fwd"]
+    TILE = VEC * THREADS
 
     @txl.kernel()
-    def clamped_swiglu_fwd(gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64, alpha: txl.float32, limit: txl.float32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_of(threads, vec, unroll, n), block=(threads // 32) * 32))
-        neg_limit = op("neg.f32", limit)
-        base = txl.cast(txl.cta_id(), "int64") * (tile * unroll) + txl.cast(txl.thread_id(), "int64") * vec
-        if vec == 1:  # unaligned fallback: one output per thread, scalar accesses only
-            with txl.if_(base < n), txl.then_():
-                io.scalar_store(out, base, fwd_one(io.scalar_load(gate_up, 2 * base), io.scalar_load(gate_up, 2 * base + 1), alpha, limit, neg_limit))
+    def clamped_swiglu_fwd(gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), num_outputs: txl.int64, alpha: txl.float32, limit: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=compute_grid(THREADS, VEC, UNROLL, num_outputs), block=(THREADS // 32) * 32))
+        neg_limit = emit_ptx("neg.f32", limit)
+        thread_start = txl.cast(txl.cta_id(), "int64") * (TILE * UNROLL) + txl.cast(txl.thread_id(), "int64") * VEC
+        if VEC == 1:  # unaligned fallback: one output per thread, scalar accesses only
+            with txl.if_(thread_start < num_outputs), txl.then_():
+                storage.store_scalar(out, thread_start, swiglu_fwd_one(storage.load_scalar(gate_up, 2 * thread_start), storage.load_scalar(gate_up, 2 * thread_start + 1), alpha, limit, neg_limit))
             return
-        with txl.if_(base + (tile * (unroll - 1) + vec) <= n):
+        with txl.if_(thread_start + (TILE * (UNROLL - 1) + VEC) <= num_outputs):
             with txl.then_():
-                nw = 2 * vec // io.per_word
-                words = [io.load_words(gate_up, (base + u * tile) * 2, nw, cfg["ld"]) for u in range(unroll)]
-                for u in range(unroll):
-                    vals = io.unpack(words[u])
-                    res = []
-                    for i in range(0, vec, 2):
-                        res += list(fwd_two(vals[2 * i : 2 * i + 4 : 2], vals[2 * i + 1 : 2 * i + 4 : 2], alpha, limit, neg_limit))
-                    io.store_words(out, base + u * tile, io.pack(res), cfg["st"])
+                num_words = 2 * VEC // storage.elems_per_word
+                gate_up_words = [storage.load_words(gate_up, (thread_start + unroll_idx * TILE) * 2, num_words, config["ld"]) for unroll_idx in range(UNROLL)]
+                for unroll_idx in range(UNROLL):
+                    values = storage.unpack_words(gate_up_words[unroll_idx])
+                    outs = []
+                    for out_idx in range(0, VEC, 2):
+                        outs += list(swiglu_fwd_two(values[2 * out_idx : 2 * out_idx + 4 : 2], values[2 * out_idx + 1 : 2 * out_idx + 4 : 2], alpha, limit, neg_limit))
+                    storage.store_words(out, thread_start + unroll_idx * TILE, storage.pack_words(outs), config["st"])
             with txl.else_():
-                with txl.serial(unroll * vec) as k:
-                    i = base + txl.cast(k // vec, "int64") * tile + txl.cast(k % vec, "int64")
-                    with txl.if_(i < n), txl.then_():
-                        r = fwd_one(io.scalar_load(gate_up, 2 * i), io.scalar_load(gate_up, 2 * i + 1), alpha, limit, neg_limit)
-                        io.scalar_store(out, i, r)
+                with txl.serial(UNROLL * VEC) as step_idx:
+                    elem_idx = thread_start + txl.cast(step_idx // VEC, "int64") * TILE + txl.cast(step_idx % VEC, "int64")
+                    with txl.if_(elem_idx < num_outputs), txl.then_():
+                        out_value = swiglu_fwd_one(storage.load_scalar(gate_up, 2 * elem_idx), storage.load_scalar(gate_up, 2 * elem_idx + 1), alpha, limit, neg_limit)
+                        storage.store_scalar(out, elem_idx, out_value)
 
     return entry_function(clamped_swiglu_fwd.compile(TARGET))
 
 
 @functools.cache
-def bwd_kernel(dtype, threads, vec, unroll):
-    io, cfg = IO(dtype), CFG["bwd"]
-    tile = vec * threads
+def compile_bwd_kernel(dtype, THREADS, VEC, UNROLL):
+    storage, config = StorageIO(dtype), LAUNCH_CONFIG["bwd"]
+    TILE = VEC * THREADS
 
     @txl.kernel()
-    def clamped_swiglu_bwd(grad_out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), n: txl.int64, alpha: txl.float32, limit: txl.float32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=grid_of(threads, vec, unroll, n), block=(threads // 32) * 32))
-        neg_limit = op("neg.f32", limit)
-        base = txl.cast(txl.cta_id(), "int64") * (tile * unroll) + txl.cast(txl.thread_id(), "int64") * vec
-        if vec == 1:  # unaligned fallback: one output per thread, scalar accesses only
-            with txl.if_(base < n), txl.then_():
-                dg, du = bwd_one(io.scalar_load(grad_out, base), io.scalar_load(gate_up, 2 * base), io.scalar_load(gate_up, 2 * base + 1), alpha, limit, neg_limit)
-                io.scalar_store(grad_gate_up, 2 * base, dg)
-                io.scalar_store(grad_gate_up, 2 * base + 1, du)
+    def clamped_swiglu_bwd(grad_out: txl.Tensor((txl.int64(),), dtype, data_alignment=1), gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), grad_gate_up: txl.Tensor((txl.int64(),), dtype, data_alignment=1), num_outputs: txl.int64, alpha: txl.float32, limit: txl.float32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=compute_grid(THREADS, VEC, UNROLL, num_outputs), block=(THREADS // 32) * 32))
+        neg_limit = emit_ptx("neg.f32", limit)
+        thread_start = txl.cast(txl.cta_id(), "int64") * (TILE * UNROLL) + txl.cast(txl.thread_id(), "int64") * VEC
+        if VEC == 1:  # unaligned fallback: one output per thread, scalar accesses only
+            with txl.if_(thread_start < num_outputs), txl.then_():
+                grad_gate, grad_up = swiglu_bwd_one(storage.load_scalar(grad_out, thread_start), storage.load_scalar(gate_up, 2 * thread_start), storage.load_scalar(gate_up, 2 * thread_start + 1), alpha, limit, neg_limit)
+                storage.store_scalar(grad_gate_up, 2 * thread_start, grad_gate)
+                storage.store_scalar(grad_gate_up, 2 * thread_start + 1, grad_up)
             return
-        with txl.if_(base + (tile * (unroll - 1) + vec) <= n):
+        with txl.if_(thread_start + (TILE * (UNROLL - 1) + VEC) <= num_outputs):
             with txl.then_():
-                nw = vec // io.per_word
-                gw = [io.load_words(gate_up, (base + u * tile) * 2, 2 * nw, cfg["ld"]) for u in range(unroll)]
-                ow = [io.load_words(grad_out, base + u * tile, nw, cfg["ld"]) for u in range(unroll)]
-                for u in range(unroll):
-                    vals, gos = io.unpack(gw[u]), io.unpack(ow[u])
-                    res = []
-                    for i in range(0, vec, 2):
-                        res += bwd_two(gos[i : i + 2], vals[2 * i : 2 * i + 4 : 2], vals[2 * i + 1 : 2 * i + 4 : 2], alpha, limit, neg_limit)
-                    io.store_words(grad_gate_up, (base + u * tile) * 2, io.pack(res), cfg["st"])
+                num_words = VEC // storage.elems_per_word
+                gate_up_words = [storage.load_words(gate_up, (thread_start + unroll_idx * TILE) * 2, 2 * num_words, config["ld"]) for unroll_idx in range(UNROLL)]
+                grad_out_words = [storage.load_words(grad_out, thread_start + unroll_idx * TILE, num_words, config["ld"]) for unroll_idx in range(UNROLL)]
+                for unroll_idx in range(UNROLL):
+                    values, grad_outs = storage.unpack_words(gate_up_words[unroll_idx]), storage.unpack_words(grad_out_words[unroll_idx])
+                    grads = []
+                    for out_idx in range(0, VEC, 2):
+                        grads += swiglu_bwd_two(grad_outs[out_idx : out_idx + 2], values[2 * out_idx : 2 * out_idx + 4 : 2], values[2 * out_idx + 1 : 2 * out_idx + 4 : 2], alpha, limit, neg_limit)
+                    storage.store_words(grad_gate_up, (thread_start + unroll_idx * TILE) * 2, storage.pack_words(grads), config["st"])
             with txl.else_():
-                with txl.serial(unroll * vec) as k:
-                    i = base + txl.cast(k // vec, "int64") * tile + txl.cast(k % vec, "int64")
-                    with txl.if_(i < n), txl.then_():
-                        dg, du = bwd_one(io.scalar_load(grad_out, i), io.scalar_load(gate_up, 2 * i), io.scalar_load(gate_up, 2 * i + 1), alpha, limit, neg_limit)
-                        io.scalar_store(grad_gate_up, 2 * i, dg)
-                        io.scalar_store(grad_gate_up, 2 * i + 1, du)
+                with txl.serial(UNROLL * VEC) as step_idx:
+                    elem_idx = thread_start + txl.cast(step_idx // VEC, "int64") * TILE + txl.cast(step_idx % VEC, "int64")
+                    with txl.if_(elem_idx < num_outputs), txl.then_():
+                        grad_gate, grad_up = swiglu_bwd_one(storage.load_scalar(grad_out, elem_idx), storage.load_scalar(gate_up, 2 * elem_idx), storage.load_scalar(gate_up, 2 * elem_idx + 1), alpha, limit, neg_limit)
+                        storage.store_scalar(grad_gate_up, 2 * elem_idx, grad_gate)
+                        storage.store_scalar(grad_gate_up, 2 * elem_idx + 1, grad_up)
 
     return entry_function(clamped_swiglu_bwd.compile(TARGET))
 
 
-def plan(entry, *tensors):
+def pick_launch_config(entry, *tensors):
     """
     The vector paths need every base pointer 32-byte aligned (and whole 4-word vectors per thread);
     otherwise one output per thread with scalar accesses.
     """
-    c = CFG[entry]
-    if all(t.data_ptr() % 32 == 0 for t in tensors):
-        return c["threads"], c["vec"], c["unroll"]
+    config = LAUNCH_CONFIG[entry]
+    if all(tensor.data_ptr() % 32 == 0 for tensor in tensors):
+        return config["threads"], config["vec"], config["unroll"]
     return 256, 1, 1
 
 
@@ -314,15 +348,15 @@ def clamped_swiglu_fwd_sm100(gate_up: torch.Tensor, alpha: float, limit: float) 
     assert gate_up.dim() == 2, f"gate_up must be 2-D, got shape {gate_up.shape}"
     assert gate_up.shape[1] % 2 == 0, f"gate_up last dim must be even, got {gate_up.shape[1]}"
     assert gate_up.is_contiguous(), "gate_up must be contiguous"
-    if gate_up.dtype not in DT:  # other float dtypes: the fp32 kernel, rounded once back
+    if gate_up.dtype not in KERNEL_DTYPE:  # other float dtypes: the fp32 kernel, rounded once back
         return clamped_swiglu_fwd_sm100(gate_up.float(), alpha, limit).to(gate_up.dtype)
-    M, two_n = gate_up.shape
-    out = torch.empty((M, two_n // 2), device=gate_up.device, dtype=gate_up.dtype)
-    n = out.numel()
-    if n == 0:
+    M, gate_up_cols = gate_up.shape
+    out = torch.empty((M, gate_up_cols // 2), device=gate_up.device, dtype=gate_up.dtype)
+    num_outputs = out.numel()
+    if num_outputs == 0:
         return out
-    kernel = fwd_kernel(DT[gate_up.dtype], *plan("fwd", gate_up, out))
-    kernel(gate_up.view(-1), out.view(-1), n, float(alpha), float(limit))
+    fn = compile_fwd_kernel(KERNEL_DTYPE[gate_up.dtype], *pick_launch_config("fwd", gate_up, out))
+    fn(gate_up.view(-1), out.view(-1), num_outputs, float(alpha), float(limit))
     return out
 
 
@@ -335,13 +369,13 @@ def clamped_swiglu_bwd_sm100(grad_output: torch.Tensor, gate_up: torch.Tensor, a
     assert grad_output.shape[1] * 2 == gate_up.shape[1]
     assert grad_output.dtype == gate_up.dtype
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
-    if gate_up.dtype not in DT:  # other float dtypes: the fp32 kernel, rounded once back
+    if gate_up.dtype not in KERNEL_DTYPE:  # other float dtypes: the fp32 kernel, rounded once back
         return clamped_swiglu_bwd_sm100(grad_output.float(), gate_up.float(), alpha, limit).to(gate_up.dtype)
     gate_up = gate_up.contiguous()
     grad_gate_up = torch.empty_like(gate_up)
-    n = grad_output.numel()
-    if n == 0:
+    num_outputs = grad_output.numel()
+    if num_outputs == 0:
         return grad_gate_up
-    kernel = bwd_kernel(DT[gate_up.dtype], *plan("bwd", grad_output, gate_up, grad_gate_up))
-    kernel(grad_output.view(-1), gate_up.view(-1), grad_gate_up.view(-1), n, float(alpha), float(limit))
+    fn = compile_bwd_kernel(KERNEL_DTYPE[gate_up.dtype], *pick_launch_config("bwd", grad_output, gate_up, grad_gate_up))
+    fn(grad_output.view(-1), gate_up.view(-1), grad_gate_up.view(-1), num_outputs, float(alpha), float(limit))
     return grad_gate_up
