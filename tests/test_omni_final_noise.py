@@ -3,6 +3,7 @@
 import argparse
 import ast
 import copy
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -10,6 +11,13 @@ from pathlib import Path
 import pytest
 
 from tests.acceptance import omni_final_noise as new
+
+# Complete helper reviewed at 045a90b327e67c544664004b7544356a8efbbf94.
+REVIEWED_HELPER_SOURCE_SHA256 = "21f0ee7aecfe69524f9dfd0f5644d79036fbf18a86fbeedfbe973f8f90e595ab"
+# D/4e source is intentionally outside that frozen review; this is a test input fingerprint.
+UNREVIEWED_LIVE_HELPER_SOURCE_SHA256 = (
+    "bd7f0054bdb132f8452f58d999865c436d3e98d7629412ece76eab6e78549409"
+)
 
 
 def git(repo, *args):
@@ -356,10 +364,11 @@ def test_common_numerical_optin_cannot_change(binding, replacement):
 
 @pytest.fixture
 def reviewed_binding(binding):
-    """Use actual reviewed source, reconstructing the hash-pinned original ASTs.
+    """Build the historical reviewed fixture, not a binding of current production.
 
-    No external checkout or GPU is needed in CI. The two reconstructed baseline
-    functions must match the independently recorded 1611d085 function hashes.
+    The full 045a90b helper snapshot is independently fingerprinted. The two
+    reconstructed baseline functions retain the recorded 1611d085 AST pins.
+    Live helper source is checked separately and must still be rejected.
     """
     args, _ = binding
     path = "pithtrain/modules/training.py"
@@ -382,14 +391,32 @@ def reviewed_binding(binding):
         for name, node in nodes.items():
             source = source.replace(f"def {name}(): return 0", ast.unparse(node))
         (repo / path).write_text(source)
-    for name in (
-        "pithtrain/modules/resume_semantics.py",
-        "pithtrain/models/qwen3_omni_talker_pipeline.py",
-    ):
-        target = args.feature_repo / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes((new.ROOT / name).read_bytes())
+    snapshot = Path(__file__).parent / "fixtures/omni_final_noise/resume_semantics_045a90b.py.txt"
+    helper_source = snapshot.read_bytes()
+    assert hashlib.sha256(helper_source).hexdigest() == REVIEWED_HELPER_SOURCE_SHA256
+    helper = args.feature_repo / "pithtrain/modules/resume_semantics.py"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_bytes(helper_source)
+    name = "pithtrain/models/qwen3_omni_talker_pipeline.py"
+    target = args.feature_repo / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes((new.ROOT / name).read_bytes())
+    # Every mutation starts from a passing historical source audit.
+    audit = new.common_audit(args.base_repo, args.feature_repo)
+    assert len(audit["scoped_equivalent_functions"]) == 2
     return args
+
+
+def test_live_helper_with_unreviewed_token_layout_is_rejected(reviewed_binding):
+    """Historical fixture success must not approve the live D/4e helper source."""
+    args = reviewed_binding
+    path = "pithtrain/modules/resume_semantics.py"
+    source = (new.ROOT / path).read_bytes()
+    assert hashlib.sha256(source).hexdigest() == UNREVIEWED_LIVE_HELPER_SOURCE_SHA256
+    # This exact live source adds deterministic_token_layout to model identity.
+    (args.feature_repo / path).write_bytes(source)
+    with pytest.raises(ValueError, match="^Scheduler metadata helper changed$"):
+        new.common_audit(args.base_repo, args.feature_repo)
 
 
 def test_actual_reviewed_function_binding_and_roundtrip(reviewed_binding, monkeypatch):
