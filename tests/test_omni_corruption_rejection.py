@@ -186,12 +186,17 @@ def protocol_worker(rank, directory):
                     raise exception("injected unrelated read failure")
                 return original_hash(path)
 
+            detail = (
+                "Wrong rejection reason for shape: rank 1: "
+                f"{exception.__name__}: injected unrelated read failure"
+            )
+            expected = "verify corruption rejection reason: " + "; ".join(
+                f"rank {rejecting_rank}: AssertionError: {detail}" for rejecting_rank in range(2)
+            )
             with patch.object(checkpoint, "_hash", broken_read):
-                with pytest.raises(
-                    checkpoint.DistributedCheckpointError,
-                    match="verify corruption rejection reason.*Wrong rejection phase",
-                ):
+                with pytest.raises(checkpoint.DistributedCheckpointError) as caught:
                     negative_case(args, cfg, data)
+            assert str(caught.value) == expected
             equal(snapshot(parts), before)
         assert not torch.cuda.is_initialized()
         (root / f"rank-{rank}.json").write_text(
