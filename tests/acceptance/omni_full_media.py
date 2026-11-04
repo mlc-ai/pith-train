@@ -4,9 +4,15 @@ Uses the existing real prepared-bundle fixtures and HF forward adapters, while
 replacing their returned tiny configs with the pinned official full config.
 No allocation, download, optimizer update, or released-weight loading occurs.
 Run each modality in a fresh process under an external 600-second hard timeout.
+
+--mode route-conditioned adds a native phase that replays the HF reference's top-k
+routes (omni_route_replay); that phase decides the verdict and the free-running
+native phase becomes a diagnostic. Audio key-bias gradients are analytically zero
+and are judged by size relative to the query bias, in every mode.
 """
 
 import argparse
+import contextlib
 import copy
 import gc
 import hashlib
@@ -23,6 +29,13 @@ from tests.acceptance.omni_reference_attention import (
     add_reference_attention_argument,
     configure_reference_attention,
     reference_contract,
+)
+from tests.acceptance.omni_route_replay import (
+    apply_key_bias_criterion,
+    capture_routes,
+    group_summary,
+    replay_routes,
+    route_statistics,
 )
 from tests.acceptance.omni_topology_contract import verify_source, write_json
 
@@ -271,7 +284,10 @@ def compare_gradients(parameters, shapes, expected=None):
                     if row["difference"] is None or row["difference"] >= text_gate.GRAD_THRESHOLD:
                         row["status"] = "FAIL"
         rows.append(row)
-    # Individual mathematically-zero gradients are still compared (including 0 vs 0).
+    # Individual mathematically-zero gradients are still compared (including 0 vs 0),
+    # except audio key biases, whose exact gradient is zero by construction and whose
+    # NSE compares two rounding residues; those are judged by relative size instead.
+    apply_key_bias_criterion(rows)
     # Each full trainable component must actually participate in the objective.
     for prefix in ("model.", "lm_head.", "audio_tower.", "visual."):
         members = [row for row in rows if row["name"].startswith(prefix)]
@@ -283,19 +299,25 @@ def compare_gradients(parameters, shapes, expected=None):
     return rows
 
 
-def run_phase(model, native, inputs, labels, shapes, phase_report, save, expected=None):
+def run_phase(
+    model, native, inputs, labels, shapes, phase_report, save, expected=None, replay=None
+):
     import torch
     import torch.nn.functional as F
 
+    if replay is not None and not native:
+        raise ValueError("Only the native model replays reference routes")
     started = time.monotonic()
     torch.cuda.reset_peak_memory_stats()
-    phase_report["forward"] = "RUNNING"
+    phase_report.update(forward="RUNNING", route_replay=replay is not None)
     save()
-    logits = (
-        model.reference_forward(inputs["input_ids"], model_context=inputs)
-        if native
-        else model(inputs)
-    )
+    with capture_routes(model, native) as routes:
+        with contextlib.nullcontext() if replay is None else replay_routes(model, replay):
+            logits = (
+                model.reference_forward(inputs["input_ids"], model_context=inputs)
+                if native
+                else model(inputs)
+            )
     loss = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten())
     forward_finite = bool(torch.isfinite(logits).all()) and bool(torch.isfinite(loss))
     torch.cuda.synchronize()
@@ -329,7 +351,15 @@ def run_phase(model, native, inputs, labels, shapes, phase_report, save, expecte
             if gradient is None or not bool(torch.isfinite(gradient).all()):
                 raise AssertionError(f"Missing or nonfinite input-feature gradient: {name}")
             feature_gradients[name] = gradient.detach().cpu()
-    return logits.detach().cpu(), loss.detach().cpu(), feature_gradients
+    return logits.detach().cpu(), loss.detach().cpu(), feature_gradients, routes
+
+
+def compare_phase(phase_report, logits, routes, reference_logits, reference_routes):
+    phase_report.update(
+        logits_error=text_gate.metric(logits, reference_logits),
+        routes=route_statistics(reference_routes, routes),
+        gradient_groups=group_summary(phase_report.get("gradient_parameters", [])),
+    )
 
 
 def execute(args, config, shapes, source, batch, fixture):
@@ -342,6 +372,7 @@ def execute(args, config, shapes, source, batch, fixture):
         "revision": text_gate.REVISION,
         "official_config_sha256": text_gate.OFFICIAL_CONFIG_SHA256,
         "modality": args.modality,
+        "mode": args.mode,
         "weight_source": args.weight_source,
         "status": "RUNNING",
         "dtype": "bfloat16",
@@ -399,6 +430,7 @@ def execute(args, config, shapes, source, batch, fixture):
         report["reference_attention"] = configure_reference_attention(
             model, config, reference_contract(args)
         )
+        report["reference_experts_implementation"] = model.model.config._experts_implementation
         save()
         parameters = parameter_map(model, False)
         text_gate.check_inventory(parameters, shapes)
@@ -406,12 +438,13 @@ def execute(args, config, shapes, source, batch, fixture):
         inputs, labels = move_inputs(batch, device)
         phase_report = {
             "implementation": "HF",
+            "role": "reference",
             "forward": "NOT_RUN",
             "backward": "NOT_RUN",
             "update": "NOT_RUN",
         }
         report["phases"].append(phase_report)
-        reference_logits, reference_loss, reference_inputs = run_phase(
+        reference_logits, reference_loss, reference_inputs, reference_routes = run_phase(
             model, False, inputs, labels, shapes, phase_report, save
         )
         if phase_report["forward"] != "PASS" or phase_report["backward"] != "PASS":
@@ -429,18 +462,33 @@ def execute(args, config, shapes, source, batch, fixture):
         if native_init != reference_init:
             raise AssertionError("HF/native full-size media weight bytes differ")
         report["weight_fingerprints"] = native_init
-        inputs, labels = move_inputs(batch, device)
-        phase_report = {
-            "implementation": "native",
-            "forward": "NOT_RUN",
-            "backward": "NOT_RUN",
-            "update": "NOT_RUN",
-        }
-        report["phases"].append(phase_report)
-        logits, loss, input_gradients = run_phase(
-            model, True, inputs, labels, shapes, phase_report, save, reference_gradients
-        )
+        conditioned = args.mode == "route-conditioned"
+        roles = ["native-free-running", "native-route-replay"] if conditioned else ["native"]
+        for role in roles:
+            replay = reference_routes if role == "native-route-replay" else None
+            if replay is not None:
+                for parameter in parameters.values():
+                    parameter.grad = None
+                torch.cuda.empty_cache()
+            inputs, labels = move_inputs(batch, device)
+            phase_report = {
+                "implementation": "native",
+                "role": role,
+                "forward": "NOT_RUN",
+                "backward": "NOT_RUN",
+                "update": "NOT_RUN",
+            }
+            report["phases"].append(phase_report)
+            logits, loss, input_gradients, routes = run_phase(
+                model, True, inputs, labels, shapes, phase_report, save, reference_gradients, replay
+            )
+            compare_phase(phase_report, logits, routes, reference_logits, reference_routes)
+            save()
         report["parity"] = {
+            "route_policy": "replayed-reference-top-k" if conditioned else "free-running",
+            "replayed_route_flips": phase_report["routes"]["flipped_token_layers"]
+            if conditioned
+            else None,
             "logit_error": text_gate.metric(logits, reference_logits),
             "logit_threshold": text_gate.LOGIT_THRESHOLD,
             "loss_close": bool(
@@ -460,6 +508,7 @@ def execute(args, config, shapes, source, batch, fixture):
         if (
             parity["logit_error"] >= text_gate.LOGIT_THRESHOLD
             or not parity["loss_close"]
+            or (conditioned and parity["replayed_route_flips"] != 0)
             or any(
                 value >= text_gate.GRAD_THRESHOLD
                 for value in parity["input_gradient_errors"].values()
@@ -467,11 +516,13 @@ def execute(args, config, shapes, source, batch, fixture):
             or phase_report["forward"] != "PASS"
             or phase_report["backward"] != "PASS"
         ):
-            raise AssertionError("Full-size media logits/loss/gradient parity failed")
+            raise AssertionError("Full-size media logits/loss/gradient/route parity failed")
         report["source_after"] = verify_source(
             Path(__file__).resolve().parents[2], args.expected_commit
         )
         report["status"] = "PASS_FULL_SIZE_FORWARD_BACKWARD"
+        if conditioned:
+            report["status"] += "_ROUTE_CONDITIONED"
     except Exception as error:
         report.update(status="FAIL", error=repr(error))
         for phase_report in report["phases"]:
@@ -481,7 +532,7 @@ def execute(args, config, shapes, source, batch, fixture):
     finally:
         report["elapsed_seconds"] = time.monotonic() - started
         save()
-    return 0 if report["status"] == "PASS_FULL_SIZE_FORWARD_BACKWARD" else 1
+    return 0 if report["status"].startswith("PASS_FULL_SIZE_FORWARD_BACKWARD") else 1
 
 
 def main():
@@ -490,6 +541,7 @@ def main():
     parser.add_argument("--official-config", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--modality", choices=MODALITIES, required=True)
+    parser.add_argument("--mode", choices=("hf-parity", "route-conditioned"), default="hf-parity")
     parser.add_argument("--weight-source", choices=("random",), required=True)
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--out", type=Path)
@@ -510,6 +562,7 @@ def main():
                 {
                     "source": source,
                     "modality": args.modality,
+                    "mode": args.mode,
                     "status": "NOT_RUN",
                     "weight_source": args.weight_source,
                     "estimate": estimate(args.modality),

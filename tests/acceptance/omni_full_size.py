@@ -6,9 +6,17 @@ not HF parity, distributed training, optimizer state, or released weights.
 HF parity mode runs the HF model first, retains gradients on CPU, releases the
 HF GPU model, then reconstructs identical native weights and compares every
 parameter without reducing the full dimensions or numerical thresholds.
+
+Route-conditioned mode keeps the same thresholds but separates the discrete top-k
+choice from the arithmetic (see omni_route_replay). After the HF reference it runs
+three more phases on the same weights and tokens: HF under the other attention
+contract (self-control), native free-running, and native replaying the reference
+routes. Only the replay phase decides the verdict; the other two are diagnostics
+that record route flips, their reference margins and per-group gradient errors.
 """
 
 import argparse
+import contextlib
 import copy
 import gc
 import hashlib
@@ -21,10 +29,17 @@ from pathlib import Path
 
 from tests.acceptance.omni_reference_attention import (
     LEGACY,
+    MATCHED,
     add_reference_attention_argument,
     configure_reference_attention,
     reference_attention_kwargs,
     reference_contract,
+)
+from tests.acceptance.omni_route_replay import (
+    capture_routes,
+    group_summary,
+    replay_routes,
+    route_statistics,
 )
 from tests.acceptance.omni_topology_contract import verify_source, write_json
 
@@ -104,7 +119,11 @@ def resource_estimate():
         "additional_gpu_headroom_required_bytes": 12 * 2**30,
         "reference_gradient_host_bytes": size,
         "recommended_host_memory_bytes": 256 * 2**30,
-        "suggested_outer_timeout_seconds": {"native": 180, "hf-parity": 600},
+        "suggested_outer_timeout_seconds": {
+            "native": 180,
+            "hf-parity": 600,
+            "route-conditioned": 1500,
+        },
         "supports": "single full-size BF16 autograd step with all gradients",
         "does_not_cover": [
             "released weights",
@@ -311,20 +330,24 @@ def build_model(config, native, device):
     return model
 
 
-def phase(model, native, inputs, labels, shapes, reference=None):
+def phase(model, native, inputs, labels, shapes, reference=None, replay=None):
     import torch
     import torch.nn.functional as F
 
+    if replay is not None and not native:
+        raise ValueError("Only the native model replays reference routes")
     start = time.monotonic()
     torch.cuda.reset_peak_memory_stats()
-    if native:
-        logits = model.reference_forward(inputs)
-    else:
-        logits = model["lm_head"](
-            model["model"](
-                input_ids=inputs, use_cache=False, **reference_attention_kwargs(model)
-            ).last_hidden_state
-        )
+    with capture_routes(model, native) as routes:
+        with contextlib.nullcontext() if replay is None else replay_routes(model, replay):
+            if native:
+                logits = model.reference_forward(inputs)
+            else:
+                logits = model["lm_head"](
+                    model["model"](
+                        input_ids=inputs, use_cache=False, **reference_attention_kwargs(model)
+                    ).last_hidden_state
+                )
     loss = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten())
     if not bool(torch.isfinite(logits).all()) or not bool(torch.isfinite(loss)):
         raise AssertionError("Nonfinite full-size logits or cross entropy")
@@ -335,6 +358,7 @@ def phase(model, native, inputs, labels, shapes, reference=None):
         "mode": "native"
         if native
         else getattr(model, "reference_attention", {"contract": LEGACY})["contract"],
+        "route_replay": replay is not None,
         "cross_entropy": loss.item(),
         "logits_shape": list(logits.shape),
         "logits_finite": True,
@@ -348,7 +372,39 @@ def phase(model, native, inputs, labels, shapes, reference=None):
     )
     cpu_logits, cpu_loss = logits.detach().cpu(), loss.detach().cpu()
     del logits, loss
-    return result, cpu_logits, cpu_loss
+    return result, cpu_logits, cpu_loss, routes
+
+
+def compare_phase(result, logits, routes, reference_logits, reference_routes):
+    """Diagnostics shared by every phase compared against the HF reference."""
+    result.update(
+        logits_error=metric(logits, reference_logits),
+        routes=route_statistics(reference_routes, routes),
+        gradient_groups=group_summary(result["gradient_parameters"]),
+    )
+    return result
+
+
+def self_control(model, config, parameters, inputs, labels, shapes, reference, contract):
+    """Diagnostic: the same HF weights and tokens under the other attention contract.
+
+    Shows how much of the per-parameter disagreement HF itself produces when only its
+    attention arithmetic changes. Never changes the gate verdict.
+    """
+    import torch
+
+    reference_gradients, reference_logits, reference_routes = reference
+    other = MATCHED if contract == LEGACY else LEGACY
+    for parameter in parameters.values():
+        parameter.grad = None
+    torch.cuda.empty_cache()
+    try:
+        attention = configure_reference_attention(model, config, other)
+        result, logits, _, routes = phase(model, False, inputs, labels, shapes, reference_gradients)
+    except Exception as error:
+        return {"role": "hf-self-control", "mode": other, "status": "ERROR", "error": repr(error)}
+    result.update(role="hf-self-control", attention=attention)
+    return compare_phase(result, logits, routes, reference_logits, reference_routes)
 
 
 def execute(args, config_data, shapes, source):
@@ -423,16 +479,23 @@ def execute(args, config_data, shapes, source):
             tokens[:, 1:].contiguous().to(device),
         )
         reference_gradients = reference_init = reference_logits = reference_loss = None
-        if args.mode == "hf-parity":
+        reference_routes = None
+        conditioned = args.mode == "route-conditioned"
+        if args.mode != "native":
             model = build_model(config, False, device)
             report["reference_attention"] = configure_reference_attention(
                 model, config, reference_contract(args)
             )
+            experts = model["model"].config._experts_implementation
+            report["reference_experts_implementation"] = experts
             save()
             parameters = parameter_map(model, False)
             check_inventory(parameters, shapes)
             reference_init = initialize(parameters, config.initializer_range)
-            result, reference_logits, reference_loss = phase(model, False, inputs, labels, shapes)
+            result, reference_logits, reference_loss, reference_routes = phase(
+                model, False, inputs, labels, shapes
+            )
+            result["role"] = "reference"
             report["phases"].append(result)
             report["weight_fingerprints"] = reference_init
             save()
@@ -441,6 +504,20 @@ def execute(args, config_data, shapes, source):
                     "HF full-size forward/backward failed; native phase not started"
                 )
             reference_gradients = {name: p.grad.detach().cpu() for name, p in parameters.items()}
+            if conditioned:
+                report["phases"].append(
+                    self_control(
+                        model,
+                        config,
+                        parameters,
+                        inputs,
+                        labels,
+                        shapes,
+                        (reference_gradients, reference_logits, reference_routes),
+                        reference_contract(args),
+                    )
+                )
+                save()
             del parameters, model
             gc.collect()
             torch.cuda.empty_cache()
@@ -451,10 +528,28 @@ def execute(args, config_data, shapes, source):
         if reference_init is not None and native_init != reference_init:
             raise AssertionError("Native and HF initial weights differ")
         report["weight_fingerprints"] = native_init
-        result, logits, loss = phase(model, True, inputs, labels, shapes, reference_gradients)
+        result, logits, loss, routes = phase(
+            model, True, inputs, labels, shapes, reference_gradients
+        )
+        result["role"] = "native-free-running" if conditioned else "native"
+        if reference_logits is not None:
+            compare_phase(result, logits, routes, reference_logits, reference_routes)
         report["phases"].append(result)
+        save()
+        if conditioned:
+            for parameter in parameters.values():
+                parameter.grad = None
+            torch.cuda.empty_cache()
+            result, logits, loss, routes = phase(
+                model, True, inputs, labels, shapes, reference_gradients, replay=reference_routes
+            )
+            result["role"] = "native-route-replay"
+            compare_phase(result, logits, routes, reference_logits, reference_routes)
+            report["phases"].append(result)
+            save()
         if reference_logits is not None:
             report["parity"] = {
+                "route_policy": "replayed-reference-top-k" if conditioned else "free-running",
                 "logits_error": metric(logits, reference_logits),
                 "logits_threshold": LOGIT_THRESHOLD,
                 "loss_rtol": LOSS_RTOL,
@@ -464,19 +559,25 @@ def execute(args, config_data, shapes, source):
                 ),
                 "all_initial_weights_identical": True,
             }
+            if conditioned:
+                # The replay must actually have produced the reference routes.
+                report["parity"]["replayed_route_flips"] = result["routes"]["flipped_token_layers"]
             if (
                 report["parity"]["logits_error"] >= LOGIT_THRESHOLD
                 or not report["parity"]["loss_close"]
+                or report["parity"].get("replayed_route_flips", 0) != 0
             ):
-                raise AssertionError("Full-size logits or cross entropy parity failed")
+                raise AssertionError("Full-size logits, cross entropy or route parity failed")
         if result["status"] != "PASS":
             raise AssertionError("Full-size native gradient verification failed")
         report["source_after"] = verify_source(
             Path(__file__).resolve().parents[2], args.expected_commit
         )
-        report["status"] = (
-            "PASS_FULL_SIZE_NATIVE" if args.mode == "native" else "PASS_FULL_SIZE_HF_PARITY"
-        )
+        report["status"] = {
+            "native": "PASS_FULL_SIZE_NATIVE",
+            "hf-parity": "PASS_FULL_SIZE_HF_PARITY",
+            "route-conditioned": "PASS_FULL_SIZE_ROUTE_CONDITIONED",
+        }[args.mode]
     except Exception as error:
         if report["status"] != "UNSUPPORTED":
             report["status"] = "FAIL"
@@ -493,7 +594,9 @@ def main():
     parser.add_argument("--official-config", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--weight-source", choices=("random", "released"), required=True)
-    parser.add_argument("--mode", choices=("native", "hf-parity"), required=True)
+    parser.add_argument(
+        "--mode", choices=("native", "hf-parity", "route-conditioned"), required=True
+    )
     parser.add_argument("--out", type=Path)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--plan", action="store_true")
