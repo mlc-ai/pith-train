@@ -13,9 +13,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from pithtrain.contexts import training as training_context
 from pithtrain.models.qwen3_omni_image_inputs import validate_image_inputs
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.model_config import resolve_text_model_config
+from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.training_data import OmniPretrainData
 from tests import test_omni_training as fixtures
 
@@ -179,8 +181,13 @@ def constructor_namespace():
         nn=torch.nn,
         partial=partial,
         math=math,
+        validate_omni_stage5_aggregation=validate_omni_stage5_aggregation,
         distributed=SimpleNamespace(pp_size=2, pp_rank=0, ep_size=1, cp_size=1),
-        training=SimpleNamespace(fp8=False, deterministic_token_layout=False),
+        training=SimpleNamespace(
+            fp8=False,
+            deterministic_token_layout=False,
+            omni_stage5_aggregation=training_context.omni_stage5_aggregation,
+        ),
         Qwen3OmniMoeVisionEncoder=Qwen3OmniMoeVisionEncoder,
     )
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
