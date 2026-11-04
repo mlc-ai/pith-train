@@ -191,8 +191,7 @@ class RowwiseKmajor:
         for offset in (8, 16):
             col_amax = [max_u16x2(amax, cute.arch.shuffle_sync_bfly(amax, offset=offset)) for amax in col_amax]
         # 2 warps share each row (along col_vec_idx), 4 share each column (along row_block_idx)
-        s_row_amax = s_red
-        s_col_amax = s_red + 64 * 2 * 4
+        s_row_amax, s_col_amax = s_red, s_red + 64 * 2 * 4
         for pair in range(4):
             sts_b32(s_row_amax + ((sub_block.row_block_idx * 4 + pair) * 2 + sub_block.warp % 2) * 4, row_amax[pair], Int32(sub_block.warp_col_vec_idx == 0))
         for k in range(4):
@@ -330,16 +329,16 @@ class StagedRowwiseKmajor(RowwiseKmajor):
         values = self.read_sub_block(s_tile.iterator.toint(), sub_block)
         self.quantize_values(values, sub_block, mX.shape[0], bases, s_red.iterator.toint(), s_tile.iterator.toint())
 
-    def stage_tile(self, x_base, S0, S1, sub_block, s_tile) -> None:
+    def stage_tile(self, x_base, row_stride, col_stride, sub_block, s_tile) -> None:
         """
-        Copy the CTA's tile of x (row r of the tile at r * S0, column c at c * S1 elements) into
-        s_tile, zero past column N; warp w copies tile lines 16w..16w+15, two elements per lane per
-        pass, consecutive lanes along the line.
+        Copy the CTA's tile of x (row r of the tile at r * row_stride, column c at c * col_stride
+        elements) into s_tile, zero past column N; warp w copies tile lines 16w..16w+15, two
+        elements per lane per pass, consecutive lanes along the line.
         """
         elem_bytes, lane, warp = self.elem_bytes, sub_block.lane, sub_block.warp
         row_start, col_start = sub_block.row_start, sub_block.pid_col * TILE
-        for r in range(16):
-            line = warp * 16 + r
+        for warp_line_idx in range(16):
+            line = warp * 16 + warp_line_idx
             for pass_idx in range(2):
                 along = 64 * pass_idx + 2 * lane
                 words = []
@@ -349,10 +348,10 @@ class StagedRowwiseKmajor(RowwiseKmajor):
                     else:
                         row, col = row_start + line, col_start + along + half
                     load_ok = Int32(col < self.N)
-                    addr = x_base + (row * S0 + Int64(col) * S1) * elem_bytes
-                    words.append(Uint32(ld_b32(addr, load_ok, Int32(0))) if self.elem_bytes == 4 else ld_u16(addr, load_ok))
+                    addr = x_base + (row * row_stride + Int64(col) * col_stride) * elem_bytes
+                    words.append(Uint32(ld_b32(addr, load_ok, Int32(0))) if elem_bytes == 4 else ld_u16(addr, load_ok))
                 s_addr = s_tile + (line * TILE + along) * elem_bytes
-                if self.elem_bytes == 4:
+                if elem_bytes == 4:
                     sts_b32_nopred(s_addr, words[0])
                     sts_b32_nopred(s_addr + 4, words[1])
                 else:
@@ -450,21 +449,21 @@ class StagedRowwiseKmajor(RowwiseKmajor):
         return row_rcp, col_rcp
 
     def quantize_and_store_values(self, values, row_rcp, col_rcp, tok_base, kmajor_base, group_start, num_group_rows, sub_block, s_tile) -> None:
-        N, width = self.N, self.tok_width
+        N, tok_width = self.N, self.tok_width
         for i in range(8):
             rcp = (u32_as_f32(row_rcp[i]),) * 4
             words = [quant4_e4m3(*[u32_as_f32(values[i][4 * half + k]) for k in range(4)], rcp) for half in range(2)]
             row_base = tok_base + (sub_block.row0 + i) * N + sub_block.col0
-            if width == 8:
+            if tok_width == 8:
                 st_v2(row_base, words[0], words[1], sub_block.col_ok)
-            elif width == 4:
+            elif tok_width == 4:
                 for half in range(2):
                     st_b32(row_base + 4 * half, words[half], Int32(sub_block.col0 + 4 * half < N))
             else:
                 s_addr = s_tile + (sub_block.row_block_idx * 8 + i) * TILE + sub_block.col_vec_idx * 8
                 sts_b32_nopred(s_addr, words[0])
                 sts_b32_nopred(s_addr + 4, words[1])
-        if width < 4:
+        if tok_width < 4:
             cute.arch.sync_threads()
             self.store_staged_rows(s_tile, tok_base, sub_block)
         kmajor_block_base = kmajor_base + group_start * N + (sub_block.row0 - group_start)
@@ -473,35 +472,35 @@ class StagedRowwiseKmajor(RowwiseKmajor):
             words = [quant4_e4m3(*[u32_as_f32(values[4 * half + k][j]) for k in range(4)], rcp) for half in range(2)]
             st_v2(kmajor_block_base + Int64(sub_block.col0 + j) * num_group_rows, words[0], words[1], Int32(sub_block.col0 + j < N))
 
-    def store_staged_rows(self, s_q, tok_base, sub_block) -> None:
+    def store_staged_rows(self, s_tile, tok_base, sub_block) -> None:
         """
-        Store the rowwise fp8 tile staged in s_q (128 bytes per tile row): warp w writes tile rows
-        16w..16w+15, each row segment (its L = min(128, N - 128 * pid_col) bytes at r * N + 128 *
-        pid_col of tok) as the aligned 4-byte words that cover it, word j from lane j (and word 32
-        from lane 0), funnel-shifted out of two staged words; a word the segment covers only in part
-        is stored byte by byte.
+        Store the rowwise fp8 tile staged in s_tile (128 bytes per tile row): warp w writes tile
+        rows 16w..16w+15, each row segment (its L = min(128, N - 128 * pid_col) bytes at r * N +
+        128 * pid_col of tok) as the aligned 4-byte words that cover it, word j from lane j (and
+        word 32 from lane 0), funnel-shifted out of two staged words; a word the segment covers only
+        in part is stored byte by byte.
         """
         lane, warp = sub_block.lane, sub_block.warp
         col_start = sub_block.pid_col * TILE
         seg_len = cutlass.min(Int32(self.N) - col_start, Int32(TILE))
-        for r in range(16):
-            tile_row = warp * 16 + r
+        for warp_row_idx in range(16):
+            tile_row = warp * 16 + warp_row_idx
             seg_start = tok_base + (sub_block.row_start + tile_row) * self.N + col_start
             shift = Int32(seg_start & 3)
             selector = Uint32(0x7654) - Uint32(shift) * Uint32(0x1111)
             for extra in range(2):
                 word_idx = lane + 32 * extra
                 word_ok = Int32(word_idx <= 32) if extra else Int32(1)
-                first = word_idx * 4 - shift  # segment offset of the word's first byte
-                s_row = s_q + tile_row * TILE
-                prev = Uint32(lds_b32_pred(s_row + word_idx * 4 - 4, word_ok & Int32(word_idx > 0), Int32(0)))
-                cur = Uint32(lds_b32_pred(s_row + word_idx * 4, word_ok & Int32(word_idx < 32), Int32(0)))
-                word = prmt_dynamic(prev, cur, selector)
+                word_start = word_idx * 4 - shift  # segment offset of the word's first byte
+                s_row = s_tile + tile_row * TILE
+                staged_lo = Uint32(lds_b32_pred(s_row + word_idx * 4 - 4, word_ok & Int32(word_idx > 0), Int32(0)))
+                staged_hi = Uint32(lds_b32_pred(s_row + word_idx * 4, word_ok & Int32(word_idx < 32), Int32(0)))
+                word = prmt_dynamic(staged_lo, staged_hi, selector)
                 addr = seg_start - Int64(shift) + word_idx * 4
-                full = word_ok & Int32(first >= 0) & Int32(first + 3 < seg_len)
-                st_b32(addr, word, full)
+                full_ok = word_ok & Int32(word_start >= 0) & Int32(word_start + 3 < seg_len)
+                st_b32(addr, word, full_ok)
                 for k in range(4):
-                    byte_ok = word_ok & (full ^ 1) & Int32(first + k >= 0) & Int32(first + k < seg_len)
+                    byte_ok = word_ok & (full_ok ^ 1) & Int32(word_start + k >= 0) & Int32(word_start + k < seg_len)
                     st_u8(addr + k, word >> (8 * k), byte_ok)
 
 
@@ -581,9 +580,9 @@ def fp8cast_rowwise_kmajor_sm90(x: torch.Tensor, grouped_mm_offs: torch.Tensor) 
         grouped_mm_offs = grouped_mm_offs.to(torch.int32).contiguous()
         if supports_rowwise_kmajor(x, grouped_mm_offs):
             return fp8cast_rowwise_kmajor_sm90(x, grouped_mm_offs)
-    S0, S1 = x.stride()
+    row_stride, col_stride = x.stride()
     # consecutive lanes run along the smaller stride; a single column is read down its rows
-    transposed = N == 1 or S0 < S1
+    transposed = N == 1 or row_stride < col_stride
     out = allocate_outputs(x, M, N)
     key = (N, G, kind, transposed)
     fn = COMPILED.get(key)
