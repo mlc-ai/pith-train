@@ -264,8 +264,7 @@ def quantize_column(words: list, rcp: Uint32, half: int, kind: str) -> Uint32:
 
 def quantize_row(words: list, rcp: Uint32, kind: str) -> list:
     """
-    8 consecutive columns of one row (4 16-bit pair words or 8 fp32 words) -> 8 fp8 bytes in two
-    words.
+    8 consecutive columns of one row (4 16-bit pair words or 8 fp32 words) -> 8 fp8 bytes (2 words).
     """
     if kind == "f32":
         return asm_words(QUANT_ROW_F32_PTX, "=r,=r,r,r,r,r,r,r,r,r,r", [ir_value(word) for word in words] + [ir_value(rcp)], 2)
@@ -285,8 +284,7 @@ def max_words(first: Uint32, second: Uint32, kind: str) -> Uint32:
 
 def widen(word: Uint32, half: int, kind: str) -> Uint32:
     """
-    fp32 bits of one element of a word: half (0 low, 1 high) of a bf16 / fp16 pair, or the fp32
-    word.
+    fp32 bits of one element of a word: half (0 low, 1 high) of a bf16 / fp16 pair, or an fp32 word.
     """
     if kind == "f32":
         return word
@@ -314,8 +312,7 @@ class SubBlock:
     """
 
     def __init__(self, tidx: Int32, pid_row: Int32, pid_col: Int32, M: Int32, N: Int32) -> None:
-        self.warp = tidx // 32
-        self.lane = tidx % 32
+        self.warp, self.lane = tidx // 32, tidx % 32
         self.col_group_idx = self.lane % 16
         self.row_group_idx = self.warp * 2 + self.lane // 16
         self.pid_row, self.pid_col = pid_row, pid_col
@@ -326,16 +323,17 @@ class SubBlock:
         self.full_cols_ok = pred_i32(self.col0 + 8 <= N)
 
 
-def load_rows(x_base: Int64, S0: Int64, sub_block: SubBlock, kind: str) -> list:
+def load_rows(x_base: Int64, row_stride: Int64, sub_block: SubBlock, kind: str) -> list:
     """
     The sub-block as 32-bit words, zero out of bounds: rows[i][k] = columns (2k, 2k+1) of row i for
-    bf16 / fp16, column k of row i for fp32. Rows of x are S0 elements apart; x, S0 and N are such
-    that every 16-byte column group is 16-byte aligned and in or out of its row as a whole.
+    bf16 / fp16, column k of row i for fp32. Rows of x are row_stride elements apart; x, row_stride
+    and N are such that every 16-byte column group is 16-byte aligned and in or out of its row as a
+    whole.
     """
     row0, col0, rows_ok, cols_ok = sub_block.row0, sub_block.col0, sub_block.rows_ok, sub_block.cols_ok
     rows = []
     for i in range(8):
-        elem_idx = Int64(row0 + i) * S0 + Int64(col0)
+        elem_idx = Int64(row0 + i) * row_stride + Int64(col0)
         if kind == "f32":
             words = []
             for half in range(2):
@@ -350,7 +348,7 @@ def load_rows(x_base: Int64, S0: Int64, sub_block: SubBlock, kind: str) -> list:
     return rows
 
 
-def gather_rows(x_base: Int64, S0: Int64, S1: Int64, sub_block: SubBlock, kind: str, s_raw: Int32, M: Int32, N: Int32) -> list:
+def gather_rows(x_base: Int64, row_stride: Int64, col_stride: Int64, sub_block: SubBlock, kind: str, s_raw: Int32, M: Int32, N: Int32) -> list:
     """
     load_rows for any other x (a non-unit column stride, or rows that are not 16-byte aligned): the
     CTA first copies its tile into s_raw (row-major, 128 elements per row), each warp instruction
@@ -363,11 +361,11 @@ def gather_rows(x_base: Int64, S0: Int64, S1: Int64, sub_block: SubBlock, kind: 
     col_offsets, cols_ok = [], []
     for col in range(4):
         tile_col = tile_col0 + 64 * (col // 2) + 2 * lane + col % 2
-        col_offsets.append(Int64(tile_col) * S1)
+        col_offsets.append(Int64(tile_col) * col_stride)
         cols_ok.append(pred_i32(tile_col < N))
-    for r in range(16):
-        tile_row = warp * 16 + r
-        row_offset = Int64(tile_row0 + tile_row) * S0
+    for warp_row in range(16):
+        tile_row = warp * 16 + warp_row
+        row_offset = Int64(tile_row0 + tile_row) * row_stride
         row_ok = pred_i32(tile_row0 + tile_row < M)
         for pass_idx in range(2):
             pair = []
@@ -424,40 +422,40 @@ def reduce_row_amax(abs_rows: list, kind: str) -> list:
         return row_amax
     row_amax = [max_words(max_words(abs_rows[i][0], abs_rows[i][1], kind), max_words(abs_rows[i][2], abs_rows[i][3], kind), kind) for i in range(8)]
     row_pair_amax = []
-    for pair in range(4):
-        amax_lo, amax_hi = prmt(row_amax[2 * pair], row_amax[2 * pair + 1], 0x5410), prmt(row_amax[2 * pair], row_amax[2 * pair + 1], 0x7632)
+    for pair_idx in range(4):
+        amax_lo, amax_hi = prmt(row_amax[2 * pair_idx], row_amax[2 * pair_idx + 1], 0x5410), prmt(row_amax[2 * pair_idx], row_amax[2 * pair_idx + 1], 0x7632)
         row_pair_amax.append(max_words(amax_lo, amax_hi, kind))
     for step in range(4):
-        for pair in range(4):
-            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(row_pair_amax[pair]), offset=1 << step))
-            row_pair_amax[pair] = max_words(row_pair_amax[pair], other, kind)
+        for pair_idx in range(4):
+            other = Uint32(cute.arch.shuffle_sync_bfly(Int32(row_pair_amax[pair_idx]), offset=1 << step))
+            row_pair_amax[pair_idx] = max_words(row_pair_amax[pair_idx], other, kind)
     return [widen(row_pair_amax[i // 2], i % 2, kind) for i in range(8)]
 
 
-def store_row_scales(row_amax: list, sub_block: SubBlock, tok_scale_base: Int64, M64: Int64) -> list:
+def store_row_scales(row_amax: list, sub_block: SubBlock, scale_tok_base: Int64, M64: Int64) -> list:
     row_scale_bits = [e8m0_scale_bits(amax) for amax in row_amax]
     # MN-major scales: scale[r, j] at j * align(rows, 4) + r.
     m_pad = (M64 + 3) // 4 * 4
     for i in range(8):
         store_ok = sub_block.rows_ok[i] & pred_i32(sub_block.col_group_idx == i)
-        st_b32(tok_scale_base + (Int64(sub_block.pid_col) * m_pad + Int64(sub_block.row0 + i)) * 4, row_scale_bits[i], store_ok)
+        st_b32(scale_tok_base + (Int64(sub_block.pid_col) * m_pad + Int64(sub_block.row0 + i)) * 4, row_scale_bits[i], store_ok)
     return row_scale_bits
 
 
-def store_tok_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, tok_base: Int64, N64: Int64, kind: str, is_tok_aligned: bool) -> None:
+def store_tok_rows(rows: list, row_scale_bits: list, sub_block: SubBlock, out_tok_base: Int64, N64: Int64, kind: str, is_tok_aligned: bool) -> None:
     row0, col0, rows_ok, cols_ok, full_cols_ok = sub_block.row0, sub_block.col0, sub_block.rows_ok, sub_block.cols_ok, sub_block.full_cols_ok
     for i in range(8):
         # 0x7F000000 - bits is the exact reciprocal of a power-of-2 scale
         quant_lo, quant_hi = quantize_row(rows[i], Uint32(0x7F000000) - row_scale_bits[i], kind)
         elem_idx = Int64(row0 + i) * N64 + Int64(col0)
         if const_expr(is_tok_aligned):
-            st_v2(tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & cols_ok[0])
+            st_v2(out_tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & cols_ok[0])
         else:
-            st8_any(tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & full_cols_ok)
+            st8_any(out_tok_base + elem_idx, quant_lo, quant_hi, rows_ok[i] & full_cols_ok)
             part_ok = rows_ok[i] & (full_cols_ok ^ 1)
             for byte_idx in range(7):
                 word = quant_lo if byte_idx < 4 else quant_hi
-                st_b8(tok_base + elem_idx + byte_idx, word >> (8 * (byte_idx % 4)), part_ok & cols_ok[byte_idx])
+                st_b8(out_tok_base + elem_idx + byte_idx, word >> (8 * (byte_idx % 4)), part_ok & cols_ok[byte_idx])
 
 
 def reduce_col_amax(sub_block: SubBlock, s_red: Int32, kind: str) -> list:
@@ -476,12 +474,12 @@ def reduce_col_amax(sub_block: SubBlock, s_red: Int32, kind: str) -> list:
     return col_amax if kind == "f32" else [widen(col_amax[j // 2], j % 2, kind) for j in range(8)]
 
 
-def store_col_scales(col_amax: list, sub_block: SubBlock, t_scale_base: Int64, N64: Int64) -> list:
+def store_col_scales(col_amax: list, sub_block: SubBlock, scale_t_base: Int64, N64: Int64) -> list:
     col_scale_bits = [e8m0_scale_bits(amax) for amax in col_amax]
     n_pad = (N64 + 3) // 4 * 4
     for j in range(8):
         store_ok = sub_block.cols_ok[j] & pred_i32(sub_block.row_group_idx == j)
-        st_b32(t_scale_base + (Int64(sub_block.pid_row) * n_pad + Int64(sub_block.col0 + j)) * 4, col_scale_bits[j], store_ok)
+        st_b32(scale_t_base + (Int64(sub_block.pid_row) * n_pad + Int64(sub_block.col0 + j)) * 4, col_scale_bits[j], store_ok)
     return col_scale_bits
 
 
@@ -499,7 +497,7 @@ def stage_transposed(rows: list, col_scale_bits: list, sub_block: SubBlock, s_ti
         asm_store("st.shared.v2.b32 [$0], {$1, $2};", "r,r,r", [ir_value(s_tile + (col_group_idx * 8 + col) * TILE + (row_group_idx ^ col_group_idx) * 8), ir_value(quant_lo), ir_value(quant_hi)])
 
 
-def store_transposed(sub_block: SubBlock, s_tile: Int32, t_base: Int64, M64: Int64, N64: Int64, m_align: int) -> None:
+def store_transposed(sub_block: SubBlock, s_tile: Int32, out_t_base: Int64, M64: Int64, N64: Int64, m_align: int) -> None:
     """
     Store the staged tile of x.T into out_t; each warp writes 4 contiguous 128-byte rows per pass
     (16 B per lane).
@@ -515,7 +513,7 @@ def store_transposed(sub_block: SubBlock, s_tile: Int32, t_base: Int64, M64: Int
         words_lo, words_hi = [cutlass.select_(is_odd_swizzle, words[2], words[0]), cutlass.select_(is_odd_swizzle, words[3], words[1])], [cutlass.select_(is_odd_swizzle, words[0], words[2]), cutlass.select_(is_odd_swizzle, words[1], words[3])]
         x_col = sub_block.pid_col * TILE + tile_row_idx
         col_ok = pred_i32(x_col < N64)
-        out_addr = t_base + Int64(x_col) * M64 + x_row_start
+        out_addr = out_t_base + Int64(x_col) * M64 + x_row_start
         if const_expr(m_align == 16):
             st_v4(out_addr, words_lo + words_hi, col_ok & pred_i32(x_row_start < M64))
         else:
@@ -543,6 +541,7 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: c
     # 2 KB (4 KB for fp32) for the cross-warp column amax, 16 KB for the transposed tile
     s_red = smem.allocate_array(Uint32, 8 * 16 * num_words, byte_alignment=16).toint()
     M64, N64 = Int64(M), Int64(N)
+
     if const_expr(is_gather):
         # the raw tile is dead once every thread holds its sub-block (before the barrier after
         # share_col_amax), so the transposed tile reuses it
@@ -551,20 +550,23 @@ def rowwise_transpose_kernel(mX: cute.Tensor, mOutTok: cute.Tensor, mScaleTok: c
     else:
         s_tile = smem.allocate_array(cutlass.Uint8, TILE * TILE, byte_alignment=128).toint()
         rows = load_rows(mX.iterator.toint(), Int64(mX.stride[0]), sub_block, kind)
-    tok_base, tok_scale_base, t_base, t_scale_base = mOutTok.iterator.toint(), mScaleTok.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint()
+
+    out_tok_base, scale_tok_base, out_t_base, scale_t_base = mOutTok.iterator.toint(), mScaleTok.iterator.toint(), mOutT.iterator.toint(), mScaleT.iterator.toint()
     abs_mask = Uint32(0x7FFFFFFF) if const_expr(kind == "f32") else Uint32(0x7FFF7FFF)
     abs_rows = [[rows[i][k] & abs_mask for k in range(num_words)] for i in range(8)]
     share_col_amax(abs_rows, sub_block, s_red, kind)
     cute.arch.barrier()
+
     # needs only registers and warp shuffles; the barrier above is for reduce_col_amax's s_red reads
     row_amax = reduce_row_amax(abs_rows, kind)
-    row_scale_bits = store_row_scales(row_amax, sub_block, tok_scale_base, M64)
-    store_tok_rows(rows, row_scale_bits, sub_block, tok_base, N64, kind, is_tok_aligned)
+    row_scale_bits = store_row_scales(row_amax, sub_block, scale_tok_base, M64)
+    store_tok_rows(rows, row_scale_bits, sub_block, out_tok_base, N64, kind, is_tok_aligned)
+
     col_amax = reduce_col_amax(sub_block, s_red, kind)
-    col_scale_bits = store_col_scales(col_amax, sub_block, t_scale_base, N64)
+    col_scale_bits = store_col_scales(col_amax, sub_block, scale_t_base, N64)
     stage_transposed(rows, col_scale_bits, sub_block, s_tile, kind)
     cute.arch.barrier()
-    store_transposed(sub_block, s_tile, t_base, M64, N64, m_align)
+    store_transposed(sub_block, s_tile, out_t_base, M64, N64, m_align)
 
 
 @cute.jit
@@ -578,25 +580,25 @@ COMPILED: dict[tuple[str, bool, int, bool], Callable] = {}
 
 
 def compile_kernel(kind: str, is_tok_aligned: bool, m_align: int, is_gather: bool) -> Callable:
-    M, N, num_tok_scale_cols, num_t_scale_cols = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
+    M, N, num_scale_tok_cols, num_scale_t_cols = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     dtype = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16, "f32": cutlass.Float32}[kind]
     x = fake(dtype, (M, N), (cute.sym_int64(), cute.sym_int64() if is_gather else 1), dtype.width // 8 if is_gather else 16)
-    out_tok, tok_scale = fake(cutlass.Float8E4M3FN, (M, N), (cute.sym_int64(), 1)), fake(cutlass.Float32, (M, num_tok_scale_cols), (1, cute.sym_int64()))
-    out_t, t_scale = fake(cutlass.Float8E4M3FN, (N, M), (cute.sym_int64(), 1)), fake(cutlass.Float32, (N, num_t_scale_cols), (1, cute.sym_int64()))
-    return cute.compile(launch, x, out_tok, tok_scale, out_t, t_scale, fake_stream(), kind, is_tok_aligned, m_align, is_gather, options="--enable-tvm-ffi")
+    out_tok, scale_tok = fake(cutlass.Float8E4M3FN, (M, N), (cute.sym_int64(), 1)), fake(cutlass.Float32, (M, num_scale_tok_cols), (1, cute.sym_int64()))
+    out_t, scale_t = fake(cutlass.Float8E4M3FN, (N, M), (cute.sym_int64(), 1)), fake(cutlass.Float32, (N, num_scale_t_cols), (1, cute.sym_int64()))
+    return cute.compile(launch, x, out_tok, scale_tok, out_t, scale_t, fake_stream(), kind, is_tok_aligned, m_align, is_gather, options="--enable-tvm-ffi")
 
 
-def quantize(x: torch.Tensor, kind: str, M: int, N: int, S0: int, S1: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def quantize(x: torch.Tensor, kind: str, M: int, N: int, row_stride: int, col_stride: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    The kernel on x, an (M, N) view with strides (S0, S1): 16-byte loads in place when S1 == 1 and
-    every 16-byte column group of every row is aligned and in or out of the row as a whole, else the
-    gather.
+    The kernel on x, an (M, N) view with strides (row_stride, col_stride): 16-byte loads in place
+    when col_stride == 1 and every 16-byte column group of every row is aligned and in or out of the
+    row as a whole, else the gather.
     """
     device = x.device
     out_tok, out_t = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), torch.empty((N, M), dtype=torch.float8_e4m3fn, device=device)
     scale_tok, scale_t = mn_major_scale(M, (N + 127) >> 7, device), mn_major_scale(N, (M + 127) >> 7, device)
-    vec = 4 if kind == "f32" else 8
-    is_gather = S1 != 1 or x.data_ptr() % 16 != 0 or S0 % vec != 0 or N % vec != 0
+    elems_per_16_bytes = 4 if kind == "f32" else 8
+    is_gather = col_stride != 1 or x.data_ptr() % 16 != 0 or row_stride % elems_per_16_bytes != 0 or N % elems_per_16_bytes != 0
     # 8-byte fp8 stores of out_tok need N % 8 == 0
     key = (kind, N % 8 == 0, 16 if M % 16 == 0 else 8 if M % 8 == 0 else 1, is_gather)
     fn = COMPILED.get(key)
@@ -619,16 +621,16 @@ def fp8_quant_grad_sm90(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, to
     kind = INPUT_KINDS.get(x.dtype)
     if kind is None:
         raise TypeError(f"fp8_quant_grad takes bfloat16, float16 or float32 input, got {x.dtype}")
-    (M, N), (S0, S1) = x.shape, x.stride()
+    (M, N), (row_stride, col_stride) = x.shape, x.stride()
     if M == 0 or N == 0:
         device = x.device
         return torch.empty((M, N), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(M, (N + 127) >> 7, device), torch.empty((N, M), dtype=torch.float8_e4m3fn, device=device), mn_major_scale(N, (M + 127) >> 7, device)
     if M == 1 or N == 1:
         # the stride of a size-1 dim addresses no element: read it as the dense one
-        S0, S1 = S0 if M > 1 else N, S1 if N > 1 else 1
-        x = x.as_strided((M, N), (S0, S1))
-    if S1 == 1 or S0 != 1:
-        return quantize(x, kind, M, N, S0, S1)
+        row_stride, col_stride = row_stride if M > 1 else N, col_stride if N > 1 else 1
+        x = x.as_strided((M, N), (row_stride, col_stride))
+    if col_stride == 1 or row_stride != 1:
+        return quantize(x, kind, M, N, row_stride, col_stride)
     # unit row stride (a transposed view): x.T has unit column stride, and its outputs are x's swapped
-    out_t, scale_t, out_tok, scale_tok = quantize(x.T, kind, N, M, S1, 1)
+    out_t, scale_t, out_tok, scale_tok = quantize(x.T, kind, N, M, col_stride, 1)
     return out_tok, scale_tok, out_t, scale_t

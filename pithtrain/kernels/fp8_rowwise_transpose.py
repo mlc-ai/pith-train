@@ -15,9 +15,9 @@ def fp8_quant_grad(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
     contiguous with fp32 xt_scale of logical shape (N, ceil(M / 128)). Scale strides are
     unspecified: both MN-major on SM90, column-major on SM100.
 
-    Per 128-element block (a partial block uses its valid elements): scale = 2^ceil(log2(max(amax,
-    1e-4) / 448)) (E8M0), fp8 = e4m3(x / scale) rounded to nearest even with saturation. Both
-    architectures return the same bytes and scale values.
+    Per 128-element block (a partial block uses its valid elements):
+    scale = 2^ceil(log2(max(amax, 1e-4) / 448)) (E8M0), fp8 = e4m3(x / scale) rounded to nearest
+    even with saturation. Both architectures return the same bytes and scale values.
     """
     match ARCH_MAJOR:
         case 9:
