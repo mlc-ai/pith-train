@@ -60,7 +60,11 @@ class GroupedLinearFunc(torch.autograd.Function):
                 deep_gemm.k_grouped_bf16_gemm_tn_contiguous(dy, x, main_grad, ks, ks_tensor, c=main_grad)  # fmt: skip
                 return
             wgrad = F.grouped_mm(dy.transpose(0, 1), x, offs=offs)
-            weight.grad = wgrad if weight.grad is None else weight.grad.add_(wgrad)
+            # W-phase callbacks execute after the original backward has returned.
+            # Preserve the BF16 GEMM result, but let autograd run leaf accumulation
+            # hooks so FSDP can promote each contribution before the next W.
+            if weight.requires_grad:
+                torch.autograd.backward(weight, wgrad)
 
         if WeightGradStore.enabled:
             WeightGradStore.put(partial(wgrad_fn, dy.detach(), input.detach(), offs.detach()))
