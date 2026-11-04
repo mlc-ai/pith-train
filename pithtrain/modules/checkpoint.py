@@ -115,17 +115,20 @@ def unwrap_dtensor_experts(value: Any, expected_n: int) -> Optional[Tuple[Any, i
             return None
         if not dt.placements:
             return None
-        if not isinstance(dt.placements[0], Shard):
+        # FSDP shards over the last mesh dim; HSDP replicates over the one before it.
+        shard_dim = dt.device_mesh.ndim - 1
+        if not isinstance(dt.placements[shard_dim], Shard):
             return None
-        if dt.placements[0].dim != 0:
+        if dt.placements[shard_dim].dim != 0:
             return None
         local = dt._local_tensor
-        if local.shape[0] >= expected_n:
+        dp_rank = dt.device_mesh.get_local_rank(shard_dim)
+        dp_size = dt.device_mesh.size(shard_dim)
+        # dp_size is the same on every rank, so all ranks agree on whether to unwrap.
+        if dp_size == 1:
             return None
-        dp_rank = dt.device_mesh.get_local_rank()
-        dp_size = dt.device_mesh.size()
-        chunk, remainder = divmod(expected_n, dp_size)
-        dp_offset = dp_rank * chunk + min(dp_rank, remainder)
+        # FSDP splits like torch.chunk: ceil(n / size) experts per rank until they run out.
+        dp_offset = dp_rank * ((expected_n + dp_size - 1) // dp_size)
         return local, local.shape[0], dp_offset
 
     if isinstance(value, DTensor):
@@ -272,6 +275,7 @@ def iter_canonical_parameters() -> Iterator[Tuple[str, torch.Tensor]]:
     so every rank must consume every entry: filtering or stopping early hangs the others. Only
     this rank's layers are yielded; joining pipeline stages is the caller's job.
     """
+    assert not training.offloaded, "training state is offloaded; call reload_training_state"
     model = training.model
     named_modules = dict(model.named_modules())
     for localized_fqn, param in model.named_parameters():
@@ -340,9 +344,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
     are plain rather than DTensors. After repack stacks them the result is a plain tensor whose
     shape equals the FSDP local shard, so [16, ...] when the full stacked parameter is [32, ...].
 
-    model.load_state_dict compares against the DTensor global shape, so these plain tensors must be
-    wrapped back into DTensors with the same mesh and placements as the model parameter. For
-    optimizer state entries, which are dicts of tensors, every tensor with dim() > 0 is wrapped.
+    Preserve the parameter's mesh, placements, global shape and stride: from_local would infer
+    the wrong shape for uneven shards. Wrap non-scalar optimizer state tensors the same way.
     """
     param_dtensors = {n: p for n, p in model.named_parameters() if isinstance(p, DTensor)}
     for name, param in param_dtensors.items():
@@ -355,6 +358,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
                 device_mesh=param.device_mesh,
                 placements=param.placements,
                 run_check=False,
+                shape=param.shape,
+                stride=param.stride(),
             )
         elif isinstance(value, dict):
             for k, v in value.items():
@@ -364,6 +369,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
                         device_mesh=param.device_mesh,
                         placements=param.placements,
                         run_check=False,
+                        shape=param.shape,
+                        stride=param.stride(),
                     )
 
 
@@ -502,6 +509,7 @@ def save_checkpoint(root: Path, step: int) -> None:
     entries locally by unwrap_dtensor_experts, so each rank writes only the
     expert keys it owns. Non-expert DTensors stay as CPU DTensors and DCP saves each rank's shard.
     """
+    assert not training.offloaded, "training state is offloaded; call reload_training_state"
     stdout = logging.stdout
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     location = Path(root, "torch-dcp", "%08d" % step)
@@ -541,6 +549,7 @@ def load_checkpoint(root: Path, step: int) -> None:
     the caller knows whether loading these weights means resuming its own run or filling a frozen
     slot such as an RL reference policy.
     """
+    assert not training.offloaded, "training state is offloaded; call reload_training_state"
     stdout = logging.stdout
     location = Path(root, "torch-dcp", "%08d" % step)
     stdout.info("Load checkpoint: %s" % location)

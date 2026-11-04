@@ -99,7 +99,7 @@ def forward_stage1(self, hidden_states, rotary_posemb, cu_seqlens=None):
 
 ### Attention kernels and compile
 
-Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func` from `pithtrain.operators.flash_attn_v4`) or, under context parallelism, `ring_attention_func` (`pithtrain.operators.ring_attention`). These are registered as custom ops that trace cleanly inside `forward_stage1_compute`'s `fullgraph=True` region, so no unwrap is needed. Attention with learned sinks (GPT-OSS) passes the sink parameter straight to the kernel via `learnable_sink=...`
+Attention runs FlashAttention v4 (`flash_attn_func` / `flash_attn_varlen_func` from `pithtrain.operators.flash_attn_v4`) or, under context parallelism, `ring_attention_func` / `ring_attention_varlen_func` (`pithtrain.operators.ring_attention`). These are registered as custom ops that trace cleanly inside `forward_stage1_compute`'s `fullgraph=True` region, so no unwrap is needed. Attention with learned sinks (GPT-OSS) passes the sink parameter straight to the kernel via `learnable_sink=...`
 - do **not** wrap it in a `score_mod` closure. See `compile.md`.
 
 ## Stage 3: `forward_stage3` - grouped expert GEMM
@@ -255,7 +255,7 @@ The router class (`gate` on Qwen3 / DeepSeek-V2, `router` on GPT-OSS - match HF'
   topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
   return topk_idx, topk_weight, lb_loss
   ```
-- `self.router_replay` initialised to `None`. When set, it is a callable `(num_tokens, top_k) -> [num_tokens, top_k]` expert indices, used to force recorded routes (RL rollout routing replay, benchmark force-balancing). The router never calls it: the layer resolves it in eager with `replay_indices(gate, hidden_states, top_k)` and passes the result as `forward`'s `replay_idx` argument, which is `None` when no replay is installed. When `replay_idx` is given, `forward` uses it as `topk_idx` and takes the weights of those experts from its own scores (`scores.gather(-1, replay_idx)`), so gradients still reach the router.
+- `self.router_replay` initialised to `None`. When set, it is a callable `(num_tokens, top_k) -> [num_tokens, top_k]` expert indices, used to force recorded routes (RL rollout routing replay, benchmark force-balancing). The router never calls it: the layer resolves it in eager with `replay_indices(gate, hidden_states, top_k)` and passes the result as `forward`'s `replay_idx` argument, which is `None` when no replay is installed. When `replay_idx` is given, `forward` uses it as `topk_idx` and takes the weights of those experts from its own scores before any group mask (`scores.gather(-1, replay_idx)`), so gradients still reach the router.
 
 The router's `forward` returns `(topk_idx, topk_weight, lb_loss)`. The layer calls `MoELoadBalanceLossTracker.add(lb_loss)` when `lb_loss is not None` (see `forward_stage1` above). `setup_model` locates the router by trying both attribute names:
 

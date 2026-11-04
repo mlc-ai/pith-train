@@ -8,6 +8,7 @@ dependencies = [
     "deep-gemm",
     "flash-attn-4[cu13]==4.0.0b28",
     "flash-linear-attention==0.5.2",
+    "quack-kernels==0.6.5",
     "transformers",
     "wandb",
     "zstandard",
@@ -56,6 +57,11 @@ extend-exclude = [".agents/skills/*/templates/"]
 
 [tool.ruff.format]
 quote-style = "double"
+exclude = ["pithtrain/kernels/**"]  # kernel code keeps calls, signatures and tables on one line
+
+[tool.ruff.lint.per-file-ignores]
+"pithtrain/kernels/**" = ["I001"]  # the import sorter would wrap kernel imports at 100 columns
+"pithtrain/kernels/__init__.py" = ["F401"]  # names re-exported via __all__.append (tests/test_import_layers.py checks them)
 
 [tool.ruff.lint]
 ignore = ["E501", "E701", "E731"]

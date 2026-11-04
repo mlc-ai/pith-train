@@ -40,7 +40,7 @@ Phases 1-4 are modeling + training correctness. Phases 5-6 are real-weight infer
 | 0 | Analyze HF's reference implementation | Have class/attribute/shape/config inventory |
 | 1 | Write `pithtrain/models/<model>.py` | Imports cleanly; `reference_forward` runs |
 | 2 | Wire into `pithtrain/modules/training.py` + `tests/test_dualpipev.py` + example config | Example config mirrors upstream; imports clean |
-| 3 | Single-GPU sanity test | pp=1/ep=1 `test_dualpipev.py` passes (loss `allclose` 1e-3, grad `calc_diff` < 1e-2) |
+| 3 | Single-GPU sanity test | pp=1/ep=1 `test_dualpipev.py` passes (loss `allclose` 1e-3, grad `calc_diff` < 1e-2, weight sync `torch.equal`) |
 | 4 | FSDP scaling (pp=1/ep=1 -> 2/2) | All 4 configs pass |
 | 5 | *(If needed)* Checkpoint converter + round-trip | `hf -> dcp -> hf -> transformers.load` succeeds |
 | 6 | *(If needed)* Ad-hoc inference test | Coherent text from real weights |
@@ -140,7 +140,7 @@ CUDA_VISIBLE_DEVICES=<g0> timeout 180 torchrun --nproc-per-node=1 $RDZV \
 
 (or `bash tests/test_dualpipev.sh <config>`). It builds the model at `phase=-1` (reference) and `phase=0`/`phase=1` (the two DualPipeV chunks) and compares the pipelined 5-stage `forward` against `reference_forward`. Single GPU, `timeout 180`.
 
-**Gate:** loss matches (`allclose`, rtol=atol=1e-3) and every parameter gradient passes (`calc_diff` < 1e-2); logits and gradients are finite.
+**Gate:** loss matches (`allclose`, rtol=atol=1e-3), every parameter gradient passes (`calc_diff` < 1e-2) and the weight sync check passes (`torch.equal`); logits and gradients are finite.
 
 ---
 
@@ -150,7 +150,7 @@ CUDA_VISIBLE_DEVICES=<g0> timeout 180 torchrun --nproc-per-node=1 $RDZV \
 
 Run the ladder in that order. After each step, stop and diagnose before continuing if anything fails. `nvidia-smi` before each run. Timeouts 120-180s; past that it's hanging (compile retrace or deadlocked all-to-all) - kill, don't raise.
 
-**Gate:** all 4 configs pass (loss `rtol=atol=1e-3`, per-param `calc_diff < 1e-2`).
+**Gate:** all 4 configs pass (loss `rtol=atol=1e-3`, per-param `calc_diff < 1e-2`, weight sync `torch.equal`).
 
 ---
 

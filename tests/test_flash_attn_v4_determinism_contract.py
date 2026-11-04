@@ -1,7 +1,7 @@
 """CPU contracts for FA4 policy transport, not FA4 numerical acceptance.
 
 The real torch.library schema, fake kernels and registered autograd run here.
-Only the external CUDA-only FA4 entry points are replaced with CPU test doubles.
+The external CUDA-only FA4 entry points and launch memoizer use CPU test doubles.
 """
 
 import sys
@@ -33,7 +33,17 @@ def wrapper(monkeypatch):
         calls.append(("backward", kwargs))
         if failure:
             raise NotImplementedError(failure[0])
-        return torch.ones_like(q), torch.full_like(k, 2), torch.full_like(v, 3)
+        grads = (torch.ones_like(q), torch.full_like(k, 2), torch.full_like(v, 3))
+        sink = kwargs.get("learnable_sink")
+        return grads if sink is None else (*grads, torch.full_like(sink, 4))
+
+    def memoized_launch(direction, inputs, options, entry):
+        calls.append(("memoized_" + direction, options))
+        return entry()
+
+    kernels = types.ModuleType("pithtrain.kernels")
+    kernels.memoized_launch = memoized_launch
+    monkeypatch.setitem(sys.modules, "pithtrain.kernels", kernels)
 
     fake = types.ModuleType("flash_attn.cute.interface")
     fake._flash_attn_fwd, fake._flash_attn_bwd = forward, backward
@@ -50,10 +60,12 @@ def wrapper(monkeypatch):
     return module, calls, failure
 
 
-def invoke(module, packed, policy=None):
+def invoke(module, packed, policy=None, sink=None):
     shape = (5, 2, 4) if packed else (1, 5, 2, 4)
     q, k, v = (torch.randn(shape, requires_grad=True) for _ in range(3))
     kwargs = dict(softmax_scale=0.5, causal=True, window_size=(3, 0))
+    if sink is not None:
+        kwargs["learnable_sink"] = sink
     if policy is not None:
         kwargs["deterministic"] = policy
     if packed:
@@ -82,6 +94,9 @@ def test_forward_captures_policy_for_backward(
     backward = next(options for name, options in calls if name == "backward")
     assert "deterministic" not in forward  # Upstream forward has no such option.
     assert backward["deterministic"] is expected
+    if not packed:
+        memoized = next(options for name, options in calls if name == "memoized_bwd")
+        assert memoized == (0.5, True, 3, 0, expected)
     for options in (forward, backward):
         assert options["softmax_scale"] == 0.5
         assert options["causal"] is True
@@ -92,6 +107,17 @@ def test_forward_captures_policy_for_backward(
             assert options["max_seqlen_q"] == options["max_seqlen_k"] == 5
     for index, value in enumerate(inputs, 1):
         torch.testing.assert_close(value.grad, torch.full_like(value, index), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("policy", [False, True])
+def test_sink_gradient_is_preserved_with_deterministic_policy(wrapper, packed, policy):
+    module, calls, _ = wrapper
+    sink = torch.randn(2, requires_grad=True)
+    out, _ = invoke(module, packed, policy, sink)
+    out.sum().backward()
+    torch.testing.assert_close(sink.grad, torch.full_like(sink, 4), rtol=0, atol=0)
+    assert [options["deterministic"] for name, options in calls if name == "backward"] == [policy]
 
 
 @pytest.mark.parametrize("packed", [False, True])

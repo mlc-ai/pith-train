@@ -1,7 +1,3 @@
-"""
-Pretrain a language model.
-"""
-
 import gc
 import time
 from dataclasses import dataclass, field
@@ -15,6 +11,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
+from pithtrain.kernels import tune_kernels
 from pithtrain.modules.checkpoint import (
     find_checkpoint,
     load_checkpoint,
@@ -22,35 +19,33 @@ from pithtrain.modules.checkpoint import (
 )
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
+from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
-from pithtrain.modules.optimizer import clip_grad_norm
+from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
 
+__all__ = [
+    "PretrainLMCfg",
+    "launch",
+    "setup_dataset",
+    "get_global_batch",
+    "objective",
+    "train_step",
+]
+
 
 @dataclass(init=False, slots=True)
 class PretrainLMCfg(SlottedDefault):
-    """
-    Configuration for pretraining a language model.
-    """
-
     distributed: DistributedCfg = field(default_factory=DistributedCfg)
-    """
-    Distributed training configuration.
-    """
 
     training: TrainingCfg = field(default_factory=TrainingCfg)
-    """
-    Model, optimizer, scheduler and checkpointing configuration.
-    """
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
-    """
-    Logging configuration.
-    """
 
     dataset: Path
     """
@@ -59,9 +54,6 @@ class PretrainLMCfg(SlottedDefault):
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
-    """
-    Build the shuffled concatenation of every tokenized shard under the corpus root.
-    """
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)
@@ -74,53 +66,41 @@ def get_global_batch(
     cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
 ) -> List[Microbatch]:
     """
-    Gather the portion of the global batch belonging to this rank, already split into micro-batches.
-
-    dp_rank alone decides which data this rank loads: the expert rank names the experts a rank
-    hosts, never the data it sees. Every pipeline rank loads the same samples, since the offsets
-    below follow the step and the data and context ranks and never the pipeline rank, so each
-    builds an identical list and DualPipeV needs no broadcast to learn the shapes. Only the first
-    rank consumes the tensors, since under the V-shape it holds both the embedding and the loss.
+    The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP blocks.
+    Every pipeline rank builds the same list, so DualPipeV needs no broadcast of shapes; only
+    pipeline rank 0 feeds the tensors to the model.
     """
-    # short-hands
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
     dp_size = distributed.dp_size
     dp_rank = distributed.dp_rank
     sequence_length = cfg.training.sequence_length
 
-    # arithmetic for dataset indices
     effective_batch_size = micro_batch_size * dp_size
     local_batch_size = global_batch_size // dp_size
     start0 = step * global_batch_size + dp_rank * micro_batch_size
 
-    # two blocks per rank under zigzag CP; at cp_size 1 this is one contiguous read
+    # Two blocks per rank under zigzag CP; at cp_size 1 they are adjacent and cover the sequence.
     front, back = zigzag_spans(distributed.cp_rank, distributed.cp_size, sequence_length)
     block = len(front)
     local_seq_len = 2 * block
 
-    # single allocation on host, then one HtoD transfer per tensor
     local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
     local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
 
-    # fill in one pass: k iterates over our rank-local batch rows. Each sample
-    # is two memmap reads (front block + back block) followed by an in-place
-    # concat into the pre-allocated host buffer.
-    for k in range(local_batch_size):
-        acc, off = divmod(k, micro_batch_size)
-        index = start0 + acc * effective_batch_size + off
+    for row in range(local_batch_size):
+        microbatch_idx, row_in_microbatch = divmod(row, micro_batch_size)
+        index = start0 + microbatch_idx * effective_batch_size + row_in_microbatch
         tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
         tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
-        local_tokens[k, :block] = tokens_a
-        local_tokens[k, block:] = tokens_b
-        local_labels[k, :block] = labels_a
-        local_labels[k, block:] = labels_b
+        local_tokens[row, :block] = tokens_a
+        local_tokens[row, block:] = tokens_b
+        local_labels[row, :block] = labels_a
+        local_labels[row, block:] = labels_b
 
     local_tokens = local_tokens.to(device, non_blocking=True)
     local_labels = local_labels.to(device, non_blocking=True)
 
-    # Rows are already micro-batch major, so a plain split reproduces the partitioning the pipeline
-    # applies itself: rows [i * mbs, (i + 1) * mbs) belong to micro-batch i.
     return [
         Microbatch(
             model_inputs=(local_tokens[i : i + micro_batch_size],),
@@ -136,12 +116,8 @@ def objective(
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Cross-entropy objective for language-model pretraining.
-
-    Returns the loss summed over the tokens of this micro-batch, so gradients accumulate across
-    micro-batches; the training step divides by the global non-ignored token count for a correct
-    token-weighted mean. The second return value is the same loss detached, which the step
-    reduces the same way to log the training loss.
+    The loss is summed over the micro-batch's tokens, not averaged: train_step divides by the
+    global token count.
     """
     (logits,) = model_outputs
     (labels,) = objective_inputs
@@ -154,29 +130,25 @@ def objective(
 
 
 def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
-    """
-    Execute one step of training.
-    """
-    # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
-        # Pushed right after cudaProfilerStart so it is the earliest in-window NVTX per globalTid
-        # (enables pid to mesh-coord lookup); range, not mark, so nsys-ui renders on the thread row.
-        d, t, parts = distributed, cfg.training, list()
-        parts.append(f"rank={d.rank}")
+        # The first NVTX range in the profile window names each thread's mesh coordinates; a range,
+        # not a mark, so the nsys UI shows it on the thread row.
+        mesh, train_cfg, parts = distributed, cfg.training, list()
+        parts.append(f"rank={mesh.rank}")
         parts.append(
-            f"pp={d.pp_rank}/{d.pp_size} dp={d.dp_rank}/{d.dp_size} "
-            f"cp={d.cp_rank}/{d.cp_size} ep={d.ep_rank}/{d.ep_size}"
+            f"pp={mesh.pp_rank}/{mesh.pp_size} dp={mesh.dp_rank}/{mesh.dp_size} "
+            f"cp={mesh.cp_rank}/{mesh.cp_size} ep={mesh.ep_rank}/{mesh.ep_size}"
         )
-        parts.append(f"mbs={t.micro_batch_size} seq={t.sequence_length}")
+        parts.append(f"mbs={train_cfg.micro_batch_size} seq={train_cfg.sequence_length}")
         torch.cuda.nvtx.range_push("; ".join(parts))
     start = cfg.training.memory_profile_start
     if start is not None and step == start:
         torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
 
     device = torch.cuda.current_device()
-    t0 = time.time()
+    step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
 
@@ -188,20 +160,15 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     global_batch_size = cfg.training.global_batch_size
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
-    # Gather the part of the global batch this rank owns, split into micro-batches.
     microbatches = get_global_batch(cfg, dataset, step, device)
 
-    # Run the forward and backward pass. The objective hands back one detached loss per
-    # micro-batch on pipeline rank 0; every other rank gets an empty list.
+    # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
     objective_outputs = model.step(microbatches, objective)
 
-    # Token-weighted reduction. The objective returns a loss summed over the tokens of each
-    # micro-batch, so dividing by the total non-ignored token count yields the correct token-mean
-    # regardless of how tokens split across micro-batches. Every rank holds the same labels, so
-    # each counts the same total for the gradient scale.
+    # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
     counted = 0
-    for mb in microbatches:
-        (labels,) = mb.objective_inputs
+    for microbatch in microbatches:
+        (labels,) = microbatch.objective_inputs
         counted = counted + (labels != -100).sum()
     num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
 
@@ -215,43 +182,35 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             torch.distributed.all_reduce(loss, group=token_group)
         loss /= num_tokens * dp_size * cp_size
 
-    # The one gradient normalization. FSDP reduces with a plain sum (see apply_fsdp), so dividing
-    # by the global token count leaves every parameter, attn or expt, at the token-weighted mean.
-    # Tokens split dp ways across the batch and cp ways along the sequence, so the global count
-    # is the local count times dp * cp, which holds only while every rank counts the same number
-    # of tokens: true for pretraining, not for packed data with -100 masks.
+    # The one gradient normalization: FSDP reduces with a plain sum, so this gives the
+    # token-weighted mean. The global count is the local count times dp * cp only while every rank
+    # counts the same number of tokens: true for pretraining, not for packed data with -100 masks.
     scale = 1.0 / (num_tokens * distributed.dp_size * distributed.cp_size)
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad.mul_(scale)
+    scale_grads_(local_grads(model), scale)
 
-    # Clip the gradients.
     gradient_norm = clip_grad_norm(
         model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
     )
 
-    # Take an optimization step (composed optimizers + their schedulers).
     for optimizer, scheduler in zip(optimizers, schedulers):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+    if training.fp8:
+        precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
 
-    # Measure the elapsed time in seconds.
-    t1 = time.time()
-    dt = torch.tensor(t1 - t0, device=device)
-    torch.distributed.all_reduce(dt, op=torch.distributed.ReduceOp.MAX)
-    elapsed = dt.item()
+    step_end_time = time.time()
+    elapsed_tensor = torch.tensor(step_end_time - step_start_time, device=device)
+    torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
+    elapsed = elapsed_tensor.item()
 
-    # Measure the peak GPU memory allocated.
     peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
     peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
     torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
 
-    # Collect the mean load balance loss (reduced across all ranks).
-    # The tracked values include the coefficient: lb_coef * E * dot(f, p).
-    # We divide it out so the logged metric is E * dot(f, p), where 1.0
-    # represents perfect balance (matches Megatron-LM convention).
+    # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
+    # is perfect balance (the Megatron-LM convention).
     moe_load_balance_coef = cfg.training.moe_load_balance_coef
     lb_total, lb_count = MoELoadBalanceLossTracker.get_total_count_and_clear()
     if moe_load_balance_coef > 0:
@@ -261,7 +220,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     else:
         lb_loss = 0.0
 
-    # Print the loss and learning rate on rank 0.
     logger = logging.stdout
     if distributed.rank == 0:
         max_steps = cfg.training.max_steps
@@ -278,7 +236,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         logger.info(" | ".join(statements))
-        # Lazily initialize WandB on the first successful step.
         activate_wandb(cfg)
         if logging.wandb is not None:
             metrics = dict()
@@ -293,10 +250,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             metrics["infra/step-time"] = elapsed
             wandb.log(metrics)
 
-    # Everything below counts completed steps, one more than the index of the step just run.
     completed = step + 1
 
-    # Stop the nsys and the memory profiler.
     stop = cfg.training.nsys_stop
     if stop is not None and completed == stop:
         torch.cuda.nvtx.range_pop()
@@ -309,10 +264,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         torch.cuda.memory._dump_snapshot(str(path))
         torch.cuda.memory._record_memory_history(enabled=None)
 
-    # We should save the checkpoint if any of the following conditions is true:
-    # 1. The current step is a multiple of save_interval.
-    # 2. The current step is the last step (max_steps).
-    # Skip entirely if save_interval is None.
     if cfg.training.save_interval is not None:
         should_save = False
         should_save |= completed % cfg.training.save_interval == 0
@@ -321,15 +272,12 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             assert cfg.training.save_location is not None
             save_checkpoint(cfg.training.save_location, completed)
 
-    # Run deferred GC here so cyclic collection never fires mid-forward/backward.
+    # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
 
 
 @record
 def launch(cfg: PretrainLMCfg) -> None:
-    """
-    Launch the pretraining of a language model.
-    """
     setup_logging(cfg)
     setup_distributed(cfg)
     dataset = setup_dataset(cfg)
@@ -339,9 +287,24 @@ def launch(cfg: PretrainLMCfg) -> None:
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(cfg.training.save_location, step)
+        if training.fp8:
+            precompute_fp8_param_scales()
+    elif cfg.training.hf_import_path is not None:
+        load_hf_into_model(cfg.training.hf_import_path, training.model)
+        if training.fp8:
+            precompute_fp8_param_scales()
     step = step or 0
+    # Freeze the startup heap (model, datasets, compiled graphs) out of the collector, so the
+    # per-step gc.collect() in train_step scans only what the step allocated.
+    gc.collect()
+    gc.freeze()
     gc.disable()
+    # Install the cached kernel launch configs now; tune the ones the first step lacked after it.
+    tune_kernels()
+    first_step = step
     while step < cfg.training.max_steps:
         train_step(cfg, dataset, step)
+        if step == first_step:
+            tune_kernels()
         step += 1
     gc.enable()

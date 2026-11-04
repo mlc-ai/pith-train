@@ -283,7 +283,9 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         )
         return tokens, residual, routing
 
-    def forward_stage3(self, gathered_tokens, expert_idxs=None, expand_idx=None):
+    def forward_stage3(
+        self, gathered_tokens, expert_idxs=None, expand_idx=None, expert_counts=None
+    ):
         if not self.is_moe:
             return self.mlp(gathered_tokens)
         if distributed.ep_size > 1:
@@ -292,6 +294,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             gathered_tokens,
             expert_idxs,
             self.mlp.experts_per_rank,
+            group_counts=expert_counts,
             deterministic=training.deterministic_token_layout,
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)

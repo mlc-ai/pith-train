@@ -86,24 +86,26 @@ def test_stable_ep_metadata_reconstructs_original_routes(rows, ep_size, experts,
         assert torch.equal(again, original)
 
 
-def test_omni_production_routing_requests_stable_layout():
+def test_omni_reference_is_stable_and_production_uses_runtime_policy():
     import ast
     from pathlib import Path
 
     source = Path(__file__).resolve().parents[2] / "pithtrain/models/qwen3_omni_moe.py"
     tree = ast.parse(source.read_text())
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"prepare_dispatch", "scatter_for_grouped_gemm"}
-    ]
-    assert len(calls) == 3
-    for call in calls:
-        assert any(
-            keyword.arg == "deterministic"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
-            for keyword in call.keywords
-        )
+    policies = {}
+    for method in ast.walk(tree):
+        if not isinstance(method, ast.FunctionDef):
+            continue
+        for call in ast.walk(method):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in {"prepare_dispatch", "scatter_for_grouped_gemm"}
+            ):
+                policy = next(k.value for k in call.keywords if k.arg == "deterministic")
+                policies[method.name] = ast.unparse(policy)
+    assert policies == {
+        "reference_forward": "True",
+        "forward_stage1": "training.deterministic_token_layout",
+        "forward_stage3": "training.deterministic_token_layout",
+    }

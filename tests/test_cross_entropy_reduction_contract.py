@@ -37,15 +37,15 @@ class TorchKernel:
             reduction = kwargs["REDUCTION"]
             self.reductions.append(reduction)
             with torch.enable_grad():
-                logits = kwargs["X_ptr"].detach().float().requires_grad_()
-                labels = kwargs["Y_ptr"]
+                logits = kwargs["logits_ptr"].detach().float().requires_grad_()
+                labels = kwargs["target_ptr"]
                 per_row = F.cross_entropy(
-                    logits, labels, ignore_index=kwargs["ignore_idx"], reduction="none"
+                    logits, labels, ignore_index=kwargs["ignore_index"], reduction="none"
                 )
-                divisor = (labels != kwargs["ignore_idx"]).sum().clamp_min(1)
+                divisor = (labels != kwargs["ignore_index"]).sum().clamp_min(1)
                 loss = per_row.sum() / (divisor if reduction == "mean" else 1)
                 gradient = torch.autograd.grad(loss, logits)[0]
-            kwargs["X_ptr"].copy_(gradient.to(kwargs["X_ptr"].dtype))
+            kwargs["logits_ptr"].copy_(gradient.to(kwargs["logits_ptr"].dtype))
             kwargs["loss_ptr"].copy_(per_row.detach())
 
         return launch
@@ -54,13 +54,18 @@ class TorchKernel:
 def wrapper():
     kernel = TorchKernel()
     namespace = load_nodes(
-        "pithtrain/operators/cross_entropy.py",
-        {"CrossEntropy", "cross_entropy"},
+        "pithtrain/kernels/cross_entropy.py",
+        {"cross_entropy_fwd_bwd"},
         dict(
             torch=torch,
             triton=SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
             cross_entropy_fwd=kernel,
         ),
+    )
+    load_nodes(
+        "pithtrain/operators/cross_entropy.py",
+        {"CrossEntropy", "cross_entropy"},
+        namespace,
     )
     return namespace["cross_entropy"], kernel
 

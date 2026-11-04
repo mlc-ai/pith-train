@@ -1,6 +1,10 @@
-"""Test the sequence-dimension collectives that context parallelism needs for hybrid models."""
+"""
+Test CP sequence collectives and the packed zigzag partition.
+"""
 
 from dataclasses import dataclass
+from itertools import accumulate
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,7 +16,9 @@ from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.cp_sequence import (
     contiguous_to_zigzag,
     prepend_conv_state,
+    zigzag_spans,
     zigzag_to_contiguous,
+    zigzag_varlen_index,
 )
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from tests.utilities import launch
@@ -119,6 +125,69 @@ def test_prepend_conv_state(cp_size: int, req: Request) -> None:
     cfg = DistributedCfg()
     cfg.context_parallel_size = cp_size
     launch(cfg, verify_prepend, req)
+
+
+@pytest.mark.parametrize("cp_size", [2, 3, 4, 8])
+def test_zigzag_varlen_index(cp_size: int) -> None:
+    """
+    Check per-document zigzag ordering and unique token ownership, including empty documents.
+    """
+    unit = 2 * cp_size
+    seqlens = [unit, 7 * unit, 0, 3 * unit, unit, 0, 0]
+    bounds = [0, *accumulate(seqlens)]
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32)
+    held = []
+    for cp_rank in range(cp_size):
+        index = zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, bounds[-1]).tolist()
+        spans = [
+            start + i
+            for start, n in zip(bounds, seqlens)
+            for span in zigzag_spans(cp_rank, cp_size, n)
+            for i in span
+        ]
+        docs = [torch.arange(start, start + n).view(1, n) for start, n in zip(bounds, seqlens) if n]
+        shards = torch.cat([zigzag_shard(doc, cp_rank, cp_size) for doc in docs], dim=1)
+        assert index == spans == shards.view(-1).tolist()
+        held += index
+    assert sorted(held) == list(range(bounds[-1]))
+    # Reject unpadded, missing-zero, decreasing and shard-local boundaries or lengths.
+    refused = [
+        ([0, unit + 2, 2 * unit], 2 * unit),
+        ([unit, 2 * unit, 3 * unit], 3 * unit),
+        ([0, 2 * unit, unit, 3 * unit], 3 * unit),
+        ([0, unit], cp_size * unit),
+        (bounds, bounds[-1] // cp_size),
+    ]
+    for cu, n in refused:
+        with pytest.raises(RuntimeError, match="whole packed sample's boundaries"):
+            zigzag_varlen_index(0, cp_size, torch.tensor(cu, dtype=torch.int32), n)
+    # CP1 accepts odd lengths but still requires whole-sample boundaries.
+    cu_seqlens = torch.tensor([0, 1, 7, 7, 10, 15], dtype=torch.int32)
+    assert zigzag_varlen_index(0, 1, cu_seqlens, 15).tolist() == list(range(15))
+    with pytest.raises(RuntimeError, match="whole packed sample's boundaries"):
+        zigzag_varlen_index(0, 1, cu_seqlens, 16)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_packed_positions(cp_size: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check positions directly: relative RoPE makes document resets invisible to attention tests.
+    Tensors stay on CPU; importing the model requires a GPU.
+    """
+    from pithtrain.models.qwen3_moe import Qwen3MoeModel
+
+    unit = 2 * cp_size
+    seqlens = [unit, 7 * unit, 0, 3 * unit]
+    cu_seqlens = torch.tensor([0, *accumulate(seqlens)], dtype=torch.int32)
+    T = sum(seqlens)
+    model = SimpleNamespace(rotary_emb=lambda S: (torch.arange(S), torch.arange(S)))
+    monkeypatch.setattr(distributed, "device", torch.device("cpu"), raising=False)
+    monkeypatch.setattr(distributed, "cp_size", cp_size, raising=False)
+    for cp_rank in range(cp_size):
+        monkeypatch.setattr(distributed, "cp_rank", cp_rank, raising=False)
+        positions, _ = Qwen3MoeModel.forward_posemb(model, T // cp_size, cu_seqlens)
+        expected = [i for n in seqlens for span in zigzag_spans(cp_rank, cp_size, n) for i in span]
+        assert positions.view(-1).tolist() == expected
 
 
 @dataclass

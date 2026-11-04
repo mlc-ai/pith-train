@@ -1,32 +1,23 @@
 """
 <HF model card URL or name>.
 
-STRUCTURAL OUTLINE - NOT a working file.
+Structural outline of a PithTrain model, not a working file. It encodes only the framework-side
+contracts every model must satisfy: the decoder-layer stage interface (forward_stage1,
+forward_stage3, forward_stage5 and reference_forward; see pithtrain/models/interface.py),
+torch.compile(fullgraph=True) on the hot compute regions, shared-expert placement inside
+forward_stage1_compute, the model-level forward (recorded pipeline path) versus reference_forward
+(plain autograd path), and the phase to stage mapping.
 
-This template encodes only the framework-side contracts that every
-PithTrain model must satisfy:
-  - the decoder-layer stage interface (`forward_stage1` / `forward_stage3`
-    / `forward_stage5` + `reference_forward`; see `pithtrain/models/interface.py`),
-  - `@torch.compile(fullgraph=True)` on the hot compute regions,
-  - shared-expert placement inside `forward_stage1_compute`,
-  - the model-level `forward` (recorded pipeline path) vs `reference_forward`
-    (plain autograd path) split, and the phase -> stage mapping.
+Everything that defines this model (class and attribute names, tensor shapes, RoPE variant,
+attention kernel, expert activation) is marked TODO_HF: fill it in from HuggingFace's
+modeling_<model>.py before looking at other PithTrain models. Renaming Qwen3, DeepSeek-V2 or
+GPT-OSS instead silently mismatches state_dict keys; see reference/conventions.md.
 
-Everything that defines *this* model (class names, attribute names,
-tensor shapes, RoPE variant, attention kernel, expert activation, etc.)
-is marked `TODO_HF` - fill in from HuggingFace's `modeling_<model>.py`
-**before** looking at other PithTrain models.  Do not start from Qwen3 /
-DeepSeek-V2 / GPT-OSS and rename; that path has produced silent
-state_dict mismatches.  See `reference/conventions.md`.
-
-The engine splits each decoder layer into five stages so it can overlap
-one micro-batch's compute with another's communication:
-
-  - Stage 1: pre-dispatch compute (LN + attention + routing).  `forward_stage1`.
-  - Stage 2: dispatch all-to-all.  Driven by the engine, NOT a layer method.
-  - Stage 3: expert compute.  `forward_stage3`.
-  - Stage 4: combine all-to-all.  Driven by the engine, NOT a layer method.
-  - Stage 5: post-combine compute (weighted sum + residual).  `forward_stage5`.
+Each decoder layer runs as five stages so one micro-batch's compute overlaps another's
+communication: stage 1 (forward_stage1) is norm, attention and routing; stage 2 is the dispatch
+all-to-all; stage 3 (forward_stage3) is expert compute; stage 4 is the combine all-to-all; stage 5
+(forward_stage5) is the weighted sum and residual. The engine drives stages 2 and 4, which are not
+layer methods.
 """
 
 import torch
@@ -42,11 +33,11 @@ from pithtrain.modules.load_balance import (
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.operators.cp_sequence import zigzag_spans
+from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.linear import BF16Linear
-from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -59,16 +50,10 @@ from pithtrain.operators.token_scatter import (
 # and annotate the classes below with it instead of the bare `config` parameter.
 
 
-# -----------------------------------------------------------------------------
-# Rotary Position Embedding
-#
-# TODO_HF: copy HF's <Prefix>RotaryEmbedding implementation (LLaMA-style,
-# YaRN, linear-scaled, etc.).  Match HF's *class name* exactly - YaRN is
-# an implementation detail, not part of the name.  The cos/sin cache is a
-# non-persistent buffer sized to `max_position_embeddings`; `forward(S)`
-# returns the leading `S` rows (the model applies per-document / per-CP
-# position selection in `forward_posemb`, not here).
-# -----------------------------------------------------------------------------
+# TODO_HF: copy HF's <Prefix>RotaryEmbedding (LLaMA-style, YaRN, linear-scaled, ...) and match its
+# class name exactly; YaRN is an implementation detail, not part of the name. The cos/sin cache is a
+# non-persistent buffer sized to max_position_embeddings and forward(S) returns its leading S rows;
+# the model selects per-document and per-CP positions in forward_posemb.
 
 
 class HFPrefixRotaryEmbedding(nn.Module):  # TODO_HF rename to match HF class
@@ -93,29 +78,15 @@ class HFPrefixRotaryEmbedding(nn.Module):  # TODO_HF rename to match HF class
         return self.cos[:S], self.sin[:S]
 
 
-# -----------------------------------------------------------------------------
-# Experts
-#
-# TODO_HF: mirror HF's expert MLP - class name, attribute names, fused vs
-# split projections, activation.
-#
-# Two storage strategies, pick the one that matches HF's checkpoint layout:
-#
-#   (a) Split projections -> `training.GroupedLinear(num_experts, in, out)`
-#       (shown below, Qwen3-style).  GroupedLinear owns the fp8/bf16 backend
-#       swap and the per-group GEMM; you just call it with the grouped-mm
-#       metadata.
-#
-#   (b) Fused gate+up or per-expert bias -> raw `nn.Parameter` of shape
-#       `[E, out, in]` plus a private `_group_linear` helper that dispatches
-#       on `training.fp8` (GPT-OSS-style; see gpt_oss.py `GptOssExperts`).
-#       If HF stores `[E, in, out]`, the transpose lives ONLY in dcp2hf,
-#       never here.
-#
-# CRITICAL: if the expert forward has a bias-add or elementwise post-op,
-# truncate `x` to `sum(ks)` before the grouped GEMM - grouped_mm may write
-# NaN into padding rows.  See reference/pitfalls.md nan-padding.
-# -----------------------------------------------------------------------------
+# TODO_HF: mirror HF's expert MLP: class name, attribute names, fused or split projections,
+# activation. Pick the storage that matches HF's checkpoint layout:
+#   (a) Split projections: training.GroupedLinear(num_experts, in, out), shown below (Qwen3-style).
+#       GroupedLinear owns the FP8/BF16 backend choice and the per-group GEMM.
+#   (b) Fused gate+up or per-expert bias: a raw nn.Parameter of shape [E, out, in] plus an
+#       apply_grouped_linear helper that dispatches on training.fp8 (GptOssExperts in gpt_oss.py).
+#       If HF stores [E, in, out], the transpose lives only in dcp2hf, never here.
+# If the expert forward has a bias-add or elementwise post-op, truncate x to sum(ks) before the
+# grouped GEMM: grouped_mm may write NaN into padding rows (reference/pitfalls.md).
 
 
 class HFPrefixExperts(nn.Module):  # TODO_HF rename to match HF class
@@ -143,15 +114,9 @@ class HFPrefixExperts(nn.Module):  # TODO_HF rename to match HF class
         return self.down_proj(silu_mul(g, u), **kwargs)
 
 
-# -----------------------------------------------------------------------------
-# Router / Gate
-#
-# TODO_HF: match HF's class name EXACTLY (e.g. `<Prefix>TopKRouter`,
-# `<Prefix>Gate`) and the attribute the MoE block uses to hold it
-# (`self.router` vs `self.gate` - follow HF).  State_dict keys depend on
-# both.  The router is a raw `nn.Parameter` weight (+ optional bias), not a
-# `training.Linear`.
-# -----------------------------------------------------------------------------
+# TODO_HF: match HF's class name exactly (e.g. <Prefix>TopKRouter, <Prefix>Gate) and the attribute
+# the MoE block holds it in (self.router or self.gate); state_dict keys depend on both. The router
+# weight (and optional bias) is a raw nn.Parameter, not a training.Linear.
 
 
 class HFPrefixGate(nn.Module):  # TODO_HF rename to match HF
@@ -178,6 +143,7 @@ class HFPrefixGate(nn.Module):  # TODO_HF rename to match HF
         # Replayed indices are resolved in eager by replay_indices and passed in as an input, so
         # the compiled gate never reads self.router_replay.
         if replay_idx is not None:
+            # If the gate masks scores by group, gather replay weights from the unmasked scores.
             topk_idx = replay_idx
             topk_weight = scores.gather(-1, topk_idx)
         if self.norm_topk_prob:
@@ -193,13 +159,9 @@ class HFPrefixGate(nn.Module):  # TODO_HF rename to match HF
         return topk_idx, topk_weight, lb_loss
 
 
-# -----------------------------------------------------------------------------
-# MoE Block (the `mlp` attribute on the decoder layer)
-#
-# TODO_HF: match HF's MoE class name (e.g. `<Prefix>MoE`, `<Prefix>MoEBlock`).
-# `experts_per_rank` is the EP-local expert count; EP degree comes from the
-# `distributed` runtime context, never a constructor arg.
-# -----------------------------------------------------------------------------
+# TODO_HF: match HF's MoE class name (e.g. <Prefix>MoE, <Prefix>MoEBlock); it is the mlp attribute
+# of the decoder layer. experts_per_rank is the EP-local expert count; the EP degree comes from the
+# distributed runtime context, never a constructor argument.
 
 
 class HFPrefixMoE(nn.Module):  # TODO_HF rename to match HF
@@ -235,19 +197,14 @@ class HFPrefixMoE(nn.Module):  # TODO_HF rename to match HF
         return y.view(*orig_shape)
 
 
-# -----------------------------------------------------------------------------
-# Attention
-#
-# TODO_HF: copy HF's attention class structure.  The framework is BSHD end
-# to end; only attention reshapes to the kernel's varlen layout.  Pick the
-# kernel dispatch that matches HF's features:
-#   - Context parallelism (cp_size > 1)     -> ring_attention_func
-#   - Packed / variable-length (cu_seqlens) -> flash_attn_varlen_func (squeeze
-#                                             batch dim of 1, unsqueeze back)
-#   - Dense causal                          -> flash_attn_func
-#   - Sliding window / attention sinks      -> pass window_size / learnable_sink
-#                                             to the flash_attn kernels (see gpt_oss.py)
-# -----------------------------------------------------------------------------
+# TODO_HF: copy HF's attention class structure. The framework is BSHD end to end; only attention
+# reshapes to the kernel's varlen layout. Kernel dispatch, in the order checked:
+#   - cp_size > 1 and cu_seqlens set -> ring_attention_varlen_func
+#   - cp_size > 1                    -> ring_attention_func
+#   - cu_seqlens set                 -> flash_attn_varlen_func on the squeezed batch of 1
+#   - otherwise (dense causal)       -> flash_attn_func
+# Sliding window or attention sinks: pass window_size / learnable_sink to the flash_attn kernels
+# (see gpt_oss.py).
 
 
 class HFPrefixAttention(nn.Module):  # TODO_HF rename to match HF
@@ -293,7 +250,9 @@ class HFPrefixAttention(nn.Module):  # TODO_HF rename to match HF
         value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
         # TODO_HF: apply q_norm/k_norm here if HF has them.
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
-        if distributed.cp_size > 1:
+        if distributed.cp_size > 1 and cu_seqlens is not None:
+            attn_output = ring_attention_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, sm_scale=self.scaling, cp_group=distributed.cp_group).unsqueeze(0)
+        elif distributed.cp_size > 1:
             attn_output = ring_attention_func(query_states, key_states, value_states, sm_scale=self.scaling, cp_group=distributed.cp_group)
         elif cu_seqlens is not None:
             attn_output = flash_attn_varlen_func(query_states.squeeze(0), key_states.squeeze(0), value_states.squeeze(0), cu_seqlens, S, softmax_scale=self.scaling, causal=True).unsqueeze(0)
@@ -301,11 +260,6 @@ class HFPrefixAttention(nn.Module):  # TODO_HF rename to match HF
             attn_output = flash_attn_func(query_states, key_states, value_states, softmax_scale=self.scaling, causal=True)
         attn_output = attn_output.reshape(B, S, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
-
-
-# -----------------------------------------------------------------------------
-# Decoder Layer - the stage-method surface (LayerProtocol).
-# -----------------------------------------------------------------------------
 
 
 class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
@@ -317,7 +271,6 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    # ----- Stage 1 ---------------------------------------------------------
     @torch.compile(fullgraph=True)
     def forward_stage1_compute(
         self,
@@ -349,7 +302,6 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)
         return dispatch_tokens, residual, routing
 
-    # ----- Stage 3 ---------------------------------------------------------
     def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
@@ -363,7 +315,6 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
-    # ----- Stage 5 ---------------------------------------------------------
     @torch.compile(fullgraph=True)
     def forward_stage5(
         self,
@@ -382,7 +333,6 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + aggregated.view(*residual.shape)
 
-    # ----- Reference (non-pipelined) ---------------------------------------
     def reference_forward(
         self,
         hidden_states: torch.Tensor,
@@ -399,15 +349,11 @@ class HFPrefixDecoderLayer(nn.Module):  # TODO_HF rename to match HF
         return residual + hidden_states
 
 
-# -----------------------------------------------------------------------------
-# Full Model - one pipeline stage (chunk) of the model, wired for DualPipeV.
-#
-# DualPipeV cuts the model into `2 * pp_size` chunks and gives each pp rank
-# two of them (a V-shape).  `phase` selects which chunk this instance is:
-#   phase 0  -> the "descending" chunk (stage_index = pp_rank),
-#   phase 1  -> the "ascending" chunk  (stage_index = 2*pp_size-1-pp_rank),
-#   phase -1 -> the whole model as a single stage (non-pipelined reference).
-# -----------------------------------------------------------------------------
+# One pipeline chunk of the model. DualPipeV cuts the model into 2 * pp_size chunks and gives each
+# pp rank two of them (a V-shape); phase selects which chunk this instance is:
+#   phase 0  -> the descending chunk, stage_index = pp_rank
+#   phase 1  -> the ascending chunk, stage_index = 2 * pp_size - 1 - pp_rank
+#   phase -1 -> the whole model as one stage (non-pipelined reference)
 
 
 class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
@@ -421,7 +367,6 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
                 stage_count = distributed.pp_size * 2
                 stage_index = stage_count - 1 - distributed.pp_rank
             case -1:
-                # non-pipelined reference: a single stage owns the whole model
                 stage_count = 1
                 stage_index = 0
             case _:
@@ -448,15 +393,13 @@ class HFPrefixModel(nn.Module):  # TODO_HF rename: typically `<Prefix>Model`
         self, S: int, cu_seqlens: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = distributed.device
+        cp_rank, cp_size = distributed.cp_rank, distributed.cp_size
         if cu_seqlens is not None:
-            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
-            lengths = ends - starts
-            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
-            cos, sin = self.rotary_emb(S)
-            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
-        cp_size = distributed.cp_size
-        spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
-        position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+            index = zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, S * cp_size)
+            position_ids = index - cu_seqlens[torch.searchsorted(cu_seqlens, index, right=True) - 1]
+        else:
+            spans = zigzag_spans(cp_rank, cp_size, S * cp_size)
+            position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

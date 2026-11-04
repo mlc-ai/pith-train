@@ -15,7 +15,6 @@ Install (users):
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
-uv venv  # skip if you already have a virtual environment
 uv pip install .
 ```
 
