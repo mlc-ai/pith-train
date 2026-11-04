@@ -19,9 +19,10 @@ def silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     silu(gate) * up as a new contiguous tensor like gate. gate, up: contiguous, same shape and float
     dtype (bf16 in practice); not modified. Computed in fp32 and rounded once to the dtype; close
     to, not bit-identical with, the PyTorch fp32 formula (an ex2.approx sigmoid with div.full.f32).
-    Deterministic; fp8_silu_mul_fwd reproduces it bit for bit outside torch.compile (inside a compiled region both
-    architectures run Inductor's code for the same formula, within an output ulp). On SM90 fewer
-    than 2^31 elements. Callable inside torch.compile regions; runs on the current stream.
+    Deterministic; fp8_silu_mul_fwd reproduces it bit for bit outside torch.compile (inside a
+    compiled region both architectures run Inductor's code for the same formula, within an output
+    ulp). On SM90 fewer than 2^31 elements. Callable inside torch.compile regions; runs on the
+    current stream.
     """
     if torch.compiler.is_compiling():
         # traced once; eager calls get these checks from the kernels

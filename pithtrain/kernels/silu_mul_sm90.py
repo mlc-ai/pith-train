@@ -167,8 +167,8 @@ class SiluMul:
 
     def apply_swiglu(self, in_words: list, is_vector: bool) -> list:
         """
-        One tuple of words per output; output word j holds the results of the elements of word j of
-        every input.
+        One tuple of words per output; output word j holds the results computed from the elements
+        of word j of every input.
         """
         out_words = [[] for _ in range(self.num_outputs)]
         for words in zip(*in_words):
@@ -180,8 +180,8 @@ class SiluMul:
 
     def unpack_word(self, word: Uint32, is_vector: bool) -> list:
         """
-        The fp32 values of a word, low element first: two 16-bit elements of a vector, or one
-        element.
+        The fp32 values of a word, low element first: one fp32 element, the two 16-bit elements
+        of a vector, or one 16-bit element.
         """
         if self.dtype == torch.float32:
             return [u32_as_f32(word)]
