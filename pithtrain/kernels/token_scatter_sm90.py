@@ -1,14 +1,14 @@
 """
 SM90 CuTe-DSL scatter_by_expert in two launches:
 
-1. GroupRanks (one CTA per 2048 tokens) ranks each token stably within its expert (token order) and,
-   in the last chunk, writes the per-group counts, the padded sizes, grouped_mm_offs and the start of
-   each group's padding in the list of zero rows. Chunks are ordered without a grid barrier: each CTA
-   takes a ticket (chunk index in dispatch order), publishes its chunk histogram behind a release
-   flag, and waits only for lower chunks, which already hold their tickets and never wait on it, so
-   forward progress needs no co-residency. Any number of groups: the per-chunk counts live in shared
-   memory up to COUNTS_SMEM_BYTES, else in a per-CTA slice of global scratch, read the same way
-   through generic addresses.
+1. GroupRanks (one CTA per 2048 tokens) ranks each token stably within its expert (token order)
+   and, in the last chunk, writes the per-group counts, the padded sizes, grouped_mm_offs and the
+   start of each group's padding in the list of zero rows. Chunks are ordered without a grid
+   barrier: each CTA takes a ticket (chunk index in dispatch order), publishes its chunk histogram
+   behind a release flag, and waits only for lower chunks, which already hold their tickets and
+   never wait on it, so forward progress needs no co-residency. Any number of groups: the per-chunk
+   counts live in shared memory up to COUNTS_SMEM_BYTES, else in a per-CTA slice of global scratch,
+   read the same way through generic addresses.
 2. RowScatter, launched as a programmatic dependent (PDL) of GroupRanks, moves one row per warp:
    each warp takes a contiguous range of the token rows, fixed before the prep results are known so
    that its first row's loads are issued while GroupRanks still runs, and a contiguous range of the
@@ -133,12 +133,12 @@ class GroupRanks:
     @cute.jit
     def rank_in_chunk(self, expert_idxs, token_oks, warp, warp_counts_base, run_base):
         """
-        Stable rank of each token within its expert inside this chunk, and its expert index (0 for an
-        invalid slot); leaves the chunk's per-expert counts in the running counts. Each round of 512
-        tokens, the leader lane of each expert in each warp writes the warp's count of that expert as
-        one byte of the expert's 16-byte row (one byte per warp); a token's rank is the running count
-        plus the bytes of the lower warps plus its lower peers, and the highest warp holding the expert
-        then folds the row into the running count and clears it.
+        Stable rank of each token within its expert inside this chunk, and its expert index (0 for
+        an invalid slot); leaves the chunk's per-expert counts in the running counts. Each round of
+        512 tokens, the leader lane of each expert in each warp writes the warp's count of that
+        expert as one byte of the expert's 16-byte row (one byte per warp); a token's rank is the
+        running count plus the bytes of the lower warps plus its lower peers, and the highest warp
+        holding the expert then folds the row into the running count and clears it.
         """
         lower_lanes_mask = lanemask_lt()
         safe_expert_idxs, chunk_ranks = [], []
@@ -238,9 +238,9 @@ class GroupRanks:
             sts_b32(s_scan + (PREP_WARPS + warp) * 4, Uint32(pad_incl), Int32(lane == 31))
             cute.arch.sync_threads()
             rows_lower, pad_lower, rows_total, pad_total = Int32(0), Int32(0), Int32(0), Int32(0)
-            for w in cutlass.range_constexpr(PREP_WARPS):
-                warp_rows, warp_pad = Int32(lds_b32(s_scan + w * 4)), Int32(lds_b32(s_scan + (PREP_WARPS + w) * 4))
-                is_lower = Int32(w < warp)
+            for other_warp in cutlass.range_constexpr(PREP_WARPS):
+                warp_rows, warp_pad = Int32(lds_b32(s_scan + other_warp * 4)), Int32(lds_b32(s_scan + (PREP_WARPS + other_warp) * 4))
+                is_lower = Int32(other_warp < warp)
                 rows_lower, pad_lower, rows_total, pad_total = rows_lower + warp_rows * is_lower, pad_lower + warp_pad * is_lower, rows_total + warp_rows, pad_total + warp_pad
             st_b32(offs_base + Int64(group_idx) * 4, Uint32(rows_carry + rows_lower + rows_incl), group_ok)
             st_b32(ks_base + Int64(group_idx) * 4, Uint32(padded), group_ok)
@@ -348,8 +348,8 @@ class RowScatter:
         vec = self.vec
         segment_bytes = 32 * ROW_UNROLL * vec
         vectors = []
-        for u in cutlass.range_constexpr(ROW_UNROLL):
-            byte_idx = segment_idx * segment_bytes + (u * 32 + lane) * vec
+        for i in cutlass.range_constexpr(ROW_UNROLL):
+            byte_idx = segment_idx * segment_bytes + (i * 32 + lane) * vec
             vectors.append(self.load_vec(src_base + byte_idx, pred & Int32(byte_idx < row_bytes)))
         return vectors
 
@@ -357,9 +357,9 @@ class RowScatter:
     def store_segment(self, dst_base, segment_idx, row_bytes, lane, vectors) -> None:
         vec = self.vec
         segment_bytes = 32 * ROW_UNROLL * vec
-        for u in cutlass.range_constexpr(ROW_UNROLL):
-            byte_idx = segment_idx * segment_bytes + (u * 32 + lane) * vec
-            self.store_vec(dst_base + byte_idx, vectors[u], Int32(byte_idx < row_bytes))
+        for i in cutlass.range_constexpr(ROW_UNROLL):
+            byte_idx = segment_idx * segment_bytes + (i * 32 + lane) * vec
+            self.store_vec(dst_base + byte_idx, vectors[i], Int32(byte_idx < row_bytes))
 
     @cute.jit
     def copy_row(self, x_base, x_row_stride, row_bytes, experts_base, offs_base, rank_base, rsi_base, out_base, token_idx, lane, first_vectors) -> None:
@@ -385,8 +385,8 @@ class RowScatter:
         segment_bytes = 32 * ROW_UNROLL * vec
         zeros = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
         for segment_idx in cutlass.range((row_bytes + segment_bytes - 1) // segment_bytes, unroll=1):
-            for u in cutlass.range_constexpr(ROW_UNROLL):
-                byte_idx = segment_idx * segment_bytes + (u * 32 + lane) * vec
+            for i in cutlass.range_constexpr(ROW_UNROLL):
+                byte_idx = segment_idx * segment_bytes + (i * 32 + lane) * vec
                 self.store_vec(dst_base + byte_idx, zeros, Int32(byte_idx < row_bytes))
 
 
@@ -486,9 +486,9 @@ def scatter_by_expert_sm90(input_tokens: torch.Tensor, expert_idxs: torch.Tensor
     group_stride = (G + 3) // 4 * 4
     # shared-memory capacity rounded up to a power of 2 (fewer compiled variants), 0 for global counts
     group_cap = 1 << (group_stride - 1).bit_length()
-    in_smem = COUNT_BYTES_PER_GROUP * group_cap <= COUNTS_SMEM_BYTES
-    group_cap = group_cap if in_smem else 0
-    scratch = get_scratch(device, num_chunks, G, 0 if in_smem else num_chunks * COUNT_BYTES_PER_GROUP * group_stride // 4)
+    use_smem = COUNT_BYTES_PER_GROUP * group_cap <= COUNTS_SMEM_BYTES
+    group_cap = group_cap if use_smem else 0
+    scratch = get_scratch(device, num_chunks, G, 0 if use_smem else num_chunks * COUNT_BYTES_PER_GROUP * group_stride // 4)
     prep_fn = PREP.get(group_cap)
     if prep_fn is None:
         prep_fn = PREP[group_cap] = compile_prep(group_cap)

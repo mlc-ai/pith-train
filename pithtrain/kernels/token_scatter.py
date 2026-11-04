@@ -1,5 +1,5 @@
 """
-Picker of token_scatter: the SM90 implementation in token_scatter_sm90, the TIRx kernel in
+Picker of scatter_by_expert: the CuTe-DSL kernel in token_scatter_sm90 on SM90, the TIRx kernel in
 token_scatter_sm100 on SM100.
 """
 
@@ -27,7 +27,7 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
       device-to-host copy (and host sync), and must match expert_idxs.
     - output_tokens: (sum(ks), hidden) row-major in input_tokens' dtype, a prefix view of an
       allocation whose rows past sum(ks), up to a multiple of 1024, are zero too. Group g occupies
-      rows [offs[g - 1], offs[g]), its tokens first, then zero rows.
+      rows [grouped_mm_offs[g - 1], grouped_mm_offs[g]), its tokens first, then zero rows.
     - reverse_shuffle_idxs: int64 (num_tokens,), the output row of each input token.
     - grouped_mm_offs: int32 (G,) cumulative padded group ends. ks_tensor: int32 (G,) padded group
       sizes (zero for an empty group). ks: the same as a host list.
@@ -36,9 +36,9 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
 
     Rows are copied exactly. Placement within a group: token order on SM90 (so every output is
     deterministic); unspecified on SM100 (atomic_add order, not deterministic; with more than 1024
-    groups SM100 takes a PyTorch path, in token order). Consumers locate a
-    token only through reverse_shuffle_idxs. An expert_idxs length other than num_tokens raises
-    ValueError (also for num_tokens == 0).
+    groups SM100 takes a PyTorch path, in token order). Consumers locate a token only through
+    reverse_shuffle_idxs. An expert_idxs length other than num_tokens raises ValueError (also for
+    num_tokens == 0).
     """
     match ARCH_MAJOR:
         case 9:
