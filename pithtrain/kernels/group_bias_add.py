@@ -1,6 +1,6 @@
 """
-Picker of group_bias_add: the SM90 implementation in group_bias_add_sm90, the TIRx kernel in
-group_bias_add_sm100 on SM100.
+Picker of group_bias_add: the CuTe-DSL kernel of group_bias_add_sm90 on SM90, the TIRx-lite
+kernel of group_bias_add_sm100 on SM100.
 """
 
 import torch
@@ -18,8 +18,7 @@ def group_bias_add(y: torch.Tensor, bias: torch.Tensor, group_indices: torch.Ten
     in [0, G); y does not overlap bias or group_indices. Each sum is computed in fp32 and rounded
     once to y's dtype, bit-identical to the PyTorch fallback y.copy_(y + bias[group_indices]), which
     every input outside the device kernel's cover takes (mixed dtypes, non-contiguous y or bias, and
-    on SM90 rows whose byte width or base address is not a multiple of 16).
-    Returns None. Deterministic.
+    on SM90 rows whose byte width or base address is not a multiple of 16). Deterministic.
     """
     match ARCH_MAJOR:
         case 9:

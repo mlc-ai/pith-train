@@ -52,7 +52,7 @@ class GroupBiasAdd:
         bx, _, _ = cute.arch.block_idx()
         y_base, bias_base, idx_base = mY.iterator.toint(), mBias.iterator.toint(), mIdx.iterator.toint()
         vec_idx, vec_ok = self.vector_coords(bx, tidx, Int32(mIdx.shape[0]) * self.vecs_per_row)
-        group_idx = self.load_group_ids(idx_base, vec_idx, vec_ok)
+        group_idx = self.load_group_idx(idx_base, vec_idx, vec_ok)
         y_words = self.load_rows(y_base, vec_idx, vec_ok)
         bias_words = self.load_bias(bias_base, group_idx, vec_idx, vec_ok)
         out_words = self.add_bias(y_words, bias_words)
@@ -65,7 +65,7 @@ class GroupBiasAdd:
         vec_idx = [(bx * VECS_PER_THREAD + i) * THREADS + tidx for i in range(VECS_PER_THREAD)]
         return vec_idx, [Int32(vec < num_vecs) for vec in vec_idx]
 
-    def load_group_ids(self, idx_base, vec_idx, vec_ok) -> list:
+    def load_group_idx(self, idx_base, vec_idx, vec_ok) -> list:
         group_idx = []
         for i in range(VECS_PER_THREAD):
             row_addr = idx_base + Int64(vec_idx[i] // self.vecs_per_row) * (self.index_dtype.width // 8)
