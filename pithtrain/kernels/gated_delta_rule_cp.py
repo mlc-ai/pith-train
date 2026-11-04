@@ -16,7 +16,8 @@ stages around one all-gather over the CP group that the caller runs:
       ag = all_gather(dhm)
       h, v_new = gdr_cp_bwd_states(k, w, u, g_cum, h0)
       dht = gdr_cp_merge(ag, r, n - 1 - r, reverse=True) if r < n - 1 else None
-      dq, dk, dv, dg, dbeta = gdr_cp_bwd_output(q, k, v, w, v_new, do, dv_local, h, g_cum, beta, A, u, dht)
+      dq, dk, dv, dg, dbeta = gdr_cp_bwd_output(q, k, v, w, v_new, do, dv_local, h, g_cum, beta,
+                                                A, u, dht)
 - SM100, TIRx kernels (chunk_gdr_cp_supported, gated_delta_rule_cp_plan, chunk_gdr_cp_*): q and k
   per value head. The stage before the all-gather returns the rank's fp32 (HV, K, V + K) payload
   (FLA 0.5.2's state summary in the forward, its gradient summary in the backward), the stage
@@ -43,12 +44,10 @@ def gated_delta_rule_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Ten
     HV 32 b), K == V == 128, bf16 q / k / v / beta and an fp32 gate. False on every other
     architecture. Constant per geometry: torch.compile guards on the shape, device and dtype checks.
     """
-    match ARCH_MAJOR:
-        case 9:
-            from pithtrain.kernels.gated_delta_rule_cp_sm90 import gated_delta_rule_cp_supported_sm90
-            return gated_delta_rule_cp_supported_sm90(q, k, v, g, beta)
-        case _:
-            return False
+    if ARCH_MAJOR != 9:
+        return False
+    from pithtrain.kernels.gated_delta_rule_cp_sm90 import gated_delta_rule_cp_supported_sm90
+    return gated_delta_rule_cp_supported_sm90(q, k, v, g, beta)
 
 
 def gdr_cp_fwd_local(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, transition: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -58,12 +57,12 @@ def gdr_cp_fwd_local(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: to
     k: bf16 (1, T, H, K) contiguous, unrepeated key heads; v: bf16 (1, T, HV, V); g: fp32 (1, T,
     HV), the raw log gate; beta: bf16 (1, T, HV). Value head j reads key head j // (HV / H).
     g_cum: fp32 (1, T, HV), the chunk-local cumulative gate in log2 units, and A: bf16 (1, T, HV,
-    64), the solved WY matrix, on the chunk algorithm of FLA 0.5.2 and what the backward reads; w: bf16 (1, T,
-    HV, K) and u: bf16 (1, T, HV, V), FLA's recompute_w_u. hm: fp32 (HV, K, V + K): with transition
-    the rank's affine state map from a zero state, he (columns :V, the final state of the
-    recurrence) and M (columns V:, the product of the chunk transitions, a TF32 chain) as FLA's
-    pre_process_fwd_kernel_merged computes them; without transition (the last rank) allocated and
-    unwritten. Deterministic; ragged T (not a multiple of 64) runs as if zero-padded. SM90 only.
+    64), the solved WY matrix, on the chunk algorithm of FLA 0.5.2 and what the backward reads;
+    w: bf16 (1, T, HV, K) and u: bf16 (1, T, HV, V), FLA's recompute_w_u. hm: fp32 (HV, K, V + K):
+    with transition the rank's affine state map from a zero state, he (columns :V, the final state
+    of the recurrence) and M (columns V:, the product of the chunk transitions, a TF32 chain) as
+    FLA's pre_process_fwd_kernel_merged computes them; without transition (the last rank) allocated
+    and unwritten. Deterministic; ragged T (not a multiple of 64) runs as if zero-padded. SM90 only.
     """
     match ARCH_MAJOR:
         case 9:
@@ -155,23 +154,24 @@ def gdr_cp_bwd_output(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, w: torc
         case _:
             raise NotImplementedError(SM90_ONLY.format(ARCH_MAJOR))
 
+
 SM100_ONLY = "the TIRx context-parallel gated delta rule kernels run on SM100 only; chunk_gdr_cp_supported is False on compute capability {}.x"
 
 
 def chunk_gdr_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether the chunk_gdr_cp_* entry points apply to this rank's call: on SM100, at the geometry the
-    kernels were verified at: q, k, v bf16 (1, S, 32, 128) with S >= 1 (q / k given per
-    value head, so already repeated to the 32 value heads where fewer key heads serve them), g fp32
-    (1, S, 32), beta bf16 (1, S, 32); otherwise False. Depends only on
-    shapes, dtypes and the device, so it gives the same answer on every rank of a CP group and for
-    a forward and its backward (whose g is the forward's g_cum).
+    kernels were verified at: q, k, v bf16 (1, T, 32, 128) with T >= 1 (q / k given per value head,
+    so already repeated to the 32 value heads where fewer key heads serve them), g fp32 (1, T, 32),
+    beta bf16 (1, T, 32); otherwise False. Depends only on shapes, dtypes and the device, so it
+    gives the same answer on every rank of a CP group and for a forward and its backward (whose g
+    is the forward's g_cum).
     """
     if ARCH_MAJOR != 10:
         return False
-    S = v.shape[1] if v.dim() == 4 else 0
-    shape = (1, S, 32, 128)
-    return S >= 1 and tuple(q.shape) == tuple(k.shape) == tuple(v.shape) == shape and tuple(g.shape) == tuple(beta.shape) == shape[:3] and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
+    T = v.shape[1] if v.dim() == 4 else 0
+    shape = (1, T, 32, 128)
+    return T >= 1 and tuple(q.shape) == tuple(k.shape) == tuple(v.shape) == shape and tuple(g.shape) == tuple(beta.shape) == shape[:3] and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
 def gated_delta_rule_cp_plan(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor, rank: int, is_first_rank: bool, is_last_rank: bool, pre_num_ranks: int, post_num_ranks: int) -> dict:
@@ -202,10 +202,10 @@ def chunk_gdr_cp_fwd_pre(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: t
     """
     The CP forward up to the all-gather: (payload, saved).
 
-    q, k: bf16 (1, S, HV, K) per value head; v: bf16 (1, S, HV, V); g: fp32 (1, S, HV), the raw
-    (natural-log, negative) gate; beta: bf16 (1, S, HV) in (0, 1); plan from
-    gated_delta_rule_cp_plan. Inputs are not modified (non-contiguous or misaligned ones are
-    copied).
+    q, k: bf16 (1, T, HV, K) per value head; v: bf16 (1, T, HV, V); g: fp32 (1, T, HV), the raw
+    (natural-log, negative) gate; beta: bf16 (1, T, HV) in (0, 1); plan: from
+    gated_delta_rule_cp_plan. Inputs are not modified (non-contiguous or misaligned
+    ones are copied).
 
     payload: fresh fp32 (HV, K, V + K), FLA 0.5.2's forward state summary of the rank's last local
     sequence (zero on the last rank of that sequence), to all-gather over the CP group. saved:
@@ -227,7 +227,7 @@ def chunk_gdr_cp_fwd_post(gathered: torch.Tensor, saved: tuple, plan: dict) -> t
     gathered: fp32 (world_size, HV, K, V + K), every rank's chunk_gdr_cp_fwd_pre payload in rank
     order; saved: that call's saved.
 
-    o: bf16 (1, S, HV, V), the rank's output. g_cum: fp32 (1, S, HV), A: bf16 (1, S, HV, 64) and
+    o: bf16 (1, T, HV, V), the rank's output. g_cum: fp32 (1, T, HV), A: bf16 (1, T, HV, 64) and
     initial_state: fp32 (1, HV, K, V) are inputs of chunk_gdr_cp_bwd_pre only: their shapes and
     dtypes are FLA's, their contents the implementation's (A also carries state checkpoints for the
     backward). Only where chunk_gdr_cp_supported is True.
@@ -245,7 +245,7 @@ def chunk_gdr_cp_bwd_pre(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cu
     The CP backward up to the all-gather: (payload, saved).
 
     q, k, v, beta: the forward inputs; g_cum, A, initial_state: chunk_gdr_cp_fwd_post's outputs;
-    do: bf16 (1, S, HV, V), the gradient of o; plan: the forward's. Inputs are not modified.
+    do: bf16 (1, T, HV, V), the gradient of o; plan: the forward's. Inputs are not modified.
 
     payload: fresh fp32 (HV, K, V + K), FLA 0.5.2's gradient summary of the rank's first local
     sequence (zero on the first rank of that sequence), to all-gather over the CP group. saved:
@@ -266,10 +266,10 @@ def chunk_gdr_cp_bwd_post(gathered: torch.Tensor, saved: tuple, plan: dict) -> t
     gathered: fp32 (world_size, HV, K, V + K), every rank's chunk_gdr_cp_bwd_pre payload in rank
     order; saved: that call's saved.
 
-    dq, dk: bf16 (1, S, HV, K) per value head (the caller sums each group for key-head gradients);
-    dv: bf16 like v; dg: fp32 (1, S, HV), with respect to the raw gate g; dbeta: bf16 like beta.
-    Matches the fp64 chunked recurrence of tests/kernels/test_gated_delta_rule_cp.py within its
-    bounds (calc_diff below 1e-3, not bit for bit). Only where chunk_gdr_cp_supported is True.
+    dq, dk: bf16 (1, T, HV, K) per value head (the caller sums each group for key-head gradients);
+    dv: bf16 like v; dg: fp32 (1, T, HV), with respect to the raw gate g; dbeta: bf16 like beta.
+    Matches an fp64 chunked recurrence to calc_diff below 1e-3, not bit for bit. Only where
+    chunk_gdr_cp_supported is True.
     """
     match ARCH_MAJOR:
         case 10:

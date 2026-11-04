@@ -57,7 +57,7 @@ def block_product(thr: cute.ThrMma, mma_tf32: cute.TiledMma, acc: cute.Tensor, s
     r_left, r_right = cute.make_rmem_tensor(thr.partition_shape_A((16, 16)), Float32), cute.make_rmem_tensor(thr.partition_shape_B((16, 16)), Float32)
     cute.autovec_copy(t_left, r_left)
     cute.autovec_copy(t_right, r_right)
-    tf32 = lambda r: cute.make_tensor(cute.recast_ptr(r.iterator, dtype=cutlass.TFloat32), r.layout)
+    tf32 = lambda regs: cute.make_tensor(cute.recast_ptr(regs.iterator, dtype=cutlass.TFloat32), regs.layout)
     cute.gemm(mma_tf32, acc, tf32(r_left), tf32(r_right), acc)
 
 
@@ -288,20 +288,20 @@ class WyRepresentation:
         warp_idx, lane = tidx // 32, tidx % 32
         base = warp_idx * 16
         if lane < 16:
-            column = [-s_l[base + r, base + lane] for r in range(16)]
+            column = [-s_l[base + row, base + lane] for row in range(16)]
             for i in cutlass.range_constexpr(2, 16):
                 row_i = [-s_l[base + i, base + k] if k < i else Float32(0.0) for k in range(16)]
-                pairs = [cute.math.fma(row_i[g], column[g], row_i[g + 8] * column[g + 8]) for g in range(8)]
+                pairs = [cute.math.fma(row_i[pair_idx], column[pair_idx], row_i[pair_idx + 8] * column[pair_idx + 8]) for pair_idx in range(8)]
                 total = ((pairs[0] + pairs[4]) + (pairs[2] + pairs[6])) + ((pairs[1] + pairs[5]) + (pairs[3] + pairs[7]))
                 own = Float32(0.0)
                 if lane < i:
                     own = -s_l[base + i, base + lane]
                 column[i] = own + total
-            for r in cutlass.range_constexpr(16):
+            for row in cutlass.range_constexpr(16):
                 identity = Float32(0.0)
-                if lane == r:
+                if lane == row:
                     identity = Float32(1.0)
-                s_inverse[base + r, base + lane] = column[r] + identity
+                s_inverse[base + row, base + lane] = column[row] + identity
         cute.arch.barrier()
 
     @cute.jit
@@ -314,7 +314,7 @@ class WyRepresentation:
         """
         warp_idx, lane = tidx // 32, tidx % 32
         thr = mma_tf32.get_slice(lane)
-        block = lambda s, i, j: cute.local_tile(s, (16, 16), (i, j))
+        block = lambda tensor, i, j: cute.local_tile(tensor, (16, 16), (i, j))
         for block_row in cutlass.range_constexpr(1, 4):
             for block_col in cutlass.range_constexpr(block_row):
                 if warp_idx == block_col:
@@ -345,8 +345,8 @@ class WyRepresentation:
         A = bf16(X), zero above the diagonal blocks (which the merge never writes).
         """
         for i in cutlass.range_constexpr(BT * BT // WY_THREADS):
-            idx = i * WY_THREADS + tidx
-            row, col = idx // BT, idx % BT
+            elem_idx = i * WY_THREADS + tidx
+            row, col = elem_idx // BT, elem_idx % BT
             value = Float32(0.0)
             if row // 16 >= col // 16:
                 value = s_inverse[row, col]
@@ -384,15 +384,15 @@ class ChunkStateOutput:
 
     @cute.kernel
     def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mO: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, mma: cute.TiledMma, ring_layout: cute.ComposedLayout, q_layout: cute.ComposedLayout, u_layout: cute.ComposedLayout, h_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout, o_layout: cute.ComposedLayout):
-        tid, _, _ = cute.arch.thread_idx()
+        tidx, _, _ = cute.arch.thread_idx()
         col_tile, head_idx, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
         s_k, s_w, s_q, s_u, s_h, s_vnew, s_vscaled, s_o, s_gcum = smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, q_layout, 1024), smem.allocate_tensor(BFloat16, u_layout, 1024), smem.allocate_tensor(BFloat16, h_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, o_layout, 1024), smem.allocate_tensor(Float32, cute.make_layout((BT, STATE_STAGES), stride=(1, BT)), 16)
         buffers = (s_k, s_w, s_q, s_u, s_h, s_vnew, s_vscaled, s_o, s_gcum)
-        if tid < self.recurrence_threads:
-            self.recurrence_loop(mK, mW, mU, mGcum, mH0, mHt, mma, buffers, tid, col_tile, head_idx)
+        if tidx < self.recurrence_threads:
+            self.recurrence_loop(mK, mW, mU, mGcum, mH0, mHt, mma, buffers, tidx, col_tile, head_idx)
         else:
-            self.output_loop(mQ, mO, mma, buffers, tid - self.recurrence_threads, col_tile, head_idx, (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT)
+            self.output_loop(mQ, mO, mma, buffers, tidx - self.recurrence_threads, col_tile, head_idx, (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT)
 
     @cute.jit
     def issue_chunk(self, load: cute.TiledCopy, load_u: cute.TiledCopy, load_gate: cute.TiledCopy, sources: tuple, targets: tuple, chunk: int, stage: int, tidx, tail: tuple):
@@ -567,8 +567,8 @@ def compile_wy(H: int, HV: int, ragged: bool = False) -> object:
     T = cute.sym_int()
     key_shape, value_shape, gate_shape = (T, H, HEAD_DIM), (T, HV, HEAD_DIM), (T, HV)
     key_stride, value_stride, gate_stride = (H * HEAD_DIM, HEAD_DIM, 1), (HV * HEAD_DIM, HEAD_DIM, 1), (HV, 1)
-    keys, values, gate, beta, a = fake(BFloat16, key_shape, key_stride), fake(BFloat16, value_shape, value_stride), fake(Float32, gate_shape, gate_stride, 4), fake(BFloat16, gate_shape, gate_stride, 2), fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1))
-    return cute.compile(WyRepresentation(H, HV, ragged), keys, values, gate, beta, gate, a, values, values, fake_stream(), options="--enable-tvm-ffi")
+    keys, values, gate, beta, a_matrix = fake(BFloat16, key_shape, key_stride), fake(BFloat16, value_shape, value_stride), fake(Float32, gate_shape, gate_stride, 4), fake(BFloat16, gate_shape, gate_stride, 2), fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1))
+    return cute.compile(WyRepresentation(H, HV, ragged), keys, values, gate, beta, gate, a_matrix, values, values, fake_stream(), options="--enable-tvm-ffi")
 
 
 def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bool = False) -> object:
@@ -602,22 +602,13 @@ def state_output(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u: torch.Ten
     _, T, H, _ = k.shape
     HV = u.shape[2]
     ragged = T % BT != 0
-    o = torch.empty_like(u)
+    out = torch.empty_like(u)
     has_h0, has_ht = h0 is not None, False
     key = ("chunk_state_output", H, HV, k.device.index, has_h0, has_ht, ragged)
     if key not in COMPILED:
         COMPILED[key] = compile_state_output(H, HV, has_h0, has_ht, ragged)
-    COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], o[0], h0, None)
-    return o
-
-
-def chunk_gdr_fwd_cute(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    chunk_gdr_fwd_pinned_sm90 on the CuTe kernels, B == 1; their ragged variants (compiled on the
-    first such call) when T is not a multiple of BT.
-    """
-    g_cum, A, w, u = wy_representation(k, v, g, beta)
-    return state_output(q, k, w, u, g_cum), g_cum, A
+    COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], out[0], h0, None)
+    return out
 
 
 def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -633,8 +624,8 @@ def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     HV, 64), the solved WY matrix. g_cum and A are inputs of chunk_gdr_bwd_pinned_sm90. The CuTe
     kernels at every T (the ragged variants when T is not a multiple of 64), on FLA 0.5.2's chunk
     algorithm and rounding points. o matches the fp32 recurrence to calc_diff < 1e-4 and a largest
-    absolute error within 2e-2 of the reference's largest magnitude
-    (tests/kernels/test_gated_delta_rule_pinned.py). Deterministic. Only where
+    absolute error within 2e-2 of the reference's largest magnitude. Deterministic. Only where
     gated_delta_rule_pinned_supported is True.
     """
-    return chunk_gdr_fwd_cute(q, k, v, g, beta)
+    g_cum, A, w, u = wy_representation(k, v, g, beta)
+    return state_output(q, k, w, u, g_cum), g_cum, A

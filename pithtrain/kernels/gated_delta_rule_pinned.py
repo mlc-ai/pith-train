@@ -1,8 +1,8 @@
 """
 Picker of the pinned dense chunked gated delta rule (chunk size 64, no initial or final state) at
 Qwen3.5's geometry: on SM90 CuTe-DSL kernels in both directions at every T (a ragged variant of
-each when T is not a multiple of 64); TIRx kernels on SM100. The callers' custom
-ops keep both opaque to torch.compile.
+each when T is not a multiple of 64); TIRx kernels on SM100. The callers' custom ops keep both
+opaque to torch.compile.
 """
 
 import torch
@@ -25,11 +25,11 @@ def consistent_geometry(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: to
     beta (B, T, HV), and T > 0. Never raises on a malformed call.
     """
     tensors = (q, k, v, g, beta)
-    if tuple(t.dim() for t in tensors) != (4, 4, 4, 3, 3):
+    if tuple(tensor.dim() for tensor in tensors) != (4, 4, 4, 3, 3):
         return False
     B, T = k.shape[:2]
     HV = v.shape[2]
-    return T > 0 and tuple(v.shape[:2]) == (B, T) and tuple(g.shape) == (B, T, HV) and tuple(beta.shape) == (B, T, HV) and len({t.device for t in tensors}) == 1 and k.device.type == "cuda" and all(t.is_contiguous() for t in tensors)
+    return T > 0 and tuple(v.shape[:2]) == (B, T) and tuple(g.shape) == (B, T, HV) and tuple(beta.shape) == (B, T, HV) and len({tensor.device for tensor in tensors}) == 1 and k.device.type == "cuda" and all(tensor.is_contiguous() for tensor in tensors)
 
 
 def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
@@ -62,10 +62,10 @@ def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call. On SM90 the geometry of
     pinned_shapes, and also the folded geometry of folded_shapes (a batch folded into the heads).
-    On SM100 the geometry the TIRx kernels were verified at, one sample's heads:
-    pinned_shapes with H 16 or 32 key heads over the 32 value heads (not a folded batch, whose
-    samples a caller runs one at a time). Otherwise False. Constant per geometry: torch.compile
-    guards on the shape, device and dtype checks.
+    On SM100 the geometry the TIRx kernels were verified at, one sample's heads: pinned_shapes with
+    H 16 or 32 key heads over the 32 value heads (not a folded batch, whose samples a caller runs
+    one at a time). Otherwise False. Constant per geometry: torch.compile guards on the shape,
+    device and dtype checks.
     """
     match ARCH_MAJOR:
         case 9:
