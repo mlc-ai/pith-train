@@ -1,56 +1,37 @@
 """
 Zigzag ring attention for context parallelism.
 
-Causal flash attention sharded across cp_size ranks. Two design choices: zigzag chunking for
-load balance, and async ring P2P for compute/comm overlap.
-
-The global sequence is split into 2 * cp_size equal chunks of size block = S / (2 * cp_size).
-Rank r holds two of them, chunk r (front block) and chunk 2 * cp_size - r - 1 (back block).
-The chunk-to-rank assignment is mirrored; for cp_size = 4 it looks like
+Causal flash attention sharded across cp_size ranks. The global sequence is split into
+2 * cp_size chunks of block = S / (2 * cp_size) tokens, and rank r holds chunk r (its front
+block) and chunk 2 * cp_size - r - 1 (its back block), which balances the causal work across
+ranks. For cp_size = 4:
 
     chunk:  0  1  2  3  4  5  6  7
     rank:   0  1  2  3  3  2  1  0
 
-Lower-indexed ranks pair one very-early chunk with one very-late chunk; higher-indexed ranks
-pair two near-middle chunks. The early chunk has few tokens before it (light causal work),
-the late one has many (heavy). They cancel, so every rank ends up doing the same amount of
-attention work.
+Q stays on its rank; K and V rotate one hop per step to rank r + 1, each hop posted before the
+step's flash call so the transfer overlaps it. The backward rotates K and V again and, in the
+same direction, the partial dK and dV, which reach their own rank after cp_size hops. Q, K, V and
+the output are in this zigzag layout; the caller permutes the sequence.
 
-Q stays on its home rank; K/V rotate one hop per step in the +1 direction. Each step posts
-its next-step batch_isend_irecv before launching its flash kernel, so the transfer overlaps
-with compute. The backward runs two rings concurrently: K/V rotates as in the forward (we
-re-derive partial outputs rather than save cp_size copies), and partial dK/dV rotates in the
-same direction so every contribution reaches its originating rank after cp_size hops.
+At step s, rank r holds the K and V of rank kv = (r - s) mod cp_size, and exactly one of three
+flash calls covers the step:
 
-Q, K, V, and the returned output are all in the zigzag local layout; the caller (data loader
-and RoPE) does the permutation.
-
-The non-obvious part is which flash call covers each step. At step s, rank r holds K/V
-originating from kv = (r - s) mod cp_size; the rotated K has its own front block (chunk kv)
-and back block (chunk 2 * cp_size - kv - 1). Comparing global chunk positions, exactly one
-of three pictures holds:
-
-    step == 0     (kv == r)   flash(q,            k,            v,            causal=True)
+    s == 0        (kv == r)   flash(q,            k,            v,            causal=True)
     1 <= s <= r   (kv <  r)   flash(q,            k[:, :block], v[:, :block], causal=False)
     s >  r        (kv >  r)   flash(q[:, block:], k,            v,            causal=False)
 
-  step 0: K is local. The four (q_part, k_part) sub-blocks line up with a 2*block local
-          causal mask, so one causal call handles everything.
+  step 0: K is local, and the local causal mask is the global one.
+  kv < r: only K's front block precedes Q, and all of Q attends to it.
+  kv > r: only Q's back block follows K, and it attends to all of K.
 
-  kv < r: K came from a lower-indexed rank, whose chunks live at extreme positions. Only its
-          front block survives the global causal mask; both halves of Q attend to it fully.
+Packed sequences use the same schedule one document at a time (zigzag_varlen_index), with one
+varlen call per step: local boundaries are cu_seqlens // cp_size and block boundaries
+cu_seqlens // (2 * cp_size).
 
-  kv > r: K came from a higher-indexed rank, whose chunks live at central positions. Only
-          Q's back block attends, sees the full rotated K, and only the back-block positions
-          of out / lse are updated.
-
-Every step costs the same: one causal pass on length 2*block, or one non-causal pass on a
-2*block-by-block rectangle.
-
-Packed sequences use the same schedule per document (cp_sequence.zigzag_varlen_index), with
-one varlen call per step. All ranks share local boundaries cu_seqlens // cp_size. Front/back
-blocks are gathered with boundaries cu_seqlens // (2 * cp_size). Causal calls have equal Q/K
-lengths; padding ensures each non-empty document has tokens in every block.
+The MLA variant rotates the compressed latent (normed_kv and k_pe) instead of per-head K and V,
+and decompresses it through kv_b on every rank. The kv_b weight gradient stays on the rank (FSDP
+reduces it across CP); only the latent gradient rotates back.
 """
 
 from typing import List, Optional, Tuple
@@ -71,14 +52,13 @@ from torch.distributed import (
 )
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from pithtrain.operators.deepgemm_quantize import (
-    fp8cast_rowwise_blockwise_transpose,
+from pithtrain.kernels import (
+    fp8_gemm_bwd,
+    fp8_gemm_fwd,
+    fp8_quant_act,
 )
 
-# FP8 (deep-gemm) shared GEMM recipe + the activation quantizer for the in-ring kv_b
-# decompression; reached only when the caller passes a quantized kv_b weight
-# (i.e. training.fp8 enabled).
-from pithtrain.operators.linear import fp8_act_weight_gemm, fp8_dgrad_wgrad
+__all__ = ["mla_ring_attention_func", "ring_attention_func", "ring_attention_varlen_func"]
 
 
 def post_ring_kv(
@@ -90,10 +70,6 @@ def post_ring_kv(
     k_recv: Optional[torch.Tensor] = None,
     v_recv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Work]]:
-    """
-    Async (K, V) ring hop. Pre-allocated recv buffers let the backward recycle just-sent
-    dK/dV buffers as the next iteration's recv slots.
-    """
     if not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("ring P2P requires contiguous send buffers")
     if k_recv is None:
@@ -123,8 +99,7 @@ def combine_partial(
     start: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Online-softmax merge of a partial flash output into the running fp32 accumulator. When
-    start > 0 only positions [start:] are updated; the first call must have start == 0.
+    Online-softmax merge of a partial flash output into the running fp32 accumulator.
     """
     partial_out = partial_out.to(torch.float32)
     partial_lse = partial_lse.transpose(-2, -1).unsqueeze(-1)
@@ -263,8 +238,8 @@ def zigzag_backward(
                     causal=False,
                 )
                 dq[:, block:] += dq_step
-            # Adopt the previous hop's dK/dV as the working accumulator.
-            # The buffers we shipped one hop ago are free to recycle.
+            # Take over the dK and dV that arrived; the buffers sent one hop ago are now free to
+            # receive the next ones.
             wait_ring(grad_work)
             grad_recv_slot_k, grad_recv_slot_v = dk, dv
             dk, dv = incoming_dk, incoming_dv
@@ -285,25 +260,10 @@ def zigzag_backward(
     return dq.to(q.dtype), incoming_dk.to(q.dtype), incoming_dv.to(q.dtype)
 
 
-# ---------------------------------------------------------------------------
-# Opaque custom-op wrappers.
-#
-# The ring forward/backward are wrapped as torch.library.custom_op so torch.compile sees
-# the whole ring -- P2P collectives, flash kernels, online-softmax merge -- as one black
-# box, exactly like the FA4 kernels in flash_attn_v4.py. This lets the decoder layer keep
-# `_forward_attention_compute` under @torch.compile(fullgraph=True) even under context
-# parallelism (Dynamo fuses the surrounding LN/RoPE/residual and emits an opaque call for
-# the ring) instead of falling back to eager. The collectives never enter the Inductor
-# graph; the op body runs eagerly at runtime.
-#
-# A ProcessGroup is not a legal custom-op argument, so the public funcs pass the group's
-# registered name (`cp_group.group_name`) and the op body resolves it via
-# `_resolve_process_group` -- the same name<->group registry the functional collectives use.
-# ---------------------------------------------------------------------------
-
-
+# Each ring is a custom op so that a fullgraph torch.compile region can call it as one opaque
+# node. A ProcessGroup cannot be a custom-op argument, so the op takes the group's name.
 @torch.library.custom_op("pithtrain::zigzag_ring_fwd", mutates_args=())
-def _zigzag_ring_fwd(
+def zigzag_ring_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -317,7 +277,7 @@ def _zigzag_ring_fwd(
     return zigzag_forward(q, k, v, sm_scale, _resolve_process_group(group_name))
 
 
-@_zigzag_ring_fwd.register_fake
+@zigzag_ring_fwd.register_fake
 def _(q, k, v, sm_scale, group_name):
     b, s, hq, _ = q.shape
     out = torch.empty((b, s, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
@@ -326,7 +286,7 @@ def _(q, k, v, sm_scale, group_name):
 
 
 @torch.library.custom_op("pithtrain::zigzag_ring_bwd", mutates_args=())
-def _zigzag_ring_bwd(
+def zigzag_ring_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -339,10 +299,9 @@ def _zigzag_ring_bwd(
     return zigzag_backward(dout, q, k, v, out, lse, sm_scale, _resolve_process_group(group_name))
 
 
-@_zigzag_ring_bwd.register_fake
+@zigzag_ring_bwd.register_fake
 def _(dout, q, k, v, out, lse, sm_scale, group_name):
-    # dk/dv take q.dtype to match zigzag_backward's `.to(q.dtype)` cast, not k/v's dtype
-    # (identical today since q/k/v share a dtype, but the meta must track the real contract).
+    # dk and dv take q.dtype, as zigzag_backward casts them to it.
     return (
         torch.empty_like(q),
         torch.empty(k.shape, dtype=q.dtype, device=q.device),
@@ -350,7 +309,7 @@ def _(dout, q, k, v, out, lse, sm_scale, group_name):
     )
 
 
-def _zigzag_setup_context(ctx, inputs, output):
+def zigzag_ring_setup_context(ctx, inputs, output):
     q, k, v, sm_scale, group_name = inputs
     out, lse = output
     ctx.save_for_backward(q, k, v, out, lse)
@@ -358,13 +317,13 @@ def _zigzag_setup_context(ctx, inputs, output):
     ctx.group_name = group_name
 
 
-def _zigzag_backward(ctx, grad_out, grad_lse):
+def zigzag_ring_backward(ctx, grad_out, grad_lse):
     q, k, v, out, lse = ctx.saved_tensors
-    dq, dk, dv = _zigzag_ring_bwd(grad_out, q, k, v, out, lse, ctx.sm_scale, ctx.group_name)
+    dq, dk, dv = zigzag_ring_bwd(grad_out, q, k, v, out, lse, ctx.sm_scale, ctx.group_name)
     return dq, dk, dv, None, None
 
 
-_zigzag_ring_fwd.register_autograd(_zigzag_backward, setup_context=_zigzag_setup_context)
+zigzag_ring_fwd.register_autograd(zigzag_ring_backward, setup_context=zigzag_ring_setup_context)
 
 
 def ring_attention_func(
@@ -375,49 +334,24 @@ def ring_attention_func(
     cp_group: ProcessGroup,
 ) -> torch.Tensor:
     """
-    Causal zigzag ring attention across context-parallel ranks.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query tensor of shape [batch, S_local, num_q_heads, head_dim] in zigzag local
-        layout, where S_local = S / cp_size for a global sequence of length S.
-    k : torch.Tensor
-        Key tensor of shape [batch, S_local, num_kv_heads, head_dim] in the same zigzag
-        layout as q. Must be contiguous; rotated around the ring during forward and
-        re-rotated during backward.
-    v : torch.Tensor
-        Value tensor of shape [batch, S_local, num_kv_heads, head_dim_v] in the same
-        zigzag layout as q. Must be contiguous.
-    sm_scale : float
-        Softmax scale, typically head_dim ** -0.5.
-    cp_group : torch.distributed.ProcessGroup
-        Context-parallel process group. Must contain at least two ranks; the single-rank
-        case is handled upstream by skipping the ring entirely.
-
-    Returns
-    -------
-    torch.Tensor
-        Attention output of shape [batch, S_local, num_q_heads, head_dim_v] in q.dtype,
-        returned in the same zigzag local layout as q.
+    Causal zigzag ring attention across the cp_group ranks (at least two). q (B, S_local, Hq, D),
+    k (B, S_local, Hkv, D) and v (B, S_local, Hkv, Dv) are in the zigzag layout, S_local being
+    S / cp_size; k and v must be contiguous. Returns the output (B, S_local, Hq, Dv) in q.dtype,
+    in the same layout.
     """
-    out, _ = _zigzag_ring_fwd(q, k, v, sm_scale, cp_group.group_name)
+    out, _ = zigzag_ring_fwd(q, k, v, sm_scale, cp_group.group_name)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Packed (varlen) zigzag ring attention: the same schedule, block-diagonal by document.
-# ---------------------------------------------------------------------------
 
 
 def document_blocks(cu_blocks: torch.Tensor, total: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Front/back indices for documents spanning [2 * cu_blocks[d], 2 * cu_blocks[d + 1]).
+    The local indices of the front and back block tokens of every document, for documents that
+    span [2 * cu_blocks[d], 2 * cu_blocks[d + 1]) of the total local tokens.
     """
-    t = torch.arange(total // 2, device=cu_blocks.device, dtype=cu_blocks.dtype)
-    doc = torch.searchsorted(cu_blocks, t, right=True) - 1
-    front = t + cu_blocks[doc]
-    return front, front + cu_blocks[doc + 1] - cu_blocks[doc]
+    token_idx = torch.arange(total // 2, device=cu_blocks.device, dtype=cu_blocks.dtype)
+    doc_idx = torch.searchsorted(cu_blocks, token_idx, right=True) - 1
+    front = token_idx + cu_blocks[doc_idx]
+    return front, front + cu_blocks[doc_idx + 1] - cu_blocks[doc_idx]
 
 
 def zigzag_varlen_forward(
@@ -468,7 +402,7 @@ def zigzag_varlen_forward(
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
         else:
-            # All remaining steps update back blocks only; gather and scatter once.
+            # The remaining steps update back blocks only, so gather them once and scatter once.
             if step == cp_rank + 1:
                 q_back = q[back]
                 out_back, lse_back = out[back], lse[back]
@@ -577,13 +511,12 @@ def zigzag_varlen_backward(
                     softmax_scale=sm_scale,
                     causal=False,
                 )
-                # Accumulate back-block dQ separately, then scatter once.
                 if step == cp_rank + 1:
                     dq_back = dq_step.to(torch.float32)
                 else:
                     dq_back += dq_step
-            # Adopt the previous hop's dK/dV as the working accumulator.
-            # The buffers we shipped one hop ago are free to recycle.
+            # Take over the dK and dV that arrived; the buffers sent one hop ago are now free to
+            # receive the next ones.
             wait_ring(grad_work)
             grad_recv_slot_k, grad_recv_slot_v = dk, dv
             dk, dv = incoming_dk, incoming_dv
@@ -607,7 +540,7 @@ def zigzag_varlen_backward(
 
 
 @torch.library.custom_op("pithtrain::zigzag_ring_varlen_fwd", mutates_args=())
-def _zigzag_ring_varlen_fwd(
+def zigzag_ring_varlen_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -622,7 +555,7 @@ def _zigzag_ring_varlen_fwd(
     return zigzag_varlen_forward(q, k, v, cu_seqlens, sm_scale, _resolve_process_group(group_name))
 
 
-@_zigzag_ring_varlen_fwd.register_fake
+@zigzag_ring_varlen_fwd.register_fake
 def _(q, k, v, cu_seqlens, sm_scale, group_name):
     t, hq, _ = q.shape
     out = torch.empty((t, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
@@ -631,7 +564,7 @@ def _(q, k, v, cu_seqlens, sm_scale, group_name):
 
 
 @torch.library.custom_op("pithtrain::zigzag_ring_varlen_bwd", mutates_args=())
-def _zigzag_ring_varlen_bwd(
+def zigzag_ring_varlen_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -646,7 +579,7 @@ def _zigzag_ring_varlen_bwd(
     return zigzag_varlen_backward(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group)
 
 
-@_zigzag_ring_varlen_bwd.register_fake
+@zigzag_ring_varlen_bwd.register_fake
 def _(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group_name):
     return (
         torch.empty_like(q),
@@ -655,7 +588,7 @@ def _(dout, q, k, v, out, lse, cu_seqlens, sm_scale, group_name):
     )
 
 
-def _zigzag_varlen_setup_context(ctx, inputs, output):
+def zigzag_ring_varlen_setup_context(ctx, inputs, output):
     q, k, v, cu_seqlens, sm_scale, group_name = inputs
     out, lse = output
     ctx.save_for_backward(q, k, v, out, lse, cu_seqlens)
@@ -663,16 +596,16 @@ def _zigzag_varlen_setup_context(ctx, inputs, output):
     ctx.group_name = group_name
 
 
-def _zigzag_varlen_backward(ctx, grad_out, grad_lse):
+def zigzag_ring_varlen_backward(ctx, grad_out, grad_lse):
     q, k, v, out, lse, cu_seqlens = ctx.saved_tensors
-    dq, dk, dv = _zigzag_ring_varlen_bwd(
+    dq, dk, dv = zigzag_ring_varlen_bwd(
         grad_out, q, k, v, out, lse, cu_seqlens, ctx.sm_scale, ctx.group_name
     )
     return dq, dk, dv, None, None, None
 
 
-_zigzag_ring_varlen_fwd.register_autograd(
-    _zigzag_varlen_backward, setup_context=_zigzag_varlen_setup_context
+zigzag_ring_varlen_fwd.register_autograd(
+    zigzag_ring_varlen_backward, setup_context=zigzag_ring_varlen_setup_context
 )
 
 
@@ -685,61 +618,18 @@ def ring_attention_varlen_func(
     cp_group: ProcessGroup,
 ) -> torch.Tensor:
     """
-    Causal zigzag ring attention over a packed sequence, block-diagonal by document.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query tensor of shape [S_local, num_q_heads, head_dim]: this rank's tokens of the packed
-        sequence in the order zigzag_varlen_index gives, two blocks of every document.
-    k, v : torch.Tensor
-        Key and value tensors of shape [S_local, num_kv_heads, head_dim(_v)] in the same layout
-        as q. Must be contiguous.
-    cu_seqlens : torch.Tensor
-        int32 boundaries of the documents in the whole packed sequence, not in this rank's
-        share of it. Every document is a multiple of 2 * cp_size tokens long, so that
-        S_local == cu_seqlens[-1] // cp_size.
-    sm_scale : float
-        Softmax scale, typically head_dim ** -0.5.
-    cp_group : torch.distributed.ProcessGroup
-        Context-parallel process group of at least two ranks.
-
-    Returns
-    -------
-    torch.Tensor
-        Attention output of shape [S_local, num_q_heads, head_dim_v] in q.dtype, in the same
-        layout as q.
+    Causal zigzag ring attention over a packed sequence, block-diagonal by document. q (S_local, Hq,
+    D), k and v (S_local, Hkv, D or Dv) hold this rank's tokens in the order zigzag_varlen_index
+    gives; k and v must be contiguous. cu_seqlens holds the int32 document boundaries of the whole
+    packed sequence, every document a multiple of 2 * cp_size tokens long, so S_local ==
+    cu_seqlens[-1] // cp_size. cp_group has at least two ranks. Returns the output (S_local, Hq, Dv)
+    in q.dtype, in the same layout.
     """
-    out, _ = _zigzag_ring_varlen_fwd(q, k, v, cu_seqlens, sm_scale, cp_group.group_name)
+    out, _ = zigzag_ring_varlen_fwd(q, k, v, cu_seqlens, sm_scale, cp_group.group_name)
     return out
 
 
-# ---------------------------------------------------------------------------
-# MLA (Multi-head Latent Attention) zigzag ring attention -- "pass the latent".
-#
-# Standard ring attention (above) would require decompressing the MLA latent
-# into full per-head K/V and rotating that around the ring:
-#     num_heads * q_head_dim (key) + num_heads * v_head_dim (value)
-# elements per token. Instead we rotate the *compressed latent* itself --
-# normed_kv (kv_lora_rank) plus the shared rope key k_pe (qk_rope_head_dim) --
-# and decompress locally on each rank via the kv_b projection. For
-# DeepSeek-V2-Lite this cuts the per-token ring payload from 5120 to 576
-# elements (~8.9x), in both the forward K/V ring and the backward gradient ring.
-#
-# kv_a_layernorm and RoPE are applied by the caller (both are per-token,
-# position-only ops), so the rotated latent already carries them; RoPE's
-# relative-position property makes pre-rotation correct. The decompression is a
-# bf16 matmul with the (FSDP-gathered) kv_b weight. Its weight gradient is
-# accumulated locally and summed across CP ranks by FSDP's reduce; only the
-# latent *activation* gradient rings back to each token's origin rank.
-#
-# The three-case flash schedule and the online-softmax merge are identical to
-# the standard ring -- the only addition is a local decompression before each
-# flash call (and its backprop on the way back).
-# ---------------------------------------------------------------------------
-
-
-def _mla_decompress(
+def mla_decompress(
     normed_kv: torch.Tensor,
     kv_b_weight: torch.Tensor,
     num_heads: int,
@@ -750,24 +640,18 @@ def _mla_decompress(
     weight_fp8: Optional[torch.Tensor] = None,
     scale_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Decompress a latent block into per-head (k_nope, value) via kv_b: y = x @ Wt.
-
-    When ``use_fp8`` the matmul uses the DeepGEMM FP8 path (mirroring FP8Linear): the latent
-    block is rowwise-quantized to FP8 here (it differs every ring hop), and the kv_b weight
-    is pre-quantized once per micro-batch by the caller (``weight_fp8``/``scale_weight``).
     """
-    b, n, _ = normed_kv.shape
+    Decompress a latent block (B, S, kv_lora_rank) into per-head k_nope and value through kv_b.
+    """
+    batch, seq_len, _ = normed_kv.shape
     if use_fp8:
-        x2d = normed_kv.reshape(b * n, normed_kv.shape[-1])
-        kv2d, _, _ = fp8_act_weight_gemm(x2d, weight_fp8, scale_weight)
-        kv = kv2d.view(b, n, num_heads, qk_nope_head_dim + v_head_dim)
+        x_2d = normed_kv.reshape(batch * seq_len, normed_kv.shape[-1])
+        kv_2d, _, _ = fp8_gemm_fwd(x_2d, weight_fp8, scale_weight)
+        kv = kv_2d.view(batch, seq_len, num_heads, qk_nope_head_dim + v_head_dim)
     else:
-        kv = F.linear(normed_kv, kv_b_weight).view(b, n, num_heads, qk_nope_head_dim + v_head_dim)
+        kv = F.linear(normed_kv, kv_b_weight).view(batch, seq_len, num_heads, qk_nope_head_dim + v_head_dim)  # fmt: skip
     k_nope, value = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
-    # k_nope is consumed only by `torch.cat([k_nope, k_pe.expand(...)], dim=-1)`, which
-    # materialises a fresh contiguous output regardless of input strides -- the .contiguous()
-    # would be a redundant copy. value goes straight into _flash_attn_{fwd,bwd}, which require
-    # contiguous K/V on the FA4 cute path, so the asymmetry is intentional.
+    # Only value needs to be contiguous: FA4 reads it directly, while k_nope goes through a cat.
     return k_nope, value.contiguous()
 
 
@@ -791,12 +675,10 @@ def mla_zigzag_forward(
     src = get_global_rank(cp_group, (cp_rank - 1) % cp_size)
     num_heads = q_nope.shape[2]
     block = q_nope.shape[1] // 2
-    _fp8_kw = dict(use_fp8=use_fp8, weight_fp8=weight_fp8, scale_weight=scale_weight)
+    fp8_kwargs = dict(use_fp8=use_fp8, weight_fp8=weight_fp8, scale_weight=scale_weight)
 
     q = torch.cat([q_nope, q_pe], dim=-1)
-    # q_back is a strided view (kept non-contiguous in forward to match the standard zigzag
-    # ring at line 144 -- FA4 forward tolerates strided q). Backward explicitly contiguous-ifies
-    # the same slice (line 462) because FA4 backward has tighter strider requirements on q.
+    # A strided view is fine for FA4's forward; the backward makes its copy contiguous.
     q_back = q[:, block:]
 
     out: Optional[torch.Tensor] = None
@@ -809,8 +691,8 @@ def mla_zigzag_forward(
         if step + 1 < cp_size:
             next_kv, next_pe, kv_work = post_ring_kv(normed_kv, k_pe, cp_group, dst, src)
         if step == 0:
-            k_nope, value = _mla_decompress(
-                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
+            k_nope, value = mla_decompress(
+                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **fp8_kwargs
             )
             key = torch.cat([k_nope, k_pe.expand(-1, -1, num_heads, -1)], dim=-1)
             partial_out, partial_lse, *_ = _flash_attn_fwd(
@@ -818,13 +700,13 @@ def mla_zigzag_forward(
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
         elif step <= cp_rank:
-            k_nope, value = _mla_decompress(
+            k_nope, value = mla_decompress(
                 normed_kv[:, :block],
                 kv_b_weight,
                 num_heads,
                 qk_nope_head_dim,
                 v_head_dim,
-                **_fp8_kw,
+                **fp8_kwargs,
             )
             key = torch.cat([k_nope, k_pe[:, :block].expand(-1, -1, num_heads, -1)], dim=-1)
             partial_out, partial_lse, *_ = _flash_attn_fwd(
@@ -832,8 +714,8 @@ def mla_zigzag_forward(
             )
             out, lse = combine_partial(out, lse, partial_out, partial_lse)
         else:
-            k_nope, value = _mla_decompress(
-                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
+            k_nope, value = mla_decompress(
+                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **fp8_kwargs
             )
             key = torch.cat([k_nope, k_pe.expand(-1, -1, num_heads, -1)], dim=-1)
             partial_out, partial_lse, *_ = _flash_attn_fwd(
@@ -872,14 +754,14 @@ def mla_zigzag_backward(
     cp_rank, cp_size = get_rank(cp_group), get_world_size(cp_group)
     dst = get_global_rank(cp_group, (cp_rank + 1) % cp_size)
     src = get_global_rank(cp_group, (cp_rank - 1) % cp_size)
-    b = q_nope.shape[0]
+    batch = q_nope.shape[0]
     num_heads = q_nope.shape[2]
     block = q_nope.shape[1] // 2
     rope_dim = k_pe.shape[-1]
     lora_rank = normed_kv.shape[-1]
     out_features = kv_b_weight.shape[0]
-    weight_f = None if use_fp8 else kv_b_weight.to(torch.float32)
-    _fp8_kw = dict(use_fp8=use_fp8, weight_fp8=weight_fp8, scale_weight=scale_weight)
+    weight_fp32 = None if use_fp8 else kv_b_weight.to(torch.float32)
+    fp8_kwargs = dict(use_fp8=use_fp8, weight_fp8=weight_fp8, scale_weight=scale_weight)
 
     q = torch.cat([q_nope, q_pe], dim=-1)
     dout = dout.contiguous()
@@ -890,26 +772,25 @@ def mla_zigzag_backward(
 
     dq: Optional[torch.Tensor] = None
     dW = torch.zeros((out_features, lora_rank), device=kv_b_weight.device, dtype=torch.float32)
-    d_nkv: Optional[torch.Tensor] = None
-    d_kpe: Optional[torch.Tensor] = None
+    d_normed_kv: Optional[torch.Tensor] = None
+    d_k_pe: Optional[torch.Tensor] = None
     next_kv: Optional[torch.Tensor] = None
     next_pe: Optional[torch.Tensor] = None
     kv_work: Optional[List[Work]] = None
-    incoming_dnkv: Optional[torch.Tensor] = None
-    incoming_dkpe: Optional[torch.Tensor] = None
-    grad_slot_nkv: Optional[torch.Tensor] = None
-    grad_slot_kpe: Optional[torch.Tensor] = None
+    incoming_d_normed_kv: Optional[torch.Tensor] = None
+    incoming_d_k_pe: Optional[torch.Tensor] = None
+    grad_recv_slot_normed_kv: Optional[torch.Tensor] = None
+    grad_recv_slot_k_pe: Optional[torch.Tensor] = None
     grad_work: Optional[List[Work]] = None
 
     for step in range(cp_size):
         if step + 1 < cp_size:
             next_kv, next_pe, kv_work = post_ring_kv(normed_kv, k_pe, cp_group, dst, src)
 
-        # Recompute the decompression for the resident block and run flash backward.
         if step == 0:
-            nkv_blk = normed_kv
-            k_nope, value = _mla_decompress(
-                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
+            normed_kv_block = normed_kv
+            k_nope, value = mla_decompress(
+                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **fp8_kwargs
             )
             key = torch.cat([k_nope, k_pe.expand(-1, -1, num_heads, -1)], dim=-1)
             dq_step, dkey_step, dvalue_step = _flash_attn_bwd(
@@ -917,9 +798,9 @@ def mla_zigzag_backward(
             )
             front = False
         elif step <= cp_rank:
-            nkv_blk = normed_kv[:, :block]
-            k_nope, value = _mla_decompress(
-                nkv_blk, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
+            normed_kv_block = normed_kv[:, :block]
+            k_nope, value = mla_decompress(
+                normed_kv_block, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **fp8_kwargs
             )
             key = torch.cat([k_nope, k_pe[:, :block].expand(-1, -1, num_heads, -1)], dim=-1)
             dq_step, dkey_step, dvalue_step = _flash_attn_bwd(
@@ -927,9 +808,9 @@ def mla_zigzag_backward(
             )
             front = True
         else:
-            nkv_blk = normed_kv
-            k_nope, value = _mla_decompress(
-                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **_fp8_kw
+            normed_kv_block = normed_kv
+            k_nope, value = mla_decompress(
+                normed_kv, kv_b_weight, num_heads, qk_nope_head_dim, v_head_dim, **fp8_kwargs
             )
             key = torch.cat([k_nope, k_pe.expand(-1, -1, num_heads, -1)], dim=-1)
             dq_step, dkey_step, dvalue_step = _flash_attn_bwd(
@@ -944,37 +825,33 @@ def mla_zigzag_backward(
             )
             front = False
 
-        # Backprop the decompression: (dk_nope, dvalue) -> d(normed_kv) + kv_b weight grad.
         dk_nope, dk_pe = torch.split(dkey_step, [qk_nope_head_dim, rope_dim], dim=-1)
-        n = dk_nope.shape[1]
+        kv_len = dk_nope.shape[1]
         if use_fp8:
-            # FP8 dgrad/wgrad via the shared recipe. dy = [dk_nope | dvalue] (M, out_features).
-            # The wgrad needs this hop's latent block transposed; we re-quantize it here rather
-            # than stash it from the forward (recompute is the deliberate memory/compute trade).
-            dy2d = (
+            # The wgrad's transposed FP8 latent block is quantized again rather than saved.
+            dy_2d = (
                 torch.cat([dk_nope, dvalue_step], dim=-1)
-                .reshape(b * n, out_features)
+                .reshape(batch * kv_len, out_features)
                 .to(normed_kv.dtype)
             )
-            _, _, x_t_fp8, scale_x_t = fp8cast_rowwise_blockwise_transpose(
-                nkv_blk.reshape(b * n, lora_rank)
+            _, _, x_t_fp8, scale_x_t = fp8_quant_act(
+                normed_kv_block.reshape(batch * kv_len, lora_rank)
             )
-            d_nkv_2d, dW_blk = fp8_dgrad_wgrad(
-                dy2d, weight_t_fp8, scale_weight_t, x_t_fp8, scale_x_t, lora_rank
+            d_normed_kv_2d, dW_block = fp8_gemm_bwd(
+                dy_2d, weight_t_fp8, scale_weight_t, x_t_fp8, scale_x_t, lora_rank
             )
-            d_nkv_blk = d_nkv_2d.view(b, n, lora_rank).to(torch.float32)
-            dW += dW_blk.to(torch.float32)
+            d_normed_kv_block = d_normed_kv_2d.view(batch, kv_len, lora_rank).to(torch.float32)
+            dW += dW_block.to(torch.float32)
         else:
             d_kv = (
                 torch.cat([dk_nope, dvalue_step], dim=-1)
-                .reshape(b * n, out_features)
+                .reshape(batch * kv_len, out_features)
                 .to(torch.float32)
             )
-            d_nkv_blk = (d_kv @ weight_f).view(b, n, lora_rank)
-            dW += d_kv.t() @ nkv_blk.reshape(b * n, lora_rank).to(torch.float32)
-        d_kpe_blk = dk_pe.sum(dim=2, keepdim=True).to(torch.float32).contiguous()
+            d_normed_kv_block = (d_kv @ weight_fp32).view(batch, kv_len, lora_rank)
+            dW += d_kv.t() @ normed_kv_block.reshape(batch * kv_len, lora_rank).to(torch.float32)
+        d_k_pe_block = dk_pe.sum(dim=2, keepdim=True).to(torch.float32).contiguous()
 
-        # dq accumulates locally (queries never leave their home rank).
         if step == 0:
             dq = dq_step.to(torch.float32)
         elif step <= cp_rank:
@@ -982,32 +859,28 @@ def mla_zigzag_backward(
         else:
             dq[:, block:] += dq_step
 
-        # Latent gradient ring (mirrors the standard dk/dv ring, on the 576-d latent).
         if step == 0:
-            # `d_nkv` aliases `d_nkv_blk` (the fp32 matmul output). Safe as a send buffer
-            # for `post_ring_kv` below because subsequent iterations rebind d_nkv_blk to a
-            # fresh matmul result -- the step-0 buffer is never mutated before step-1's
-            # wait_ring(grad_work). If a future refactor adds in-place ops on d_nkv_blk,
-            # replace these with .clone() to break the alias.
-            d_nkv = d_nkv_blk
-            d_kpe = d_kpe_blk
+            # Aliasing is safe: later steps rebind d_normed_kv_block to a new tensor and never
+            # write this send buffer in place.
+            d_normed_kv = d_normed_kv_block
+            d_k_pe = d_k_pe_block
         else:
             wait_ring(grad_work)
-            grad_slot_nkv, grad_slot_kpe = d_nkv, d_kpe
-            d_nkv, d_kpe = incoming_dnkv, incoming_dkpe
+            grad_recv_slot_normed_kv, grad_recv_slot_k_pe = d_normed_kv, d_k_pe
+            d_normed_kv, d_k_pe = incoming_d_normed_kv, incoming_d_k_pe
             if front:
-                d_nkv[:, :block] += d_nkv_blk
-                d_kpe[:, :block] += d_kpe_blk
+                d_normed_kv[:, :block] += d_normed_kv_block
+                d_k_pe[:, :block] += d_k_pe_block
             else:
-                d_nkv += d_nkv_blk
-                d_kpe += d_kpe_blk
+                d_normed_kv += d_normed_kv_block
+                d_k_pe += d_k_pe_block
 
         if step + 1 < cp_size:
             wait_ring(kv_work)
             normed_kv, k_pe = next_kv, next_pe
 
-        incoming_dnkv, incoming_dkpe, grad_work = post_ring_kv(
-            d_nkv, d_kpe, cp_group, dst, src, grad_slot_nkv, grad_slot_kpe
+        incoming_d_normed_kv, incoming_d_k_pe, grad_work = post_ring_kv(
+            d_normed_kv, d_k_pe, cp_group, dst, src, grad_recv_slot_normed_kv, grad_recv_slot_k_pe
         )
 
     wait_ring(grad_work)
@@ -1016,14 +889,14 @@ def mla_zigzag_backward(
     return (
         dq_nope.contiguous().to(dtype),
         dq_pe.contiguous().to(dtype),
-        incoming_dnkv.to(dtype),
-        incoming_dkpe.to(dtype),
+        incoming_d_normed_kv.to(dtype),
+        incoming_d_k_pe.to(dtype),
         dW,
     )
 
 
 @torch.library.custom_op("pithtrain::mla_zigzag_ring_fwd", mutates_args=())
-def _mla_zigzag_ring_fwd(
+def mla_zigzag_ring_fwd(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
     normed_kv: torch.Tensor,
@@ -1059,7 +932,7 @@ def _mla_zigzag_ring_fwd(
     )
 
 
-@_mla_zigzag_ring_fwd.register_fake
+@mla_zigzag_ring_fwd.register_fake
 def _(
     q_nope,
     q_pe,
@@ -1083,7 +956,7 @@ def _(
 
 
 @torch.library.custom_op("pithtrain::mla_zigzag_ring_bwd", mutates_args=())
-def _mla_zigzag_ring_bwd(
+def mla_zigzag_ring_bwd(
     dout: torch.Tensor,
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -1123,7 +996,7 @@ def _mla_zigzag_ring_bwd(
     )
 
 
-@_mla_zigzag_ring_bwd.register_fake
+@mla_zigzag_ring_bwd.register_fake
 def _(
     dout,
     q_nope,
@@ -1145,8 +1018,7 @@ def _(
 ):
     out_features, lora_rank = kv_b_weight.shape
     dW = torch.empty((out_features, lora_rank), dtype=torch.float32, device=kv_b_weight.device)
-    # d_normed_kv / d_k_pe take q_nope.dtype to match mla_zigzag_backward's `.to(q_nope.dtype)`
-    # cast (identical today since latent and query share a dtype, but the meta must track it).
+    # d_normed_kv and d_k_pe take q_nope.dtype, as mla_zigzag_backward casts them to it.
     return (
         torch.empty_like(q_nope),
         torch.empty_like(q_pe),
@@ -1156,7 +1028,7 @@ def _(
     )
 
 
-def _mla_zigzag_setup_context(ctx, inputs, output):
+def mla_zigzag_ring_setup_context(ctx, inputs, output):
     (
         q_nope,
         q_pe,
@@ -1180,17 +1052,16 @@ def _mla_zigzag_setup_context(ctx, inputs, output):
     ctx.v_head_dim = v_head_dim
     ctx.group_name = group_name
     ctx.use_fp8 = use_fp8
-    # FP8 weight tensors (None in bf16) are non-differentiable inputs reused in backward;
-    # stash on ctx as the autograd.Function this replaced did. dW routes to kv_b_weight.
+    # The FP8 weights (None in BF16) are non-differentiable, so they stay off the saved tensors.
     ctx.weight_fp8 = weight_fp8
     ctx.scale_weight = scale_weight
     ctx.weight_t_fp8 = weight_t_fp8
     ctx.scale_weight_t = scale_weight_t
 
 
-def _mla_zigzag_backward(ctx, grad_out, grad_lse):
+def mla_zigzag_ring_backward(ctx, grad_out, grad_lse):
     q_nope, q_pe, normed_kv, k_pe, kv_b_weight, out, lse = ctx.saved_tensors
-    dq_nope, dq_pe, d_normed_kv, d_k_pe, dW = _mla_zigzag_ring_bwd(
+    dq_nope, dq_pe, d_normed_kv, d_k_pe, dW = mla_zigzag_ring_bwd(
         grad_out,
         q_nope,
         q_pe,
@@ -1209,7 +1080,6 @@ def _mla_zigzag_backward(ctx, grad_out, grad_lse):
         ctx.weight_t_fp8,
         ctx.scale_weight_t,
     )
-    # Grads positionally match the fwd inputs; only the five differentiable tensors carry one.
     return (
         dq_nope,
         dq_pe,
@@ -1228,8 +1098,8 @@ def _mla_zigzag_backward(ctx, grad_out, grad_lse):
     )
 
 
-_mla_zigzag_ring_fwd.register_autograd(
-    _mla_zigzag_backward, setup_context=_mla_zigzag_setup_context
+mla_zigzag_ring_fwd.register_autograd(
+    mla_zigzag_ring_backward, setup_context=mla_zigzag_ring_setup_context
 )
 
 
@@ -1246,46 +1116,20 @@ def mla_ring_attention_func(
     kv_b_quant: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """
-    Causal zigzag ring attention for MLA, rotating the compressed latent.
-
-    Parameters
-    ----------
-    q_nope, q_pe : torch.Tensor
-        Query no-position / rope parts, shapes [batch, S_local, num_heads, qk_nope_head_dim]
-        and [batch, S_local, num_heads, qk_rope_head_dim], in zigzag local layout. RoPE is
-        already applied to q_pe by the caller. Queries stay on their home rank.
-    normed_kv : torch.Tensor
-        The compressed latent after kv_a_layernorm, shape [batch, S_local, kv_lora_rank], in
-        zigzag local layout. Rotated around the ring; decompressed locally via kv_b_weight.
-    k_pe : torch.Tensor
-        Shared rope key, shape [batch, S_local, 1, qk_rope_head_dim], RoPE already applied.
-        Rotated around the ring alongside normed_kv.
-    kv_b_weight : torch.Tensor
-        kv_b projection weight, shape [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank].
-        FSDP-gathered (full) inside forward_attention; its gradient is reduced across CP by FSDP.
-    sm_scale : float
-        Softmax scale, typically q_head_dim ** -0.5.
-    qk_nope_head_dim, v_head_dim : int
-        Head dims used to split the decompressed kv into (k_nope, value).
-    cp_group : torch.distributed.ProcessGroup
-        Context-parallel process group (>= 2 ranks; cp_size == 1 is handled upstream).
-    kv_b_quant : optional tuple
-        (weight_fp8, scale_weight, weight_t_fp8, scale_weight_t) -- the kv_b weight
-        pre-quantized once per micro-batch via FP8Linear._get_quantized_weight(). When given,
-        the in-ring decompression uses the FP8 DeepGEMM path (matmul + dgrad/wgrad) instead of
-        a bf16 F.linear. None -> bf16 path. ``kv_b_weight`` (the bf16 master) is still passed
-        so its gradient (dW) routes to kv_b_proj.weight for FSDP.
-
-    Returns
-    -------
-    torch.Tensor
-        Attention output [batch, S_local, num_heads, v_head_dim] in q dtype, zigzag layout.
+    Causal zigzag ring attention for MLA across the cp_group ranks (at least two), rotating the
+    compressed latent. In the zigzag layout, with RoPE already applied: q_nope (B, S_local, H,
+    qk_nope_head_dim), q_pe (B, S_local, H, qk_rope_head_dim), normed_kv (B, S_local, kv_lora_rank)
+    after kv_a_layernorm, and k_pe (B, S_local, 1, qk_rope_head_dim); normed_kv and k_pe must be
+    contiguous. kv_b_weight is the full (H * (qk_nope_head_dim + v_head_dim), kv_lora_rank) bf16
+    weight, which receives the gradient. With kv_b_quant, the quantized kv_b weight (weight_fp8,
+    scale_weight, weight_t_fp8, scale_weight_t), the decompression runs in FP8. Returns the output
+    (B, S_local, H, v_head_dim) in q_nope's dtype, in the same layout.
     """
     use_fp8 = kv_b_quant is not None
     weight_fp8, scale_weight, weight_t_fp8, scale_weight_t = (
         kv_b_quant if use_fp8 else (None, None, None, None)
     )
-    out, _ = _mla_zigzag_ring_fwd(
+    out, _ = mla_zigzag_ring_fwd(
         q_nope,
         q_pe,
         normed_kv,

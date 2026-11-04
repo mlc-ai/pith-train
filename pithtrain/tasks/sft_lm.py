@@ -288,7 +288,19 @@ def train_step(cfg: SFTLMCfg, microbatches: list[Microbatch], *, token_group) ->
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+    refresh_fp8_param_scales()
     return SFTStepResult(True, targets, loss)
+
+
+def refresh_fp8_param_scales() -> None:
+    """
+    Under FP8, FSDP gathers FP8 weight shards computed from the fp32 shards; recompute them after
+    the weights change, or the next gather asserts that they are stale.
+    """
+    if getattr(training, "fp8", False):
+        from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
+
+        precompute_fp8_param_scales()
 
 
 def launch(
@@ -357,6 +369,7 @@ def launch(
                 strict=True,
                 resume_config=checkpoint_contract,
             )
+            refresh_fp8_param_scales()
         adapter.validate_state_dict(adapter.state_dict())
     elif resume_scan is not None:
         raise ValueError("resume_scan requires a native checkpoint root")

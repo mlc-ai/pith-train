@@ -1,16 +1,26 @@
-"""Load balancing for MoE routing."""
-
 from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed
 import torch.distributed._functional_collectives as funcol
 
+__all__ = [
+    "GlobalBatchLoadBalanceLoss",
+    "MicroBatchLoadBalanceLoss",
+    "MoELoadBalanceLossInjector",
+    "MoELoadBalanceLossTracker",
+    "SequenceLevelLoadBalanceLoss",
+    "force_balance",
+    "make_load_balance_loss_fn",
+    "replay_indices",
+]
 
-def _expert_token_counts(idx_flat: torch.Tensor, n_bins: int) -> torch.Tensor:
-    """Equivalent to ``torch.bincount(idx_flat, minlength=n_bins)`` but without
-    the synchronous ``input.max().item()`` that ATen's CUDA bincount issues to
-    size its output. Assumes all values in ``[0, n_bins)``."""
+
+def expert_token_counts(idx_flat: torch.Tensor, n_bins: int) -> torch.Tensor:
+    """
+    torch.bincount(idx_flat, minlength=n_bins) without the host sync of CUDA bincount. Every value
+    must lie in [0, n_bins).
+    """
     out = torch.zeros(n_bins, dtype=torch.long, device=idx_flat.device)
     # Stride-0 view of a single 1 avoids materializing a full-size ones tensor.
     ones = torch.ones(1, dtype=torch.long, device=idx_flat.device).expand_as(idx_flat)
@@ -20,8 +30,8 @@ def _expert_token_counts(idx_flat: torch.Tensor, n_bins: int) -> torch.Tensor:
 
 class MoELoadBalanceLossInjector(torch.autograd.Function):
     """
-    Attach a load balance loss to the computation graph. The output tensor
-    passes through unchanged; in the backward pass the loss gradient is injected.
+    Attach a load-balance loss to the graph: output passes through unchanged, and the backward
+    gives lb_loss a gradient of one.
     """
 
     @staticmethod
@@ -40,12 +50,12 @@ torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
 class MicroBatchLoadBalanceLoss:
     """
-    Micro-batch load balance loss (https://arxiv.org/abs/2101.03961).
+    Micro-batch load-balance loss (https://arxiv.org/abs/2101.03961):
 
-        loss = coeff * E * sum_i(f_i * P_i)
+        loss = lb_coef * E * sum_i(f_i * P_i)
 
-    where f_i is the fraction of tokens dispatched to expert i and P_i is
-    the average router probability for expert i.
+    where f_i is the fraction of tokens dispatched to expert i and P_i is the mean router
+    probability of expert i, both over the micro-batch.
     """
 
     def __init__(self, lb_coef: float) -> None:
@@ -60,7 +70,7 @@ class MicroBatchLoadBalanceLoss:
     ) -> torch.Tensor:
         num_tokens = scores.shape[0]
 
-        tokens_per_expert = _expert_token_counts(topk_idx.reshape(-1), num_experts)
+        tokens_per_expert = expert_token_counts(topk_idx.reshape(-1), num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype)
         f = tokens_per_expert / (num_tokens * top_k)
         p = scores.mean(dim=0)
@@ -73,16 +83,10 @@ class MicroBatchLoadBalanceLoss:
 
 class GlobalBatchLoadBalanceLoss:
     """
-    Global-batch load balance loss (https://arxiv.org/abs/2501.11873).
-
-    Synchronises expert selection frequencies across DP x EP ranks via
-    all-reduce and accumulates counts across gradient-accumulation
-    micro-steps. The buffer is cleared after each optimizer step via
-    MoELoadBalanceLossTracker.reset().
-
-    Accumulation state uses pre-allocated tensors with in-place ops so that
-    __call__ is compatible with torch.compile (no Python attribute mutation).
-    Call init_buffers() before the first forward pass.
+    Global-batch load-balance loss (https://arxiv.org/abs/2501.11873): f_i is the fraction of tokens
+    routed to expert i over process_group and over the micro-batches of the step, which reset()
+    clears. Call init_buffers before the first forward; the counts live in preallocated tensors
+    updated in place, so __call__ compiles.
     """
 
     def __init__(
@@ -95,15 +99,14 @@ class GlobalBatchLoadBalanceLoss:
         self.group_size = (
             torch.distributed.get_world_size(process_group) if process_group is not None else 1
         )
-        self._count_buffer: Optional[torch.Tensor] = None
-        self._total_tokens: Optional[torch.Tensor] = None
+        self.count_buffer: Optional[torch.Tensor] = None
+        self.total_tokens: Optional[torch.Tensor] = None
 
     def init_buffers(self, num_experts: int, device: torch.device) -> None:
-        """Pre-allocate accumulation buffers. Must be called before __call__."""
-        if self._count_buffer is None:
-            # float32 to match scores dtype (softmax always outputs float32).
-            self._count_buffer = torch.zeros(num_experts, dtype=torch.float32, device=device)
-            self._total_tokens = torch.zeros((), dtype=torch.int32, device=device)
+        if self.count_buffer is None:
+            # float32 to match the dtype of scores, a softmax output.
+            self.count_buffer = torch.zeros(num_experts, dtype=torch.float32, device=device)
+            self.total_tokens = torch.zeros((), dtype=torch.int32, device=device)
 
     def __call__(
         self,
@@ -114,41 +117,32 @@ class GlobalBatchLoadBalanceLoss:
     ) -> torch.Tensor:
         num_tokens = scores.shape[0]
 
-        tokens_per_expert = _expert_token_counts(topk_idx.reshape(-1), num_experts)
+        tokens_per_expert = expert_token_counts(topk_idx.reshape(-1), num_experts)
         tokens_per_expert = tokens_per_expert.to(scores.dtype)
 
-        # Synchronise counts across DP x EP ranks. Functional collective (not in-place
-        # all_reduce) keeps the compiled gate fullgraph-traceable; counts carry no gradient.
+        # A functional collective keeps the gate fullgraph-traceable; counts need no gradient.
         if self.process_group is not None:
             tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.process_group)
 
-        # Accumulate in the gradient-accumulation buffer (in-place tensor ops).
-        self._count_buffer.add_(tokens_per_expert.detach())
-        self._total_tokens.add_(num_tokens * top_k * self.group_size)
+        self.count_buffer.add_(tokens_per_expert.detach())
+        self.total_tokens.add_(num_tokens * top_k * self.group_size)
 
-        f = self._count_buffer / self._total_tokens
+        f = self.count_buffer / self.total_tokens
         p = scores.mean(dim=0)
 
         return self.lb_coef * num_experts * torch.dot(f, p)
 
     def reset(self) -> None:
-        if self._count_buffer is not None:
-            self._count_buffer.zero_()
-            self._total_tokens.zero_()
+        if self.count_buffer is not None:
+            self.count_buffer.zero_()
+            self.total_tokens.zero_()
 
 
 class SequenceLevelLoadBalanceLoss:
     """
-    Sequence-level load balance loss (https://arxiv.org/abs/2405.04434).
-
-    Computes the standard load balance loss independently per sequence, then
-    averages over the batch.  This matches the DeepSeek-V2 formulation where
-    T is the number of tokens in a *single sequence*, not the micro-batch.
-
-    With CP, each CP rank sees only a chunk of the sequence.
-    The expert fraction f is all-reduced across CP ranks and normalized
-    by the full sequence length so that the LB gradient direction at the
-    gate weight matches CP=1.
+    Sequence-level load-balance loss (https://arxiv.org/abs/2405.04434): the load-balance loss of
+    each sequence of sequence_length tokens, averaged over the batch. Under context parallelism f
+    is summed over cp_group and normalized by the full sequence length, so the loss matches CP=1.
     """
 
     def __init__(
@@ -162,13 +156,9 @@ class SequenceLevelLoadBalanceLoss:
         self.cp_group = cp_group
         self.cp_size = cp_group.size() if cp_group is not None else 1
 
-    def _all_reduce_expert_counts(self, tokens_per_expert: torch.Tensor) -> torch.Tensor:
-        """All-reduce expert counts across CP ranks (noop when cp_group is None).
-
-        Uses the functional collective (not in-place ``torch.distributed.all_reduce``) so the
-        gate's ``compute`` stays traceable under ``torch.compile(fullgraph=True)`` even with CP
-        active -- counts are non-differentiable, so the reduce never enters the backward."""
-        if self.cp_group is not None:
+    def all_reduce_expert_counts(self, tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        # A functional collective keeps the gate fullgraph-traceable; counts need no gradient.
+        if self.cp_size > 1:
             tokens_per_expert = funcol.all_reduce(tokens_per_expert, "sum", self.cp_group)
         return tokens_per_expert
 
@@ -180,20 +170,20 @@ class SequenceLevelLoadBalanceLoss:
         top_k: int,
     ) -> torch.Tensor:
         sequence_length = self.sequence_length
-        bsz = scores.shape[0] // sequence_length
+        batch_size = scores.shape[0] // sequence_length
 
-        # Per-expert token counts per sequence: offset topk indices into a
-        # flattened [B*E] space so we can bincount in a single call.
-        batch_offsets = torch.arange(bsz, device=topk_idx.device)
+        # Offset each sequence's indices into its own block of num_experts bins, so one count
+        # covers the whole batch.
+        batch_offsets = torch.arange(batch_size, device=topk_idx.device)
         batch_offsets = batch_offsets.unsqueeze(1).expand(-1, sequence_length * top_k) * num_experts
-        flat_idx = topk_idx.view(bsz, -1) + batch_offsets
-        tokens_per_expert = _expert_token_counts(flat_idx.reshape(-1), bsz * num_experts)
-        tokens_per_expert = tokens_per_expert.to(scores.dtype).view(bsz, num_experts)
+        flat_idx = topk_idx.view(batch_size, -1) + batch_offsets
+        tokens_per_expert = expert_token_counts(flat_idx.reshape(-1), batch_size * num_experts)
+        tokens_per_expert = tokens_per_expert.to(scores.dtype).view(batch_size, num_experts)
 
-        tokens_per_expert = self._all_reduce_expert_counts(tokens_per_expert)
+        tokens_per_expert = self.all_reduce_expert_counts(tokens_per_expert)
 
         f = tokens_per_expert / (sequence_length * self.cp_size * top_k)
-        p = scores.view(bsz, sequence_length, num_experts).mean(dim=1)
+        p = scores.view(batch_size, sequence_length, num_experts).mean(dim=1)
 
         per_seq = (f * p).sum(dim=1) * num_experts
         return self.lb_coef * per_seq.mean()
@@ -203,7 +193,10 @@ class SequenceLevelLoadBalanceLoss:
 
 
 class MoELoadBalanceLossTracker:
-    """Tracks load balance loss instances and accumulates loss values for logging."""
+    """
+    The registry of load-balance losses, reset after each optimizer step, and the loss values
+    accumulated for logging.
+    """
 
     instances: List = []
     losses: List = []
@@ -214,8 +207,8 @@ class MoELoadBalanceLossTracker:
 
     @classmethod
     def reset(cls) -> None:
-        for inst in cls.instances:
-            inst.reset()
+        for instance in cls.instances:
+            instance.reset()
 
     @classmethod
     def add(cls, loss: torch.Tensor) -> None:
@@ -223,7 +216,9 @@ class MoELoadBalanceLossTracker:
 
     @classmethod
     def get_total_count_and_clear(cls) -> Tuple[float, int]:
-        """Return (total, count) of accumulated losses and clear the log."""
+        """
+        Syncs with the device.
+        """
         if not cls.losses:
             return 0.0, 0
         total = torch.stack(cls.losses).sum().item()
@@ -239,11 +234,6 @@ def make_load_balance_loss_fn(
     sequence_length: int = 0,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """
-    Create a load balance loss callable for MoE gates.
-
-    Returns a callable with signature (scores, topk_idx, num_experts, top_k) -> loss.
-    """
     match lb_type:
         case "micro-batch":
             loss = MicroBatchLoadBalanceLoss(lb_coef)
@@ -259,10 +249,8 @@ def make_load_balance_loss_fn(
 
 def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
     """
-    Build a benchmark-only router replay that spreads tokens evenly across all
-    ``num_experts`` (round-robin), giving every expert an equal, dropless load.
-    The returned callable gives the ``[num_tokens, top_k]`` indices a gate should use. They depend
-    only on the shape, so each shape is built once and the same tensor is returned after that.
+    A benchmark-only router replay that gives every expert an equal load. The returned function maps
+    (num_tokens, top_k) to the (num_tokens, top_k) expert indices a gate should use.
     """
     cache: dict[tuple[int, int], torch.Tensor] = {}
 
@@ -271,9 +259,9 @@ def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
         if indices is None:
             stride = num_experts // top_k
             device = torch.cuda.current_device()
-            t = torch.arange(num_tokens, device=device).unsqueeze(1)
-            j = torch.arange(top_k, device=device).unsqueeze(0)
-            indices = cache[(num_tokens, top_k)] = (t + j * stride) % num_experts
+            token = torch.arange(num_tokens, device=device).unsqueeze(1)
+            slot = torch.arange(top_k, device=device).unsqueeze(0)
+            indices = cache[(num_tokens, top_k)] = (token + slot * stride) % num_experts
         return indices
 
     return replay
@@ -283,9 +271,11 @@ def replay_indices(
     gate: torch.nn.Module, hidden_states: torch.Tensor, top_k: int
 ) -> torch.Tensor | None:
     """
-    The replayed top-k indices from gate.router_replay, or None if none is installed.
-
-    Resolved in eager so the compiled gate gets them as an input, not traced Python state.
+    Call it in eager mode, so the compiled gate takes the indices as an input.
+    router_replay(num_tokens, top_k) returns expert ids [num_tokens, top_k] as a contiguous int64
+    or int32 tensor on the current device, rows in loader token order (zigzag under CP). Layers
+    with another token order relayout the rows. Called once per gate per forward, never from a
+    backward; each gate's store keys routes by layer and training.current_microbatch.
     """
     if gate.router_replay is None:
         return None

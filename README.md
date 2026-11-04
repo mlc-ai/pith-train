@@ -23,7 +23,6 @@ NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Py
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
-uv venv  # skip if you already have a virtual environment
 ```
 
 **For users:**
@@ -87,7 +86,7 @@ PithTrain is structured in three layers:
   - *Pipeline Engine* — DualPipeV scheduler with 5-stage overlapped forward-backward execution and P2P communication.
   - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x FSDP x CP x EP).
   - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
-- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (Triton).
+- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (CuTeDSL, Triton).
 
 ## Contributing
 

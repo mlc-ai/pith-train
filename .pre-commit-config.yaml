@@ -21,6 +21,7 @@ repos:
       - id: ruff                 # linter
         args: [--fix]
       - id: ruff-format          # formatter
+        exclude: ^pithtrain/kernels/   # kernel code is not reformatted (pyproject.toml)
 
   # Type checking — disabled for now due to 297 pre-existing errors.
   # Enable once type annotations are cleaned up across the codebase.

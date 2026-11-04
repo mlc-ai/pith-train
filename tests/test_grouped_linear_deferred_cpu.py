@@ -99,6 +99,7 @@ def production(request, record_property):
     # __init__, in contrast, eagerly imports DualPipeV and unrelated GPU modules.
     pithtrain = importlib.import_module("pithtrain")
     operators = importlib.import_module("pithtrain.operators")
+    modules = importlib.import_module("pithtrain.modules")
     assert Path(pithtrain.__file__).resolve() == (repo / "pithtrain/__init__.py").resolve()
     with pytest.MonkeyPatch.context() as patch:
         pipeline = ModuleType("pithtrain.pipeline")
@@ -129,7 +130,21 @@ def production(request, record_property):
         linear = shim("pithtrain.operators.linear", [])
         linear.ARCH_MAJOR = UnavailableArchitecture()
         linear.BF16Linear = UnavailableBF16Linear
-        for module in (deep_gemm, quantize, linear):
+        # The kernel library probes the device at import; every name these modules use fails on use.
+        kernels = shim(
+            "pithtrain.kernels",
+            [
+                "bf16_experts_supported",
+                "fp8_fused_experts_supported",
+                "fp8_grouped_gemm",
+                "fp8_grouped_wgrad_empty",
+                "fp8_quant_grouped",
+                "fp8_quant_weight_grouped",
+                "k_grouped_fp8_gemm",
+            ],
+        )
+        patch.setattr(pithtrain, "kernels", kernels, raising=False)
+        for module in (deep_gemm, quantize, linear, kernels):
             patch.setitem(sys.modules, module.__name__, module)
             if module.__name__.startswith("pithtrain.operators."):
                 patch.setattr(operators, module.__name__.rsplit(".", 1)[1], module, raising=False)
@@ -149,9 +164,9 @@ def production(request, record_property):
         )
         grouped = load("pithtrain.operators.grouped_linear", source, operators)
         accumulation = load(
-            "pithtrain.operators.wgrad_accumulation",
-            repo / "pithtrain/operators/wgrad_accumulation.py",
-            operators,
+            "pithtrain.modules.wgrad_accumulation",
+            repo / "pithtrain/modules/wgrad_accumulation.py",
+            modules,
         )
         assert grouped.F is F and grouped.F.grouped_mm is native_grouped_mm
         assert grouped.WeightGradStore is execution.WeightGradStore
@@ -200,6 +215,7 @@ def production(request, record_property):
                         deep_gemm.__name__,
                         quantize.__name__,
                         linear.__name__,
+                        kernels.__name__,
                     ],
                 },
                 sort_keys=True,

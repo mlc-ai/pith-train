@@ -262,6 +262,7 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *args, **kwargs: 0)
     data_cfg = DataCfg()
     root = data_cfg.dataset = Path(cfg.output)
     data_cfg.format = "prepared_bundle"

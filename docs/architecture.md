@@ -14,7 +14,7 @@ The codebase is organized into three layers:
 |---|---|---|
 | Application | `pithtrain/tasks` | End-to-end workflows: pretraining, corpus tokenization, checkpoint conversion. |
 | Engine | `pithtrain/{pipeline,models,modules,contexts}` | The bulk of PithTrain: pipeline scheduler, model implementations, and distributed/training infrastructure. |
-| Operator | `pithtrain/operators` | Fused Triton / library-backed kernels for compute- and communication-critical paths. |
+| Operator | `pithtrain/{operators,kernels}` | Autograd ops, layers and collectives (`operators`) over fused Triton / CuTe-DSL / library-backed kernels (`kernels`) for compute- and communication-critical paths. |
 
 Everything sits on top of PyTorch (NCCL, FSDP2, DCP, `torch.compile`), with external kernel libraries (DeepGEMM, FlashAttention) and a Python kernel DSL (Triton) at the operator layer.
 
@@ -29,7 +29,8 @@ pithtrain/
 ├── models/    # ENGINE: one file per model family (qwen3_moe.py); interface.py is the contract
 ├── modules/   # ENGINE: distributed + training infra (distributed.py, training.py)
 ├── contexts/  # ENGINE: runtime state (distributed.pp_group, training.model)
-└── operators/ # OPERATOR: fused kernels
+├── operators/ # OPERATOR: autograd ops, layers and collectives over the kernels
+└── kernels/   # KERNEL: Triton / CuTe-DSL kernels and launchers, _sm90 / _sm100 per feature
 ```
 
 The sections below drill into the parts that carry the most architecture: the model contract, the pipeline engine, and the parallelism mesh.
@@ -114,7 +115,7 @@ Gradients. The two classes reduce over groups of different size, yet either *sum
 
 ## 5. FP8 training
 
-FP8 matmuls are backed by DeepSeek's [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), which does 128-element block-scaled FP8 GEMMs (E8M0 power-of-2 scales on both -- native MXFP8 PTX on Blackwell, emulated on Hopper). PithTrain wraps it in `pithtrain/operators/linear.py` and `pithtrain/operators/grouped_linear.py`, with the block-scaling quantization in custom Triton kernels (`pithtrain/operators/deepgemm_quantize.py`).
+FP8 matmuls are backed by DeepSeek's [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), which does 128-element block-scaled FP8 GEMMs (E8M0 power-of-2 scales on both -- native MXFP8 PTX on Blackwell, emulated on Hopper). PithTrain wraps it in `pithtrain/operators/linear.py` and `pithtrain/operators/grouped_linear.py`, with the block-scaling quantization in custom kernels (`pithtrain/kernels/fp8_rowwise_*.py`, `fp8_weight_quant*.py`: Triton, with bit-identical CuTe-DSL ports on Hopper).
 
 A whole model flips between FP8 and BF16 through one flag, `TrainingCfg.fp8`. At training setup (`pithtrain/modules/training.py`) it binds the linear classes the models build with, published on the `training` context:
 
@@ -134,13 +135,13 @@ Saving converts localized to canonical, loading converts back. Because the on-di
 
 ## 7. Operators
 
-`pithtrain/operators` holds the performance-critical kernels, many wrapped by [PyTorch custom operators](https://docs.pytorch.org/tutorials/advanced/custom_ops_landing_page.html) with hand-written autograd. Wrapping a kernel in a custom operator lets `torch.compile` treat it as one opaque node; PithTrain compiles all transformer computation with `torch.compile(fullgraph=True)` except the MoE expert computation, whose per-expert shapes are data-dependent under EP. Full-graph mode is deliberate: it turns a silent graph break into a compile error.
+`pithtrain/kernels` holds the performance-critical kernels, and `pithtrain/operators` wraps many of them in [PyTorch custom operators](https://docs.pytorch.org/tutorials/advanced/custom_ops_landing_page.html) with hand-written autograd. Wrapping a kernel in a custom operator lets `torch.compile` treat it as one opaque node; PithTrain compiles all transformer computation with `torch.compile(fullgraph=True)` except the MoE expert computation, whose per-expert shapes are data-dependent under EP. Full-graph mode is deliberate: it turns a silent graph break into a compile error.
 
 A few of the most important, roughly in order:
 
-1. `ep_dispatch.py`: fused Triton kernels for expert-parallel token dispatch with deduplication; central to MoE routing and the all-to-all overlap.
+1. `ep_dispatch.py`: expert-parallel token dispatch with deduplication (fused index kernels in `kernels/ep_dispatch*.py`); central to MoE routing and the all-to-all overlap.
 2. `ring_attention.py`: zigzag, causal-balanced ring attention for context parallelism (standard, packed and MLA-aware variants).
-3. `deepgemm_quantize.py`: fused block-scaled FP8 quantization behind the FP8 training path.
+3. `kernels/fp8_*`: fused block-scaled FP8 quantization behind the FP8 training path, and `fp8_experts.py`, the FP8 expert ops built on it.
 4. `token_scatter.py`: groups tokens per expert ahead of the grouped GEMM.
 
 The rest are smaller fused activation, loss, and attention-wrapper kernels.

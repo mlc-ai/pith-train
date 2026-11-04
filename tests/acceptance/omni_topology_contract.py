@@ -10,7 +10,7 @@ from pathlib import Path
 # Fingerprints bind the AST adapter and independent inventory to reviewed source.
 # The entire implementation is additionally bound to --expected-commit at runtime.
 SOURCE_HASHES = {
-    "tests/test_dualpipev.py": "ab2dd5716c78e0864ed62236bd59e6b803ebe74bbcc6b1053f42263dc9919597",
+    "tests/test_dualpipev.py": "21b7d0238d20b15e6df73f4976a0e6dab32746961fd406ebf45f8d9d60b97031",
     "tests/configs/qwen3_omni_text/tiny.json": "d03f488586dcb3053b10f24338dbe95d2bf4b8f499230adb980cfec98e86c702",
 }
 TEST_SHA256 = SOURCE_HASHES["tests/test_dualpipev.py"]

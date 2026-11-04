@@ -1,7 +1,3 @@
-"""
-PithTrain training module.
-"""
-
 from __future__ import annotations
 
 import math
@@ -33,6 +29,11 @@ from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodal
 from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
 from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
+from pithtrain.modules.fp8_param_gather import (
+    install_fp8_param_gather,
+    install_raw_fp8_param_gather,
+)
+from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.model_config import resolve_text_model_config
 from pithtrain.modules.omni_stage5_policy import (
@@ -41,14 +42,29 @@ from pithtrain.modules.omni_stage5_policy import (
 )
 from pithtrain.modules.optimizer import Muon, is_muon_param
 from pithtrain.modules.reproducibility import configure_deterministic_training
+from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
-from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV
 
 from .distributed import DistributedCfg
 
-# Pipeline-stage model implementations; grows as models are added.
+__all__ = [
+    "TrainingCfg",
+    "is_muon_param",
+    "make_muon_optimizer",
+    "make_adamw_optimizer",
+    "make_wsd_scheduler",
+    "make_constant_scheduler",
+    "init_weights",
+    "apply_fsdp",
+    "model_class_for_config",
+    "setup_model",
+    "offload_training_state",
+    "reload_training_state",
+    "setup_training",
+]
+
 PIPELINE_STAGE_MODELS = (
     DeepSeekV2Model,
     GptOssModel,
@@ -60,9 +76,8 @@ PIPELINE_STAGE_MODELS = (
 
 def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     """
-    Muon for the 2D hidden weights, AdamW for the rest (the is_muon_param split). Weight decay
-    (0.1, per "Muon is Scalable for LLM Training") applies to both: decaying the RMSNorm gamma
-    keeps per-layer output RMS from blowing up.
+    The default weight_decay of 0.1 follows "Muon is Scalable for LLM Training"; decaying the norm
+    weights too bounds the output RMS.
     """
     muon_params, adamw_params = [], []
     for name, param in training.model.named_parameters():
@@ -77,11 +92,8 @@ def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple
 
 
 def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
-    """
-    AdamW over all parameters.
-    """
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
-    return (AdamW(training.model.parameters(), **kwargs),)
+    return (AdamW(training.model.parameters(), fused=True, **kwargs),)
 
 
 def make_wsd_scheduler(
@@ -94,8 +106,8 @@ def make_wsd_scheduler(
     decay_shape: Literal["cosine", "linear"] = "cosine",
 ) -> tuple[LRScheduler, ...]:
     """
-    Warmup-stable-decay: linear warmup, hold lr, then cosine or linear decay. Set
-    decay_ratio = 1 - warmup_ratio for a pure anneal.
+    Warmup-stable-decay: linear warmup from start_lr, hold lr, then cosine or linear decay to
+    final_lr. Set decay_ratio = 1 - warmup_ratio for a pure anneal.
     """
     if decay_shape not in ("cosine", "linear"):
         raise ValueError(f"Unknown decay_shape: {decay_shape!r}")
@@ -108,13 +120,10 @@ def make_wsd_scheduler(
     start_factor, final_factor = start_lr / cfg.lr, final_lr / cfg.lr
 
     def lr_lambda(step: int) -> float:
-        # Warmup start_lr -> lr.
         if step < warmup_steps:
             return start_factor + (1 - start_factor) * (step / warmup_steps)
-        # Stable at lr.
         if decay_steps == 0 or step < warmup_steps + stable_steps:
             return 1.0
-        # Decay lr -> final_lr.
         t = min((step - warmup_steps - stable_steps) / decay_steps, 1.0)
         match decay_shape:
             case "cosine":
@@ -140,9 +149,6 @@ def make_wsd_scheduler(
 
 
 def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
-    """
-    Hold lr constant for the whole run: no warmup, no decay.
-    """
     from pithtrain.modules.resume_semantics import bind_scheduler_factory
 
     return bind_scheduler_factory(
@@ -154,10 +160,6 @@ def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
 
 @dataclass(init=False, slots=True)
 class TrainingCfg(SlottedDefault):
-    """
-    Configuration for the model and how it is trained.
-    """
-
     native_multimodal: bool = False
     """Joint native text/image/audio/video Thinker with fixed encoder collectives."""
 
@@ -172,57 +174,46 @@ class TrainingCfg(SlottedDefault):
 
     sequence_length: int
     """
-    The sequence length for each training sample.
-
-    On the rollout path it is an upper bound rather than an actual length: variable-length samples
-    are packed end to end into a single micro-batch, and no such micro-batch may carry more tokens.
+    The number of tokens in each training sample. For packed variable-length samples it is an
+    upper bound on the tokens in one micro-batch.
     """
 
     seed: int = 1234
-    """
-    The random seed for reproducibility.
-    """
 
     lr: float
-    """
-    The base learning rate to construct the optimizer.
-    """
 
     max_steps: int
-    """
-    The maximum number of training steps.
-    """
 
     micro_batch_size: int
-    """
-    The size of each micro-batch used during training.
-    """
 
     global_batch_size: int
     """
-    The size of the global batch used during training.
-
-    Gradients will be accumulated over multiple micro-batches to achieve this batch size.
+    The number of samples in a step, across all data-parallel ranks; gradients accumulate over the
+    micro-batches that make it up.
     """
 
     optimizer: Callable[[TrainingCfg], tuple[Optimizer, ...]]
     """
-    Builder for the optimizers, or supply your own. make_muon_optimizer splits parameters between
-    Muon and AdamW by is_muon_param, make_adamw_optimizer puts them all in AdamW.
+    Builds the optimizers from this config: make_muon_optimizer, make_adamw_optimizer or your own.
     """
 
     scheduler: Callable[[TrainingCfg], tuple[LRScheduler, ...]]
     """
-    Builder for the schedulers, one per optimizer, or supply your own. make_wsd_scheduler warms up,
-    holds, then decays; make_constant_scheduler holds the learning rate for the whole run.
+    Builds one scheduler per optimizer from this config: make_wsd_scheduler,
+    make_constant_scheduler or your own.
     """
 
     model: Path
     """
-    The model to train, a HuggingFace model directory, for example
-    examples/pretrain_lm/qwen3-30b-a3b. Only config.json is read: the architecture is built from
-    it and the weights come from the checkpoint, so a directory holding config.json alone is
-    enough to pretrain from scratch.
+    A HuggingFace model directory. Only its config.json is read; the weights come from the
+    checkpoint or from init_weights.
+    """
+
+    hf_import_path: Optional[Path] = None
+    """
+    A HuggingFace safetensors directory to stream the initial weights from, skipping hf2dcp.
+    Used only when save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS
+    (MXFP4) and Qwen3.5-MoE; not compatible with hsdp_replica > 1.
     """
 
     deterministic: bool = False
@@ -257,125 +248,116 @@ class TrainingCfg(SlottedDefault):
 
     save_interval: Optional[int] = None
     """
-    The interval (in steps) at which to save checkpoints. When None, checkpoint saving is disabled
-    but loading still occurs from save_location (if set). This is useful for validation runs that
-    need to load a pretrained checkpoint without writing new ones.
+    Steps between checkpoint saves. When None, nothing is saved, but a checkpoint is still loaded
+    from save_location if set.
     """
 
     save_location: Optional[Path] = None
     """
-    The directory for checkpoint storage. Checkpoints are loaded from and saved to
-    <save_location>/torch-dcp/XXXXXXXX. When None, both loading and saving are disabled and
-    the model trains from scratch.
+    The checkpoint directory; checkpoints are loaded from and saved to
+    <save_location>/torch-dcp/<step>. When None, the model trains from scratch and saves nothing.
     """
 
     moe_load_balance_coef: float = 0.0
     """
-    Coefficient for the MoE load balance loss. Set to 0 to disable. Typical values are 1e-2 to 1e-1.
+    Coefficient of the MoE load balance loss, typically 1e-2 to 1e-1; 0 disables it.
     """
 
     moe_load_balance_type: Literal["micro-batch", "global-batch", "sequence"] = "micro-batch"
     """
-    Load balance loss strategy for MoE layers.
+    Scope of the MoE load balance loss.
 
-    micro-batch computes one loss per micro-batch (https://arxiv.org/abs/2101.03961). global-batch
-    synchronises expert selection frequencies across the DP x EP ranks and accumulates them across
-    gradient accumulation steps (https://arxiv.org/abs/2501.11873). sequence computes the loss
-    independently per sequence and averages over the batch (https://arxiv.org/abs/2405.04434).
+    micro-batch: one loss per micro-batch (https://arxiv.org/abs/2101.03961).
+    global-batch: expert frequencies summed over the dp x cp ranks and the step's micro-batches
+    (https://arxiv.org/abs/2501.11873).
+    sequence: one loss per sequence, averaged over the batch (https://arxiv.org/abs/2405.04434).
     """
 
     benchmark: bool = False
     """
-    Benchmark mode: enable tuning that makes throughput measurement easy to set up and comparable
-    but is wrong for real training. False by default, so normal training is unaffected.
-
-    It force-balances MoE routing, so every expert gets an equal, dropless token load, the
-    convention NeMo Megatron-Bridge uses for its MoE benchmarks
-    (https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html).
+    Force-balance MoE routing so every expert gets an equal token load, as NeMo Megatron-Bridge
+    does for its MoE benchmarks. For throughput measurement only; wrong for real training.
     """
 
     fp8: bool = False
     """
-    Enable FP8 training via DeepGEMM (128-element block scaling); False is BF16. Supports SM90
-    (Hopper) and SM100+ (Blackwell).
+    Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
     """
 
     init_std: float = 0.02
-    """
-    Standard deviation for weight initialization. Input layers use N(0, init_std). Output layers
-    use N(0, init_std / sqrt(2 * num_layers)).
-    """
 
     nsys_start: Optional[int] = None
     """
-    Training step at which to start the CUDA profiler (for Nsight Systems).
-
-    The profiler starts at the beginning of this step. Set to None to disable.
+    Step at whose start the CUDA profiler starts, for Nsight Systems; None disables it.
     """
 
     nsys_stop: Optional[int] = None
     """
-    Training step at which to stop the CUDA profiler (for Nsight Systems).
-
-    The profiler stops at the beginning of this step, so this step and later steps are not
-    profiled. To profile a single step N, set nsys_start=N and nsys_stop=N+1. Set to None to
-    disable.
+    Step at whose start the CUDA profiler stops, so this step is not profiled. To profile step N
+    alone, set nsys_start=N and nsys_stop=N+1.
     """
 
     memory_profile_start: Optional[int] = None
     """
-    Training step at which to start recording CUDA memory allocation history.
-
-    When set, torch.cuda.memory._record_memory_history is called at the beginning of this step with
-    full stack traces for both allocations and frees. Set to None to disable.
+    Step at whose start CUDA memory history recording starts, with stack traces of allocations
+    and frees; None disables it.
     """
 
     memory_profile_stop: Optional[int] = None
     """
-    Training step at which to stop recording and dump the memory snapshot.
-
-    At the beginning of this step the recorded history is dumped to memory_profile_output and
-    recording is disabled. To profile a single step N, set memory_profile_start=N and
-    memory_profile_stop=N+1. Set to None to disable.
+    Step at whose start the recorded history is dumped to memory_profile_output and recording
+    stops. To profile step N alone, set memory_profile_start=N and memory_profile_stop=N+1.
     """
 
     memory_profile_output: Path = Path.cwd()
     """
-    Output directory for the CUDA memory snapshot. Each rank writes a pickle file named
-    snapshot-rank00000.pickle etc. into this directory. The snapshot can be visualized at
-    https://pytorch.org/memory_viz.
+    Directory of the CUDA memory snapshots, one snapshot-rank<rank>.pickle per rank. View them at
+    https://pytorch.org/memory_viz in a browser.
     """
 
 
-def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> None:
+def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed: int = 0) -> None:
     """
-    Apply scaled normal initialization to one pipeline-stage module, for example a DeepSeekV2Model.
+    Initialize this rank's V-chunks (an nn.Sequential of two models) in place, before FSDP shards
+    them. Every parameter of 2 or more dims draws from N(0, init_std), except o_proj and down_proj,
+    which use N(0, init_std / sqrt(2 * num_layers)) with num_layers of the full model. 1D parameters
+    stay as they are, except the media encoders' norm weights and biases, set to 1 and 0.
 
-    Every 2-D weight draws from N(0, init_std), except the output projections o_proj and down_proj,
-    which use N(0, init_std / sqrt(2 * num_layers)) to keep variance from growing with depth.
-    num_layers is the layer count of the full model, not of this stage alone. 1-D parameters,
-    meaning layer-norm weights and biases, are left untouched.
+    Each parameter draws from a stream keyed by its name in the full model, and each routed expert
+    of a 3D stacked expert weight from one keyed also by its global expert index, so every parallel
+    layout starts from the same weights. The 2D stacked expert biases of gpt-oss draw as one tensor,
+    so they differ across EP sizes.
     """
-    # Scale down residual-stream projections (o_proj, down_proj) to bound variance growth.
     output_std = init_std / math.sqrt(2.0 * num_layers)
-    for name, param in model.named_parameters():
+    for chunk_name, param in model.named_parameters():
+        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
         if name.startswith(("visual.", "audio_tower.")) and param.dim() == 1:
             nn.init.zeros_(param) if name.endswith("bias") else nn.init.ones_(param)
             continue
         if param.dim() < 2:
-            continue  # skip biases, layer-norm weights, etc.
-        if "o_proj" in name or "down_proj" in name:
-            torch.nn.init.normal_(param, mean=0.0, std=output_std)
+            continue
+        std = output_std if "o_proj" in name or "down_proj" in name else init_std
+        # Routed experts are stacked (local experts, ...), the local ones of this EP rank.
+        if ".experts." in name and param.dim() == 3:
+            first_expert = distributed.ep_rank * param.shape[0]
+            for local_idx in range(param.shape[0]):
+                generator = weight_generator(seed, name, param.device, first_expert + local_idx)
+                torch.nn.init.normal_(param[local_idx], mean=0.0, std=std, generator=generator)
         else:
-            torch.nn.init.normal_(param, mean=0.0, std=init_std)
+            generator = weight_generator(seed, name, param.device)
+            torch.nn.init.normal_(param, mean=0.0, std=std, generator=generator)
+
+
+def weight_generator(seed: int, name: str, device: torch.device, *index: int) -> torch.Generator:
+    key = (*name.encode(), *index)
+    state = np.random.SeedSequence(seed, spawn_key=key).generate_state(1, np.uint64)[0]
+    return torch.Generator(device=device).manual_seed(int(state))
 
 
 def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     """
-    Split a replica group into hsdp_replica replicas, giving FSDP a mesh to shard within one.
-
-    FSDP2 reads a 2-D mesh as (replicate, shard), so the replica count goes first and the shard dim
-    lands innermost, keeping each shard group contiguous in the rank order of the group being split.
+    The (replica, shard) layout FSDP2 reads as replicate-then-shard; each shard group is a
+    contiguous block of the mesh.
     """
     size = mesh.size()
     assert size % hsdp_replica == 0, f"{size=} not divisible by {hsdp_replica=}"
@@ -383,15 +365,15 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
 
 
 def apply_fsdp(model, hsdp_replica: int = 1):
-    # Two parameter classes, each with its own replica group. The expert parameters are the routed
-    # expert weights, unique per EP rank and replicated over the dp axis of the expert view; the
-    # attention parameters are everything else, replicated over the whole dp x cp stage. Hence the
-    # separate fully_shard call on the experts below: the FSDP2 module walk stops at an
-    # already-sharded submodule, so the outer call never sees the expert parameters.
+    """
+    Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
+    weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
+    gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
+    """
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     if hsdp_replica > 1:
-        # Flatten under a separate name: _unflatten takes the flattened dim away from the mesh
-        # it came from, and the load-balance group in setup_model reads the default flattening.
+        # A separate name: _unflatten takes the flattened dim away from its mesh, and setup_model
+        # reads the default flattening for the load-balance group.
         attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten("hsdp_stage")
         attn_fsdp_mesh = split_replicas(attn_fsdp_mesh, hsdp_replica)
         expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
@@ -403,17 +385,16 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         output_dtype=None,
         cast_forward_inputs=True,
     )
-    # Pipeline activations already have PARAM_DTYPE. Keep root context tensors
-    # (e.g. media timing) in their original precision, consistently with the
-    # overlapped path which calls prolog/posemb directly. Compute children
-    # still cast their floating inputs through their own FSDP policies.
+    # Pipeline activations already have PARAM_DTYPE. Root context tensors (e.g. media timing) keep
+    # their precision, as on the overlapped path that calls prolog/posemb directly; compute children
+    # still cast their floating inputs through their own policies.
     root_mp = replace(compute_mp, cast_forward_inputs=False)
-
-    # FSDP recommends shard models from the bottom to the top.
+    install_lean_hooks()
+    # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
+    # the expert parameters stay out of the layer's group.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
-        # Stage-edge modules (embed / norm / lm_head): every non-"layers" child that
-        # owns parameters. reshard_after_forward=True since each runs once per step.
+        # Embeddings, final norm and LM head run once per step, so they reshard after forward.
         edges = (
             model[i].fsdp_edge_modules()
             if isinstance(model[i], Qwen3OmniMoeTalkerTextModel)
@@ -435,27 +416,27 @@ def apply_fsdp(model, hsdp_replica: int = 1):
                     reshard_after_forward=False,
                     mp_policy=compute_mp,
                 )
+                if hasattr(layer.mlp.experts, "forward_from_tokens"):
+                    register_fsdp_forward_method(layer.mlp.experts, "forward_from_tokens")
             fully_shard(
                 layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=compute_mp
             )
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(
-            model[i],
-            mesh=attn_fsdp_mesh,
-            reshard_after_forward=False,
-            mp_policy=root_mp,
-        )
+            register_fsdp_forward_method(layer, "forward_stage1")
+            register_fsdp_forward_method(layer, "forward_stage3")
+            register_fsdp_forward_method(layer, "forward_stage5")
+        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=root_mp)
 
-    # Sum gradients instead of the FSDP2 default average. The two classes reduce over groups of
-    # different size, attn over dp x cp and expt over the expert dp axis, yet either sum is
-    # already the true global gradient: an expert is fed the tokens of its whole EP group through
-    # the all-to-all. Summing puts both classes on the same scale, and the training step applies
-    # the one normalization, by the global token count.
+    # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
+    # global gradient, so the step's single divide by the global token count normalizes both.
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+
+    # Gathering FP8 weights in FP8 gives the same operands as quantizing the gathered bf16 weight.
+    if training.fp8:
+        install_fp8_param_gather(model, (FP8Linear, FP8GroupedLinear))
+        # gpt-oss raw expert parameters; must follow the call above, which resets the registry.
+        install_raw_fp8_param_gather(model)
     return model
 
 
@@ -527,7 +508,6 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    # All models read their parallel groups from the distributed context directly.
     ModelClass = model_class_for_config(
         source_config,
         native_vision=cfg.native_vision,
@@ -543,15 +523,11 @@ def setup_model(
     modules.append(ModelClass(selected_config, phase=0))
     modules.append(ModelClass(selected_config, phase=1))
 
-    # Apply scaled normal weight initialization before FSDP sharding.
-    num_layers = module_config.num_hidden_layers
-    for module in modules:
-        init_weights(module, num_layers, cfg.init_std)
-
     modules = nn.Sequential(*modules)
+    init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
     apply_fsdp(modules, distributed_cfg.hsdp_replica)
-    if not cfg.fp8:
-        install_wgrad_accumulation(modules)
+    install_wgrad_accumulation(modules)
+    install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
@@ -559,10 +535,9 @@ def setup_model(
 
     local_seq_len = cfg.sequence_length // cp_size
 
-    # Propagate MoE load balance loss to gate modules.
     if cfg.moe_load_balance_coef > 0:
-        # Global-batch statistics cover every rank holding tokens for this stage, the same flat
-        # dp x cp mesh apply_fsdp already built, so this adds no communicator.
+        # With hsdp_replica 1 this reuses the flat dp x cp mesh apply_fsdp built,
+        # adding no communicator.
         lb_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
         for i in range(2):
             for layer in modules[i].layers.values():
@@ -579,7 +554,6 @@ def setup_model(
                         loss_fn.init_buffers(gate.num_experts, gate.weight.device)
                     gate.load_balance_loss_fn = loss_fn
 
-    # Benchmark mode: force-balance the routing of every MoE gate.
     if cfg.benchmark:
         for module in modules.modules():
             if hasattr(module, "router_replay"):
@@ -588,41 +562,33 @@ def setup_model(
     training.model = DualPipeV(modules)
 
 
-_offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []
+offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []
 """
 Each evicted CUDA storage with its pinned host copy; non-empty only while offloaded.
 """
 
-_pinned_buffers: dict[int, list[torch.Tensor]] = {}
+offload_buffer_pool: dict[int, list[torch.Tensor]] = {}
 """
-Free pinned host buffers by byte size, kept for the life of the process. Page-locking is the
-expensive part of an offload, so the buffers are allocated once rather than on every rollout.
+Free pinned host buffers by byte size, kept for the life of the process, because page-locking is
+the expensive part of an offload.
 """
 
 
-def _take_pinned(num_bytes: int) -> torch.Tensor:
-    """
-    A pinned host buffer of exactly num_bytes, reused from the pool when one is free.
-    """
-    free = _pinned_buffers.setdefault(num_bytes, [])
+def take_pinned_buffer(num_bytes: int) -> torch.Tensor:
+    free = offload_buffer_pool.setdefault(num_bytes, [])
     if free:
         return free.pop()
     return torch.empty(num_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
 
 
-def _storage_bytes(storage: torch.UntypedStorage) -> torch.Tensor:
-    """
-    A uint8 tensor spanning the whole of storage, for copying it somewhere else.
-    """
+def storage_bytes(storage: torch.UntypedStorage) -> torch.Tensor:
     return torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage)
 
 
-def _training_state_storages() -> list[torch.UntypedStorage]:
+def training_state_storages() -> list[torch.UntypedStorage]:
     """
-    The distinct CUDA storages behind this rank's parameter shards and optimizer state.
-
-    Deduplicated by address, because FSDP2 keeps the padded shard buffer and the parameter's local
-    tensor as two views of one allocation.
+    Deduplicated by address, because FSDP2's padded shard buffer and a parameter's local tensor
+    share one allocation.
     """
     storages: dict[int, torch.UntypedStorage] = {}
 
@@ -647,52 +613,51 @@ def _training_state_storages() -> list[torch.UntypedStorage]:
 
 def offload_training_state() -> None:
     """
-    Move this rank's parameter shards and optimizer state to pinned host memory and free the GPU
-    memory behind them. Only the storages are resized away, so every tensor, view and optimizer
-    state entry survives and reload has nothing to rebuild. Gradients are not included.
+    Copy this rank's parameter shards and optimizer state to pinned host memory and free their
+    GPU storages. Tensors keep their identity, so reload_training_state restores them in place.
+    Gradients stay on the GPU. Nothing may read or write the state until reload_training_state
+    clears training.offloaded. A no-op while already offloaded.
     """
-    if _offloaded_state:
+    if training.offloaded:
         return
 
-    # An unsharded parameter is a separate allocation the walk below would not see.
+    # An unsharded parameter is a separate allocation that the storage walk would miss.
     for module in training.model.modules():
         if isinstance(module, FSDPModule):
             module.reshard()
 
-    for storage in _training_state_storages():
-        host = _take_pinned(storage.size())
-        host.copy_(_storage_bytes(storage), non_blocking=True)
-        _offloaded_state.append((storage, host))
+    evicted = []
+    for storage in training_state_storages():
+        host = take_pinned_buffer(storage.size())
+        host.copy_(storage_bytes(storage), non_blocking=True)
+        evicted.append((storage, host))
 
-    # The copies are asynchronous, so nothing may be freed until they land.
+    # Publish and free only after all copies finish; a pinning failure must allow retry.
     torch.cuda.synchronize()
-    for storage, _ in _offloaded_state:
+    offloaded_state.extend(evicted)
+    training.offloaded = True
+    for storage, _ in offloaded_state:
         storage.resize_(0)
     torch.cuda.empty_cache()
 
 
 def reload_training_state() -> None:
-    """
-    Bring the offloaded state back onto the device. A no-op when nothing was offloaded.
-    """
-    if not _offloaded_state:
+    if not training.offloaded:
         return
 
-    for storage, host in _offloaded_state:
+    for storage, host in offloaded_state:
         storage.resize_(host.numel())
-        _storage_bytes(storage).copy_(host, non_blocking=True)
+        storage_bytes(storage).copy_(host, non_blocking=True)
 
     # The copies are asynchronous, so no buffer may return to the pool until they land.
     torch.cuda.synchronize()
-    for _, host in _offloaded_state:
-        _pinned_buffers[host.numel()].append(host)
-    _offloaded_state.clear()
+    for _, host in offloaded_state:
+        offload_buffer_pool[host.numel()].append(host)
+    offloaded_state.clear()
+    training.offloaded = False
 
 
 def setup_training(cfg: object) -> None:
-    """
-    Build the model, the optimizers and the schedulers of this run into the training runtime state.
-    """
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)

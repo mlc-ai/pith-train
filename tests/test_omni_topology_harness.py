@@ -248,15 +248,15 @@ def native_constructor_namespace(package, case, rank):
                     and ast.unparse(d.func) == "torch.compile"
                 )
             ]
-    partition = next(
+    partition = [
         n
         for n in ast.parse((package / "pithtrain/pipeline/dualpipev.py").read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "layer_partition"
-    )
+        if isinstance(n, ast.FunctionDef) and n.name in ("layer_sizes", "layer_partition")
+    ]
     tree = ast.Module(
         body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-            partition,
+            *partition,
             *classes,
         ],
         type_ignores=[],

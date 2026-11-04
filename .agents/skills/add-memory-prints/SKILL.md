@@ -246,7 +246,7 @@ if _profiling:
 
 ```python
 for i in range(step_1):
-    self._forward_chunk(0)
+    self.forward_chunk(0)
 ```
 
 Replace with:
@@ -256,7 +256,7 @@ for i in range(step_1):
     if _profiling and i == 1:
         import pithtrain.pipeline.execution as _mod
         _mod._layer_mem_profile = True
-    self._forward_chunk(0)
+    self.forward_chunk(0)
     if _profiling and i == 1:
         _mod._layer_mem_profile = False
     if _profiling:
@@ -283,28 +283,28 @@ if _profiling:
 
 ```python
 for i in range(step_2):
-    self._forward_chunk(0, recv=False, send=False)
-    self._recv_forward(0)
-    self._forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
-    self._send_forward(0)
+    self.forward_chunk(0, recv=False, send=False)
+    self.recv_forward(0)
+    self.forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
+    self.send_forward(0)
 ```
 
 Replace with:
 
 ```python
 for i in range(step_2):
-    self._forward_chunk(0, recv=False, send=False)
+    self.forward_chunk(0, recv=False, send=False)
     if _profiling:
         torch.cuda.synchronize()
         print(
             f"[rank={distributed.rank} pp={pp_rank}] Step2 i={i} forward_chunk(0): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
             flush=True,
         )
-    self._recv_forward(0)
+    self.recv_forward(0)
     if _profiling and i == 0:
         import pithtrain.pipeline.execution as _mod
         _mod._layer_mem_profile = True
-    self._forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
+    self.forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
     if _profiling and i == 0:
         _mod._layer_mem_profile = False
     if _profiling:
@@ -313,7 +313,7 @@ for i in range(step_2):
             f"[rank={distributed.rank} pp={pp_rank}] Step2 i={i} forward_chunk(1): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
             flush=True,
         )
-    self._send_forward(0)
+    self.send_forward(0)
 ```
 
 After the loop:
@@ -332,10 +332,10 @@ if _profiling:
 
 ```python
 for i in range(step_3):
-    self._backward_chunk(1, enable_zb=True)
-    self._recv_forward(1)
-    self._weight_chunk()
-    self._forward_chunk(1, recv=False)
+    self.backward_chunk(1, enable_zb=True)
+    self.recv_forward(1)
+    self.weight_chunk()
+    self.forward_chunk(1, recv=False)
 ```
 
 Replace with:
@@ -349,22 +349,22 @@ for i in range(step_3):
             f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} before B1: {_ms3:.2f} GiB | {_mem_detail()}",
             flush=True,
         )
-    self._backward_chunk(1, enable_zb=True)
+    self.backward_chunk(1, enable_zb=True)
     if _profiling:
         torch.cuda.synchronize()
         print(
             f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} after B1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
             flush=True,
         )
-    self._recv_forward(1)
-    self._weight_chunk()
+    self.recv_forward(1)
+    self.weight_chunk()
     if _profiling:
         torch.cuda.synchronize()
         print(
             f"[rank={distributed.rank} pp={pp_rank}] Step3 i={i} after W1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
             flush=True,
         )
-    self._forward_chunk(1, recv=False)
+    self.forward_chunk(1, recv=False)
     if _profiling:
         torch.cuda.synchronize()
         print(
@@ -385,7 +385,7 @@ if _profiling:
     )
 ```
 
-**4E: Step 4 (nF0B1F1B0)** — after the last `self._forward_backward_chunk(1, 0)` inside the loop (there is one at the end of every iteration), add:
+**4E: Step 4 (nF0B1F1B0)** — after the last `self.forward_backward_chunk(1, 0)` inside the loop (there is one at the end of every iteration), add:
 
 ```python
     if _profiling:
@@ -410,7 +410,7 @@ if _profiling:
 
 **4F: Steps 5-7** — no prints needed.
 
-**4G: After Step 8** — after `assert WeightGradStore.funcs_queue.empty()`, before `self._commit_and_wait_comm()`:
+**4G: After Step 8** — after `assert WeightGradStore.funcs_queue.empty()`, before `self.commit_and_wait_comm()`:
 
 ```python
 if _profiling:

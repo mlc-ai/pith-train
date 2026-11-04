@@ -344,15 +344,20 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             routing = Stage5RoutingInfo(routing, Stage5RouteMetadata.from_expert_ids(indices))
         return tokens, residual, routing
 
-    def forward_stage3(self, gathered_tokens, expert_idxs=None, expand_idx=None):
+    def forward_stage3(
+        self, gathered_tokens, expert_idxs=None, expand_idx=None, expert_counts=None
+    ):
         if not self.is_moe:
             return self.mlp(gathered_tokens)
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
+        # expert_counts, the rows per local expert from the dispatch, saves the host copy of the
+        # group sizes.
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
             gathered_tokens,
             expert_idxs,
             self.mlp.experts_per_rank,
+            group_counts=expert_counts,
             deterministic=self.mlp.deterministic_token_layout,
             canonical=self.canonical_expert_rows,
         )

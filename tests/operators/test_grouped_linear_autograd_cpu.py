@@ -28,7 +28,7 @@ def classes():
         Callable=Callable,
     )
     for name, selected in [
-        ("pithtrain/pipeline/execution.py", {"WeightGradStore"}),
+        ("pithtrain/contexts/weight_grad_store.py", {"WeightGradStore"}),
         ("pithtrain/operators/grouped_linear.py", {"GroupedLinearFunc", "GroupedLinear"}),
     ]:
         source = root / name

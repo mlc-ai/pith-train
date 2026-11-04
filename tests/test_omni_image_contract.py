@@ -8,6 +8,7 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -146,17 +147,27 @@ def test_visual_initialization_after_empty_allocation():
     import math
 
     tree = ast.parse((ROOT / "pithtrain/modules/training.py").read_text())
-    function = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "init_weights"
-    )
-    ns = {"torch": torch, "nn": torch.nn, "math": math}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "initialization", "exec"), ns)
+    functions = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name in ("init_weights", "weight_generator")
+    ]
+    ns = {
+        "torch": torch,
+        "nn": torch.nn,
+        "math": math,
+        "np": np,
+        "distributed": SimpleNamespace(ep_rank=0),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "initialization", "exec"), ns)
     model = torch.nn.Module()
     model.visual = torch.nn.Sequential(
         torch.nn.Conv3d(3, 8, 2), torch.nn.LayerNorm(8), torch.nn.Linear(8, 16)
     )
     model.to_empty(device="cpu")
-    ns["init_weights"](model, 4)
+    # init_weights takes a rank's V-chunks, an nn.Sequential, and names parameters without
+    # the chunk index.
+    ns["init_weights"](torch.nn.Sequential(model), 4)
     for name, value in model.named_parameters():
         assert torch.isfinite(value).all(), name
         if value.ndim == 1:
@@ -181,8 +192,9 @@ def constructor_namespace():
         nn=torch.nn,
         partial=partial,
         math=math,
+        np=np,
         validate_omni_stage5_aggregation=validate_omni_stage5_aggregation,
-        distributed=SimpleNamespace(pp_size=2, pp_rank=0, ep_size=1, cp_size=1),
+        distributed=SimpleNamespace(pp_size=2, pp_rank=0, ep_size=1, ep_rank=0, cp_size=1),
         training=SimpleNamespace(
             fp8=False,
             deterministic_token_layout=False,
@@ -191,17 +203,17 @@ def constructor_namespace():
         Qwen3OmniMoeVisionEncoder=Qwen3OmniMoeVisionEncoder,
     )
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    partition = next(
+    partition = [
         n
         for n in ast.parse((ROOT / "pithtrain/pipeline/dualpipev.py").read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "layer_partition"
-    )
-    init = next(
+        if isinstance(n, ast.FunctionDef) and n.name in ("layer_sizes", "layer_partition")
+    ]
+    init = [
         n
         for n in ast.parse((ROOT / "pithtrain/modules/training.py").read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "init_weights"
-    )
-    nodes = [future, partition, init]
+        if isinstance(n, ast.FunctionDef) and n.name in ("init_weights", "weight_generator")
+    ]
+    nodes = [future, *partition, *init]
     for filename, selected in (
         ("pithtrain/operators/linear.py", {"BF16Linear"}),
         ("pithtrain/models/qwen3_omni_moe.py", None),
@@ -332,36 +344,32 @@ def test_default_text_factory_preserves_constructor_rng_and_parameters():
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(814)
         default = cls(config, -1)
-        ns["init_weights"](default, config.num_hidden_layers)
+        ns["init_weights"](torch.nn.Sequential(default), config.num_hidden_layers)
         default_rng = torch.get_rng_state()
         torch.manual_seed(814)
         explicit = cls(config, -1, decoder_layer_factory=ns["Qwen3OmniMoeThinkerTextDecoderLayer"])
-        ns["init_weights"](explicit, config.num_hidden_layers)
+        ns["init_weights"](torch.nn.Sequential(explicit), config.num_hidden_layers)
         assert torch.equal(torch.get_rng_state(), default_rng)
         for name, value in default.state_dict().items():
             torch.testing.assert_close(value, explicit.state_dict()[name], rtol=0, atol=0)
 
 
-def test_image_rng_change_is_explicit_but_same_initialized_state_still_loads_exactly():
+def test_image_constructor_rng_change_no_longer_reaches_initialized_state():
+    """
+    The legacy image constructor allocated each decoder twice, so it consumes more of the global
+    RNG. init_weights draws every parameter from a stream keyed by the seed and the parameter's
+    name, so both constructions initialize to identical states without any reseeding.
+    """
     ns = constructor_namespace()
     config = allocation_config()
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(814)
         old = legacy_image_constructor(ns, config, -1)
-        ns["init_weights"](old, config.text_config.num_hidden_layers)
+        ns["init_weights"](torch.nn.Sequential(old), config.text_config.num_hidden_layers)
         old_rng = torch.get_rng_state()
         torch.manual_seed(814)
         current = ns["Qwen3OmniMoeThinkerImageModel"](config, -1)
-        ns["init_weights"](current, config.text_config.num_hidden_layers)
+        ns["init_weights"](torch.nn.Sequential(current), config.text_config.num_hidden_layers)
         assert not torch.equal(torch.get_rng_state(), old_rng)
-        assert not torch.equal(
-            current.layers["0"].self_attn.q_proj.weight, old.layers["0"].self_attn.q_proj.weight
-        )
-        # A deliberate common initialization seed after construction yields the
-        # exact same values. Production does not do this reseed: its random
-        # initialization/source evidence must be refreshed for this repair.
-        for model in (old, current):
-            torch.manual_seed(915)
-            ns["init_weights"](model, config.text_config.num_hidden_layers)
         for name, value in current.state_dict().items():
             torch.testing.assert_close(value, old.state_dict()[name], rtol=0, atol=0)

@@ -2,7 +2,8 @@
 Cache control for FP8-quantized weights.
 
 Quantizing a weight is per-step work, not per-micro-batch work. This module holds the version
-counter that lets every FP8 linear module skip the redundant casts.
+counter that lets every FP8 linear module skip the redundant casts. Unlike the other contexts it
+is per-step state, which DualPipeV.step advances, not a value set once at startup.
 """
 
 import torch.nn as nn
@@ -37,5 +38,5 @@ class FP8WeightCacheControl:
         """
         for module in modules:
             for m in module.modules():
-                if hasattr(m, "_wq_cache"):
-                    m._wq_cache = None
+                if hasattr(m, "quantized_weight_cache"):
+                    m.quantized_weight_cache = None

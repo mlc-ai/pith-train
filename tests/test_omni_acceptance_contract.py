@@ -386,6 +386,7 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
     )
     stub_module(monkeypatch, "pithtrain.pipeline.execution", model_forward=lambda *a, **kw: None)
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *args, **kwargs: 0)
     monkeypatch.setattr(torch.cuda, "get_rng_state", torch.get_rng_state)
     return context
 

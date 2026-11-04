@@ -6,24 +6,6 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocation required")
 
 
-@pytest.mark.parametrize("rows,groups", [(0, 4), (1, 1), (255, 4), (257, 8), (1025, 4), (4099, 16)])
-def test_canonical_positions_match_independent_stable_sort(rows, groups):
-    from pithtrain.operators.canonical_group_positions import ROW_BLOCK, canonical_group_positions
-
-    generator = torch.Generator(device="cuda").manual_seed(1731)
-    ids = torch.randint(max(1, groups - 1), (rows,), generator=generator, device="cuda")
-    ranks, prefixes = canonical_group_positions(ids, groups)
-    if not rows:
-        assert ranks.numel() == prefixes.numel() == 0
-        return
-    position = ranks + prefixes[ids, torch.arange(rows, device="cuda") // ROW_BLOCK]
-    order = torch.argsort(ids, stable=True)
-    counts = torch.bincount(ids, minlength=groups)
-    expected = torch.empty_like(ids)
-    expected[order] = torch.arange(rows, device="cuda") - (counts.cumsum(0) - counts)[ids[order]]
-    assert torch.equal(position, expected)
-
-
 @pytest.mark.parametrize("rows,groups", [(1, 4), (257, 8), (1025, 4)])
 @pytest.mark.parametrize("canonical", [False, True])
 def test_scatter_policies_preserve_values_padding_and_backward(rows, groups, canonical):

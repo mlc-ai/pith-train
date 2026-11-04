@@ -29,6 +29,7 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
 )
 from pithtrain.modules.microbatch import Microbatch
+from pithtrain.modules.optimizer import local_grads, scale_grads_
 from pithtrain.modules.training_data import OmniPretrainData, global_loss_mean, global_target_count
 from tests import test_training_data as data_fixtures
 from tests.test_data_config import ROOT, example_modules
@@ -136,7 +137,11 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         gc=gc,
         objective=None,
         distributed=SimpleNamespace(dp_size=1, pp_rank=0, rank=1, attn_mesh=mesh),
-        training=SimpleNamespace(model=model, optimizers=[optimizer], schedulers=[scheduler]),
+        training=SimpleNamespace(
+            model=model, optimizers=[optimizer], schedulers=[scheduler], fp8=False
+        ),
+        local_grads=local_grads,
+        scale_grads_=scale_grads_,
         logging=SimpleNamespace(stdout=None),
         global_target_count=global_target_count,
         global_loss_mean=global_loss_mean,
@@ -175,7 +180,11 @@ def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_sta
 
     # launch resolves train_step in its globals, so replace only that callback.
     task = task_functions(
-        gc=SimpleNamespace(disable=lambda: None, enable=lambda: None),
+        gc=SimpleNamespace(
+            collect=lambda: 0, freeze=lambda: None, disable=lambda: None, enable=lambda: None
+        ),
+        training=SimpleNamespace(fp8=False),
+        tune_kernels=lambda: None,
         setup_logging=lambda cfg: None,
         setup_distributed=lambda cfg: None,
         setup_dataset=lambda cfg: data,
@@ -241,7 +250,7 @@ def test_public_launch_initializes_weights_with_fresh_prepared_data(
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.9)
         for key, value in dict(
-            model=model, optimizers=(optimizer,), schedulers=(scheduler,)
+            model=model, optimizers=(optimizer,), schedulers=(scheduler,), fp8=False
         ).items():
             monkeypatch.setattr(training, key, value, raising=False)
         snapshots.update(
@@ -273,7 +282,11 @@ def test_public_launch_initializes_weights_with_fresh_prepared_data(
 
     monkeypatch.setattr(logging, "stdout", std_logging.getLogger(__name__), raising=False)
     task = task_functions(
-        gc=SimpleNamespace(disable=lambda: None, enable=lambda: None),
+        gc=SimpleNamespace(
+            collect=lambda: 0, freeze=lambda: None, disable=lambda: None, enable=lambda: None
+        ),
+        training=training,
+        tune_kernels=lambda: None,
         setup_logging=lambda cfg: None,
         setup_distributed=lambda cfg: None,
         setup_dataset=lambda cfg: data,

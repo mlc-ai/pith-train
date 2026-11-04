@@ -75,12 +75,12 @@ def native_meta(raw):
 
     ns["model_forward"] = unavailable
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    partition = next(
+    partition = [
         n
         for n in ast.parse((ROOT / "pithtrain/pipeline/dualpipev.py").read_text()).body
-        if isinstance(n, ast.FunctionDef) and n.name == "layer_partition"
-    )
-    nodes = [future, partition]
+        if isinstance(n, ast.FunctionDef) and n.name in ("layer_sizes", "layer_partition")
+    ]
+    nodes = [future, *partition]
     for filename, selected in (
         ("pithtrain/operators/linear.py", {"BF16Linear"}),
         ("pithtrain/models/qwen3_omni_moe.py", None),

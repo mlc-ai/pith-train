@@ -85,7 +85,7 @@ Use the **`add-new-model`** skill — it covers the full scope below and runs th
 
 ### Add a new operator / kernel
 
-1. Implement the kernel in `pithtrain/operators/<op>.py` (Triton preferred).
+1. Implement the kernel in `pithtrain/kernels/<feature>.py` (Triton preferred; an SM90-specific CuTe-DSL version goes in `<feature>_sm90.py` next to the Triton `<feature>_sm100.py`, behind a picker `<feature>.py`, see AGENTS.md "Kernels") and its autograd op or layer in `pithtrain/operators/<op>.py`.
 2. **Ship a PyTorch reference implementation in the same module** — this is the layer's contract and what the test compares against.
 3. Add `tests/test_<op>.py` comparing fused vs reference (use `calc_diff` and an appropriate tolerance for reduced precision; remember the `grouped_mm` padding gotcha).
 4. Optionally add a benchmark under `benchmarks/operators/`.

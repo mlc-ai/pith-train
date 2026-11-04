@@ -1,17 +1,6 @@
 """
-Benchmark DeepGEMM FP8 linear layers vs BF16 baselines.
-
-Run all benchmarks:
-    python3 -m benchmarks.operators.fp8.test_deepgemm
-
-Section 1 - Non-grouped: FP8Linear vs Linear
-Section 2 - Grouped: FP8GroupedLinear vs GroupedLinear
-
-Forward FLOPS:   2*M*N*K
-Backward FLOPS:  4*M*N*K  (dgrad: 2MNK, wgrad: 2MNK)
-
-Forward I/O  (BF16, 2B/elem): 2*(M*K + N*K + M*N)
-Backward I/O (BF16, 2B/elem): 2*(2*M*N + 2*M*K + 2*N*K)
+Benchmark DeepGEMM FP8 linear layers against BF16 (and Transformer Engine MXFP8 when installed).
+Run with python3 -m benchmarks.operators.fp8.test_deepgemm.
 """
 
 import itertools
@@ -24,8 +13,9 @@ import torch.nn as nn
 from triton.testing import do_bench
 
 from benchmarks.operators.utilities import Metrics
+from pithtrain.kernels import fp8_group_indices
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
-from pithtrain.operators.linear import ARCH_MAJOR, FP8Linear
+from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
 try:
@@ -39,9 +29,6 @@ except ImportError:
 if HAS_TE:
     _TE_FP8_RECIPE = MXFP8BlockScaling()
 
-# ---------------------------------------------------------------------------
-# Non-grouped workloads
-# ---------------------------------------------------------------------------
 # M values x (N, K) pairs from DeepGEMM generators.py enumerate_normal
 M_VALUES = [128, 2048, 4096, 8192]
 NK_PAIRS = [
@@ -54,14 +41,11 @@ NK_PAIRS = [
     (7168, 2048),
 ]
 
-NormalWorkload = Tuple[int, int, int]  # (M, N, K)
+NormalWorkload = Tuple[int, int, int]
 NORMAL_WORKLOADS: List[NormalWorkload] = [
     (m, n, k) for m, (n, k) in itertools.product(M_VALUES, NK_PAIRS)
 ]
 
-# ---------------------------------------------------------------------------
-# Grouped workloads
-# ---------------------------------------------------------------------------
 GROUP_SHAPES = [(4, 8192), (8, 4096), (16, 2048), (32, 1024)]  # (num_groups, m_per_group)
 GROUP_NK_PAIRS = [
     (6144, 7168),
@@ -72,15 +56,12 @@ GROUP_NK_PAIRS = [
     (7168, 2048),
 ]
 
-GroupWorkload = Tuple[int, int, int, int]  # (num_groups, m_per_group, N, K)
+GroupWorkload = Tuple[int, int, int, int]
 GROUP_WORKLOADS: List[GroupWorkload] = [
     (g, mpg, n, k) for (g, mpg), (n, k) in itertools.product(GROUP_SHAPES, GROUP_NK_PAIRS)
 ]
 
 
-# ---------------------------------------------------------------------------
-# Non-grouped benchmarks
-# ---------------------------------------------------------------------------
 def bench_normal_fwd(M: int, N: int, K: int) -> Metrics:
     torch.manual_seed(42)
     x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
@@ -186,21 +167,13 @@ def bench_normal_bwd(M: int, N: int, K: int) -> Metrics:
     return Metrics(ref_time, fp8_time, flops, io_bytes, te_ms=te_time)
 
 
-# ---------------------------------------------------------------------------
-# Grouped benchmarks
-# ---------------------------------------------------------------------------
 def _make_group_indices(grouped_mm_offs: torch.Tensor, M: int):
-    """Build per-row group indices for Hopper; returns None on Blackwell."""
-    if ARCH_MAJOR >= 10:
-        return None
-    row_indices = torch.arange(M, device=grouped_mm_offs.device)
-    return torch.searchsorted(grouped_mm_offs, row_indices, right=True).to(torch.int32)
+    return fp8_group_indices(grouped_mm_offs, M)
 
 
 def _make_grouped_inputs(
     num_groups: int, m_per_group: int, K: int
 ) -> Tuple[torch.Tensor, torch.Tensor, list, torch.Tensor, int, torch.Tensor | None]:
-    """Create scattered input and grouped_mm_offs (outside timed region)."""
     m = num_groups * m_per_group
     tokens = torch.randn((m, K), dtype=torch.bfloat16, device="cuda")
     expert_idxs = torch.randint(0, num_groups, (m,), device="cuda")
@@ -332,9 +305,6 @@ def bench_grouped_bwd(num_groups: int, m_per_group: int, N: int, K: int) -> Metr
     return Metrics(ref_time, fp8_time, flops, io_bytes, te_ms=te_time)
 
 
-# ---------------------------------------------------------------------------
-# Output formatting
-# ---------------------------------------------------------------------------
 def _format_table(
     title: str,
     dim_labels: str,
@@ -401,7 +371,6 @@ def main() -> None:
 
     te_tag = " vs TE FP8" if HAS_TE else ""
 
-    # --- Non-grouped ---
     normal_rows = []
     for M, N, K in NORMAL_WORKLOADS:
         fwd = bench_normal_fwd(M, N, K)
@@ -418,7 +387,6 @@ def main() -> None:
         )
     )
 
-    # --- Grouped ---
     grouped_rows = []
     for num_groups, m_per_group, N, K in GROUP_WORKLOADS:
         fwd = bench_grouped_fwd(num_groups, m_per_group, N, K)

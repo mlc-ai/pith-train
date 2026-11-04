@@ -115,6 +115,18 @@ HF's live Parameter is often `[E, in, out]` - the transposed layout - because HF
 
 **Do not pick a different layout without evidence** (a microbench showing materially faster kernels on our target hardware). In the absence of evidence, deviating from the consensus is strictly worse: kernel authors tune for it, and quantized paths (MXFP4, FP8) are usually pre-packed in the consensus layout.
 
+### Kernels: only through `pithtrain.kernels`, never by architecture
+
+A model file imports kernels only as `from pithtrain.kernels import <name>` with `<name>` in `pithtrain/kernels/__init__.py`'s `__all__` (never a submodule such as `pithtrain.kernels.fp8_gemm`), and it never branches on the GPU architecture: no `ARCH_MAJOR`, `is_sm90` or `torch.cuda.get_device_capability`. Where the existing models take a fused path, copy their gate, which is a capability query named for the feature:
+
+```python
+if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:   # fused FP8 experts
+    ...
+return not training.fp8 and bf16_experts_supported(num_local_experts)  # BF16 CuTe experts
+```
+
+`tests/test_import_layers.py` fails on any other import or an architecture check. A new kernel the model needs goes into `pithtrain/kernels/` with a contract docstring, an entry in `__all__` and a pure-PyTorch verifier in `tests/kernels/test_<feature>.py` (AGENTS.md, "Kernels").
+
 ### Verifying layout correctness after conversion
 
 Norms are invariant under transposition. A norm match does NOT prove the layout is right. The real check is element-wise:

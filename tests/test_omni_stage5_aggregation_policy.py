@@ -136,15 +136,16 @@ def test_legacy_tuple_abis_and_wrapper_replace_serialization():
         "expand_idx",
         "dispatch_splits",
         "combine_splits",
+        "expert_counts",
     )
     assert execution.Stage5Args._fields == ("moe_outs", "topk_weight", "residual")
     base = RoutingInfo(torch.ones(2, 2), torch.arange(4))
     metadata = Stage5RouteMetadata.from_expert_ids(torch.tensor([[3, 0], [1, 2]]))
     wrapped = Stage5RoutingInfo(base, metadata)
-    a, b, c, d, e, f = wrapped
+    a, b, c, d, e, f, g = wrapped
     assert a is base.topk_weight and b is base.expert_idxs
-    assert (c, d, e, f) == (None, None, None, None)
-    assert len(wrapped) == 6 and wrapped[0] is base[0]
+    assert (c, d, e, f, g) == (None, None, None, None, None)
+    assert len(wrapped) == 7 and wrapped[0] is base[0]
     assert tuple(wrapped._asdict()) == RoutingInfo._fields
     assert wrapped._asdict()["topk_weight"] is base.topk_weight
     indexes = torch.randperm(4)
@@ -212,7 +213,7 @@ def test_default_stage1_no_extra_metadata_factory_clone_sort_or_wrapper():
     )
     hidden = torch.randn(1, 2, 4)
     tokens, residual, routing = namespace["forward_stage1"](layer, hidden, None)
-    assert type(routing) is RoutingInfo and len(routing) == 6
+    assert type(routing) is RoutingInfo and len(routing) == len(RoutingInfo._fields)
     assert routing.topk_weight is weights and torch.equal(routing.expert_idxs, ids.flatten())
     assert residual is hidden and tokens.shape == (6, 4)
 

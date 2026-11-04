@@ -1,5 +1,3 @@
-"""Test that Gated DeltaNet on a packed row matches running each of its documents on its own."""
-
 from dataclasses import dataclass
 from itertools import accumulate
 
@@ -10,6 +8,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from pithtrain.contexts import training
 from pithtrain.modules.distributed import DistributedCfg
+from pithtrain.operators.linear import BF16Linear
 from tests.utilities import launch
 
 
@@ -31,7 +30,7 @@ def verify_packed(req: PackedRequest) -> None:
     # Imported here: the model module needs a GPU at import, and collection must not.
     from pithtrain.models.qwen35_moe import Qwen35MoeGatedDeltaNet
 
-    training.Linear = nn.Linear
+    training.Linear, training.fp8 = BF16Linear, False  # what setup_model binds for BF16
     device = torch.cuda.current_device()
     config = Qwen3_5MoeTextConfig(
         hidden_size=512,
@@ -56,21 +55,21 @@ def verify_packed(req: PackedRequest) -> None:
     tokens = torch.randn(1, S, config.hidden_size, device=device, dtype=torch.bfloat16)
     grad_out = torch.randn(1, S, config.hidden_size, device=device, dtype=torch.bfloat16)
 
-    def run(packed: bool, cu: torch.Tensor | None) -> dict:
+    def run(packed: bool, seqlens: torch.Tensor | None) -> dict:
         layer.zero_grad(set_to_none=True)
         x = tokens.clone().requires_grad_(True)
         if packed:
-            out = forward(x, cu)
+            out = forward(x, seqlens)
         else:
             spans = zip([0, *bounds[:-1]], bounds)
-            out = torch.cat([layer(x[:, a:b]) for a, b in spans], dim=1)
+            out = torch.cat([layer(x[:, start:end]) for start, end in spans], dim=1)
         out.backward(grad_out)
-        grads = {name: p.grad for name, p in layer.named_parameters()}
+        grads = {name: param.grad for name, param in layer.named_parameters()}
         return {"out": out.detach(), "dx": x.grad, **grads}
 
-    reference = run(packed=False, cu=None)
-    packed = run(packed=True, cu=cu_seqlens)
-    leaky = run(packed=True, cu=None)
+    reference = run(packed=False, seqlens=None)
+    packed = run(packed=True, seqlens=cu_seqlens)
+    leaky = run(packed=True, seqlens=None)
     for name, ref in reference.items():
         error = relative_error(ref, packed[name])
         control = relative_error(ref, leaky[name])

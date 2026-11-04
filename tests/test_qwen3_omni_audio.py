@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -188,10 +189,12 @@ def test_two_live_audio_microbatches_keep_independent_graphs():
     assert_gradients(native, independent)
 
 
-def training_function(name, namespace):
+def training_function(name, namespace, helpers=()):
     tree = ast.parse((ROOT / "pithtrain/modules/training.py").read_text())
-    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "training", "exec"), namespace)
+    functions = [
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in (name, *helpers)
+    ]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "training", "exec"), namespace)
     return namespace[name]
 
 
@@ -223,12 +226,23 @@ def test_audio_modules_are_adamw_parameters_and_initialize_after_meta_allocation
     assert not choose("module.0.audio_tower.conv2d1.weight", torch.empty(4, 1, 3, 3))
     assert not choose("module.0.audio_tower.layers.0.self_attn.q_proj.weight", torch.empty(16, 16))
     assert choose("module.0.layers.0.self_attn.q_proj.weight", torch.empty(16, 16))
-    initialize = training_function("init_weights", {"torch": torch, "nn": torch.nn, "math": math})
+    initialize = training_function(
+        "init_weights",
+        {
+            "torch": torch,
+            "nn": torch.nn,
+            "math": math,
+            "np": np,
+            "distributed": SimpleNamespace(ep_rank=0),
+        },
+        helpers=("weight_generator",),
+    )
     with torch.device("meta"):
         model = torch.nn.Module()
         model.audio_tower = Qwen3OmniMoeAudioEncoder(audio_config())
     model.to_empty(device="cpu")
-    initialize(model, 4)
+    # init_weights takes a rank's V-chunks and names parameters without the chunk index.
+    initialize(torch.nn.Sequential(model), 4)
     for name, value in model.named_parameters():
         assert torch.isfinite(value).all(), name
         if value.ndim == 1:

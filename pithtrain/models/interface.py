@@ -3,6 +3,17 @@ from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
+__all__ = [
+    "AllToAllSplits",
+    "LayerProtocol",
+    "MLPProtocol",
+    "MetadataStage5Protocol",
+    "ModelProtocol",
+    "RoutingInfo",
+    "Stage5RouteMetadata",
+    "Stage5RoutingInfo",
+]
+
 
 class AllToAllSplits(NamedTuple):
     input_splits: List[int]
@@ -16,6 +27,11 @@ class RoutingInfo(NamedTuple):
     expand_idx: Optional[torch.Tensor] = None
     dispatch_splits: Optional[AllToAllSplits] = None
     combine_splits: Optional[AllToAllSplits] = None
+    expert_counts: Optional[list[int]] = None
+    """
+    Rows routed to each local expert, on the host, when dispatch already knows them; lets stage 3
+    size its grouped GEMMs without another device-to-host sync.
+    """
 
 
 class Stage5RouteMetadata(NamedTuple):
@@ -34,7 +50,7 @@ class Stage5RouteMetadata(NamedTuple):
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class Stage5RoutingInfo:
-    """Optional-only metadata owner; ordinary RoutingInfo's six-field ABI is unchanged.
+    """Optional-only metadata owner; the ordinary RoutingInfo tuple is unchanged.
 
     Delegate legacy attributes and tuple adapters to the original route. After
     aggregation, gather autograd owns the integer permutation required by VJPs;
@@ -74,18 +90,13 @@ class MetadataStage5Protocol(Protocol):
     ) -> torch.Tensor: ...
 
 
-class MLPProtocol(Protocol):
-    """
-    Protocol for the MLP component of a DualPipeV-compatible decoder layer.
-    """
+class MLPProtocol(Protocol): ...
 
 
 class LayerProtocol(Protocol):
     """
-    Protocol for a DualPipeV-compatible decoder layer.
-
-    Each layer is split into five stages so the pipeline scheduler can interleave different
-    micro-batches and overlap the compute of one with the communication of another.
+    A DualPipeV decoder layer, split into five stages so the pipeline scheduler can overlap the
+    compute of one micro-batch with the communication of another.
 
     - Stage 1: pre-dispatch compute.
     - Stage 2: dispatch all-to-all.
@@ -99,10 +110,7 @@ class LayerProtocol(Protocol):
 
     def reference_forward(
         self, hidden_states: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
-        """
-        Reference forward implementation for correctness validation.
-        """
+    ) -> torch.Tensor: ...
 
     def forward_stage1(
         self,
@@ -111,8 +119,8 @@ class LayerProtocol(Protocol):
         cu_seqlens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[RoutingInfo | Stage5RoutingInfo]]:
         """
-        Stage 1, the pre-dispatch compute (runs before the stage-2 dispatch).
-        Run the attention sublayer and shared experts, then route tokens to experts and prepare the dispatch (MoE layers).
+        Stage 1, before the dispatch: run the attention sublayer and shared experts, then route the
+        tokens to experts and prepare the dispatch (MoE layers).
         """
 
     def forward_stage3(
@@ -120,10 +128,11 @@ class LayerProtocol(Protocol):
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
         expand_idx: Optional[torch.Tensor] = None,
+        expert_counts: Optional[list[int]] = None,
     ) -> torch.Tensor:
         """
-        Stage 3, the expert compute (runs after the stage-2 dispatch and before the stage-4 combine).
-        Run the experts (or dense MLP) on the dispatched tokens.
+        Stage 3, between the dispatch and the combine: run the experts (or the dense MLP) on the
+        tokens this rank received.
         """
 
     def forward_stage5(
@@ -134,16 +143,12 @@ class LayerProtocol(Protocol):
         residual: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Stage 5, the post-combine compute (runs after the stage-4 combine).
-        Aggregate the expert outputs by router weights and add the residual from stage 1.
+        Stage 5, after the combine: weight the expert outputs by the router weights, sum them per
+        token and add the residual from stage 1.
         """
 
 
 class ModelProtocol(Protocol):
-    """
-    Protocol for a DualPipeV-compatible transformer language model.
-    """
-
     # Text-only models may omit this. Media models declare their implemented inputs
     # and forward the stage-selected model_context into model_forward(...).
     # Only stage 0 receives encoder payloads; other stages get tokens/masks/layout.
@@ -154,19 +159,15 @@ class ModelProtocol(Protocol):
     hidden_size: int
     layers: Dict[str, LayerProtocol]
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Reference forward implementation for correctness validation.
-        """
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 
     def forward_posemb(
         self, S: int, cu_seqlens: Optional[torch.Tensor] = None, *, model_context=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute the (cos, sin) rotary embeddings for this rank's S tokens. When
-        ``cu_seqlens`` is set the sequence is packed, so positions restart at zero
-        at each document boundary; it holds the boundaries of the whole packed
-        sample, also under context parallelism.
+        The (cos, sin) rotary embeddings for this rank's S tokens. When cu_seqlens is set the
+        sequence is packed and positions restart at zero at each document boundary; cu_seqlens
+        holds the boundaries of the whole packed sample, also under context parallelism.
         """
 
     def forward_prolog(self, hidden_states: torch.Tensor, *, model_context=None) -> torch.Tensor:
@@ -176,5 +177,5 @@ class ModelProtocol(Protocol):
 
     def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Epilog compute (last stage only): final norm + lm_head projection to logits.
+        Epilog compute (last stage only): final norm and lm_head projection to logits.
         """

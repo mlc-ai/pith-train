@@ -66,3 +66,6 @@ Thumbs.db
 debug
 workspace
 wandb
+
+# Humanize RLCR state and KDA task records.
+.humanize/
