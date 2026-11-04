@@ -132,13 +132,8 @@ def test_one_bad_image_rejects_all_pp_and_dp_ranks(training_bundle, processor_co
 
 
 def test_optimizer_keeps_vision_conv_and_projection_in_adamw():
-    tree = ast.parse((ROOT / "pithtrain/modules/training.py").read_text())
-    function = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "is_muon_param"
-    )
-    ns = {"torch": torch}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "optimizer", "exec"), ns)
-    choose = ns["is_muon_param"]
+    from pithtrain.modules.optimizer import is_muon_param as choose
+
     assert not choose("module.0.visual.patch_embed.proj.weight", torch.empty(8, 3, 2, 2, 2))
     assert not choose("module.0.visual.blocks.0.attn.qkv.weight", torch.empty(24, 8))
     assert choose("module.0.layers.0.self_attn.q_proj.weight", torch.empty(24, 8))

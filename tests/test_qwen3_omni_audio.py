@@ -218,7 +218,8 @@ def test_audio_registration_preserves_existing_model_selection():
 
 
 def test_audio_modules_are_adamw_parameters_and_initialize_after_meta_allocation():
-    choose = training_function("is_muon_param", {"torch": torch})
+    from pithtrain.modules.optimizer import is_muon_param as choose
+
     assert not choose("module.0.audio_tower.conv2d1.weight", torch.empty(4, 1, 3, 3))
     assert not choose("module.0.audio_tower.layers.0.self_attn.q_proj.weight", torch.empty(16, 16))
     assert choose("module.0.layers.0.self_attn.q_proj.weight", torch.empty(16, 16))

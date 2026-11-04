@@ -29,6 +29,33 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate
 
+
+def is_muon_param(name: str, param: torch.Tensor) -> bool:
+    """
+    True if Muon should optimize param, False if it belongs to AdamW instead.
+
+    Muon takes the 2D hidden weights: attention q/k/v/o, MLA projections, dense and shared-expert
+    gate/up/down, and the stacked 3D expert weights. AdamW takes everything else, meaning the 1D
+    norms, biases and sinks, the embeddings, the LM head, the MoE gate and router, and the 2D
+    stacked expert biases.
+    """
+    if param.ndim < 2 or "visual." in name or "audio_tower." in name:
+        return False
+    if name.endswith(".bias") or name.endswith("_bias"):
+        return False
+    if name.endswith(
+        ("embed_tokens.weight", "lm_head.weight", "codec_embedding.weight", "codec_head.weight")
+    ):
+        return False
+    if (
+        ".gate.weight" in name
+        or ".router.weight" in name
+        or (".model.layers." in "." + name and name.endswith("shared_expert_gate.weight"))
+    ):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Newton-Schulz orthogonalization
 # ---------------------------------------------------------------------------

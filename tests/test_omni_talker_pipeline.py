@@ -196,7 +196,7 @@ def test_pipeline_parameter_names_and_fsdp_edges_are_not_duplicate_modules():
 def test_registry_and_muon_codec_exclusions_execute_actual_functions():
     path = ROOT / "pithtrain/modules/training.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    names = ("model_class_for_config", "is_muon_param")
+    names = ("model_class_for_config",)
     marker = object()
     namespace = dict(
         torch=torch, resolve_text_model_config=lambda cfg: cfg, Qwen3OmniMoeTalkerTextModel=marker
@@ -210,7 +210,8 @@ def test_registry_and_muon_codec_exclusions_execute_actual_functions():
         )
         is marker
     )
-    classify = namespace["is_muon_param"]
+    from pithtrain.modules.optimizer import is_muon_param as classify
+
     value = torch.zeros(4, 8)
     for name in (
         "model.codec_embedding.weight",
