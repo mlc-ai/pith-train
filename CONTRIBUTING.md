@@ -36,7 +36,7 @@ Requires an NVIDIA Hopper (SM90) or Blackwell (SM100) GPU, CUDA >= 13.0, and Pyt
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
 uv venv
-uv sync                  # installs dev + runtime deps (contributors use this, not `uv pip install .`)
+uv sync                  # installs every dependency (contributors use this, not `uv pip install .`)
 pre-commit install       # optional but recommended: run hooks on commit
 ```
 

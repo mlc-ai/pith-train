@@ -14,10 +14,10 @@ dependencies = [
     "transformers",
     "wandb",
     "zstandard",
+    "pre-commit",
+    "pytest",
+    "ruff",
 ]
-
-[dependency-groups]
-dev = ["pre-commit", "pytest", "ruff"]
 
 [build-system]
 build-backend = "setuptools.build_meta"
