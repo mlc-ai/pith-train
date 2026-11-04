@@ -185,7 +185,7 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
 def _reduction_worker(rank, rendezvous):
     dist.init_process_group(
         "gloo",
-        init_method=f"file://{rendezvous}",
+        init_method=Path(rendezvous).resolve().as_uri(),
         rank=rank,
         world_size=4,
         timeout=timedelta(seconds=45),

@@ -21,7 +21,7 @@ def dispatch_methods(overlapped):
     cls = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DualPipeV"
     )
-    names = {"setup_step_metadata", "_forward_compute_chunk", "_forward_backward_compute_chunk"}
+    names = {"setup_step_metadata", "forward_compute_chunk", "forward_backward_compute_chunk"}
     nodes = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     module = ModuleType("cpu_dispatch_fixture")
@@ -110,16 +110,16 @@ def test_pipeline_passes_media_only_to_stage_zero(pp_rank, phase, overlap, with_
     pipeline_module = dispatch_methods(overlapped)
     for name in (
         "setup_step_metadata",
-        "_forward_compute_chunk",
-        "_forward_backward_compute_chunk",
+        "forward_compute_chunk",
+        "forward_backward_compute_chunk",
     ):
         setattr(engine, name, MethodType(getattr(pipeline_module.DualPipeV, name), engine))
     assert engine.setup_step_metadata(batches) == 3
     assert engine.p2p_shapes == [[(1, 3, 3)]] * 3
     if overlap:
-        engine._forward_backward_compute_chunk(phase, 1 - phase)
+        engine.forward_backward_compute_chunk(phase, 1 - phase)
     else:
-        engine._forward_compute_chunk(phase)
+        engine.forward_compute_chunk(phase)
     assert len(seen) == 1
     stage, kwargs, replay_microbatch = seen[0]
     assert stage == modules[phase].stage_index

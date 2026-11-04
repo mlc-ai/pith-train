@@ -1,6 +1,6 @@
 """CPU checks of dense batch contents and the shared checkpoint boundary.
 
-Only corpus shuffle placement and its barrier are mocked: the real memmap,
+Only the shuffle owner's rank, placement and barrier are mocked: the real memmap,
 shuffle, DP/CP slicing, batch adapter, and DCP serialization code execute.
 """
 
@@ -29,6 +29,11 @@ def text_corpus(tmp_path, monkeypatch, request):
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
     token_root = tmp_path / "tokens/train"
     token_root.mkdir(parents=True)
+    # Simulate the one shuffle writer, then readers on the other ranks. Rewriting an
+    # already mapped cache is invalid on Windows, where all rank views share this process.
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda: int((token_root / "indices.npy").exists())
+    )
     inputs, labels = [], []
     # Distinct shards exercise concat offsets; short tails must stay dropped.
     for shard, count in enumerate((17, 19)):

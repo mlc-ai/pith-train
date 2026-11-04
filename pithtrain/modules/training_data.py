@@ -159,7 +159,7 @@ class OmniPretrainData:
         if cfg.format != "prepared_bundle":
             raise ValueError("OmniPretrainData requires prepared_bundle format")
         # Keep legacy text training independent of the optional omni-data extra.
-        from pithtrain.tasks.prepare_omni_data import read_verified_bundle
+        from pithtrain.modules.omni_bundle import read_verified_bundle
 
         self.root, self.cfg = Path(cfg.dataset).resolve(), cfg
         self.is_text = list(cfg.modalities) == ["text"]
@@ -273,7 +273,7 @@ class OmniPretrainData:
             getattr(model_config, "thinker_config", model_config), "text_config", model_config
         )
         # The pinned processor config defines the embedding vocabulary, not tokenizer.vocab_size.
-        from pithtrain.tasks.prepare_omni_data import processor_for
+        from pithtrain.modules.omni_bundle import processor_for
 
         def prepare():
             self._processor, self._thinker_config = processor_for(self.recipe, True)
@@ -334,8 +334,8 @@ class OmniPretrainData:
         return result
 
     def _make_iterator(self):
+        from pithtrain.modules.omni_bundle import processor_for
         from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
-        from pithtrain.tasks.prepare_omni_data import processor_for
 
         if self._processor is None:
             self._processor, self._thinker_config = processor_for(self.recipe, True)

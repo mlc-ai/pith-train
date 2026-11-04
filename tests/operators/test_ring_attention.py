@@ -1,5 +1,3 @@
-"""Test the correctness of ring attention under context parallelism."""
-
 from dataclasses import dataclass, fields
 from itertools import accumulate
 
@@ -37,24 +35,11 @@ class Result:
 
 
 def extract_zigzag(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
-    """
-    Extract this rank's zigzag-local slice along the sequence dim (dim=1).
-
-    The global sequence is split into 2*cp_size equal chunks; rank r holds
-    chunk r (front) concatenated with chunk 2*cp_size - r - 1 (mirror back).
-    """
     chunks = x.chunk(2 * cp_size, dim=1)
     return torch.cat([chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]], dim=1).contiguous()
 
 
 def record(req: Request) -> tuple[Result, Result]:
-    """
-    Record the forward output and the input gradients dQ, dK, dV for both the
-    baseline and the implementation. The baseline is flash_attn_func run on the
-    full sequence with no CP communication; the implementation is the zigzag
-    ring_attention_func run on this rank's zigzag-local slice of Q/K/V with K/V
-    rotated around the CP ring during the forward and backward passes.
-    """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
@@ -107,11 +92,6 @@ def test_ring_attention_vs_dense(cp_size: int, req: Request) -> None:
     launch(cfg, verify, req)
 
 
-# ---------------------------------------------------------------------------
-# Packed sequences: every document zigzag-sharded on its own.
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class VarlenRequest:
     seqlens: tuple[int, ...]
@@ -122,18 +102,12 @@ class VarlenRequest:
 
 
 def extract_zigzag_varlen(x: torch.Tensor, cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int):
-    """
-    Shard each document independently; skip empty documents before chunking.
-    """
     bounds = cu_seqlens.tolist()
     docs = [x[start:end].unsqueeze(0) for start, end in zip(bounds[:-1], bounds[1:]) if end > start]
     return torch.cat([extract_zigzag(doc, cp_rank, cp_size).squeeze(0) for doc in docs])
 
 
 def record_varlen(req: VarlenRequest) -> tuple[Result, Result]:
-    """
-    Compare the packed ring against whole-sample varlen attention with random output gradients.
-    """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
@@ -206,11 +180,6 @@ def test_ring_attention_varlen_vs_full(cp_size: int, req: VarlenRequest) -> None
     launch(cfg, verify_varlen, req)
 
 
-# ---------------------------------------------------------------------------
-# MLA "pass the latent" ring attention.
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class MLARequest:
     B: int
@@ -222,10 +191,9 @@ class MLARequest:
     v_head_dim: int = 128
     atol: float = 1e-3
     atol_weight: float = 1e-2
-    # Relative-error tolerance for the kv_b weight gradient. Cosine is scale-invariant
-    # and would hide a uniform magnitude bug (e.g. a missed cross-CP sum), so we ALSO
-    # require ||dW_imp - dW_ref|| / ||dW_ref|| < rtol_weight. Bf16-noise floor at the
-    # sizes we test (S<=2048, H<=16, R=512) is ~5e-3.
+    # Relative L2 tolerance for the kv_b weight gradient. Cosine is scale-invariant and would hide a
+    # uniform magnitude bug such as a missed cross-CP sum. The bf16 noise floor at the tested sizes
+    # (S<=2048, H<=16, R=512) is about 5e-3.
     rtol_weight: float = 1e-2
 
 
@@ -239,13 +207,6 @@ class MLAResult:
 
 
 def record_mla(req: MLARequest):
-    """
-    Reference: full-sequence MLA attention (decompress the latent via kv_b, then dense MLA
-    flash attention) with no CP. Implementation: rotate the compressed latent around the
-    zigzag ring and decompress on each rank. We compare the forward output and the input
-    gradients (dq_nope, dq_pe, d_normed_kv, d_k_pe) on this rank's zigzag slice, plus the
-    kv_b weight gradient -- which is global, so the per-rank partials are summed across CP.
-    """
     cp_group = distributed.cp_group
     cp_rank, cp_size = cp_group.rank(), cp_group.size()
     device = torch.cuda.current_device()
@@ -261,7 +222,6 @@ def record_mla(req: MLARequest):
     k_pe_full = torch.randn(req.B, req.S, 1, rope, device=device, dtype=torch.bfloat16)
     w_full = torch.randn(out_features, R, device=device, dtype=torch.bfloat16) / (R**0.5)
 
-    # Reference: dense full-sequence MLA, no CP.
     q_nope_r = q_nope_full.clone().requires_grad_(True)
     q_pe_r = q_pe_full.clone().requires_grad_(True)
     normed_kv_r = normed_kv_full.clone().requires_grad_(True)
@@ -288,7 +248,6 @@ def record_mla(req: MLARequest):
     )
     dW_ref = w_r.grad
 
-    # Implementation: zigzag-local latent rotated around the ring.
     q_nope_i = extract_zigzag(q_nope_full, cp_rank, cp_size).clone().requires_grad_(True)
     q_pe_i = extract_zigzag(q_pe_full, cp_rank, cp_size).clone().requires_grad_(True)
     normed_kv_i = extract_zigzag(normed_kv_full, cp_rank, cp_size).clone().requires_grad_(True)
@@ -320,9 +279,8 @@ def verify_mla(req: MLARequest) -> None:
         error = cosine_error(getattr(ref, f.name), getattr(imp, f.name))
         if error >= req.atol:
             raise AssertionError(f"{f.name} diverged: {error=:.2e} >= {req.atol=}")
-    # Promote to fp32 for the dW comparison: the implementation now returns dW in fp32
-    # (kept full-precision through FSDP's fp32 reduce-scatter), while the reference is
-    # bf16 from autograd through F.linear -- norm/dot are dtype-sensitive at small mags.
+    # Compare dW in fp32: both gradients reach the test as bf16 (autograd casts the op's fp32 dW to
+    # the parameter's dtype), and norms and dot products in bf16 are imprecise at small magnitudes.
     dW_ref_f = dW_ref.to(torch.float32)
     dW_imp_f = dW_imp.to(torch.float32)
     werr = cosine_error(dW_ref_f, dW_imp_f)
@@ -347,18 +305,12 @@ def test_mla_ring_attention_vs_dense(cp_size: int, req: MLARequest) -> None:
     launch(cfg, verify_mla, req)
 
 
-# ---------------------------------------------------------------------------
-# FP8 in-ring kv_b decompression (pass-latent CP with training.fp8 enabled).
-# ---------------------------------------------------------------------------
-
-
 def record_mla_fp8(req: MLARequest):
     """
-    Like record_mla but exercises the FP8 in-ring kv_b path. The reference decompresses the
-    latent via an FP8Linear on the *full* sequence (so its kv_b quantization error matches the
-    implementation); the implementation passes the same FP8-quantized kv_b weight into the ring
-    via ``kv_b_quant``. Comparing fp8-vs-fp8 isolates the in-ring math from the (large) e4m3
-    quantization error, so a tight tolerance is meaningful.
+    Like record_mla, but with kv_b in FP8. The reference decompresses the full-sequence latent with
+    an FP8Linear, so its kv_b quantization error matches the implementation, which passes the same
+    quantized kv_b weight into the ring as kv_b_quant. Comparing fp8 with fp8 isolates the in-ring
+    math from the large e4m3 quantization error, so a tight tolerance is meaningful.
     """
     from pithtrain.operators.linear import FP8Linear
 
@@ -377,7 +329,6 @@ def record_mla_fp8(req: MLARequest):
     k_pe_full = torch.randn(req.B, req.S, 1, rope, device=device, dtype=torch.bfloat16)
     w_full = torch.randn(out_features, R, device=device, dtype=torch.bfloat16) / (R**0.5)
 
-    # Reference: dense full-sequence MLA, no CP, kv_b decompressed via FP8Linear.
     ref_lin = FP8Linear(R, out_features, bias=False).to(device).to(torch.bfloat16)
     ref_lin.weight.data.copy_(w_full)
     q_nope_r = q_nope_full.clone().requires_grad_(True)
@@ -405,10 +356,9 @@ def record_mla_fp8(req: MLARequest):
     )
     dW_ref = ref_lin.weight.grad
 
-    # Implementation: zigzag-local latent rotated around the ring, FP8 in-ring decompress.
     imp_lin = FP8Linear(R, out_features, bias=False).to(device).to(torch.bfloat16)
     imp_lin.weight.data.copy_(w_full)
-    kv_b_quant = imp_lin._get_quantized_weight()
+    kv_b_quant = imp_lin.get_quantized_weight()
     q_nope_i = extract_zigzag(q_nope_full, cp_rank, cp_size).clone().requires_grad_(True)
     q_pe_i = extract_zigzag(q_pe_full, cp_rank, cp_size).clone().requires_grad_(True)
     normed_kv_i = extract_zigzag(normed_kv_full, cp_rank, cp_size).clone().requires_grad_(True)
@@ -441,16 +391,12 @@ def _relerr(ref: torch.Tensor, imp: torch.Tensor) -> float:
 
 def verify_mla_fp8(req: MLARequest) -> None:
     ref, imp, dW_ref, dW_imp = record_mla_fp8(req)
-    # fp8-vs-fp8 reference: the only differences are the ring vs dense flash recompute order
-    # and per-hop vs whole-sequence activation quant blocking -- both small. Check BOTH cosine
-    # (direction) AND relative L2 error (magnitude): cosine is scale-invariant and would hide a
-    # uniform fp8 scale bug, so relerr is the one that actually pins down magnitude. Tolerances
-    # are looser than the bf16 test (e4m3 noise) but a broken/transposed fp8 GEMM gives O(1)
-    # error on both, so this still catches it.
-    atol_fp8 = 2e-2  # cosine
-    # relerr is a few percent under fp8 (per-hop e4m3 block quant; dW, summed over all CP hops,
-    # is the worst at ~3.6e-2 observed). A broken fp8 GEMM gives O(1) relerr, so 6e-2 still
-    # catches it while leaving headroom for legitimate quant noise.
+    # The fp8 reference differs only in the flash recompute order (ring vs dense) and in activation
+    # quant blocking (per hop vs whole sequence). Cosine is scale-invariant and would hide a uniform
+    # fp8 scale bug, so relative L2 error is checked too.
+    atol_fp8 = 2e-2
+    # Per-hop e4m3 block quant gives a relative error of a few percent, worst for dW (about 3.6e-2)
+    # since it sums over all CP hops; a broken fp8 GEMM gives O(1).
     rtol_fp8 = 6e-2
     for f in fields(ref):
         a, b = getattr(ref, f.name), getattr(imp, f.name)

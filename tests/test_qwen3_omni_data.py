@@ -253,7 +253,7 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     with pytest.raises(ValueError, match="not been prepared"):
         create_omni_dataloader(cfg.output, processor, config, stage="image", split="train")
     # This is the real writer's bundle and reader/resume path. Only GPU shuffle
-    # placement/barrier are replaced so the memmap and checkpoint boundary run on CPU.
+    # owner rank/placement/barrier are replaced so the memmap and checkpoint boundary run on CPU.
     from types import SimpleNamespace
 
     from pithtrain.modules.data_config import DataCfg
@@ -264,6 +264,9 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
     data_cfg = DataCfg()
     root = data_cfg.dataset = Path(cfg.output)
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda: int((root / "tokens/train/indices.npy").exists())
+    )
     data_cfg.format = "prepared_bundle"
     training = SimpleNamespace(
         global_batch_size=1, micro_batch_size=1, sequence_length=4, seed=431, max_steps=2

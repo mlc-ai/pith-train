@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from pithtrain.modules.microbatch import Microbatch
+from pithtrain.modules.optimizer import local_grads, scale_grads_
 from pithtrain.modules.training_data import global_loss_mean, global_target_count
 
 
@@ -57,9 +58,10 @@ class OtherData:
         self.events.append(("commit", step))
 
 
-@pytest.mark.parametrize("fail_optimizer", [False, True])
+@pytest.mark.parametrize("fail_stage", [None, "optimizer", "scheduler"])
+@pytest.mark.parametrize("fp8", [False, True])
 def test_task_commits_only_after_successful_optimizer_and_scheduler(
-    monkeypatch, tmp_path, fail_optimizer
+    monkeypatch, tmp_path, fail_stage, fp8
 ):
     events = []
     data = OtherData(events)
@@ -72,9 +74,15 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         return [loss.detach()]
 
     def optimizer_step():
+        torch.testing.assert_close(weight.grad, torch.tensor(1.0))
         events.append("optimizer")
-        if fail_optimizer:
+        if fail_stage == "optimizer":
             raise RuntimeError("optimizer failed")
+
+    def scheduler_step():
+        events.append("scheduler")
+        if fail_stage == "scheduler":
+            raise RuntimeError("scheduler failed")
 
     def save_checkpoint(root, step, *, data_state):
         assert root == tmp_path and data_state is data.checkpoint_state
@@ -83,7 +91,7 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
 
     model.step = model_step
     optimizer = SimpleNamespace(step=optimizer_step, zero_grad=lambda **_: None)
-    scheduler = SimpleNamespace(step=lambda: events.append("scheduler"))
+    scheduler = SimpleNamespace(step=scheduler_step)
     tc = SimpleNamespace(
         nsys_start=None,
         nsys_stop=None,
@@ -116,27 +124,39 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         gc=gc,
         objective=None,
         distributed=SimpleNamespace(dp_size=1, pp_rank=0, rank=1, attn_mesh=mesh),
-        training=SimpleNamespace(model=model, optimizers=[optimizer], schedulers=[scheduler]),
+        training=SimpleNamespace(
+            model=model, optimizers=[optimizer], schedulers=[scheduler], fp8=fp8
+        ),
         logging=SimpleNamespace(stdout=None),
         global_target_count=global_target_count,
         global_loss_mean=global_loss_mean,
+        local_grads=local_grads,
+        scale_grads_=scale_grads_,
+        precompute_fp8_param_scales=lambda: events.append("fp8-scales"),
         clip_grad_norm=lambda *_, **__: torch.tensor(1.0),
         MoELoadBalanceLossTracker=SimpleNamespace(
             reset=lambda: None, get_total_count_and_clear=lambda: (0, 0)
         ),
         save_checkpoint=save_checkpoint,
     )
-    if fail_optimizer:
-        with pytest.raises(RuntimeError, match="optimizer failed"):
+    if fail_stage:
+        with pytest.raises(RuntimeError, match=f"{fail_stage} failed"):
             task.train_step(cfg, data, 0)
-        assert events == [("read", 0), "optimizer"]
+        expected = [("read", 0), "optimizer"]
+        if fail_stage == "scheduler":
+            expected.append("scheduler")
+        assert events == expected
     else:
         task.train_step(cfg, data, 0)
-        assert events == [("read", 0), "optimizer", "scheduler", ("commit", 0), ("save", 1)]
+        expected = [("read", 0), "optimizer", "scheduler"]
+        if fp8:
+            expected.append("fp8-scales")
+        assert events == [*expected, ("commit", 0), ("save", 1)]
 
 
 @pytest.mark.parametrize("has_data_state", [False, True])
-def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_state):
+@pytest.mark.parametrize("fp8", [False, True])
+def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_state, fp8):
     events = []
     data = OtherData(events)
     if not has_data_state:
@@ -153,7 +173,9 @@ def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_sta
 
     # launch resolves train_step in its globals, so replace only that callback.
     task = task_functions(
-        gc=SimpleNamespace(disable=lambda: None, enable=lambda: None),
+        gc=SimpleNamespace(
+            collect=lambda: None, freeze=lambda: None, disable=lambda: None, enable=lambda: None
+        ),
         setup_logging=lambda cfg: None,
         setup_distributed=lambda cfg: None,
         setup_dataset=lambda cfg: data,
@@ -161,7 +183,53 @@ def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_sta
         logging=SimpleNamespace(stdout=SimpleNamespace(info=lambda *_: None)),
         find_checkpoint=lambda root: 2,
         load_checkpoint=load_checkpoint,
+        training=SimpleNamespace(fp8=fp8),
+        precompute_fp8_param_scales=lambda: events.append("fp8-scales"),
+        tune_kernels=lambda: events.append("tune"),
     )
     task.launch.__globals__["train_step"] = step
     task.launch(SimpleNamespace(training=SimpleNamespace(save_location=tmp_path, max_steps=4)))
-    assert events == ["restore", 2, 3]
+    expected = ["restore", "fp8-scales"] if fp8 else ["restore"]
+    assert events == [*expected, "tune", 2, "tune", 3]
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_launch_imports_hf_weights_before_first_data_step(tmp_path, fp8):
+    events = []
+    data = OtherData(events)
+    model = object()
+
+    def load_hf(path, target):
+        assert path == tmp_path / "hf" and target is model
+        events.append("hf-import")
+
+    task = task_functions(
+        gc=SimpleNamespace(
+            collect=lambda: None, freeze=lambda: None, disable=lambda: None, enable=lambda: None
+        ),
+        setup_logging=lambda cfg: None,
+        setup_distributed=lambda cfg: None,
+        setup_dataset=lambda cfg: data,
+        setup_training=lambda cfg: None,
+        logging=SimpleNamespace(stdout=SimpleNamespace(info=lambda *_: None)),
+        find_checkpoint=lambda root: None,
+        load_hf_into_model=load_hf,
+        training=SimpleNamespace(fp8=fp8, model=model),
+        precompute_fp8_param_scales=lambda: events.append("fp8-scales"),
+        tune_kernels=lambda: events.append("tune"),
+    )
+
+    def step(cfg, source, number):
+        assert source is data
+        events.append(number)
+
+    task.launch.__globals__["train_step"] = step
+    task.launch(
+        SimpleNamespace(
+            training=SimpleNamespace(
+                save_location=tmp_path, hf_import_path=tmp_path / "hf", max_steps=1
+            )
+        )
+    )
+    expected = ["hf-import", "fp8-scales"] if fp8 else ["hf-import"]
+    assert events == [*expected, "tune", 0, "tune"]

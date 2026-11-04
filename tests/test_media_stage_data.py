@@ -56,13 +56,12 @@ def assert_batches(batches, expected, owns_media):
 
 
 def _media_worker(rank, rendezvous, root, reference_file):
-    from pithtrain.modules import qwen3_omni_data
-    from pithtrain.tasks import prepare_omni_data
+    from pithtrain.modules import omni_bundle, qwen3_omni_data
 
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
-        init_method=f"file://{rendezvous}",
+        init_method=Path(rendezvous).resolve().as_uri(),
         rank=rank,
         world_size=4,
         timeout=timedelta(seconds=90),
@@ -119,8 +118,8 @@ def _media_worker(rank, rendezvous, root, reference_file):
 
     with ExitStack() as stack:
         for module, name, counter in (
-            (prepare_omni_data, "read_verified_bundle", "verify"),
-            (prepare_omni_data, "processor_for", "processor"),
+            (omni_bundle, "read_verified_bundle", "verify"),
+            (omni_bundle, "processor_for", "processor"),
             (qwen3_omni_data, "create_omni_dataloader", "loader"),
         ):
             stack.enter_context(
