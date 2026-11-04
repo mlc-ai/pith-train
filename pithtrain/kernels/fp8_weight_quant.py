@@ -5,8 +5,8 @@ and the FP8 parameter all-gather kernels.
 The blockwise transposes are also called inside torch.compile regions. SM90 runs the CuTe-DSL kernel
 there behind an opaque op defined in fp8_weight_quant_sm90; SM100 runs the TIRx kernel through a
 torch.library custom op with a fake implementation, so a compiled region calls it as an opaque
-op. The all-gather kernels run the CuTe-DSL port on SM90 and the TIRx kernels on SM100. Every scale
-is row-major: the E8M0 2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
+op. The all-gather kernels are CuTe-DSL on SM90 and TIRx on SM100. Every scale is row-major: the
+E8M0 2^ceil(log2(max(amax, 1e-4) / 448)) of its 128x128 tile's amax.
 """
 
 from typing import Any, Optional, Sequence
@@ -30,8 +30,8 @@ def fp8_quant_weight_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, to
 @fp8_quant_weight_op.register_fake
 def fp8_quant_weight_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     N, K = x.shape
-    rows, cols = (N + 127) // 128, (K + 127) // 128
-    return x.new_empty((N, K), dtype=torch.float8_e4m3fn), x.new_empty((rows, cols), dtype=torch.float32), x.new_empty((K, N), dtype=torch.float8_e4m3fn), x.new_empty((cols, rows), dtype=torch.float32)
+    num_row_tiles, num_col_tiles = (N + 127) // 128, (K + 127) // 128
+    return x.new_empty((N, K), dtype=torch.float8_e4m3fn), x.new_empty((num_row_tiles, num_col_tiles), dtype=torch.float32), x.new_empty((K, N), dtype=torch.float8_e4m3fn), x.new_empty((num_col_tiles, num_row_tiles), dtype=torch.float32)
 
 
 @torch.library.custom_op("pithtrain::fp8_quant_weight_grouped_sm100", mutates_args=())
@@ -46,8 +46,8 @@ def fp8_quant_weight_grouped_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 @fp8_quant_weight_grouped_op.register_fake
 def fp8_quant_weight_grouped_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     G, N, K = x.shape
-    rows, cols = (N + 127) // 128, (K + 127) // 128
-    return x.new_empty((G, N, K), dtype=torch.float8_e4m3fn), x.new_empty((G, rows, cols), dtype=torch.float32), x.new_empty((G, K, N), dtype=torch.float8_e4m3fn), x.new_empty((G, cols, rows), dtype=torch.float32)
+    num_row_tiles, num_col_tiles = (N + 127) // 128, (K + 127) // 128
+    return x.new_empty((G, N, K), dtype=torch.float8_e4m3fn), x.new_empty((G, num_row_tiles, num_col_tiles), dtype=torch.float32), x.new_empty((G, K, N), dtype=torch.float8_e4m3fn), x.new_empty((G, num_col_tiles, num_row_tiles), dtype=torch.float32)
 
 
 def fp8_quant_weight(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

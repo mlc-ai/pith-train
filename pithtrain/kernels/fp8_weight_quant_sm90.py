@@ -1,14 +1,14 @@
 """
-CuTe-DSL (SM90) kernels of the fp8_weight_quant feature: the blockwise transposes, the FP8 parameter
-all-gather kernels, and one-launch variants of the shard amax and the scales over a fixed list of
-tensors. The blockwise transposes take bf16 or fp32 inputs of any shape and strides without a copy.
-Every call goes through opaque torch.library ops whose kernels are C++ (OPS_SOURCE, built with the
-host compiler at first import), so eager calls and torch.compile regions launch the CuTe kernel the
-same way, without re-entering Python.
+CuTe-DSL (SM90) kernels of the fp8_weight_quant feature: the blockwise transposes, the FP8
+parameter all-gather kernels, and one-launch variants of the shard amax and the scales over a fixed
+list of tensors. The blockwise transposes take bf16 or fp32 inputs of any shape and strides without
+a copy. Every call goes through opaque torch.library ops whose kernels are C++ (OPS_SOURCE, built
+with the host compiler at first import), so eager calls and torch.compile regions launch the CuTe
+kernel the same way, without re-entering Python.
 
-Numerics follow the SM90 E8M0 recipe (its SM90 E8M0 scale) exactly. The tile amax is an
-integer max over the magnitude bits (|x| of finite non-negative floats orders like its bit pattern),
-so a NaN orders above inf: NaN inputs are out of contract.
+Numerics follow the SM90 E8M0 recipe exactly. The tile amax is an integer max over the magnitude
+bits (|x| of finite non-negative floats orders like its bit pattern), so a NaN orders above inf:
+NaN inputs are out of contract.
 """
 
 import fcntl
@@ -184,9 +184,8 @@ def load_rows(x_base: Int64, row0: Int32, col0: Int32, num_rows: Int32, K: Int32
     Load the thread's 8x8 block, rows row0 + i valid when 0 <= row0 + i < num_rows.
 
     x_base addresses element (0, 0) of a (rows, K) matrix with unit column stride and row_stride
-    elements between rows. Returns 8 rows of words: four
-    bf16x2 words per row for 2-byte (or bf16-rounded) data, eight fp32 words for 4-byte data, two
-    words of four bytes for 1-byte data.
+    elements between rows. Returns 8 rows of words: four bf16x2 words per row for 2-byte (or
+    bf16-rounded) data, eight fp32 words for 4-byte data, two words of four bytes for 1-byte data.
     """
     rows = []
     for i in cutlass.range_constexpr(8):
@@ -524,8 +523,8 @@ def resolve(dtype: torch.dtype, shape: tuple, stride: tuple, x_addr: int) -> tup
         return None, False, ()
     group_stride, row_stride, col_stride = (stride[0] if G > 1 else 0) if is_batched else 0, stride[-2], stride[-1]
     # a view whose transpose has unit column stride runs on that transpose with the outputs swapped
-    swap = N > 1 and K > 1 and col_stride != 1 and row_stride == 1
-    if swap:
+    is_swapped = N > 1 and K > 1 and col_stride != 1 and row_stride == 1
+    if is_swapped:
         N, K, row_stride, col_stride = K, N, col_stride, row_stride
     # strides of size-1 dims never move the address: zero them so they do not affect alignment
     row_stride, col_stride = row_stride if N > 1 else 0, col_stride if K > 1 else 1
@@ -537,18 +536,19 @@ def resolve(dtype: torch.dtype, shape: tuple, stride: tuple, x_addr: int) -> tup
         store, out_width, out_t_width = "regs", 8, 8
     else:
         store, out_width, out_t_width = "staged", store_width(K), store_width(N)
-    return compile_blockwise(dtype, "vec" if is_vec else "staged", store, out_width, out_t_width, is_batched), swap, (group_stride, row_stride, col_stride)
+    return compile_blockwise(dtype, "vec" if is_vec else "staged", store, out_width, out_t_width, is_batched), is_swapped, (group_stride, row_stride, col_stride)
 
 
 # fp8_quant_weight[_grouped] on SM90 as torch.library ops, used for every call (eager and inside
-# torch.compile regions, where they are opaque). Their kernels are C++ (OPS_SOURCE, built with the host
-# compiler at first import): a CUDA kernel checks the input, allocates the four outputs and launches the
-# CuTe kernel through a cache of (compiled kernel's tvm-ffi function, output swap, strides) keyed by
-# (dtype, sizes, strides, address mod 16), each entry resolved once by resolve() through a tvm-ffi
-# global function, on torch's current stream. The Autograd-key kernel runs that launch directly for
-# real tensors outside tracing and dispatch modes (the outputs never carry gradients), which skips the
-# autograd-not-implemented fallback, and redispatches below autograd otherwise (fake or functional
-# tensors, an active TorchDispatchMode), to the fake or the CUDA kernel.
+# torch.compile regions, where they are opaque). Their kernels are C++ (OPS_SOURCE, built with the
+# host compiler at first import): a CUDA kernel checks the input, allocates the four outputs and
+# launches the CuTe kernel through a cache of (compiled kernel's tvm-ffi function, output swap,
+# strides) keyed by (dtype, sizes, strides, address mod 16), each entry resolved once by resolve()
+# through a tvm-ffi global function, on torch's current stream. The Autograd-key kernel runs that
+# launch directly for real tensors outside tracing and dispatch modes (the outputs never
+# carry gradients), which skips the autograd-not-implemented fallback, and redispatches below
+# autograd otherwise (fake or functional tensors, an active TorchDispatchMode), to the fake or
+# the CUDA kernel.
 OPS_SOURCE = r"""
 #include <Python.h>
 #include <ATen/ATen.h>
@@ -702,21 +702,22 @@ TORCH_LIBRARY_IMPL(pithtrain, Autograd, m) {
 def resolve_for_ops(scalar_type: int, sizes: Sequence[int], strides: Sequence[int], align: int) -> list:
     """
     resolve() for the C++ kernels: [tvm-ffi function of the compiled kernel or None, output swap,
-    group / row / column strides] of an input of this torch ScalarType (bf16 or fp32), sizes, strides
-    and address modulo 16.
+    group / row / column strides] of an input of this torch ScalarType (bf16 or fp32), sizes,
+    strides and address modulo 16.
     """
     dtype = {15: torch.bfloat16, 6: torch.float32}[scalar_type]
-    fn, swap, launch_strides = resolve(dtype, tuple(sizes), tuple(strides), align)
-    return [None, False, 0, 0, 0] if fn is None else [fn._tvm_ffi_function, swap, *launch_strides]
+    fn, is_swapped, launch_strides = resolve(dtype, tuple(sizes), tuple(strides), align)
+    return [None, False, 0, 0, 0] if fn is None else [fn._tvm_ffi_function, is_swapped, *launch_strides]
 
 
 def build_ops() -> str:
     """
     The shared library of OPS_SOURCE, built with the host C++ compiler against this torch and
     tvm-ffi once per source and version, cached in ~/.cache/pithtrain. Each builder writes its own
-    source and library under names unique to the host and process and publishes the library with an
-    atomic rename, so concurrent builders (ranks, nodes) never see a partial file; the file lock only
-    keeps them from building it more than once where it holds (a missed lock costs a duplicate build).
+    source and library under names unique to the host and process and publishes the library with
+    an atomic rename, so concurrent builders (ranks, nodes) never see a partial file; the file lock
+    only keeps them from building it more than once where it holds (a missed lock costs a
+    duplicate build).
     """
     digest = hashlib.sha256("\n".join([OPS_SOURCE, torch.__version__, tvm_ffi.__version__, sys.version]).encode()).hexdigest()[:16]
     root = os.path.join(os.path.expanduser("~/.cache/pithtrain"), "fp8_weight_quant_ops_sm90", digest)
@@ -727,8 +728,8 @@ def build_ops() -> str:
         if not os.path.exists(library):
             unique = f"{socket.gethostname()}.{os.getpid()}"
             source, partial = os.path.join(root, f"ops.{unique}.cpp"), f"{library}.{unique}.tmp"
-            with open(source, "w") as f:
-                f.write(OPS_SOURCE)
+            with open(source, "w") as source_file:
+                source_file.write(OPS_SOURCE)
             includes = cpp_extension.include_paths(device_type="cuda") + [sysconfig.get_paths()["include"], tvm_ffi.libinfo.find_include_path(), tvm_ffi.libinfo.find_dlpack_include_path()]
             tvm_ffi_dir = os.path.dirname(tvm_ffi.libinfo.find_libtvm_ffi())
             command = ["c++", "-O2", "-std=c++17", "-shared", "-fPIC", f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}", source, "-o", partial]
@@ -768,8 +769,7 @@ def shard_tile(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_rows:
         return
     is_aligned = const_expr(mode != "scalar")
     tidx, warp, lane, block_row, block_col = thread_coords()
-    row0 = tile_row_idx * BLOCK + block_row - row_offset
-    col0 = tile_col_idx * BLOCK + block_col
+    row0, col0 = tile_row_idx * BLOCK + block_row - row_offset, tile_col_idx * BLOCK + block_col
     group_elem_start = Int64(group_idx) * Int64(local_rows) * Int64(K)
     rows = load_rows(shard_base + group_elem_start * 4, row0, col0, local_rows, K, Int64(K), 4, True, is_aligned)
     if const_expr(is_cast):
@@ -788,8 +788,8 @@ def shard_tile(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_rows:
 def shard_tile_row(shard_base: Int64, amax_addr: Int64, out_base: Int64, local_rows: Int32, K: Int32, tile_row_idx: Int32, tile_col_idx: Int32, group_idx: Int32, row_offset: Int32, is_cast: cutlass.Constexpr[bool]):
     """
     Row-major variant of shard_tile: a warp loads one 128-column tile row (16 bytes per lane), warps
-    take rows round-robin, so a shard holding a few rows of a tile still uses all 8 warps. Needs K %
-    4 == 0 and a 16-byte aligned shard.
+    take rows round-robin, so a shard holding a few rows of a tile still uses all 8 warps. Needs
+    K % 4 == 0 and a 16-byte aligned shard.
     """
     tidx, _, _ = cute.arch.thread_idx()
     warp, lane = tidx // 32, tidx % 32
@@ -849,8 +849,7 @@ def reduce_shard_rows_amax(words: list, warp: Int32, lane: Int32) -> Uint32:
 
 class ShardTile:
     def __init__(self, is_cast: bool, mode: str) -> None:
-        self.is_cast = is_cast
-        self.mode = mode
+        self.is_cast, self.mode = is_cast, mode
 
     @cute.jit
     def __call__(self, mShard: cute.Tensor, mAmax: cute.Tensor, mOut: cute.Tensor, row_offset: Int32, group_offset: Int32, stream: cuda.CUstream):
@@ -994,7 +993,7 @@ class PackTranspose:
 
 
 def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
-    G, N, K = x.shape
+    _, N, K = x.shape
     if x.numel() == 0:
         return
     if N % 16 == 0 and K % 16 == 0 and x.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0:
