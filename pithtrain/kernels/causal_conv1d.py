@@ -19,20 +19,20 @@ def causal_conv1d_empty(x: torch.Tensor, offset: int) -> torch.Tensor:
     included): logical (B, S, C) in x's dtype, a transposed view of a dense (B, C, S) tensor
     (strides (C * S, 1, S)), the layout of nn.Conv1d's sliced output. For fake implementations.
     """
-    B, L, C = x.shape
-    return x.new_empty((B, C, L - offset)).transpose(1, 2)
+    B, T, C = x.shape
+    return x.new_empty((B, C, T - offset)).transpose(1, 2)
 
 
 def causal_conv1d_fwd(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Tensor:
     """
-    Causal depthwise conv y[b, t, c] = sum over k = 0 .. K - 1 of w[c, k] * x[b, t + offset - (K -
-    1) + k, c], taps at negative positions skipped.
+    Causal depthwise conv y[b, t, c] = sum over k = 0 .. K - 1 of
+    w[c, k] * x[b, t + offset - (K - 1) + k, c], taps at negative positions skipped.
 
     x: bf16 (B, offset + S, C) contiguous, its first offset rows history. w: (C, 1, K) or (C, K)
     contiguous with K <= 8 (SM90 raises ValueError beyond; SM100 does not check), any float dtype
-    (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C)
-    in the layout of causal_conv1d_empty, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2),
-    w, padding=K - 1, groups=C)[..., offset:offset + S].transpose(1, 2).
+    (read as fp32). Neither is modified. Returns a fresh bf16 (B, S, C) in the layout of
+    causal_conv1d_empty, bit-identical to ATen's CUDA conv1d(x.transpose(1, 2), w, padding=K - 1,
+    groups=C)[..., offset:offset + S].transpose(1, 2).
     """
     match ARCH_MAJOR:
         case 9:

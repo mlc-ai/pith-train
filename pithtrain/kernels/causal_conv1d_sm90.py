@@ -149,10 +149,10 @@ def load_chunk(addr: Int64, row_ok: Int32, chan0: Int32, C: cutlass.Constexpr, i
     if cutlass.const_expr(is_vector):
         words = list(ld_v4(addr, row_ok & Int32(chan0 < C)))
     else:
-        for half in range(4):
-            lo = ld_b16(addr + 4 * half, row_ok & Int32(chan0 + 2 * half < C))
-            hi = ld_b16(addr + 4 * half + 2, row_ok & Int32(chan0 + 2 * half + 1 < C))
-            words.append(lo | (hi << 16))
+        for word_idx in range(4):
+            word_lo = ld_b16(addr + 4 * word_idx, row_ok & Int32(chan0 + 2 * word_idx < C))
+            word_hi = ld_b16(addr + 4 * word_idx + 2, row_ok & Int32(chan0 + 2 * word_idx + 1 < C))
+            words.append(word_lo | (word_hi << 16))
     return words
 
 
@@ -163,21 +163,21 @@ def store_chunk(addr: Int64, words: list, row_ok: Int32, chan0: Int32, C: cutlas
     if cutlass.const_expr(is_vector):
         st_v4(addr, tuple(words), row_ok & Int32(chan0 < C))
     else:
-        for half in range(4):
-            st_b16(addr + 4 * half, words[half], row_ok & Int32(chan0 + 2 * half < C))
-            st_b16(addr + 4 * half + 2, words[half] >> 16, row_ok & Int32(chan0 + 2 * half + 1 < C))
+        for word_idx in range(4):
+            st_b16(addr + 4 * word_idx, words[word_idx], row_ok & Int32(chan0 + 2 * word_idx < C))
+            st_b16(addr + 4 * word_idx + 2, words[word_idx] >> 16, row_ok & Int32(chan0 + 2 * word_idx + 1 < C))
 
 
 def load_weights(w_base: Int64, chan0: Int32, C: cutlass.Constexpr, K: cutlass.Constexpr, is_w_fp32: cutlass.Constexpr) -> list:
     """
-    w[c, k] of the thread's 8 channels as fp32, weights[c][k]; zeros past C.
+    w[chan, k] of the thread's 8 channels as fp32, weights[chan][k]; zeros past C.
     """
     weights = []
-    for c in range(8):
-        chan_ok = Int32(chan0 + c < C)
+    for chan in range(8):
+        chan_ok = Int32(chan0 + chan < C)
         taps = []
         for k in range(K):
-            elem_addr = w_base + (Int64(chan0 + c) * K + k) * (4 if is_w_fp32 else 2)
+            elem_addr = w_base + (Int64(chan0 + chan) * K + k) * (4 if is_w_fp32 else 2)
             if cutlass.const_expr(is_w_fp32):
                 taps.append(u32_as_f32(Uint32(ld_relaxed(elem_addr, chan_ok))))
             else:
@@ -199,8 +199,8 @@ def sum_over_token_blocks(value: Float32) -> Float32:
 
 class ThreadTile:
     """
-    The thread's channel group and token block: channels chan0 .. chan0 + 7 of channel tile by,
-    token block row0 .. row0 + tokens - 1 of the CTA's chunk starting at chunk_start.
+    The thread's channel group and token block: channels chan0 .. chan0 + 7 of channel tile by, and
+    token block block_idx of tokens rows, starting block_offset rows into the CTA's chunk.
     """
 
     def __init__(self, tidx, by, tokens: int) -> None:
@@ -252,38 +252,38 @@ class ConvFwd:
 
     def convolve(self, rows: list, weights: list) -> list:
         """
-        out_words[c][j // 2] packs outputs j, j + 1 of channel c (the channels-first order).
+        out_words[chan][j // 2] packs outputs j, j + 1 of channel chan (the channels-first order).
         """
         out_words = []
-        for c in range(8):
+        for chan in range(8):
             outputs = []
             for j in range(FWD_TOKENS):
                 acc = Float32(0.0)
                 for k in range(self.K):
-                    acc = fma_f32(weights[c][k], element(rows[j + k], c), acc)
+                    acc = fma_f32(weights[chan][k], element(rows[j + k], chan), acc)
                 outputs.append(acc)
             out_words.append([pack_bf16(outputs[2 * i], outputs[2 * i + 1]) for i in range(FWD_TOKENS // 2)])
         return out_words
 
     def store_channels_first(self, y_base: Int64, out_words: list, out_start: Int32, S: Int32, chan0: Int32) -> None:
-        for c in range(8):
-            chan_ok = Int32(chan0 + c < self.C)
-            chan_addr = y_base + (Int64(chan0 + c) * S + out_start) * 2
+        for chan in range(8):
+            chan_ok = Int32(chan0 + chan < self.C)
+            chan_addr = y_base + (Int64(chan0 + chan) * S + out_start) * 2
             if cutlass.const_expr(self.is_col_vector):
                 for i in range(FWD_TOKENS // 8):
-                    st_v4(chan_addr + 16 * i, tuple(out_words[c][4 * i : 4 * i + 4]), chan_ok & Int32(out_start + 8 * i < S))
+                    st_v4(chan_addr + 16 * i, tuple(out_words[chan][4 * i : 4 * i + 4]), chan_ok & Int32(out_start + 8 * i < S))
             else:
                 for j in range(FWD_TOKENS):
-                    word = out_words[c][j // 2]
+                    word = out_words[chan][j // 2]
                     st_b16(chan_addr + 2 * j, (word >> 16) if j % 2 else word, chan_ok & Int32(out_start + j < S))
 
 
 class ConvBwd:
     """
     dx of input rows and the partial dw of the outputs t = row - offset, over num_iters chunks of
-    BWD_WARPS * 8 * BWD_TOKENS rows per CTA (grid: channel tile, split, batch entry). Each CTA writes
-    one fp32 partial of its 32 channels; the last CTA of a channel tile to finish sums the partials
-    in order, writes dw and resets the tile's counter.
+    BWD_WARPS * 8 * BWD_TOKENS rows per CTA (grid: channel tile, split, batch entry). Each CTA
+    writes one fp32 partial of its 32 channels; the last CTA of a channel tile to finish sums the
+    partials in order, writes dw and resets the tile's counter.
 
     The thread's window of g is the BWD_TOKENS + K - 1 output rows from row0 - offset: dx[row0 + j]
     reads g window entries j .. j + K - 1, dw reads entries 0 .. BWD_TOKENS - 1 against x rows
@@ -333,8 +333,8 @@ class ConvBwd:
 
     def load_g_window(self, g_base: Int64, out_start: Int32, S: Int32, g_stride: Int64, chan0: Int32) -> list:
         """
-        g_window[i][c] = g[out_start + i, chan0 + c] as fp32, zero outside [0, S) and past C. g_stride
-        is the stride between rows (channels-last) or between channels (channels-first).
+        g_window[i][chan] = g[out_start + i, chan0 + chan] as fp32, zero outside [0, S) and past C.
+        g_stride is the stride between rows (channels-last) or between channels (channels-first).
         """
         C, window = self.C, self.window
         g_window = [[None] * 8 for _ in range(window)]
@@ -343,28 +343,28 @@ class ConvBwd:
                 out_idx = out_start + i
                 row_ok = Int32(out_idx >= 0) & Int32(out_idx < S)
                 words = load_chunk(g_base + (Int64(out_idx) * g_stride + chan0) * 2, row_ok, chan0, C, self.is_g_vector)
-                for c in range(8):
-                    g_window[i][c] = element(words, c)
+                for chan in range(8):
+                    g_window[i][chan] = element(words, chan)
         elif cutlass.const_expr(self.is_g_vector):
-            # out_start - g_shift is a multiple of 8, and S too: each 8-token vector is in or out whole
+            # out_start - g_shift and S are multiples of 8: each 8-token vector is in or out whole
             vec_start = out_start - self.g_shift
             num_vecs = (self.g_shift + window + 7) // 8
-            for c in range(8):
-                chan_ok = Int32(chan0 + c < C)
-                chan_addr = g_base + Int64(chan0 + c) * g_stride * 2
+            for chan in range(8):
+                chan_ok = Int32(chan0 + chan < C)
+                chan_addr = g_base + Int64(chan0 + chan) * g_stride * 2
                 words = []
-                for v in range(num_vecs):
-                    tok_idx = vec_start + 8 * v
+                for vec_idx in range(num_vecs):
+                    tok_idx = vec_start + 8 * vec_idx
                     words += list(ld_v4(chan_addr + Int64(tok_idx) * 2, chan_ok & Int32(tok_idx >= 0) & Int32(tok_idx < S)))
                 for i in range(window):
-                    g_window[i][c] = element(words, self.g_shift + i)
+                    g_window[i][chan] = element(words, self.g_shift + i)
         else:
-            for c in range(8):
-                chan_ok = Int32(chan0 + c < C)
-                chan_addr = g_base + Int64(chan0 + c) * g_stride * 2
+            for chan in range(8):
+                chan_ok = Int32(chan0 + chan < C)
+                chan_addr = g_base + Int64(chan0 + chan) * g_stride * 2
                 for i in range(window):
                     out_idx = out_start + i
-                    g_window[i][c] = bf16_lo(ld_b16(chan_addr + Int64(out_idx) * 2, chan_ok & Int32(out_idx >= 0) & Int32(out_idx < S)))
+                    g_window[i][chan] = bf16_lo(ld_b16(chan_addr + Int64(out_idx) * 2, chan_ok & Int32(out_idx >= 0) & Int32(out_idx < S)))
         return g_window
 
     def load_x_window(self, x_base: Int64, row_start: Int32, L: Int32, chan0: Int32) -> list:
@@ -384,10 +384,10 @@ class ConvBwd:
             words = []
             for pair in range(4):
                 accs = []
-                for c in (2 * pair, 2 * pair + 1):
+                for chan in (2 * pair, 2 * pair + 1):
                     acc = Float32(0.0)
                     for k in range(K):
-                        acc = fma_f32(weights[c][k], g_window[j + K - 1 - k][c], acc)
+                        acc = fma_f32(weights[chan][k], g_window[j + K - 1 - k][chan], acc)
                     accs.append(acc)
                 words.append(pack_bf16(accs[0], accs[1]))
             row_idx = row0 + j
@@ -395,15 +395,16 @@ class ConvBwd:
 
     def accumulate_dw(self, acc_dw, g_window: list, x_rows: list) -> None:
         """
-        acc_dw[c * K + k] += g_window[j][c] * x_rows[j + k][c] over the thread's outputs j in order.
+        acc_dw[chan * K + k] += g_window[j][chan] * x_rows[j + k][chan], over the thread's
+        outputs j in order.
         """
         K = self.K
-        for c in range(8):
+        for chan in range(8):
             for k in range(K):
-                acc = acc_dw[c * K + k]
+                acc = acc_dw[chan * K + k]
                 for j in range(BWD_TOKENS):
-                    acc = fma_f32(g_window[j][c], element(x_rows[j + k], c), acc)
-                acc_dw[c * K + k] = acc
+                    acc = fma_f32(g_window[j][chan], element(x_rows[j + k], chan), acc)
+                acc_dw[chan * K + k] = acc
 
     @cute.jit
     def reduce_dw_in_cta(self, acc_dw, tidx, s_dw: Int32) -> None:
@@ -421,9 +422,9 @@ class ConvBwd:
         cute.arch.sync_threads()
 
     @cute.jit
-    def store_partial(self, partials_base: Int64, s_dw: Int32, partial_idx: Int32, chan_tile: Int32, tidx) -> None:
+    def store_partial(self, partials_base: Int64, s_dw: Int32, partial_idx: Int32, chan_tile_idx: Int32, tidx) -> None:
         """
-        partials[partial_idx, c, k] = the sum over the warps, in order, of s_dw[w][c][k].
+        partials[partial_idx, chan, k] = the sum over the warps, in order, of s_dw[w][chan][k].
         """
         K, C = self.K, self.C
         for i in cutlass.range_constexpr((CHANNELS_PER_CTA * K + BWD_WARPS * 32 - 1) // (BWD_WARPS * 32)):
@@ -432,7 +433,7 @@ class ConvBwd:
             acc = Float32(0.0)
             for warp in cutlass.range_constexpr(BWD_WARPS):
                 acc = acc + u32_as_f32(lds_b32(s_dw + (warp * CHANNELS_PER_CTA * K + entry * entry_ok) * 4))
-            chan_idx = chan_tile * CHANNELS_PER_CTA + entry // K
+            chan_idx = chan_tile_idx * CHANNELS_PER_CTA + entry // K
             st_f32(partials_base + ((Int64(partial_idx) * C + chan_idx) * K + entry % K) * 4, acc, entry_ok & Int32(chan_idx < C))
 
     @cute.jit
@@ -449,15 +450,15 @@ class ConvBwd:
         return Int32(lds_b32(s_is_last))
 
     @cute.jit
-    def store_dw(self, partials_base: Int64, dw_base: Int64, counter_addr: Int64, num_partials: Int32, chan_tile: Int32, tidx) -> None:
+    def store_dw(self, partials_base: Int64, dw_base: Int64, counter_addr: Int64, num_partials: Int32, chan_tile_idx: Int32, tidx) -> None:
         """
-        dw[c, k] = the sum over the partials, in order, cast to w's dtype; resets the counter.
+        dw[chan, k] = the sum over the partials, in order, cast to w's dtype; resets the counter.
         """
         K, C = self.K, self.C
         fence_gpu()  # the other CTAs' partials, published before their count
         for i in cutlass.range_constexpr((CHANNELS_PER_CTA * K + BWD_WARPS * 32 - 1) // (BWD_WARPS * 32)):
             entry = i * BWD_WARPS * 32 + tidx
-            chan_idx = chan_tile * CHANNELS_PER_CTA + entry // K
+            chan_idx = chan_tile_idx * CHANNELS_PER_CTA + entry // K
             entry_ok = Int32(entry < CHANNELS_PER_CTA * K) & Int32(chan_idx < C)
             acc = Float32(0.0)
             for partial_idx in cutlass.range(num_partials, unroll=1):
@@ -506,10 +507,10 @@ class ConvBwdTma:
     rows), writes dx[j] = sum over k in order of w[k] * g[j + K - 1 - k] (fp32 fma, ATen's order)
     with one 16-byte store, and adds g[j] * x[j + k] to its dw sums.
 
-    dw order (deterministic, no atomics or partials): (1) each thread's sum[chan][k] over its rows in
-    increasing order across all stages; (2) butterfly over the 4 token blocks of a warp sharing the
-    channel group (shuffle xor 8, then xor 16); (3) the 4 warps' sums in warp order from 0.0 through
-    shared memory; (4) one rounding to w's dtype.
+    dw order (deterministic, no atomics or partials): (1) each thread's sum[chan][k] over its rows
+    in increasing order across all stages; (2) butterfly over the 4 token blocks of a warp sharing
+    the channel group (shuffle xor 8, then xor 16); (3) the 4 warps' sums in warp order from 0.0
+    through shared memory; (4) one rounding to w's dtype.
     """
 
     def __init__(self, C: int, K: int, is_w_fp32: bool) -> None:
@@ -542,15 +543,15 @@ class ConvBwdTma:
             init_ring(full0, empty0, self.ring.num_slots)
         cute.arch.sync_threads()
         num_stages = (L + self.stage_rows - 1) // self.stage_rows
-        chan_tile = bx * TMA_CHANNELS
+        tile_chan0 = bx * TMA_CHANNELS
         if warp == self.producer_warp:
             if tidx == 0:
-                self.load_loop(atom_g, atom_x, slots, full0, empty0, num_stages, chan_tile, offset)
+                self.load_loop(atom_g, atom_x, slots, full0, empty0, num_stages, tile_chan0, offset)
         else:
-            self.compute_loop(mW, mDx, mDw, slots, full0, empty0, s_dw, num_stages, chan_tile, L, tidx - 32)
+            self.compute_loop(mW, mDx, mDw, slots, full0, empty0, s_dw, num_stages, tile_chan0, L, tidx - 32)
 
     @cute.jit
-    def load_loop(self, atom_g: cute.CopyAtom, atom_x: cute.CopyAtom, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, chan_tile: Int32, offset: Int32) -> None:
+    def load_loop(self, atom_g: cute.CopyAtom, atom_x: cute.CopyAtom, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, tile_chan0: Int32, offset: Int32) -> None:
         cpasync.prefetch_descriptor(atom_g)
         cpasync.prefetch_descriptor(atom_x)
         g_desc, x_desc = tma_desc_addr(atom_g), tma_desc_addr(atom_x)
@@ -561,13 +562,13 @@ class ConvBwdTma:
             expect_slot_bytes(full, 2 * self.box_bytes)
             slot_addr = slots + slot_idx * self.ring.slot_bytes
             row0 = stage_idx * self.stage_rows
-            tma_load_rows(slot_addr, g_desc, chan_tile, row0 - offset, full)
-            tma_load_rows(slot_addr + self.box_stride, x_desc, chan_tile, row0 - (self.K - 1), full)
+            tma_load_rows(slot_addr, g_desc, tile_chan0, row0 - offset, full)
+            tma_load_rows(slot_addr + self.box_stride, x_desc, tile_chan0, row0 - (self.K - 1), full)
 
     @cute.jit
-    def compute_loop(self, mW: cute.Tensor, mDx: cute.Tensor, mDw: cute.Tensor, slots: Int32, full0: Int32, empty0: Int32, s_dw: Int32, num_stages: Int32, chan_tile: Int32, L: Int32, consumer_idx: Int32) -> None:
+    def compute_loop(self, mW: cute.Tensor, mDx: cute.Tensor, mDw: cute.Tensor, slots: Int32, full0: Int32, empty0: Int32, s_dw: Int32, num_stages: Int32, tile_chan0: Int32, L: Int32, consumer_idx: Int32) -> None:
         group_idx, block_idx = consumer_idx % 8, consumer_idx // 8
-        chan0 = chan_tile + group_idx * 8
+        chan0 = tile_chan0 + group_idx * 8
         weights = load_weights(mW.iterator.toint(), chan0, self.C, self.K, self.is_w_fp32)
         acc_dw = cute.make_rmem_tensor((8 * self.K,), Float32)
         for i in cutlass.range_constexpr(8 * self.K):
@@ -578,7 +579,7 @@ class ConvBwdTma:
             mbar_wait(full0 + 8 * slot_idx, parity)
             g_slot = slots + slot_idx * self.ring.slot_bytes
             self.compute_stage(g_slot, g_slot + self.box_stride, empty0 + 8 * slot_idx, local0, group_idx, weights, acc_dw, mDx.iterator.toint(), stage_idx * self.stage_rows + local0, L, chan0)
-        self.reduce_dw(acc_dw, consumer_idx, s_dw, mDw.iterator.toint(), chan_tile)
+        self.reduce_dw(acc_dw, consumer_idx, s_dw, mDw.iterator.toint(), tile_chan0)
 
     def load_box_row(self, slot_addr: Int32, row_idx: Int32, group_idx: Int32) -> list:
         """
@@ -616,11 +617,11 @@ class ConvBwdTma:
                     acc_dw[chan * K + k] = fma_f32(g_rows[j][chan], x_rows[j + k][chan], acc_dw[chan * K + k])
 
     @cute.jit
-    def reduce_dw(self, acc_dw, consumer_idx: Int32, s_dw: Int32, dw_base: Int64, chan_tile: Int32) -> None:
+    def reduce_dw(self, acc_dw, consumer_idx: Int32, s_dw: Int32, dw_base: Int64, tile_chan0: Int32) -> None:
         """
         Steps (2) to (4) of the dw order: butterfly within each warp, lanes 0 .. 7 of warp w store
         s_dw[w][channel][k], then after a barrier of the consumers thread e < 64 * K writes
-        dw[chan_tile * K + e] = sum over w in order of s_dw[w][e], rounded once.
+        dw[tile_chan0 * K + e] = sum over w in order of s_dw[w][e], rounded once.
         """
         K = self.K
         lane, consumer_warp = consumer_idx % 32, consumer_idx // 32
@@ -639,7 +640,7 @@ class ConvBwdTma:
             acc = Float32(0.0)
             for warp_idx in cutlass.range_constexpr(TMA_CONSUMERS // 32):
                 acc = acc + u32_as_f32(lds_b32(s_dw + (warp_idx * TMA_CHANNELS * K + entry * entry_ok) * 4))
-            elem_idx = Int64(chan_tile) * K + entry
+            elem_idx = Int64(tile_chan0) * K + entry
             if cutlass.const_expr(self.is_w_fp32):
                 st_f32(dw_base + elem_idx * 4, acc, entry_ok)
             else:
@@ -649,10 +650,11 @@ class ConvBwdTma:
 class ConvFwdTma:
     """
     Forward on the TMA ring, one CTA per 64-channel tile over all S outputs (B == 1, S % 8 == 0).
-    Stage s covers outputs [s * stage_rows, + stage_rows) and loads x rows [s * stage_rows + offset - (K - 1), + stage_rows + K - 1).
-    Two consumer groups take alternate stages. Consumer thread: channel group (warp % 2) * 4 +
-    lane % 4, token block (warp // 2) * 8 + lane // 4 of its group (stage_rows / 16 = 8 outputs), so one
-    16-byte store of a warp writes 4 channels x 128 contiguous bytes of the channels-first y.
+    Stage s covers outputs [s * stage_rows, + stage_rows) and loads x rows
+    [s * stage_rows + offset - (K - 1), + stage_rows + K - 1). Two consumer groups take alternate
+    stages. Consumer thread: channel group (warp % 2) * 4 + lane % 4, token block
+    (warp // 2) * 8 + lane // 4 of its group (stage_rows / 16 = 8 outputs), so one 16-byte store of
+    a warp writes 4 channels x 128 contiguous bytes of the channels-first y.
     """
 
     def __init__(self, C: int, K: int, is_w_fp32: bool) -> None:
@@ -681,15 +683,15 @@ class ConvFwdTma:
             init_ring(full0, empty0, self.ring.num_slots)
         cute.arch.sync_threads()
         num_stages = (S + self.stage_rows - 1) // self.stage_rows
-        chan_tile = bx * TMA_CHANNELS
+        tile_chan0 = bx * TMA_CHANNELS
         if warp == self.producer_warp:
             if tidx == 0:
-                self.load_loop(atom_x, slots, full0, empty0, num_stages, chan_tile, offset)
+                self.load_loop(atom_x, slots, full0, empty0, num_stages, tile_chan0, offset)
         else:
-            self.compute_loop(mW, mY, slots, full0, empty0, num_stages, chan_tile, S, tidx - 32)
+            self.compute_loop(mW, mY, slots, full0, empty0, num_stages, tile_chan0, S, tidx - 32)
 
     @cute.jit
-    def load_loop(self, atom_x: cute.CopyAtom, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, chan_tile: Int32, offset: Int32) -> None:
+    def load_loop(self, atom_x: cute.CopyAtom, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, tile_chan0: Int32, offset: Int32) -> None:
         cpasync.prefetch_descriptor(atom_x)
         x_desc = tma_desc_addr(atom_x)
         for stage_idx in cutlass.range(num_stages, unroll=1):
@@ -697,14 +699,14 @@ class ConvFwdTma:
             mbar_wait(empty0 + 8 * slot_idx, parity ^ 1)
             full = full0 + 8 * slot_idx
             expect_slot_bytes(full, self.box_bytes)
-            tma_load_rows(slots + slot_idx * self.ring.slot_bytes, x_desc, chan_tile, stage_idx * self.stage_rows + offset - (self.K - 1), full)
+            tma_load_rows(slots + slot_idx * self.ring.slot_bytes, x_desc, tile_chan0, stage_idx * self.stage_rows + offset - (self.K - 1), full)
 
     @cute.jit
-    def compute_loop(self, mW: cute.Tensor, mY: cute.Tensor, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, chan_tile: Int32, S: Int32, consumer_idx: Int32) -> None:
+    def compute_loop(self, mW: cute.Tensor, mY: cute.Tensor, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, tile_chan0: Int32, S: Int32, consumer_idx: Int32) -> None:
         group, group_thread = consumer_idx // TMA_CONSUMERS, consumer_idx % TMA_CONSUMERS
         lane, group_warp = group_thread % 32, group_thread // 32
         group_idx, block_idx = (group_warp % 2) * 4 + lane % 4, (group_warp // 2) * 8 + lane // 4
-        chan0 = chan_tile + group_idx * 8
+        chan0 = tile_chan0 + group_idx * 8
         weights = load_weights(mW.iterator.toint(), chan0, self.C, self.K, self.is_w_fp32)
         local0 = block_idx * self.tokens
         for stage_idx in cutlass.range(group, num_stages, FWD_TMA_GROUPS, unroll=1):
@@ -719,7 +721,8 @@ class ConvFwdTma:
 
     def store_y(self, y_base: Int64, rows: list, weights: list, out_start: Int32, S: Int32, chan0: Int32) -> None:
         """
-        y[chan, out_start + j] = sum over k in order of w[chan][k] * rows[j + k][chan], 8 outputs per store.
+        y[chan, out_start + j] = sum over k in order of w[chan][k] * rows[j + k][chan], with one
+        store per 8 outputs.
         """
         for chan in range(8):
             outputs = []
@@ -774,7 +777,7 @@ def is_tma_input(x: torch.Tensor, K: int) -> bool:
     x and the weight width the TMA kernels take: one sequence of bf16 x, contiguous and 16-byte
     aligned (the TMA descriptor's base), C a multiple of the 64-channel tile, 2 <= K <= 4.
     """
-    B, L, C = x.shape
+    B, _, C = x.shape
     return B == 1 and C % TMA_CHANNELS == 0 and 2 <= K <= TMA_MAX_TAPS and x.dtype == torch.bfloat16 and x.is_contiguous() and x.data_ptr() % 16 == 0
 
 
