@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from pithtrain.contexts import training as training_context
+from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from tests.acceptance import omni_topology_gradients as strict_gradients
 from tests.acceptance.omni_topology_contract import (
     BY_NAME,
@@ -263,8 +265,12 @@ def native_constructor_namespace(package, case, rank):
         "torch": torch,
         "nn": torch.nn,
         "F": torch.nn.functional,
+        "validate_omni_stage5_aggregation": validate_omni_stage5_aggregation,
         "training": SimpleNamespace(
-            Linear=torch.nn.Linear, fp8=False, deterministic_token_layout=False
+            Linear=torch.nn.Linear,
+            fp8=False,
+            deterministic_token_layout=False,
+            omni_stage5_aggregation=training_context.omni_stage5_aggregation,
         ),
         "BF16Linear": torch.nn.Linear,
         "distributed": SimpleNamespace(

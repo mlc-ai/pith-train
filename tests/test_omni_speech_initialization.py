@@ -26,6 +26,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 
+from pithtrain.contexts import training as training_context
 from pithtrain.models.qwen3_omni_audio import Qwen3OmniMoeAudioEncoder
 from pithtrain.models.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
 from pithtrain.models.qwen3_omni_speech import Qwen3OmniMoeSpeechModel
@@ -33,6 +34,7 @@ from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalG
 from pithtrain.models.qwen3_omni_vision import Qwen3OmniMoeVideoEncoder, Qwen3OmniMoeVisionEncoder
 from pithtrain.modules import omni_speech_initialization as initialize
 from pithtrain.modules.omni_speech_fsdp import apply_speech_fsdp, materialize_speech_shards
+from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.tasks.convert_checkpoint import qwen3_omni_full as full
 from tests import test_omni_full_converter as fixtures
 
@@ -56,8 +58,13 @@ def native_meta(raw):
         nn=nn,
         partial=partial,
         math=math,
+        validate_omni_stage5_aggregation=validate_omni_stage5_aggregation,
         distributed=SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, cp_size=1),
-        training=SimpleNamespace(fp8=False, deterministic_token_layout=False),
+        training=SimpleNamespace(
+            fp8=False,
+            deterministic_token_layout=False,
+            omni_stage5_aggregation=training_context.omni_stage5_aggregation,
+        ),
         Qwen3OmniMoeAudioEncoder=Qwen3OmniMoeAudioEncoder,
         Qwen3OmniMoeVisionEncoder=Qwen3OmniMoeVisionEncoder,
         Qwen3OmniMoeVideoEncoder=Qwen3OmniMoeVideoEncoder,

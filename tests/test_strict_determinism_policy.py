@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from pithtrain.contexts import training
+from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.reproducibility import (
     configure_deterministic_training,
     runtime_determinism_snapshot,
@@ -212,6 +213,7 @@ def test_public_initializer_freezes_model_mode_and_semantic_identity(monkeypatch
         torch=torch,
         nn=torch.nn,
         training=training,
+        validate_omni_stage5_aggregation=validate_omni_stage5_aggregation,
         distributed=SimpleNamespace(ep_size=1),
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
