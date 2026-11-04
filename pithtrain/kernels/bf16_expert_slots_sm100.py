@@ -1,20 +1,23 @@
 """
-SM100 bf16_expert_slots in TIRx-lite: one launch per call (two for indexed segment_sum), no memsets.
+SM100 bf16_expert_slots in TIRx-lite: one launch per call (two for a split segment_sum), and no
+memsets at all.
 
 group_slots: five clusters of 16 CTAs, each cluster computing the histograms and scan redundantly
 and storing a fifth of the slots, each CTA owning a slice of the slots held in registers: per-(tile,
 warp) match.any counts and a slice histogram that every CTA pushes into every peer's shared memory
 before one cluster barrier; the mask is zeroed by its owners before that barrier and OR-ed with
 global reductions after it, then each slice is ranked with no further barrier (a slice too large
-for registers takes the rescan kernel, where every CTA rescans all slots). gather_sum is persistent:
-in each CTA warp 0 turns its tokens' mask bits into units of up to 4 grouped rows (looked up in the
-per-(expert, token) table), one bulk copy per row into a 2-stage mbarrier ring, and every thread adds
-a unit's rows in ascending expert order.
+for registers takes the rescan kernel, where every CTA rescans all slots). gather_sum is
+persistent: in each CTA a producer warp packs the grouped rows of consecutive tokens (looked up in
+the per-(expert, token) table) into units, one bulk copy per row into an mbarrier ring, and every
+consumer thread adds a unit's rows in ascending expert order.
+
 gather_rows is a 16-byte vector copy. segment_sum without an index gives each warp one 256-row
 chunk, streamed through a per-thread cp.async ring, and adds the chunk sums in order through shared
-memory; with an index it takes two launches: one warp per (chunk, 512-column block) writes the
-chunk's fp32 sum, then a second kernel, launched with programmatic dependent launch so its launch
-and prologue overlap the first one's tail, adds each segment's chunk sums in order.
+memory; with an index (or a large input without one) it takes two launches: one warp per (chunk,
+512-column block) writes the chunk's fp32 sum, then a second kernel, launched with programmatic
+dependent launch so its launch and prologue overlap the first one's tail, adds each segment's chunk
+sums in order.
 """
 
 import functools
@@ -33,16 +36,16 @@ __all__ = ["bf16_expert_group_slots_sm100", "bf16_expert_gather_sum_sm100", "bf1
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
-    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
-    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on
+    every call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
-FULL = 0xFFFFFFFF
+FULL_MASK = 0xFFFFFFFF
 
 
 class GroupSlots(NamedTuple):
@@ -54,1237 +57,1324 @@ class GroupSlots(NamedTuple):
     table: Optional[torch.Tensor]
 
 
-def u322(x):
-    return txl.Cast("uint32", x)
+def as_u32(value):
+    return txl.Cast("uint32", value)
 
 
-def i322(x):
-    return txl.Cast("int32", x)
+def as_i32(value):
+    return txl.Cast("int32", value)
 
 
-# ------------------------------------------------------------------------------------- group_slots
+def warp_inclusive_scan(value, peer, lane):
+    """
+    Turn each lane's value into the inclusive prefix sum over lanes 0 .. lane; peer is scratch.
+    """
+    for offset in (1, 2, 4, 8, 16):
+        txl.ptx.shfl_sync.up.b32(peer, value, txl.uint32(offset), txl.uint32(0), txl.uint32(FULL_MASK))
+        txl.assign(value, value + txl.Select(lane >= offset, peer, txl.int32(0)))
+
+
+def store_expert_offsets(cu, G, lane, pair_excl, total_even, pair_incl):
+    """
+    Store cu[2 * lane] and cu[2 * lane + 1] from warp 0's scan of expert pairs, and cu[64] when
+    G is 64.
+    """
+    with txl.if_(2 * lane <= G), txl.then_():
+        txl.ptx.st.global_.s32(cu.ptr_to([2 * lane]), pair_excl)
+    with txl.if_(2 * lane + 1 <= G), txl.then_():
+        txl.ptx.st.global_.s32(cu.ptr_to([2 * lane + 1]), pair_excl + total_even)
+    if G == 64:
+        with txl.if_(lane == 31), txl.then_():
+            txl.ptx.st.global_.s32(cu.ptr_to([64]), pair_incl)
+
+
+def add_bf16x2(acc, words, word_idx, pair):
+    """
+    Add the low and high bf16 of words[word_idx] to acc[2 * pair] and acc[2 * pair + 1].
+    """
+    lo = txl.reinterpret(txl.shift_left(words[word_idx], txl.uint32(16)), ty="float32")
+    hi = txl.reinterpret(words[word_idx] & txl.uint32(0xFFFF0000), ty="float32")
+    txl.assign(acc[2 * pair], acc[2 * pair] + lo)
+    txl.assign(acc[2 * pair + 1], acc[2 * pair + 1] + hi)
+
+
+def pack_bf16x2(words, acc):
+    """
+    Round the 8 fp32 sums in acc to bf16 pairs in words[0 .. 4).
+    """
+    for pair in range(4):
+        txl.ptx["cvt.rn.bf16x2.f32"](words[pair], acc[2 * pair + 1], acc[2 * pair])
+
 
 TILE = 1024  # slots ranked per CTA (one per thread)
-MAXT = 4096  # tokens per mask window in shared memory
+MASK_WINDOW = 4096  # tokens per mask window in shared memory
 
 
 @functools.cache
-def group_slots_kernel(G: int, has_x: bool):
-    NW = TILE // 32
+def compile_group_slots(G: int, has_expand: bool):
+    """
+    The rescan kernel: one CTA per 1024-slot tile, every CTA counting all slots itself.
+    """
+    NUM_WARPS = TILE // 32
 
     @txl.kernel()
     def group_slots(e: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), a_idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), row_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), slot_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), S: txl.int32, T: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.max(1, (S + TILE - 1) // TILE), block=(NW) * 32))
-        b = txl.cta_id()
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        nb = txl.max(1, (S + TILE - 1) // TILE)
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.max(1, (S + TILE - 1) // TILE), block=NUM_WARPS * 32))
+        cta_idx = txl.cta_id()
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        num_ctas = txl.max(1, (S + TILE - 1) // TILE)
         smem = txl.smem_pool()
-        tot = smem.alloc([64], txl.i32)
-        bef = smem.alloc([64], txl.i32)
-        cus = smem.alloc([64], txl.i32)
-        wc = smem.alloc([64 * NW], txl.i32)
-        msk = smem.alloc([MAXT], txl.u64)
-        lt = txl.shift_left(txl.uint32(1), u322(lane)) - txl.uint32(1)
+        s_expert_total = smem.alloc([64], txl.i32)
+        s_expert_before = smem.alloc([64], txl.i32)  # slots of each expert before this CTA's tile
+        s_expert_start = smem.alloc([64], txl.i32)
+        s_warp_count = smem.alloc([64 * NUM_WARPS], txl.i32)
+        s_mask = smem.alloc([MASK_WINDOW], txl.u64)
+        lane_mask_lt = txl.shift_left(txl.uint32(1), as_u32(lane)) - txl.uint32(1)
 
-        with txl.if_(tid < 64), txl.then_():
-            txl.ptx.st.shared.s32(tot.ptr_to([tid]), txl.int32(0))
-            txl.ptx.st.shared.s32(bef.ptr_to([tid]), txl.int32(0))
-        with txl.serial(0, (64 * NW) // TILE) as i:
-            txl.ptx.st.shared.s32(wc.ptr_to([i * TILE + tid]), txl.int32(0))
+        def zero_counters():
+            with txl.if_(tidx < 64), txl.then_():
+                txl.ptx.st.shared.s32(s_expert_total.ptr_to([tidx]), txl.int32(0))
+                txl.ptx.st.shared.s32(s_expert_before.ptr_to([tidx]), txl.int32(0))
+            with txl.serial(0, (64 * NUM_WARPS) // TILE) as i:
+                txl.ptx.st.shared.s32(s_warp_count.ptr_to([i * TILE + tidx]), txl.int32(0))
 
-        tpb = (T + nb - 1) // nb  # tokens owned by this CTA: [t0, t0 + tpb)
-        t0 = b * tpb
-        nwin = txl.max(1, (tpb + MAXT - 1) // MAXT)
-        before = b * TILE
-        U = 4
-        ev = txl.alloc_local([U], txl.i64)
-        xv = txl.alloc_local([U], txl.i64)
-        peers = txl.alloc_local([U], txl.u32)
-        old = txl.local_scalar(txl.u64)
-        with txl.serial(0, nwin) as w_:
-            wt0 = t0 + w_ * MAXT
-            wt1 = txl.min(txl.min(t0 + tpb, T), wt0 + MAXT)
-            with txl.serial(0, MAXT // TILE) as i:
-                txl.ptx.st.shared.u64(msk.ptr_to([i * TILE + tid]), txl.uint64(0))
-            txl.cuda.cta_sync()
-            with txl.serial(0, (S + TILE * U - 1) // (TILE * U)) as k:
-                for u in range(U):
-                    j = (k * U + u) * TILE + tid
-                    txl.assign(ev[u], txl.int64(64))
-                    with txl.if_(j < S), txl.then_():
-                        txl.ptx.ld.global_.nc.s64(ev[u], e.ptr_to([j]))
-                        if has_x:
-                            txl.ptx.ld.global_.nc.s64(xv[u], x.ptr_to([j]))
+        def count_and_mark_slots(window_idx, window_start, window_end):
+            """
+            Set the mask bits of the window's tokens; in the first window also count every expert.
+            """
+            with txl.serial(0, (S + TILE * UNROLL - 1) // (TILE * UNROLL)) as step:
+                for i in range(UNROLL):
+                    slot_idx = (step * UNROLL + i) * TILE + tidx
+                    txl.assign(slot_experts[i], txl.int64(64))
+                    with txl.if_(slot_idx < S), txl.then_():
+                        txl.ptx.ld.global_.nc.s64(slot_experts[i], e.ptr_to([slot_idx]))
+                        if has_expand:
+                            txl.ptx.ld.global_.nc.s64(slot_tokens[i], x.ptr_to([slot_idx]))
                         else:
-                            txl.assign(xv[u], txl.Cast("int64", j))
-                for u in range(U):
-                    j = (k * U + u) * TILE + tid
-                    ei = i322(ev[u])
-                    if has_x:
-                        xi = i322(xv[u])
-                        with txl.if_(txl.And(ei < 64, txl.And(xi >= wt0, xi < wt1))), txl.then_():
-                            txl.ptx.atom.shared.or_.b64(
-                                old, msk.ptr_to([xi - wt0]), txl.shift_left(txl.uint64(1), txl.Cast("uint64", ei))
-                            )
-                    with txl.if_(w_ == 0), txl.then_():
-                        txl.ptx["match.any.sync.b32"](peers[u], ei, txl.uint32(FULL))
-                        lead = (peers[u] & lt) == txl.uint32(0)
-                        with txl.if_(txl.And(lead, ei < 64)), txl.then_():
-                            cnt = i322(txl.popcount(peers[u]))
-                            txl.ptx.red.shared.add.s32(tot.ptr_to([ei]), cnt)
+                            txl.assign(slot_tokens[i], txl.Cast("int64", slot_idx))
+                for i in range(UNROLL):
+                    slot_idx = (step * UNROLL + i) * TILE + tidx
+                    expert = as_i32(slot_experts[i])
+                    if has_expand:
+                        token = as_i32(slot_tokens[i])
+                        with txl.if_(txl.And(expert < 64, txl.And(token >= window_start, token < window_end))), txl.then_():
+                            txl.ptx.atom.shared.or_.b64(mask_word, s_mask.ptr_to([token - window_start]), txl.shift_left(txl.uint64(1), txl.Cast("uint64", expert)))
+                    with txl.if_(window_idx == 0), txl.then_():
+                        txl.ptx["match.any.sync.b32"](peer_masks[i], expert, txl.uint32(FULL_MASK))
+                        is_leader = (peer_masks[i] & lane_mask_lt) == txl.uint32(0)
+                        with txl.if_(txl.And(is_leader, expert < 64)), txl.then_():
+                            peer_count = as_i32(txl.popcount(peer_masks[i]))
+                            txl.ptx.red.shared.add.s32(s_expert_total.ptr_to([expert]), peer_count)
                             # a 1024-slot step lies wholly before this CTA's tile or not at all
-                            with txl.if_(j < before), txl.then_():
-                                txl.ptx.red.shared.add.s32(bef.ptr_to([ei]), cnt)
+                            with txl.if_(slot_idx < tile_start), txl.then_():
+                                txl.ptx.red.shared.add.s32(s_expert_before.ptr_to([expert]), peer_count)
+
+        def scan_expert_starts():
+            """
+            Warp 0: exclusive scan of the expert totals, two experts a lane, stored to
+            s_expert_start and cu.
+            """
+            total_even = txl.local_scalar(txl.i32)
+            total_odd = txl.local_scalar(txl.i32)
+            txl.ptx.ld.shared.s32(total_even, s_expert_total.ptr_to([2 * lane]))
+            txl.ptx.ld.shared.s32(total_odd, s_expert_total.ptr_to([2 * lane + 1]))
+            pair_total = txl.local_scalar(txl.i32, init=total_even + total_odd)
+            pair_incl = txl.local_scalar(txl.i32, init=pair_total)
+            peer = txl.local_scalar(txl.i32)
+            warp_inclusive_scan(pair_incl, peer, lane)
+            pair_excl = pair_incl - pair_total
+            txl.ptx.st.shared.s32(s_expert_start.ptr_to([2 * lane]), pair_excl)
+            txl.ptx.st.shared.s32(s_expert_start.ptr_to([2 * lane + 1]), pair_excl + total_even)
+            with txl.if_(cta_idx == 0), txl.then_():
+                store_expert_offsets(cu, G, lane, pair_excl, total_even, pair_incl)
+
+        def count_warp_slots():
+            """
+            Load this thread's slot of the tile, rank it in its warp and store the warp's counts.
+            """
+            slot_idx = tile_start + tidx
+            slot_expert = txl.local_scalar(txl.i64, init=txl.int64(64))
+            slot_token = txl.local_scalar(txl.i64, init=txl.int64(0))
+            with txl.if_(slot_idx < S), txl.then_():
+                txl.ptx.ld.global_.nc.s64(slot_expert, e.ptr_to([slot_idx]))
+                if has_expand:
+                    txl.ptx.ld.global_.nc.s64(slot_token, x.ptr_to([slot_idx]))
+            expert = as_i32(slot_expert)
+            peer_mask = txl.local_scalar(txl.u32)
+            txl.ptx["match.any.sync.b32"](peer_mask, expert, txl.uint32(FULL_MASK))
+            lane_rank = as_i32(txl.popcount(peer_mask & lane_mask_lt))
+            with txl.if_(txl.And(lane_rank == 0, expert < 64)), txl.then_():
+                txl.ptx.st.shared.s32(s_warp_count.ptr_to([expert * NUM_WARPS + warp]), as_i32(txl.popcount(peer_mask)))
+            return slot_idx, expert, slot_token, lane_rank
+
+        def scan_warp_counts():
+            """
+            Per-expert exclusive scan over the warps: warp w scans experts w and w + 32.
+            """
+            for half in range(2):
+                scan_expert = warp + 32 * half
+                count = txl.local_scalar(txl.i32)
+                txl.ptx.ld.shared.s32(count, s_warp_count.ptr_to([scan_expert * NUM_WARPS + lane]))
+                count_incl = txl.local_scalar(txl.i32, init=count)
+                peer = txl.local_scalar(txl.i32)
+                warp_inclusive_scan(count_incl, peer, lane)
+                txl.ptx.st.shared.s32(s_warp_count.ptr_to([scan_expert * NUM_WARPS + lane]), count_incl - count)
+
+        def store_slot_maps(slot_idx, expert, slot_token, lane_rank):
+            with txl.if_(slot_idx < S), txl.then_():
+                expert_start = txl.local_scalar(txl.i32)
+                tile_before = txl.local_scalar(txl.i32)
+                warp_before = txl.local_scalar(txl.i32)
+                txl.ptx.ld.shared.s32(expert_start, s_expert_start.ptr_to([expert]))
+                txl.ptx.ld.shared.s32(tile_before, s_expert_before.ptr_to([expert]))
+                txl.ptx.ld.shared.s32(warp_before, s_warp_count.ptr_to([expert * NUM_WARPS + warp]))
+                row_idx = txl.local_scalar(txl.i32, init=expert_start + tile_before + warp_before + lane_rank)
+                txl.ptx.st.global_.s32(row_of.ptr_to([slot_idx]), row_idx)
+                txl.ptx.st.global_.s32(slot_of.ptr_to([row_idx]), slot_idx)
+                if has_expand:
+                    token = as_i32(slot_token)
+                    txl.ptx.st.global_.s32(a_idx.ptr_to([row_idx]), token)
+                    txl.ptx.st.global_.s32(table.ptr_to([expert * T + token]), row_idx)
+                else:
+                    txl.ptx.st.global_.s32(a_idx.ptr_to([row_idx]), slot_idx)
+
+        zero_counters()
+
+        tokens_per_cta = (T + num_ctas - 1) // num_ctas  # tokens owned by this CTA: [token_start, token_start + tokens_per_cta)
+        token_start = cta_idx * tokens_per_cta
+        num_windows = txl.max(1, (tokens_per_cta + MASK_WINDOW - 1) // MASK_WINDOW)
+        tile_start = cta_idx * TILE
+        UNROLL = 4
+        slot_experts = txl.alloc_local([UNROLL], txl.i64)
+        slot_tokens = txl.alloc_local([UNROLL], txl.i64)
+        peer_masks = txl.alloc_local([UNROLL], txl.u32)
+        mask_word = txl.local_scalar(txl.u64)
+        with txl.serial(0, num_windows) as window_idx:
+            window_start = token_start + window_idx * MASK_WINDOW
+            window_end = txl.min(txl.min(token_start + tokens_per_cta, T), window_start + MASK_WINDOW)
+            with txl.serial(0, MASK_WINDOW // TILE) as i:
+                txl.ptx.st.shared.u64(s_mask.ptr_to([i * TILE + tidx]), txl.uint64(0))
             txl.cuda.cta_sync()
-            if has_x:
-                with txl.serial(0, MAXT // TILE) as i:
-                    t = wt0 + i * TILE + tid
-                    with txl.if_(t < wt1), txl.then_():
-                        txl.ptx.ld.shared.u64(old, msk.ptr_to([i * TILE + tid]))
-                        txl.ptx.st.global_.u64(mask.ptr_to([t]), old)
+            count_and_mark_slots(window_idx, window_start, window_end)
+            txl.cuda.cta_sync()
+            if has_expand:
+                with txl.serial(0, MASK_WINDOW // TILE) as i:
+                    token = window_start + i * TILE + tidx
+                    with txl.if_(token < window_end), txl.then_():
+                        txl.ptx.ld.shared.u64(mask_word, s_mask.ptr_to([i * TILE + tidx]))
+                        txl.ptx.st.global_.u64(mask.ptr_to([token]), mask_word)
             txl.cuda.cta_sync()
 
-        # cu: exclusive scan of the totals by warp 0 (two experts a lane)
         with txl.if_(warp == 0), txl.then_():
-            a0 = txl.local_scalar(txl.i32)
-            a1 = txl.local_scalar(txl.i32)
-            txl.ptx.ld.shared.s32(a0, tot.ptr_to([2 * lane]))
-            txl.ptx.ld.shared.s32(a1, tot.ptr_to([2 * lane + 1]))
-            s = txl.local_scalar(txl.i32, init=a0 + a1)
-            incl = txl.local_scalar(txl.i32, init=s)
-            o = txl.local_scalar(txl.i32)
-            for d in (1, 2, 4, 8, 16):
-                txl.ptx.shfl_sync.up.b32(o, incl, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-                txl.assign(incl, incl + txl.Select(lane >= d, o, txl.int32(0)))
-            ex = incl - s
-            txl.ptx.st.shared.s32(cus.ptr_to([2 * lane]), ex)
-            txl.ptx.st.shared.s32(cus.ptr_to([2 * lane + 1]), ex + a0)
-            with txl.if_(b == 0), txl.then_():
-                with txl.if_(2 * lane <= G), txl.then_():
-                    txl.ptx.st.global_.s32(cu.ptr_to([2 * lane]), ex)
-                with txl.if_(2 * lane + 1 <= G), txl.then_():
-                    txl.ptx.st.global_.s32(cu.ptr_to([2 * lane + 1]), ex + a0)
-                if G == 64:
-                    with txl.if_(lane == 31), txl.then_():
-                        txl.ptx.st.global_.s32(cu.ptr_to([64]), incl)
+            scan_expert_starts()
 
-        # rank this CTA's tile
-        j = before + tid
-        e0 = txl.local_scalar(txl.i64, init=txl.int64(64))
-        x0 = txl.local_scalar(txl.i64, init=txl.int64(0))
-        with txl.if_(j < S), txl.then_():
-            txl.ptx.ld.global_.nc.s64(e0, e.ptr_to([j]))
-            if has_x:
-                txl.ptx.ld.global_.nc.s64(x0, x.ptr_to([j]))
-        ei = i322(e0)
-        pr = txl.local_scalar(txl.u32)
-        txl.ptx["match.any.sync.b32"](pr, ei, txl.uint32(FULL))
-        lrank = i322(txl.popcount(pr & lt))
-        with txl.if_(txl.And(lrank == 0, ei < 64)), txl.then_():
-            txl.ptx.st.shared.s32(wc.ptr_to([ei * NW + warp]), i322(txl.popcount(pr)))
+        slot_idx, expert, slot_token, lane_rank = count_warp_slots()
         txl.cuda.cta_sync()
-        # per-expert exclusive scan over the warps: warp w scans experts w, w + 32
-        for half in range(2):
-            ee = warp + 32 * half
-            v = txl.local_scalar(txl.i32)
-            txl.ptx.ld.shared.s32(v, wc.ptr_to([ee * NW + lane]))
-            inc = txl.local_scalar(txl.i32, init=v)
-            o2 = txl.local_scalar(txl.i32)
-            for d in (1, 2, 4, 8, 16):
-                txl.ptx.shfl_sync.up.b32(o2, inc, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-                txl.assign(inc, inc + txl.Select(lane >= d, o2, txl.int32(0)))
-            txl.ptx.st.shared.s32(wc.ptr_to([ee * NW + lane]), inc - v)
+        scan_warp_counts()
         txl.cuda.cta_sync()
-        with txl.if_(j < S), txl.then_():
-            c0 = txl.local_scalar(txl.i32)
-            c1 = txl.local_scalar(txl.i32)
-            c2 = txl.local_scalar(txl.i32)
-            txl.ptx.ld.shared.s32(c0, cus.ptr_to([ei]))
-            txl.ptx.ld.shared.s32(c1, bef.ptr_to([ei]))
-            txl.ptx.ld.shared.s32(c2, wc.ptr_to([ei * NW + warp]))
-            row = txl.local_scalar(txl.i32, init=c0 + c1 + c2 + lrank)
-            txl.ptx.st.global_.s32(row_of.ptr_to([j]), row)
-            txl.ptx.st.global_.s32(slot_of.ptr_to([row]), j)
-            if has_x:
-                xi = i322(x0)
-                txl.ptx.st.global_.s32(a_idx.ptr_to([row]), xi)
-                txl.ptx.st.global_.s32(table.ptr_to([ei * T + xi]), row)
-            else:
-                txl.ptx.st.global_.s32(a_idx.ptr_to([row]), j)
+        store_slot_maps(slot_idx, expert, slot_token, lane_rank)
 
     return entry_function(group_slots.compile(TARGET))
 
 
-CCS = 16  # (non-portable cluster size, launches on B200) cluster group_slots: the whole call is one cluster of CCS CTAs, CTA r owns slots [r * SP, r * SP + SP)
-NCL = 5  # clusters: each computes the histograms/scan redundantly and stores 1/NCL of the slots (five shorten the large-row rank/store tail)
-CSP = (1024, 2048, 4096, 8192)  # slots per CTA held in registers: the smaller fits if it can (fewer registers); larger S rescans
+CLUSTER_SIZE = 16  # CTAs per cluster (a non-portable size, which B200 launches); CTA r of a cluster owns slots [r * slice_len, r * slice_len + slice_len)
+NUM_CLUSTERS = 5  # each cluster computes the histograms and scan redundantly and stores 1/NUM_CLUSTERS of the slots (five shorten the large-row rank and store tail)
+CLUSTER_SLOTS_PER_CTA = (1024, 2048, 4096, 8192)  # slots per CTA held in registers: the smallest that fits (fewer registers); larger S rescans
 
 
 @functools.cache
-def group_slots_cluster_kernel(G: int, has_x: bool, csp: int):
-    NW = TILE // 32
-    U = csp // TILE  # 1024-slot tiles per CTA, held in registers
+def compile_group_slots_cluster(G: int, has_expand: bool, slots_per_cta: int):
+    """
+    The cluster kernel: NUM_CLUSTERS clusters of CLUSTER_SIZE CTAs, each CTA holding up to
+    slots_per_cta slots in registers.
+    """
+    NUM_WARPS = TILE // 32
+    NUM_TILES = slots_per_cta // TILE  # 1024-slot tiles per CTA, held in registers
 
+    # e and x are the int64 ids viewed as int32 pairs: the low word of slot j at 2 * j
     @txl.kernel()
-    def group_slots_cluster(e: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), # int64 ids viewed as int32 pairs: the low word at 2 * j
-        x: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), a_idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), row_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), slot_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), S: txl.int32, T: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=CCS * NCL, block=(NW) * 32, cluster=CCS))
-        r = txl.cuda.cluster_cta_id("x")
-        # peers' shared memory may be written only once every CTA of the cluster has started: arrive now,
-        # wait just before the first remote store (by then the wait is free)
+    def group_slots_cluster(e: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), a_idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), row_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), slot_of: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), S: txl.int32, T: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=CLUSTER_SIZE * NUM_CLUSTERS, block=NUM_WARPS * 32, cluster=CLUSTER_SIZE))
+        cluster_rank = txl.cuda.cluster_cta_id("x")
+        # peers' shared memory may be written only once every CTA of the cluster has started: arrive
+        # now, wait just before the first remote store (by then the wait is free)
         txl.ptx.barrier.cluster.arrive.relaxed()
-        cl = txl.cta_id() // CCS  # this cluster stores warp-tiles (u, warp) with (u * NW + warp) % NCL == cl
-        # and owns the mask tokens of 32-token blocks b with b % NCL == cl (interleaved: every CTA's slots
-        # spread their mask bits over all clusters, whatever the token order of the slots)
-        TT = ((T + 32 * NCL - 1) // (32 * NCL)) * 32  # owned tokens per cluster (upper bound)
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
+        cluster_idx = txl.cta_id() // CLUSTER_SIZE  # this cluster stores warp-tiles (tile, warp) with (tile * NUM_WARPS + warp) % NUM_CLUSTERS == cluster_idx
+        # and owns the mask tokens of 32-token blocks b with b % NUM_CLUSTERS == cluster_idx
+        # (interleaved: every CTA's slots spread their mask bits over all clusters, whatever the token
+        # order of the slots)
+        cluster_tokens = ((T + 32 * NUM_CLUSTERS - 1) // (32 * NUM_CLUSTERS)) * 32  # owned tokens per cluster (upper bound)
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
         smem = txl.smem_pool()
-        hist = smem.alloc([64], txl.i32)  # this CTA's slice histogram
-        allh = smem.alloc([CCS * 64], txl.i32)  # every CTA's histogram, pushed here before the cluster barrier
-        base = smem.alloc([64], txl.i32)  # cu[e] + slots of e before this CTA's slice
-        wc = smem.alloc([U * 64 * NW], txl.i32)  # (tile, expert, warp) counts, then their exclusive scan
-        lt = txl.shift_left(txl.uint32(1), u322(lane)) - txl.uint32(1)
-        SP = (S + CCS - 1) // CCS
-        s0 = r * SP
-        n = txl.max(0, txl.min(S, s0 + SP) - s0)
-        TPC = (TT + CCS - 1) // CCS
-        raddr = txl.local_scalar(txl.u32)
+        s_hist = smem.alloc([64], txl.i32)  # this CTA's slice histogram
+        s_all_hist = smem.alloc([CLUSTER_SIZE * 64], txl.i32)  # every CTA's histogram, pushed here before the cluster barrier
+        s_slice_base = smem.alloc([64], txl.i32)  # cu[e] + slots of e before this CTA's slice
+        s_tile_count = smem.alloc([NUM_TILES * 64 * NUM_WARPS], txl.i32)  # (tile, expert, warp) counts, then their exclusive scan
+        lane_mask_lt = txl.shift_left(txl.uint32(1), as_u32(lane)) - txl.uint32(1)
+        slice_len = (S + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+        slice_start = cluster_rank * slice_len
+        num_slots = txl.max(0, txl.min(S, slice_start + slice_len) - slice_start)
+        tokens_per_cta = (cluster_tokens + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+        remote_addr = txl.local_scalar(txl.u32)
 
-        def csync():
+        def cluster_sync():
             txl.ptx.barrier.cluster.arrive.release()
             txl.ptx.barrier.cluster.wait.acquire()
 
-        def iket_range(name):
-            token = txl.alloc_local([1], "uint32")
-            txl.assign(token[0], txl.cuda.iket.sentinel_token(name))
+        def start_profile_range(name):
+            range_token = txl.alloc_local([1], "uint32")
+            txl.assign(range_token[0], txl.cuda.iket.sentinel_token(name))
             with txl.if_(lane == 0), txl.then_():
-                txl.assign(token[0], txl.cuda.iket.range_start(name))
-            return token
+                txl.assign(range_token[0], txl.cuda.iket.range_start(name))
+            return range_token
 
-        tk = iket_range("stage")
-        ev = txl.alloc_local([U], txl.i32)
-        xv = txl.alloc_local([U], txl.i32)
-        prs = txl.alloc_local([U], txl.u32)
-        for u in range(U):
-            jl = u * TILE + tid
-            txl.assign(ev[u], txl.int32(64))
-            with txl.if_(jl < n), txl.then_():
-                txl.ptx.ld.global_.nc.s32(ev[u], e.ptr_to([2 * (s0 + jl)]))
-                if has_x:
-                    txl.ptx.ld.global_.nc.s32(xv[u], x.ptr_to([2 * (s0 + jl)]))
-        with txl.if_(tid < 64), txl.then_():
-            txl.ptx.st.shared.s32(hist.ptr_to([tid]), txl.int32(0))
-        for u in range(U):
-            with txl.if_(u * TILE < n), txl.then_():
-                for i in range((64 * NW) // TILE):
-                    txl.ptx.st.shared.s32(wc.ptr_to([u * 64 * NW + i * TILE + tid]), txl.int32(0))
-        if has_x:
-            with txl.serial(0, (TPC + TILE - 1) // TILE) as i:
-                o = r * TPC + i * TILE + tid  # owned-token ordinal
-                t = ((o >> 5) * NCL + cl) * 32 + (o & 31)
-                with txl.if_(txl.And(t < T, i * TILE + tid < TPC)), txl.then_():
-                    txl.ptx.st.global_.u64(mask.ptr_to([t]), txl.uint64(0))
+        def load_slots():
+            """
+            Load the expert (64 past the end) and token of each slot of the slice into registers.
+            """
+            slot_experts = txl.alloc_local([NUM_TILES], txl.i32)
+            slot_tokens = txl.alloc_local([NUM_TILES], txl.i32)
+            peer_masks = txl.alloc_local([NUM_TILES], txl.u32)
+            for tile in range(NUM_TILES):
+                local_idx = tile * TILE + tidx
+                txl.assign(slot_experts[tile], txl.int32(64))
+                with txl.if_(local_idx < num_slots), txl.then_():
+                    txl.ptx.ld.global_.nc.s32(slot_experts[tile], e.ptr_to([2 * (slice_start + local_idx)]))
+                    if has_expand:
+                        txl.ptx.ld.global_.nc.s32(slot_tokens[tile], x.ptr_to([2 * (slice_start + local_idx)]))
+            return slot_experts, slot_tokens, peer_masks
+
+        def zero_counts():
+            with txl.if_(tidx < 64), txl.then_():
+                txl.ptx.st.shared.s32(s_hist.ptr_to([tidx]), txl.int32(0))
+            for tile in range(NUM_TILES):
+                with txl.if_(tile * TILE < num_slots), txl.then_():
+                    for i in range((64 * NUM_WARPS) // TILE):
+                        txl.ptx.st.shared.s32(s_tile_count.ptr_to([tile * 64 * NUM_WARPS + i * TILE + tidx]), txl.int32(0))
+
+        def zero_owned_mask():
+            with txl.serial(0, (tokens_per_cta + TILE - 1) // TILE) as i:
+                owned_idx = cluster_rank * tokens_per_cta + i * TILE + tidx  # owned-token ordinal
+                token = ((owned_idx >> 5) * NUM_CLUSTERS + cluster_idx) * 32 + (owned_idx & 31)
+                with txl.if_(txl.And(token < T, i * TILE + tidx < tokens_per_cta)), txl.then_():
+                    txl.ptx.st.global_.u64(mask.ptr_to([token]), txl.uint64(0))
+
+        def count_slots():
+            """
+            Per (tile, warp) match.any counts, and the slice histogram.
+            """
+            for tile in range(NUM_TILES):
+                with txl.if_(tile * TILE < num_slots), txl.then_():
+                    txl.ptx["match.any.sync.b32"](peer_masks[tile], slot_experts[tile], txl.uint32(FULL_MASK))
+                    with txl.if_(txl.And((peer_masks[tile] & lane_mask_lt) == txl.uint32(0), slot_experts[tile] < 64)), txl.then_():
+                        peer_count = as_i32(txl.popcount(peer_masks[tile]))
+                        txl.ptx.red.shared.add.s32(s_hist.ptr_to([slot_experts[tile]]), peer_count)
+                        txl.ptx.st.shared.s32(s_tile_count.ptr_to([(tile * 64 + slot_experts[tile]) * NUM_WARPS + warp]), peer_count)
+
+        def push_histogram():
+            """
+            The slice histogram is complete: push it to every peer now, under the scan that follows.
+            """
+            txl.ptx.barrier.cluster.wait()
+            with txl.if_(tidx < 64), txl.then_():
+                count = txl.local_scalar(txl.i32)
+                txl.ptx.ld.shared.s32(count, s_hist.ptr_to([tidx]))
+                for peer_rank in range(CLUSTER_SIZE):
+                    txl.ptx.mapa.shared__cluster.u32(remote_addr, txl.cuda.cvta_generic_to_shared(s_all_hist.ptr_to([cluster_rank * 64 + tidx])), txl.uint32(peer_rank))
+                    txl.ptx["st.shared::cluster.s32"](remote_addr, count)
+
+        def scan_tile_counts():
+            """
+            Per-expert exclusive scan over (tile, warp): warp w scans experts w and w + 32.
+            """
+            count = txl.local_scalar(txl.i32)
+            count_incl = txl.local_scalar(txl.i32)
+            peer = txl.local_scalar(txl.i32)
+            carry = txl.local_scalar(txl.i32)
+            tile_total = txl.local_scalar(txl.i32)
+            for half in range(2):
+                scan_expert = warp + 32 * half
+                txl.assign(carry, txl.int32(0))
+                for tile in range(NUM_TILES):
+                    with txl.if_(tile * TILE < num_slots), txl.then_():
+                        txl.ptx.ld.shared.s32(count, s_tile_count.ptr_to([(tile * 64 + scan_expert) * NUM_WARPS + lane]))
+                        txl.assign(count_incl, count)
+                        warp_inclusive_scan(count_incl, peer, lane)
+                        txl.ptx.st.shared.s32(s_tile_count.ptr_to([(tile * 64 + scan_expert) * NUM_WARPS + lane]), carry + count_incl - count)
+                        txl.ptx.shfl_sync.idx.b32(tile_total, count_incl, txl.uint32(31), txl.uint32(31), txl.uint32(FULL_MASK))
+                        txl.assign(carry, carry + tile_total)
+
+        def or_mask_bits():
+            for tile in range(NUM_TILES):
+                with txl.if_(txl.And(tile * TILE + tidx < num_slots, ((slot_tokens[tile] >> 5) % NUM_CLUSTERS) == cluster_idx)), txl.then_():
+                    txl.ptx.red.global_.or_.b64(mask.ptr_to([slot_tokens[tile]]), txl.shift_left(txl.uint64(1), txl.Cast("uint64", slot_experts[tile])))
+
+        def scan_slice_bases():
+            """
+            Warp 0: the totals and this slice's offsets for experts 2 * lane and 2 * lane + 1,
+            then the cu scan.
+            """
+            hist_even = txl.alloc_local([CLUSTER_SIZE], txl.i32)
+            hist_odd = txl.alloc_local([CLUSTER_SIZE], txl.i32)
+            for peer_rank in range(CLUSTER_SIZE):
+                txl.ptx.ld.shared.v2.b32(hist_even[peer_rank], hist_odd[peer_rank], s_all_hist.ptr_to([peer_rank * 64 + 2 * lane]))
+            total_even = txl.local_scalar(txl.i32, init=txl.int32(0))
+            total_odd = txl.local_scalar(txl.i32, init=txl.int32(0))
+            before_even = txl.local_scalar(txl.i32, init=txl.int32(0))
+            before_odd = txl.local_scalar(txl.i32, init=txl.int32(0))
+            for peer_rank in range(CLUSTER_SIZE):
+                txl.assign(total_even, total_even + hist_even[peer_rank])
+                txl.assign(total_odd, total_odd + hist_odd[peer_rank])
+                txl.assign(before_even, before_even + txl.Select(cluster_rank > peer_rank, hist_even[peer_rank], txl.int32(0)))
+                txl.assign(before_odd, before_odd + txl.Select(cluster_rank > peer_rank, hist_odd[peer_rank], txl.int32(0)))
+            pair_total = txl.local_scalar(txl.i32, init=total_even + total_odd)
+            pair_incl = txl.local_scalar(txl.i32, init=pair_total)
+            peer = txl.local_scalar(txl.i32)
+            warp_inclusive_scan(pair_incl, peer, lane)
+            pair_excl = txl.local_scalar(txl.i32, init=pair_incl - pair_total)
+            txl.ptx.st.shared.s32(s_slice_base.ptr_to([2 * lane]), pair_excl + before_even)
+            txl.ptx.st.shared.s32(s_slice_base.ptr_to([2 * lane + 1]), pair_excl + total_even + before_odd)
+            with txl.if_(txl.And(cluster_rank == 0, cluster_idx == 0)), txl.then_():
+                store_expert_offsets(cu, G, lane, pair_excl, total_even, pair_incl)
+
+        def store_slot_maps():
+            """
+            Rank and store the slots of the warp-tiles this cluster owns.
+            """
+            slice_base = txl.local_scalar(txl.i32)
+            warp_base = txl.local_scalar(txl.i32)
+            for tile in range(NUM_TILES):
+                local_idx = tile * TILE + tidx
+                with txl.if_(txl.And(local_idx < num_slots, (tile * NUM_WARPS + warp) % NUM_CLUSTERS == cluster_idx)), txl.then_():
+                    slot_idx = slice_start + local_idx
+                    txl.ptx.ld.shared.s32(slice_base, s_slice_base.ptr_to([slot_experts[tile]]))
+                    txl.ptx.ld.shared.s32(warp_base, s_tile_count.ptr_to([(tile * 64 + slot_experts[tile]) * NUM_WARPS + warp]))
+                    row_idx = txl.local_scalar(txl.i32, init=slice_base + warp_base + as_i32(txl.popcount(peer_masks[tile] & lane_mask_lt)))
+                    txl.ptx.st.global_.s32(row_of.ptr_to([slot_idx]), row_idx)
+                    txl.ptx.st.global_.s32(slot_of.ptr_to([row_idx]), slot_idx)
+                    if has_expand:
+                        txl.ptx.st.global_.s32(a_idx.ptr_to([row_idx]), slot_tokens[tile])
+                        txl.ptx.st.global_.s32(table.ptr_to([slot_experts[tile] * T + slot_tokens[tile]]), row_idx)
+                    else:
+                        txl.ptx.st.global_.s32(a_idx.ptr_to([row_idx]), slot_idx)
+
+        stage_range = start_profile_range("stage")
+        slot_experts, slot_tokens, peer_masks = load_slots()
+        zero_counts()
+        if has_expand:
+            zero_owned_mask()
         txl.cuda.cta_sync()
-        for u in range(U):
-            with txl.if_(u * TILE < n), txl.then_():
-                txl.ptx["match.any.sync.b32"](prs[u], ev[u], txl.uint32(FULL))
-                with txl.if_(txl.And((prs[u] & lt) == txl.uint32(0), ev[u] < 64)), txl.then_():
-                    cnt = i322(txl.popcount(prs[u]))
-                    txl.ptx.red.shared.add.s32(hist.ptr_to([ev[u]]), cnt)
-                    txl.ptx.st.shared.s32(wc.ptr_to([(u * 64 + ev[u]) * NW + warp]), cnt)
+        count_slots()
         txl.cuda.cta_sync()
-        # the slice histogram is complete: push it to every peer now, under the scan below
-        txl.ptx.barrier.cluster.wait()
-        with txl.if_(tid < 64), txl.then_():
-            hv = txl.local_scalar(txl.i32)
-            txl.ptx.ld.shared.s32(hv, hist.ptr_to([tid]))
-            for q in range(CCS):
-                txl.ptx.mapa.shared__cluster.u32(raddr, txl.cuda.cvta_generic_to_shared(allh.ptr_to([r * 64 + tid])), txl.uint32(q))
-                txl.ptx["st.shared::cluster.s32"](raddr, hv)
-        # per-expert exclusive scan over (tile, warp): warp w scans experts w and w + 32
-        v = txl.local_scalar(txl.i32)
-        inc = txl.local_scalar(txl.i32)
-        o2 = txl.local_scalar(txl.i32)
-        carry = txl.local_scalar(txl.i32)
-        tl_ = txl.local_scalar(txl.i32)
-        for half in range(2):
-            ee = warp + 32 * half
-            txl.assign(carry, txl.int32(0))
-            for u in range(U):
-                with txl.if_(u * TILE < n), txl.then_():
-                    txl.ptx.ld.shared.s32(v, wc.ptr_to([(u * 64 + ee) * NW + lane]))
-                    txl.assign(inc, v)
-                    for d in (1, 2, 4, 8, 16):
-                        txl.ptx.shfl_sync.up.b32(o2, inc, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-                        txl.assign(inc, inc + txl.Select(lane >= d, o2, txl.int32(0)))
-                    txl.ptx.st.shared.s32(wc.ptr_to([(u * 64 + ee) * NW + lane]), carry + inc - v)
-                    txl.ptx.shfl_sync.idx.b32(tl_, inc, txl.uint32(31), txl.uint32(31), txl.uint32(FULL))
-                    txl.assign(carry, carry + tl_)
-        txl.cuda.iket.range_end(tk[0])
-        tk2 = iket_range("csync1")
-        csync()  # all histograms pushed; the mask zeros visible cluster-wide
-        txl.cuda.iket.range_end(tk2[0])
-        tk3 = iket_range("mask-dsmem")
-        if has_x:
-            for u in range(U):
-                with txl.if_(txl.And(u * TILE + tid < n, ((xv[u] >> 5) % NCL) == cl)), txl.then_():
-                    txl.ptx.red.global_.or_.b64(mask.ptr_to([xv[u]]), txl.shift_left(txl.uint64(1), txl.Cast("uint64", ev[u])))
-        # warp 0: totals and this slice's offsets for experts 2 * lane and 2 * lane + 1, then the cu scan
+        push_histogram()
+        scan_tile_counts()
+        txl.cuda.iket.range_end(stage_range[0])
+
+        sync_range = start_profile_range("csync1")
+        cluster_sync()  # all histograms pushed; the mask zeros visible cluster-wide
+        txl.cuda.iket.range_end(sync_range[0])
+
+        mask_range = start_profile_range("mask-dsmem")
+        if has_expand:
+            or_mask_bits()
         with txl.if_(warp == 0), txl.then_():
-            h0 = txl.alloc_local([CCS], txl.i32)
-            h1 = txl.alloc_local([CCS], txl.i32)
-            for q in range(CCS):
-                txl.ptx.ld.shared.v2.b32(h0[q], h1[q], allh.ptr_to([q * 64 + 2 * lane]))
-            a0 = txl.local_scalar(txl.i32, init=txl.int32(0))
-            a1 = txl.local_scalar(txl.i32, init=txl.int32(0))
-            b0 = txl.local_scalar(txl.i32, init=txl.int32(0))
-            b1 = txl.local_scalar(txl.i32, init=txl.int32(0))
-            for q in range(CCS):
-                txl.assign(a0, a0 + h0[q])
-                txl.assign(a1, a1 + h1[q])
-                txl.assign(b0, b0 + txl.Select(r > q, h0[q], txl.int32(0)))
-                txl.assign(b1, b1 + txl.Select(r > q, h1[q], txl.int32(0)))
-            s = txl.local_scalar(txl.i32, init=a0 + a1)
-            incl = txl.local_scalar(txl.i32, init=s)
-            o = txl.local_scalar(txl.i32)
-            for d in (1, 2, 4, 8, 16):
-                txl.ptx.shfl_sync.up.b32(o, incl, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-                txl.assign(incl, incl + txl.Select(lane >= d, o, txl.int32(0)))
-            ex = txl.local_scalar(txl.i32, init=incl - s)
-            txl.ptx.st.shared.s32(base.ptr_to([2 * lane]), ex + b0)
-            txl.ptx.st.shared.s32(base.ptr_to([2 * lane + 1]), ex + a0 + b1)
-            with txl.if_(txl.And(r == 0, cl == 0)), txl.then_():
-                with txl.if_(2 * lane <= G), txl.then_():
-                    txl.ptx.st.global_.s32(cu.ptr_to([2 * lane]), ex)
-                with txl.if_(2 * lane + 1 <= G), txl.then_():
-                    txl.ptx.st.global_.s32(cu.ptr_to([2 * lane + 1]), ex + a0)
-                if G == 64:
-                    with txl.if_(lane == 31), txl.then_():
-                        txl.ptx.st.global_.s32(cu.ptr_to([64]), incl)
+            scan_slice_bases()
         txl.cuda.cta_sync()
-        txl.cuda.iket.range_end(tk3[0])
-        tk5 = iket_range("rank")
-        c0 = txl.local_scalar(txl.i32)
-        c2 = txl.local_scalar(txl.i32)
-        for u in range(U):
-            jl = u * TILE + tid
-            with txl.if_(txl.And(jl < n, (u * NW + warp) % NCL == cl)), txl.then_():
-                j = s0 + jl
-                txl.ptx.ld.shared.s32(c0, base.ptr_to([ev[u]]))
-                txl.ptx.ld.shared.s32(c2, wc.ptr_to([(u * 64 + ev[u]) * NW + warp]))
-                row = txl.local_scalar(txl.i32, init=c0 + c2 + i322(txl.popcount(prs[u] & lt)))
-                txl.ptx.st.global_.s32(row_of.ptr_to([j]), row)
-                txl.ptx.st.global_.s32(slot_of.ptr_to([row]), j)
-                if has_x:
-                    txl.ptx.st.global_.s32(a_idx.ptr_to([row]), xv[u])
-                    txl.ptx.st.global_.s32(table.ptr_to([ev[u] * T + xv[u]]), row)
-                else:
-                    txl.ptx.st.global_.s32(a_idx.ptr_to([row]), j)
-        txl.cuda.iket.range_end(tk5[0])
+        txl.cuda.iket.range_end(mask_range[0])
+
+        rank_range = start_profile_range("rank")
+        store_slot_maps()
+        txl.cuda.iket.range_end(rank_range[0])
 
     return entry_function(group_slots_cluster.compile(TARGET))
 
 
 def bf16_expert_group_slots_sm100(expert_idxs, expand_idx, num_groups, num_tokens):
+    """
+    bf16_expert_group_slots on SM100: the cluster kernel up to CLUSTER_SIZE * 8192 slots, else
+    the rescan kernel.
+    """
     assert 0 < num_groups <= 64
-    S, dev = expert_idxs.shape[0], expert_idxs.device
-    cu = torch.empty(num_groups + 1, dtype=torch.int32, device=dev)
-    a_idx = torch.empty(S, dtype=torch.int32, device=dev)
-    row_of = torch.empty(S, dtype=torch.int32, device=dev)
-    slot_of = torch.empty(S, dtype=torch.int32, device=dev)
-    has_x = expand_idx is not None
-    if has_x:
-        mask = torch.empty(num_tokens, dtype=torch.int64, device=dev)
-        table = torch.empty(num_tokens * num_groups, dtype=torch.int32, device=dev)
+    S, device = expert_idxs.shape[0], expert_idxs.device
+    cu = torch.empty(num_groups + 1, dtype=torch.int32, device=device)
+    a_idx = torch.empty(S, dtype=torch.int32, device=device)
+    row_of = torch.empty(S, dtype=torch.int32, device=device)
+    slot_of = torch.empty(S, dtype=torch.int32, device=device)
+    has_expand = expand_idx is not None
+    if has_expand:
+        mask = torch.empty(num_tokens, dtype=torch.int64, device=device)
+        table = torch.empty(num_tokens * num_groups, dtype=torch.int32, device=device)
     else:
-        mask = torch.empty(1, dtype=torch.int64, device=dev)
-        table = torch.empty(1, dtype=torch.int32, device=dev)
-    csp = next((c for c in CSP if S <= CCS * c), None)
-    if csp is not None:
-        k = group_slots_cluster_kernel(num_groups, has_x, csp)
-        k(expert_idxs.view(torch.int32), (expand_idx if has_x else expert_idxs).view(torch.int32), cu, a_idx, row_of,
-          slot_of, mask.view(torch.uint64), table, S, num_tokens if has_x else 0)
-        if not has_x:
+        mask = torch.empty(1, dtype=torch.int64, device=device)
+        table = torch.empty(1, dtype=torch.int32, device=device)
+    slots_per_cta = next((slots for slots in CLUSTER_SLOTS_PER_CTA if S <= CLUSTER_SIZE * slots), None)
+    if slots_per_cta is not None:
+        fn = compile_group_slots_cluster(num_groups, has_expand, slots_per_cta)
+        fn(expert_idxs.view(torch.int32), (expand_idx if has_expand else expert_idxs).view(torch.int32), cu, a_idx, row_of, slot_of, mask.view(torch.uint64), table, S, num_tokens if has_expand else 0)
+        if not has_expand:
             return GroupSlots(cu, a_idx, row_of, slot_of, None, None)
         return GroupSlots(cu, a_idx, row_of, slot_of, mask, table)
-    k = group_slots_kernel(num_groups, has_x)
-    k(expert_idxs, expand_idx if has_x else expert_idxs, cu, a_idx, row_of, slot_of, mask.view(torch.uint64),
-      table, S, num_tokens if has_x else 0)
-    if not has_x:
+    fn = compile_group_slots(num_groups, has_expand)
+    fn(expert_idxs, expand_idx if has_expand else expert_idxs, cu, a_idx, row_of, slot_of, mask.view(torch.uint64), table, S, num_tokens if has_expand else 0)
+    if not has_expand:
         return GroupSlots(cu, a_idx, row_of, slot_of, None, None)
     return GroupSlots(cu, a_idx, row_of, slot_of, mask, table)
 
 
-# -------------------------------------------------------------------------------------- gather_sum
-
-
-GS_BATCH = 8  # experts per prefetched batch
-GS_CTAS_PER_SM = {2880: 3}  # by H; default 4
+GATHER_SUM_BATCH = 8  # experts per prefetched batch
+GATHER_SUM_CTAS_PER_SM = {2880: 3}  # by H; default 4
 NUM_SMS = 148
 
 
 @functools.cache
-def gather_sum_kernel(G: int, H: int):
-    V = H // 8
-    NW = (V + 31) // 32
-    KB = min(GS_BATCH, G)
-    GRID = NUM_SMS * GS_CTAS_PER_SM.get(H, 4)
+def compile_gather_sum(G: int, H: int):
+    """
+    Register-only gather_sum (used when USE_GATHER_SUM_TMA and USE_MULTI_TOKEN_UNITS are off): one
+    token per CTA step, the next token's rows prefetched in batches of GATHER_SUM_BATCH experts.
+    """
+    NUM_VECS = H // 8
+    NUM_WARPS = (NUM_VECS + 31) // 32
+    BATCH = min(GATHER_SUM_BATCH, G)
+    GRID = NUM_SMS * GATHER_SUM_CTAS_PER_SM.get(H, 4)
 
     @txl.kernel()
     def gather_sum(grad: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), T: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW) * 32))
-        tid = txl.thread_id()
-        grid = txl.min(T, GRID)
-        active = tid < V
-        t = txl.local_scalar(txl.i32, init=txl.cta_id())
-        low = txl.local_scalar(txl.u64)
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=NUM_WARPS * 32))
+        tidx = txl.thread_id()
+        grid_size = txl.min(T, GRID)
+        vec_ok = tidx < NUM_VECS
+        token_idx = txl.local_scalar(txl.i32, init=txl.cta_id())
+        lowest_bit = txl.local_scalar(txl.u64)
         acc = txl.alloc_local([8], txl.f32)
-        w = txl.alloc_local([4 * KB], txl.u32)
-        rc = txl.alloc_local([KB], txl.i32)  # current token's grouped rows (-1: none)
-        rn = txl.alloc_local([KB], txl.i32)  # next token's
-        ee = txl.alloc_local([KB], txl.i32)
-        rem_c = txl.local_scalar(txl.u64)
-        rem_n = txl.local_scalar(txl.u64)
-        m_n = txl.local_scalar(txl.u64, init=txl.uint64(0))
-        m_n2 = txl.local_scalar(txl.u64)
-        row = txl.local_scalar(txl.i32)
+        words = txl.alloc_local([4 * BATCH], txl.u32)
+        rows_cur = txl.alloc_local([BATCH], txl.i32)  # current token's grouped rows (-1: none)
+        rows_next = txl.alloc_local([BATCH], txl.i32)  # next token's
+        batch_experts = txl.alloc_local([BATCH], txl.i32)
+        remaining_cur = txl.local_scalar(txl.u64)
+        remaining_next = txl.local_scalar(txl.u64)
+        next_mask = txl.local_scalar(txl.u64, init=txl.uint64(0))
+        next_next_mask = txl.local_scalar(txl.u64)
+        row_idx = txl.local_scalar(txl.i32)
 
-        def take_batch(m, tt, rows):
-            # pop the next KB experts of bitmask m (ascending) and load their grouped rows
-            for k in range(KB):
-                txl.assign(low, m & (txl.uint64(0) - m))
-                txl.assign(ee[k], txl.Select(low != txl.uint64(0), i322(txl.popcount(low - txl.uint64(1))), txl.int32(-1)))
-                txl.assign(m, m ^ low)
-            for k in range(KB):
+        def take_batch(expert_bits, token, rows):
+            # pop the next BATCH experts of expert_bits (ascending) and load their grouped rows
+            for k in range(BATCH):
+                txl.assign(lowest_bit, expert_bits & (txl.uint64(0) - expert_bits))
+                txl.assign(batch_experts[k], txl.Select(lowest_bit != txl.uint64(0), as_i32(txl.popcount(lowest_bit - txl.uint64(1))), txl.int32(-1)))
+                txl.assign(expert_bits, expert_bits ^ lowest_bit)
+            for k in range(BATCH):
                 txl.assign(rows[k], txl.int32(-1))
-                with txl.if_(ee[k] >= 0), txl.then_():
-                    txl.ptx.ld.global_.nc.s32(rows[k], table.ptr_to([ee[k] * T + tt]))
+                with txl.if_(batch_experts[k] >= 0), txl.then_():
+                    txl.ptx.ld.global_.nc.s32(rows[k], table.ptr_to([batch_experts[k] * T + token]))
 
-        def add_rows(rows):
-            for k in range(KB):
-                with txl.if_(txl.And(rows[k] >= 0, active)), txl.then_():
-                    txl.ptx.ld.global_.nc.v4.b32(w[4 * k], w[4 * k + 1], w[4 * k + 2], w[4 * k + 3],
-                                                 grad.ptr_to([txl.Cast("int64", rows[k]) * (H // 2) + tid * 4]))
+        def load_rows(rows):
+            for k in range(BATCH):
+                with txl.if_(txl.And(rows[k] >= 0, vec_ok)), txl.then_():
+                    txl.ptx.ld.global_.nc.v4.b32(words[4 * k], words[4 * k + 1], words[4 * k + 2], words[4 * k + 3], grad.ptr_to([txl.Cast("int64", rows[k]) * (H // 2) + tidx * 4]))
 
-        def accumulate(rows):
-            for k in range(KB):
+        def add_loaded_rows(rows):
+            for k in range(BATCH):
                 with txl.if_(rows[k] >= 0), txl.then_():
-                    for p in range(4):
-                        lo = txl.reinterpret(txl.shift_left(w[4 * k + p], txl.uint32(16)), ty="float32")
-                        hi = txl.reinterpret(w[4 * k + p] & txl.uint32(0xFFFF0000), ty="float32")
-                        txl.assign(acc[2 * p], acc[2 * p] + lo)
-                        txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
+                    for pair in range(4):
+                        add_bf16x2(acc, words, 4 * k + pair, pair)
 
         # prologue: rows of the first token, mask of the second
-        txl.assign(rem_c, txl.uint64(0))
-        with txl.if_(t < T), txl.then_():
-            txl.ptx.ld.global_.nc.u64(rem_c, mask.ptr_to([t]))
-        take_batch(rem_c, t, rc)
-        with txl.if_(t + grid < T), txl.then_():
-            txl.ptx.ld.global_.nc.u64(m_n, mask.ptr_to([t + grid]))
-        with txl.while_(t < T):
-            add_rows(rc)
-            txl.assign(m_n2, txl.uint64(0))
-            with txl.if_(t + 2 * grid < T), txl.then_():
-                txl.ptx.ld.global_.nc.u64(m_n2, mask.ptr_to([t + 2 * grid]))
-            txl.assign(rem_n, m_n)
-            take_batch(rem_n, t + grid, rn)
+        txl.assign(remaining_cur, txl.uint64(0))
+        with txl.if_(token_idx < T), txl.then_():
+            txl.ptx.ld.global_.nc.u64(remaining_cur, mask.ptr_to([token_idx]))
+        take_batch(remaining_cur, token_idx, rows_cur)
+        with txl.if_(token_idx + grid_size < T), txl.then_():
+            txl.ptx.ld.global_.nc.u64(next_mask, mask.ptr_to([token_idx + grid_size]))
+        with txl.while_(token_idx < T):
+            load_rows(rows_cur)
+            txl.assign(next_next_mask, txl.uint64(0))
+            with txl.if_(token_idx + 2 * grid_size < T), txl.then_():
+                txl.ptx.ld.global_.nc.u64(next_next_mask, mask.ptr_to([token_idx + 2 * grid_size]))
+            txl.assign(remaining_next, next_mask)
+            take_batch(remaining_next, token_idx + grid_size, rows_next)
             for i in range(8):
                 txl.assign(acc[i], txl.float32(0))
-            accumulate(rc)
-            # experts past the first KB (rare): one at a time, still ascending
-            with txl.while_(rem_c != txl.uint64(0)):
-                txl.assign(low, rem_c & (txl.uint64(0) - rem_c))
-                txl.assign(rem_c, rem_c ^ low)
-                txl.ptx.ld.global_.nc.s32(row, table.ptr_to([i322(txl.popcount(low - txl.uint64(1))) * T + t]))
-                with txl.if_(active), txl.then_():
-                    txl.ptx.ld.global_.nc.v4.b32(w[0], w[1], w[2], w[3],
-                                                 grad.ptr_to([txl.Cast("int64", row) * (H // 2) + tid * 4]))
-                    for p in range(4):
-                        lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
-                        hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
-                        txl.assign(acc[2 * p], acc[2 * p] + lo)
-                        txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
-            with txl.if_(active), txl.then_():
-                for p in range(4):
-                    txl.ptx["cvt.rn.bf16x2.f32"](w[p], acc[2 * p + 1], acc[2 * p])
-                txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", t) * (H // 2) + tid * 4]), w[0], w[1], w[2], w[3])
-            for k in range(KB):
-                txl.assign(rc[k], rn[k])
-            txl.assign(rem_c, rem_n)
-            txl.assign(m_n, m_n2)
-            txl.assign(t, t + grid)
+            add_loaded_rows(rows_cur)
+            # experts past the first BATCH (rare): one at a time, still ascending
+            with txl.while_(remaining_cur != txl.uint64(0)):
+                txl.assign(lowest_bit, remaining_cur & (txl.uint64(0) - remaining_cur))
+                txl.assign(remaining_cur, remaining_cur ^ lowest_bit)
+                txl.ptx.ld.global_.nc.s32(row_idx, table.ptr_to([as_i32(txl.popcount(lowest_bit - txl.uint64(1))) * T + token_idx]))
+                with txl.if_(vec_ok), txl.then_():
+                    txl.ptx.ld.global_.nc.v4.b32(words[0], words[1], words[2], words[3], grad.ptr_to([txl.Cast("int64", row_idx) * (H // 2) + tidx * 4]))
+                    for pair in range(4):
+                        add_bf16x2(acc, words, pair, pair)
+            with txl.if_(vec_ok), txl.then_():
+                pack_bf16x2(words, acc)
+                txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", token_idx) * (H // 2) + tidx * 4]), words[0], words[1], words[2], words[3])
+            for k in range(BATCH):
+                txl.assign(rows_cur[k], rows_next[k])
+            txl.assign(remaining_cur, remaining_next)
+            txl.assign(next_mask, next_next_mask)
+            txl.assign(token_idx, token_idx + grid_size)
 
     return entry_function(gather_sum.compile(TARGET))
 
 
-GS_TMA = True
-GS2_CFG = {2048: (2, 6), 2880: (2, 4)}  # by H: (pipeline stages, CTAs per SM); default (2, 2)
-GS2_BATCH = 4  # grouped rows per unit
+USE_GATHER_SUM_TMA = True
+GATHER_SUM_TMA_CFG = {2048: (2, 6), 2880: (2, 4)}  # by H: (pipeline stages, CTAs per SM); default (2, 2)
+GATHER_SUM_TMA_BATCH = 4  # grouped rows per unit
 BULK_G2S = "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
-EVF = {"gs": False, "rows": False, "seg": True}  # stream-once reads marked L2 evict_first: helps segment_sum, hurts gather_rows, neutral for gather_sum
+EVICT_FIRST = {"gs": False, "rows": False, "seg": True}  # mark stream-once reads L2 evict_first: it helps segment_sum, not gather_rows or gather_sum
 
 
 @functools.cache
-def gather_sum_tma_kernel(G: int, H: int):
+def compile_gather_sum_tma(G: int, H: int):
     """
-    Persistent: warp 0 turns each token's mask bits into units of up to KB grouped rows, one bulk copy
-    per row into an ST-deep shared-memory ring; every thread adds a unit's rows in ascending expert order.
+    Persistent: warp 0 turns each token's mask bits into units of up to UNIT_ROWS grouped rows, one
+    bulk copy per row into a STAGES-deep shared-memory ring; every thread adds a unit's rows in
+    ascending expert order.
     """
-    V = H // 8
-    NW = (V + 31) // 32
-    KB = min(GS2_BATCH, G)
-    ST, CPS = GS2_CFG.get(H, (2, 2))
-    GRID = NUM_SMS * CPS
-    RW = H // 2  # u32 words per row
-    RB = H * 2  # bytes per row
-    assert RB % 16 == 0 and KB <= 32
+    NUM_VECS = H // 8
+    NUM_WARPS = (NUM_VECS + 31) // 32
+    UNIT_ROWS = min(GATHER_SUM_TMA_BATCH, G)
+    STAGES, CTAS_PER_SM = GATHER_SUM_TMA_CFG.get(H, (2, 2))
+    GRID = NUM_SMS * CTAS_PER_SM
+    ROW_WORDS = H // 2  # u32 words per row
+    ROW_BYTES = H * 2
+    assert ROW_BYTES % 16 == 0 and UNIT_ROWS <= 32
 
     @txl.kernel()
     def gather_sum_tma(grad: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), T: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW) * 32))
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        grid = txl.min(T, GRID)
-        active = tid < V
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=NUM_WARPS * 32))
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        grid_size = txl.min(T, GRID)
+        vec_ok = tidx < NUM_VECS
         smem = txl.smem_pool()
-        stage = smem.alloc([ST * KB * RW], txl.u32, align=128)
-        bars = smem.alloc([ST], txl.u64, align=8)
-        meta = smem.alloc([2 * ST], txl.i32)  # per slot: token, rows | last << 8 (-1: no more units)
-        with txl.if_(tid < ST), txl.then_():
-            txl.ptx.mbarrier.init.shared.b64(bars.ptr_to([tid]), txl.uint32(1))
+        s_stage = smem.alloc([STAGES * UNIT_ROWS * ROW_WORDS], txl.u32, align=128)
+        s_full = smem.alloc([STAGES], txl.u64, align=8)
+        s_unit_meta = smem.alloc([2 * STAGES], txl.i32)  # per slot: token, rows | last << 8 (-1: no more units)
+        with txl.if_(tidx < STAGES), txl.then_():
+            txl.ptx.mbarrier.init.shared.b64(s_full.ptr_to([tidx]), txl.uint32(1))
         txl.ptx.fence.mbarrier_init.release.cluster()
         txl.cuda.cta_sync()
 
         # producer state (warp 0, uniform across its lanes)
-        tp = txl.local_scalar(txl.i32, init=txl.cta_id())
-        mp = txl.local_scalar(txl.u64, init=txl.uint64(0))
-        mn = txl.local_scalar(txl.u64, init=txl.uint64(0))
-        low = txl.local_scalar(txl.u64)
-        ee = txl.alloc_local([KB], txl.i32)
-        em = txl.local_scalar(txl.i32)
-        nv = txl.local_scalar(txl.i32)
-        rr = txl.local_scalar(txl.i32)
+        token_idx = txl.local_scalar(txl.i32, init=txl.cta_id())
+        token_mask = txl.local_scalar(txl.u64, init=txl.uint64(0))
+        next_mask = txl.local_scalar(txl.u64, init=txl.uint64(0))
+        lowest_bit = txl.local_scalar(txl.u64)
+        unit_experts = txl.alloc_local([UNIT_ROWS], txl.i32)
+        lane_expert = txl.local_scalar(txl.i32)
+        num_rows = txl.local_scalar(txl.i32)
+        row_idx = txl.local_scalar(txl.i32)
         with txl.if_(warp == 0), txl.then_():
-            with txl.if_(tp < T), txl.then_():
-                txl.ptx.ld.global_.nc.u64(mp, mask.ptr_to([tp]))
-            with txl.if_(tp + grid < T), txl.then_():
-                txl.ptx.ld.global_.nc.u64(mn, mask.ptr_to([tp + grid]))
+            with txl.if_(token_idx < T), txl.then_():
+                txl.ptx.ld.global_.nc.u64(token_mask, mask.ptr_to([token_idx]))
+            with txl.if_(token_idx + grid_size < T), txl.then_():
+                txl.ptx.ld.global_.nc.u64(next_mask, mask.ptr_to([token_idx + grid_size]))
 
         def produce(slot):
-            with txl.if_(tp < T):
+            with txl.if_(token_idx < T):
                 with txl.then_():
-                    txl.assign(nv, txl.int32(0))
-                    txl.assign(em, txl.int32(-1))
-                    for k in range(KB):
-                        txl.assign(low, mp & (txl.uint64(0) - mp))
-                        txl.assign(ee[k], txl.Select(low != txl.uint64(0), i322(txl.popcount(low - txl.uint64(1))), txl.int32(-1)))
-                        txl.assign(mp, mp ^ low)
-                        txl.assign(nv, nv + txl.Select(ee[k] >= 0, txl.int32(1), txl.int32(0)))
-                        txl.assign(em, txl.Select(lane == k, ee[k], em))
-                    last = txl.Select(mp == txl.uint64(0), txl.int32(1), txl.int32(0))
+                    txl.assign(num_rows, txl.int32(0))
+                    txl.assign(lane_expert, txl.int32(-1))
+                    for k in range(UNIT_ROWS):
+                        txl.assign(lowest_bit, token_mask & (txl.uint64(0) - token_mask))
+                        txl.assign(unit_experts[k], txl.Select(lowest_bit != txl.uint64(0), as_i32(txl.popcount(lowest_bit - txl.uint64(1))), txl.int32(-1)))
+                        txl.assign(token_mask, token_mask ^ lowest_bit)
+                        txl.assign(num_rows, num_rows + txl.Select(unit_experts[k] >= 0, txl.int32(1), txl.int32(0)))
+                        txl.assign(lane_expert, txl.Select(lane == k, unit_experts[k], lane_expert))
+                    is_last = txl.Select(token_mask == txl.uint64(0), txl.int32(1), txl.int32(0))
                     with txl.if_(lane == 0), txl.then_():
-                        txl.ptx.st.shared.s32(meta.ptr_to([2 * slot]), tp)
-                        txl.ptx.st.shared.s32(meta.ptr_to([2 * slot + 1]), nv + last * 256)
-                        txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bars.ptr_to([slot]), u322(nv * RB))
-                    txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-                    with txl.if_(em >= 0), txl.then_():
-                        txl.ptx.ld.global_.nc.s32(rr, table.ptr_to([em * T + tp]))
-                        txl.ptx[BULK_G2S](
-                            stage.ptr_to([(slot * KB + lane) * RW]),
-                            grad.ptr_to([txl.Cast("int64", rr) * RW]),
-                            txl.uint32(RB),
-                            bars.ptr_to([slot]),
-                        )
-                    with txl.if_(mp == txl.uint64(0)), txl.then_():
-                        txl.assign(tp, tp + grid)
-                        txl.assign(mp, mn)
-                        txl.assign(mn, txl.uint64(0))
-                        with txl.if_(tp + grid < T), txl.then_():
-                            txl.ptx.ld.global_.nc.u64(mn, mask.ptr_to([tp + grid]))
+                        txl.ptx.st.shared.s32(s_unit_meta.ptr_to([2 * slot]), token_idx)
+                        txl.ptx.st.shared.s32(s_unit_meta.ptr_to([2 * slot + 1]), num_rows + is_last * 256)
+                        txl.ptx.mbarrier.arrive.expect_tx.shared.b64(s_full.ptr_to([slot]), as_u32(num_rows * ROW_BYTES))
+                    txl.ptx["bar.warp.sync"](txl.uint32(FULL_MASK))
+                    with txl.if_(lane_expert >= 0), txl.then_():
+                        txl.ptx.ld.global_.nc.s32(row_idx, table.ptr_to([lane_expert * T + token_idx]))
+                        txl.ptx[BULK_G2S](s_stage.ptr_to([(slot * UNIT_ROWS + lane) * ROW_WORDS]), grad.ptr_to([txl.Cast("int64", row_idx) * ROW_WORDS]), txl.uint32(ROW_BYTES), s_full.ptr_to([slot]))
+                    with txl.if_(token_mask == txl.uint64(0)), txl.then_():
+                        txl.assign(token_idx, token_idx + grid_size)
+                        txl.assign(token_mask, next_mask)
+                        txl.assign(next_mask, txl.uint64(0))
+                        with txl.if_(token_idx + grid_size < T), txl.then_():
+                            txl.ptx.ld.global_.nc.u64(next_mask, mask.ptr_to([token_idx + grid_size]))
                 with txl.else_():
                     with txl.if_(lane == 0), txl.then_():
-                        txl.ptx.st.shared.s32(meta.ptr_to([2 * slot + 1]), txl.int32(-1))
-                        txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bars.ptr_to([slot]), txl.uint32(0))
+                        txl.ptx.st.shared.s32(s_unit_meta.ptr_to([2 * slot + 1]), txl.int32(-1))
+                        txl.ptx.mbarrier.arrive.expect_tx.shared.b64(s_full.ptr_to([slot]), txl.uint32(0))
 
         with txl.if_(warp == 0), txl.then_():
-            for q in range(ST):
-                produce(q)
+            for stage in range(STAGES):
+                produce(stage)
 
         acc = txl.alloc_local([8], txl.f32)
-        w = txl.alloc_local([4], txl.u32)
-        i = txl.local_scalar(txl.i32, init=txl.int32(0))
-        go = txl.local_scalar(txl.i32, init=txl.int32(1))
-        tt = txl.local_scalar(txl.i32)
-        info = txl.local_scalar(txl.i32)
-        sl = txl.local_scalar(txl.i32)
-        for p in range(8):
-            txl.assign(acc[p], txl.float32(0))
-        with txl.while_(go > 0):
-            txl.assign(sl, i % ST)
-            txl.cuda.mbarrier_wait(bars.ptr_to([sl]), u322((i // ST) & 1))
-            txl.ptx.ld.shared.s32(tt, meta.ptr_to([2 * sl]))
-            txl.ptx.ld.shared.s32(info, meta.ptr_to([2 * sl + 1]))
-            with txl.if_(info < 0):
+        words = txl.alloc_local([4], txl.u32)
+        unit_idx = txl.local_scalar(txl.i32, init=txl.int32(0))
+        is_running = txl.local_scalar(txl.i32, init=txl.int32(1))
+        token = txl.local_scalar(txl.i32)
+        unit_info = txl.local_scalar(txl.i32)
+        slot = txl.local_scalar(txl.i32)
+        for i in range(8):
+            txl.assign(acc[i], txl.float32(0))
+        with txl.while_(is_running > 0):
+            txl.assign(slot, unit_idx % STAGES)
+            txl.cuda.mbarrier_wait(s_full.ptr_to([slot]), as_u32((unit_idx // STAGES) & 1))
+            txl.ptx.ld.shared.s32(token, s_unit_meta.ptr_to([2 * slot]))
+            txl.ptx.ld.shared.s32(unit_info, s_unit_meta.ptr_to([2 * slot + 1]))
+            with txl.if_(unit_info < 0):
                 with txl.then_():
-                    txl.assign(go, txl.int32(0))
+                    txl.assign(is_running, txl.int32(0))
                 with txl.else_():
-                    with txl.if_(active), txl.then_():
-                        for k in range(KB):
-                            with txl.if_(k < (info & 255)), txl.then_():
-                                txl.ptx.ld.shared.v4.b32(w[0], w[1], w[2], w[3], stage.ptr_to([(sl * KB + k) * RW + tid * 4]))
-                                for p in range(4):
-                                    lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
-                                    hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
-                                    txl.assign(acc[2 * p], acc[2 * p] + lo)
-                                    txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
-                    with txl.if_(info >= 256), txl.then_():
-                        with txl.if_(active), txl.then_():
-                            for p in range(4):
-                                txl.ptx["cvt.rn.bf16x2.f32"](w[p], acc[2 * p + 1], acc[2 * p])
-                            txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", tt) * RW + tid * 4]), w[0], w[1], w[2], w[3])
-                        for p in range(8):
-                            txl.assign(acc[p], txl.float32(0))
-            txl.cuda.cta_sync()  # every thread is done with slot sl
-            with txl.if_(txl.And(go > 0, warp == 0)), txl.then_():
-                produce(sl)
-            txl.assign(i, i + 1)
+                    with txl.if_(vec_ok), txl.then_():
+                        for k in range(UNIT_ROWS):
+                            with txl.if_(k < (unit_info & 255)), txl.then_():
+                                txl.ptx.ld.shared.v4.b32(words[0], words[1], words[2], words[3], s_stage.ptr_to([(slot * UNIT_ROWS + k) * ROW_WORDS + tidx * 4]))
+                                for pair in range(4):
+                                    add_bf16x2(acc, words, pair, pair)
+                    with txl.if_(unit_info >= 256), txl.then_():
+                        with txl.if_(vec_ok), txl.then_():
+                            pack_bf16x2(words, acc)
+                            txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", token) * ROW_WORDS + tidx * 4]), words[0], words[1], words[2], words[3])
+                        for i in range(8):
+                            txl.assign(acc[i], txl.float32(0))
+            txl.cuda.cta_sync()  # every thread is done with the slot
+            with txl.if_(txl.And(is_running > 0, warp == 0)), txl.then_():
+                produce(slot)
+            txl.assign(unit_idx, unit_idx + 1)
 
     return entry_function(gather_sum_tma.compile(TARGET))
 
 
-GS_PRODUCER_WARP = True  # tma3: a dedicated producer warp and per-slot empty barriers (no CTA barrier per unit)
-GS_SPIN = True  # tma3 consumers wait with a hint-free try_wait spin
-GS3 = True  # multi-token units (below) instead of one token per unit
-GS3_CFG = {2048: (4, 3, 4), 2880: (4, 2, 4)}  # by H: (pipeline stages, CTAs per SM, grouped rows per unit); producer-warp sweep
-GS3_CFG_BY_G = {(64, 2048): (3, 3, 5), (8, 2048): (6, 3, 3)}  # by (G, H), ahead of GS3_CFG: sparse EP4 packs more consecutive tokens per unit, dense local masks trade unit width for a deeper ring
+USE_PRODUCER_WARP = True  # a dedicated producer warp and per-slot empty barriers (no CTA barrier per unit)
+USE_SPIN_WAIT = True  # consumers wait with a hint-free try_wait spin
+USE_MULTI_TOKEN_UNITS = True  # multi-token units (below) instead of one token per unit
+MULTI_TOKEN_CFG = {2048: (4, 3, 4), 2880: (4, 2, 4)}  # by H: (pipeline stages, CTAs per SM, grouped rows per unit)
+MULTI_TOKEN_CFG_BY_G = {(64, 2048): (3, 3, 5), (8, 2048): (6, 3, 3)}  # by (G, H), ahead of MULTI_TOKEN_CFG: sparse EP4 packs more consecutive tokens per unit, dense local masks trade unit width for a deeper ring
 LAST_BIT = 1 << 30
 NOROW_BIT = 1 << 29
 
 
 @functools.cache
-def gather_sum_tma3_kernel(G: int, H: int):
+def compile_gather_sum_multi_token(G: int, H: int):
     """
-    Persistent: warp 0 packs the grouped rows of consecutive tokens (ascending expert order within a
-    token) into units of KB entries, one bulk copy per row into an ST-deep ring; an entry is (token,
-    last-of-token, no-row). Every thread adds a unit's rows; a token's last entry rounds and stores it.
-    Token masks are read 32 tokens at a time (one per lane), the next window prefetched.
+    Persistent: the producer warp packs the grouped rows of consecutive tokens (ascending expert
+    order within a token) into units of UNIT_ROWS entries, one bulk copy per row into a STAGES-deep
+    ring; an entry is (token, last-of-token, no-row). Every consumer thread adds a unit's rows; a
+    token's last entry rounds and stores it. Token masks are read 32 tokens at a time (one per
+    lane), the next window prefetched.
     """
-    V = H // 8
-    NW = (V + 31) // 32
-    ST, CPS, KB = GS3_CFG_BY_G.get((G, H), GS3_CFG.get(H, (2, 2, 4)))
-    GRID = NUM_SMS * CPS
-    RW = H // 2  # u32 words per row
-    RB = H * 2  # bytes per row
-    assert RB % 16 == 0 and KB <= 32
+    NUM_VECS = H // 8
+    NUM_WARPS = (NUM_VECS + 31) // 32
+    STAGES, CTAS_PER_SM, UNIT_ROWS = MULTI_TOKEN_CFG_BY_G.get((G, H), MULTI_TOKEN_CFG.get(H, (2, 2, 4)))
+    GRID = NUM_SMS * CTAS_PER_SM
+    ROW_WORDS = H // 2  # u32 words per row
+    ROW_BYTES = H * 2
+    assert ROW_BYTES % 16 == 0 and UNIT_ROWS <= 32
 
-    PW = NW if GS_PRODUCER_WARP else 0  # the producer warp (a dedicated extra warp, or consumer warp 0)
+    PRODUCER_WARP = NUM_WARPS if USE_PRODUCER_WARP else 0  # a dedicated extra warp, or consumer warp 0
 
     @txl.kernel()
     def gather_sum_tma3(grad: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), mask: txl.Tensor((txl.int64(),), txl.u64, data_alignment=1), table: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), T: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NW + (1 if GS_PRODUCER_WARP else 0)) * 32))
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        cta = txl.cta_id()
-        grid = txl.min(T, GRID)
-        active = tid < V
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=txl.min(T, GRID), block=(NUM_WARPS + (1 if USE_PRODUCER_WARP else 0)) * 32))
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        cta_idx = txl.cta_id()
+        grid_size = txl.min(T, GRID)
+        vec_ok = tidx < NUM_VECS
         smem = txl.smem_pool()
-        stage = smem.alloc([ST * KB * RW], txl.u32, align=128)
-        bars = smem.alloc([ST], txl.u64, align=8)
-        meta_n = smem.alloc([ST], txl.i32)  # entries in the unit (-1: no more units)
-        meta_e = smem.alloc([ST * KB], txl.i32)  # token | LAST_BIT | NOROW_BIT
-        empt = smem.alloc([ST], txl.u64, align=8)  # slot consumed: one arrival per consumer thread
-        with txl.if_(tid < ST), txl.then_():
-            txl.ptx.mbarrier.init.shared.b64(bars.ptr_to([tid]), txl.uint32(1))
-            txl.ptx.mbarrier.init.shared.b64(empt.ptr_to([tid]), txl.uint32(NW * 32))
+        s_stage = smem.alloc([STAGES * UNIT_ROWS * ROW_WORDS], txl.u32, align=128)
+        s_full = smem.alloc([STAGES], txl.u64, align=8)
+        s_unit_len = smem.alloc([STAGES], txl.i32)  # entries in the unit (-1: no more units)
+        s_unit_entries = smem.alloc([STAGES * UNIT_ROWS], txl.i32)  # token | LAST_BIT | NOROW_BIT
+        s_empty = smem.alloc([STAGES], txl.u64, align=8)  # slot consumed: one arrival per consumer thread
+        with txl.if_(tidx < STAGES), txl.then_():
+            txl.ptx.mbarrier.init.shared.b64(s_full.ptr_to([tidx]), txl.uint32(1))
+            txl.ptx.mbarrier.init.shared.b64(s_empty.ptr_to([tidx]), txl.uint32(NUM_WARPS * 32))
         txl.ptx.fence.mbarrier_init.release.cluster()
         txl.cuda.cta_sync()
 
-        # producer state (warp 0; uniform across its lanes except win / winn / per-entry registers)
-        win = txl.local_scalar(txl.u64, init=txl.uint64(0))  # mask of token cta + (wbase + lane) * grid
-        winn = txl.local_scalar(txl.u64, init=txl.uint64(0))  # the next window
-        wbase = txl.local_scalar(txl.i32, init=txl.int32(0))
-        cur = txl.local_scalar(txl.i32, init=txl.int32(0))
-        tp = txl.local_scalar(txl.i32, init=cta)
-        mp = txl.local_scalar(txl.u64, init=txl.uint64(0))
-        low = txl.local_scalar(txl.u64)
-        ek = txl.local_scalar(txl.i32)
-        em = txl.local_scalar(txl.i32)  # this lane's entry: expert (-1: none)
-        tk = txl.local_scalar(txl.i32)  # this lane's entry: token word
-        nv = txl.local_scalar(txl.i32)
-        nr = txl.local_scalar(txl.i32)
-        rr = txl.local_scalar(txl.i32)
-        lo32 = txl.local_scalar(txl.u32)
-        hi32 = txl.local_scalar(txl.u32)
+        # producer state (uniform across the producer warp's lanes except the window masks and the
+        # per-entry registers)
+        window_masks = txl.local_scalar(txl.u64, init=txl.uint64(0))  # mask of token cta_idx + (window_start + lane) * grid_size
+        next_window_masks = txl.local_scalar(txl.u64, init=txl.uint64(0))
+        window_start = txl.local_scalar(txl.i32, init=txl.int32(0))
+        window_pos = txl.local_scalar(txl.i32, init=txl.int32(0))
+        token_idx = txl.local_scalar(txl.i32, init=cta_idx)
+        token_mask = txl.local_scalar(txl.u64, init=txl.uint64(0))
+        lowest_bit = txl.local_scalar(txl.u64)
+        expert = txl.local_scalar(txl.i32)
+        lane_expert = txl.local_scalar(txl.i32)  # this lane's entry: expert (-1: none)
+        lane_entry = txl.local_scalar(txl.i32)  # this lane's entry: token word
+        num_entries = txl.local_scalar(txl.i32)
+        num_rows = txl.local_scalar(txl.i32)
+        row_idx = txl.local_scalar(txl.i32)
+        mask_lo = txl.local_scalar(txl.u32)
+        mask_hi = txl.local_scalar(txl.u32)
 
-        pol = txl.local_scalar(txl.u64)
-        txl.ptx.createpolicy.fractional.L2__evict_first.b64(pol, txl.float32(1.0))
+        evict_policy = txl.local_scalar(txl.u64)
+        txl.ptx.createpolicy.fractional.L2__evict_first.b64(evict_policy, txl.float32(1.0))
 
-        def load_window(dst, base):
-            t_ = cta + (base + lane) * grid
+        def load_window(dst, start):
+            token = cta_idx + (start + lane) * grid_size
             txl.assign(dst, txl.uint64(0))
-            with txl.if_(t_ < T), txl.then_():
-                txl.ptx.ld.global_.nc.u64(dst, mask.ptr_to([t_]))
+            with txl.if_(token < T), txl.then_():
+                txl.ptx.ld.global_.nc.u64(dst, mask.ptr_to([token]))
 
-        def fetch_mask():  # mp = mask of window entry cur (all lanes)
-            lw = txl.Cast("uint32", win & txl.uint64(0xFFFFFFFF))
-            hw = txl.Cast("uint32", win >> txl.uint64(32))
-            txl.ptx.shfl_sync.idx.b32(lo32, lw, u322(cur), txl.uint32(31), txl.uint32(FULL))
-            txl.ptx.shfl_sync.idx.b32(hi32, hw, u322(cur), txl.uint32(31), txl.uint32(FULL))
-            txl.assign(mp, (txl.Cast("uint64", hi32) << txl.uint64(32)) | txl.Cast("uint64", lo32))
-
-        with txl.if_(warp == PW), txl.then_():
-            load_window(win, txl.int32(0))
-            load_window(winn, txl.int32(32))
-            fetch_mask()
+        def fetch_mask():
+            """
+            token_mask = the mask of window entry window_pos, in every lane.
+            """
+            window_lo = txl.Cast("uint32", window_masks & txl.uint64(0xFFFFFFFF))
+            window_hi = txl.Cast("uint32", window_masks >> txl.uint64(32))
+            txl.ptx.shfl_sync.idx.b32(mask_lo, window_lo, as_u32(window_pos), txl.uint32(31), txl.uint32(FULL_MASK))
+            txl.ptx.shfl_sync.idx.b32(mask_hi, window_hi, as_u32(window_pos), txl.uint32(31), txl.uint32(FULL_MASK))
+            txl.assign(token_mask, (txl.Cast("uint64", mask_hi) << txl.uint64(32)) | txl.Cast("uint64", mask_lo))
 
         def produce(slot):
-            txl.assign(nv, txl.int32(0))
-            txl.assign(nr, txl.int32(0))
-            txl.assign(em, txl.int32(-1))
-            for k in range(KB):
-                with txl.if_(tp < T), txl.then_():
-                    txl.assign(low, mp & (txl.uint64(0) - mp))
-                    txl.assign(ek, txl.Select(low != txl.uint64(0), i322(txl.popcount(low - txl.uint64(1))), txl.int32(-1)))
-                    txl.assign(mp, mp ^ low)
-                    word = tp + txl.Select(mp == txl.uint64(0), txl.int32(LAST_BIT), txl.int32(0)) + txl.Select(ek < 0, txl.int32(NOROW_BIT), txl.int32(0))
+            """
+            Fill ring slot with the next unit: its entries, then one bulk copy per grouped row.
+            """
+            txl.assign(num_entries, txl.int32(0))
+            txl.assign(num_rows, txl.int32(0))
+            txl.assign(lane_expert, txl.int32(-1))
+            for k in range(UNIT_ROWS):
+                with txl.if_(token_idx < T), txl.then_():
+                    txl.assign(lowest_bit, token_mask & (txl.uint64(0) - token_mask))
+                    txl.assign(expert, txl.Select(lowest_bit != txl.uint64(0), as_i32(txl.popcount(lowest_bit - txl.uint64(1))), txl.int32(-1)))
+                    txl.assign(token_mask, token_mask ^ lowest_bit)
+                    entry_word = token_idx + txl.Select(token_mask == txl.uint64(0), txl.int32(LAST_BIT), txl.int32(0)) + txl.Select(expert < 0, txl.int32(NOROW_BIT), txl.int32(0))
                     with txl.if_(lane == k), txl.then_():
-                        txl.assign(em, ek)
-                        txl.assign(tk, word)
-                    txl.assign(nv, nv + 1)
-                    txl.assign(nr, nr + txl.Select(ek >= 0, txl.int32(1), txl.int32(0)))
-                    with txl.if_(mp == txl.uint64(0)), txl.then_():  # token done: next token of this CTA
-                        txl.assign(cur, cur + 1)
-                        with txl.if_(cur == 32), txl.then_():
-                            txl.assign(win, winn)
-                            txl.assign(wbase, wbase + 32)
-                            txl.assign(cur, txl.int32(0))
-                            load_window(winn, wbase + 32)
-                        txl.assign(tp, cta + (wbase + cur) * grid)
+                        txl.assign(lane_expert, expert)
+                        txl.assign(lane_entry, entry_word)
+                    txl.assign(num_entries, num_entries + 1)
+                    txl.assign(num_rows, num_rows + txl.Select(expert >= 0, txl.int32(1), txl.int32(0)))
+                    with txl.if_(token_mask == txl.uint64(0)), txl.then_():  # token done: next token of this CTA
+                        txl.assign(window_pos, window_pos + 1)
+                        with txl.if_(window_pos == 32), txl.then_():
+                            txl.assign(window_masks, next_window_masks)
+                            txl.assign(window_start, window_start + 32)
+                            txl.assign(window_pos, txl.int32(0))
+                            load_window(next_window_masks, window_start + 32)
+                        txl.assign(token_idx, cta_idx + (window_start + window_pos) * grid_size)
                         fetch_mask()
             with txl.if_(lane == 0), txl.then_():
-                txl.ptx.st.shared.s32(meta_n.ptr_to([slot]), txl.Select(nv > 0, nv, txl.int32(-1)))
-            with txl.if_(lane < nv), txl.then_():
-                txl.ptx.st.shared.s32(meta_e.ptr_to([slot * KB + lane]), tk)
-            txl.ptx["bar.warp.sync"](txl.uint32(FULL))  # every lane's meta store before the (releasing) arrive
+                txl.ptx.st.shared.s32(s_unit_len.ptr_to([slot]), txl.Select(num_entries > 0, num_entries, txl.int32(-1)))
+            with txl.if_(lane < num_entries), txl.then_():
+                txl.ptx.st.shared.s32(s_unit_entries.ptr_to([slot * UNIT_ROWS + lane]), lane_entry)
+            txl.ptx["bar.warp.sync"](txl.uint32(FULL_MASK))  # every lane's meta store before the (releasing) arrive
             with txl.if_(lane == 0), txl.then_():
-                txl.ptx.mbarrier.arrive.expect_tx.shared.b64(bars.ptr_to([slot]), u322(nr * RB))
-            with txl.if_(txl.And(lane < nv, em >= 0)), txl.then_():
-                txl.ptx.ld.global_.nc.s32(rr, table.ptr_to([em * T + (tk & txl.int32(NOROW_BIT - 1))]))
-                if EVF["gs"]:
-                    txl.ptx[BULK_G2S + ".L2::cache_hint"](
-                        stage.ptr_to([(slot * KB + lane) * RW]),
-                        grad.ptr_to([txl.Cast("int64", rr) * RW]),
-                        txl.uint32(RB),
-                        bars.ptr_to([slot]),
-                        pol,
-                    )
+                txl.ptx.mbarrier.arrive.expect_tx.shared.b64(s_full.ptr_to([slot]), as_u32(num_rows * ROW_BYTES))
+            with txl.if_(txl.And(lane < num_entries, lane_expert >= 0)), txl.then_():
+                txl.ptx.ld.global_.nc.s32(row_idx, table.ptr_to([lane_expert * T + (lane_entry & txl.int32(NOROW_BIT - 1))]))
+                if EVICT_FIRST["gs"]:
+                    txl.ptx[BULK_G2S + ".L2::cache_hint"](s_stage.ptr_to([(slot * UNIT_ROWS + lane) * ROW_WORDS]), grad.ptr_to([txl.Cast("int64", row_idx) * ROW_WORDS]), txl.uint32(ROW_BYTES), s_full.ptr_to([slot]), evict_policy)
                 else:
-                    txl.ptx[BULK_G2S](
-                        stage.ptr_to([(slot * KB + lane) * RW]),
-                        grad.ptr_to([txl.Cast("int64", rr) * RW]),
-                        txl.uint32(RB),
-                        bars.ptr_to([slot]),
-                    )
+                    txl.ptx[BULK_G2S](s_stage.ptr_to([(slot * UNIT_ROWS + lane) * ROW_WORDS]), grad.ptr_to([txl.Cast("int64", row_idx) * ROW_WORDS]), txl.uint32(ROW_BYTES), s_full.ptr_to([slot]))
 
-        def spin(bar, parity):
-            rdy = txl.local_scalar(txl.u32, init=txl.uint32(0))
-            with txl.while_(rdy == txl.uint32(0)):
-                txl.ptx.mbarrier.try_wait.parity.shared.b64(rdy, bar, parity)
+        def spin_wait(barrier, parity):
+            is_ready = txl.local_scalar(txl.u32, init=txl.uint32(0))
+            with txl.while_(is_ready == txl.uint32(0)):
+                txl.ptx.mbarrier.try_wait.parity.shared.b64(is_ready, barrier, parity)
 
-        with txl.if_(warp == PW), txl.then_():
-            for q in range(ST):
-                produce(q)
-            if GS_PRODUCER_WARP:  # refill each slot once its consumers release it, until the end marker
-                pi = txl.local_scalar(txl.i32, init=txl.int32(ST))
-                fin = txl.local_scalar(txl.i32, init=txl.Select(nv == 0, txl.int32(1), txl.int32(0)))
-                ps = txl.local_scalar(txl.i32)
-                with txl.while_(fin == 0):
-                    txl.assign(ps, pi % ST)
-                    spin(empt.ptr_to([ps]), u322((pi // ST - 1) & 1))
-                    produce(ps)
-                    txl.assign(fin, txl.Select(nv == 0, txl.int32(1), txl.int32(0)))
-                    txl.assign(pi, pi + 1)
+        def producer_loop():
+            """
+            Fill every slot once, then (with a dedicated producer warp) refill each slot once its
+            consumers release it, until the end marker.
+            """
+            for slot in range(STAGES):
+                produce(slot)
+            if USE_PRODUCER_WARP:
+                unit_idx = txl.local_scalar(txl.i32, init=txl.int32(STAGES))
+                is_done = txl.local_scalar(txl.i32, init=txl.Select(num_entries == 0, txl.int32(1), txl.int32(0)))
+                slot = txl.local_scalar(txl.i32)
+                with txl.while_(is_done == 0):
+                    txl.assign(slot, unit_idx % STAGES)
+                    spin_wait(s_empty.ptr_to([slot]), as_u32((unit_idx // STAGES - 1) & 1))
+                    produce(slot)
+                    txl.assign(is_done, txl.Select(num_entries == 0, txl.int32(1), txl.int32(0)))
+                    txl.assign(unit_idx, unit_idx + 1)
+
+        def add_unit_rows(slot, unit_len):
+            """
+            Add the unit's rows to acc; a token's last entry rounds, stores and resets acc.
+            """
+            for k in range(UNIT_ROWS):
+                with txl.if_(k < unit_len), txl.then_():
+                    txl.ptx.ld.shared.s32(entry_word, s_unit_entries.ptr_to([slot * UNIT_ROWS + k]))
+                    with txl.if_((entry_word & txl.int32(NOROW_BIT)) == 0), txl.then_():
+                        txl.ptx.ld.shared.v4.b32(words[0], words[1], words[2], words[3], s_stage.ptr_to([(slot * UNIT_ROWS + k) * ROW_WORDS + tidx * 4]))
+                        for pair in range(4):
+                            add_bf16x2(acc, words, pair, pair)
+                    with txl.if_((entry_word & txl.int32(LAST_BIT)) != 0), txl.then_():
+                        pack_bf16x2(words, acc)
+                        token = entry_word & txl.int32(NOROW_BIT - 1)
+                        txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", token) * ROW_WORDS + tidx * 4]), words[0], words[1], words[2], words[3])
+                        for i in range(8):
+                            txl.assign(acc[i], txl.float32(0))
+
+        with txl.if_(warp == PRODUCER_WARP), txl.then_():
+            load_window(window_masks, txl.int32(0))
+            load_window(next_window_masks, txl.int32(32))
+            fetch_mask()
+
+        with txl.if_(warp == PRODUCER_WARP), txl.then_():
+            producer_loop()
 
         acc = txl.alloc_local([8], txl.f32)
-        w = txl.alloc_local([4], txl.u32)
-        i = txl.local_scalar(txl.i32, init=txl.int32(0))
-        go = txl.local_scalar(txl.i32, init=txl.int32(1))
-        nn = txl.local_scalar(txl.i32)
-        wd = txl.local_scalar(txl.i32)
-        sl = txl.local_scalar(txl.i32)
-        for p in range(8):
-            txl.assign(acc[p], txl.float32(0))
-        txl.assign(go, txl.Select(warp < NW, txl.int32(1), txl.int32(0)))
-        with txl.while_(go > 0):
-            txl.assign(sl, i % ST)
-            if GS_SPIN:  # try_wait without a suspend-time hint, in a spin loop
-                rdy = txl.local_scalar(txl.u32, init=txl.uint32(0))
-                with txl.while_(rdy == txl.uint32(0)):
-                    txl.ptx.mbarrier.try_wait.parity.shared.b64(rdy, bars.ptr_to([sl]), u322((i // ST) & 1))
+        words = txl.alloc_local([4], txl.u32)
+        unit_idx = txl.local_scalar(txl.i32, init=txl.int32(0))
+        is_running = txl.local_scalar(txl.i32, init=txl.int32(1))
+        unit_len = txl.local_scalar(txl.i32)
+        entry_word = txl.local_scalar(txl.i32)
+        slot = txl.local_scalar(txl.i32)
+        for i in range(8):
+            txl.assign(acc[i], txl.float32(0))
+        txl.assign(is_running, txl.Select(warp < NUM_WARPS, txl.int32(1), txl.int32(0)))
+        with txl.while_(is_running > 0):
+            txl.assign(slot, unit_idx % STAGES)
+            if USE_SPIN_WAIT:  # try_wait without a suspend-time hint, in a spin loop
+                is_ready = txl.local_scalar(txl.u32, init=txl.uint32(0))
+                with txl.while_(is_ready == txl.uint32(0)):
+                    txl.ptx.mbarrier.try_wait.parity.shared.b64(is_ready, s_full.ptr_to([slot]), as_u32((unit_idx // STAGES) & 1))
             else:
-                txl.cuda.mbarrier_wait(bars.ptr_to([sl]), u322((i // ST) & 1))
-            txl.ptx.ld.shared.s32(nn, meta_n.ptr_to([sl]))
-            with txl.if_(nn < 0):
+                txl.cuda.mbarrier_wait(s_full.ptr_to([slot]), as_u32((unit_idx // STAGES) & 1))
+            txl.ptx.ld.shared.s32(unit_len, s_unit_len.ptr_to([slot]))
+            with txl.if_(unit_len < 0):
                 with txl.then_():
-                    txl.assign(go, txl.int32(0))
+                    txl.assign(is_running, txl.int32(0))
                 with txl.else_():
-                    with txl.if_(active), txl.then_():
-                        for k in range(KB):
-                            with txl.if_(k < nn), txl.then_():
-                                txl.ptx.ld.shared.s32(wd, meta_e.ptr_to([sl * KB + k]))
-                                with txl.if_((wd & txl.int32(NOROW_BIT)) == 0), txl.then_():
-                                    txl.ptx.ld.shared.v4.b32(w[0], w[1], w[2], w[3], stage.ptr_to([(sl * KB + k) * RW + tid * 4]))
-                                    for p in range(4):
-                                        lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
-                                        hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
-                                        txl.assign(acc[2 * p], acc[2 * p] + lo)
-                                        txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
-                                with txl.if_((wd & txl.int32(LAST_BIT)) != 0), txl.then_():
-                                    for p in range(4):
-                                        txl.ptx["cvt.rn.bf16x2.f32"](w[p], acc[2 * p + 1], acc[2 * p])
-                                    tt = wd & txl.int32(NOROW_BIT - 1)
-                                    txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", tt) * RW + tid * 4]), w[0], w[1], w[2], w[3])
-                                    for p in range(8):
-                                        txl.assign(acc[p], txl.float32(0))
-            if GS_PRODUCER_WARP:
-                with txl.if_(go > 0), txl.then_():  # each consumer thread releases the slot after its own reads
-                    txl.ptx.mbarrier.arrive.shared.b64(empt.ptr_to([sl]))
+                    with txl.if_(vec_ok), txl.then_():
+                        add_unit_rows(slot, unit_len)
+            if USE_PRODUCER_WARP:
+                with txl.if_(is_running > 0), txl.then_():  # each consumer thread releases the slot after its own reads
+                    txl.ptx.mbarrier.arrive.shared.b64(s_empty.ptr_to([slot]))
             else:
-                txl.cuda.cta_sync()  # every thread is done with slot sl
-                with txl.if_(txl.And(go > 0, warp == 0)), txl.then_():
-                    produce(sl)
-            txl.assign(i, i + 1)
+                txl.cuda.cta_sync()  # every thread is done with the slot
+                with txl.if_(txl.And(is_running > 0, warp == 0)), txl.then_():
+                    produce(slot)
+            txl.assign(unit_idx, unit_idx + 1)
 
     return entry_function(gather_sum_tma3.compile(TARGET))
 
 
 def bf16_expert_gather_sum_sm100(grad, maps, num_groups, max_slots):
+    """
+    bf16_expert_gather_sum on SM100; max_slots is not needed here.
+    """
     T, H = maps.mask.shape[0], grad.shape[1]
     out = torch.empty(T, H, dtype=torch.bfloat16, device=grad.device)
     if T:
-        k = (gather_sum_tma3_kernel if GS3 else gather_sum_tma_kernel if GS_TMA else gather_sum_kernel)(num_groups, H)
-        k(grad.view(-1).view(torch.uint32), maps.mask.view(torch.uint64), maps.table, out.view(-1).view(torch.uint32), T)
+        fn = (compile_gather_sum_multi_token if USE_MULTI_TOKEN_UNITS else compile_gather_sum_tma if USE_GATHER_SUM_TMA else compile_gather_sum)(num_groups, H)
+        fn(grad.view(-1).view(torch.uint32), maps.mask.view(torch.uint64), maps.table, out.view(-1).view(torch.uint32), T)
     return out
 
-
-# ------------------------------------------------------------------------------------- gather_rows
 
 ROWS_PER_CTA = 4
 
 
 @functools.cache
-def gather_rows_kernel(N: int):
-    V = N // 8
-    NW = 8
+def compile_gather_rows(N: int):
+    """
+    ROWS_PER_CTA rows per CTA, each thread loading all its 16-byte vectors before storing any.
+    """
+    NUM_VECS = N // 8
+    NUM_WARPS = 8
 
     @txl.kernel()
     def gather_rows(x: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), R: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(R + ROWS_PER_CTA - 1) // ROWS_PER_CTA, block=(NW) * 32))
-        b = txl.cta_id()
-        tid = txl.thread_id()
-        NI = (V * ROWS_PER_CTA + NW * 32 - 1) // (NW * 32)
-        w = txl.alloc_local([4 * NI], txl.u32)
-        src = txl.alloc_local([NI], txl.i32)
-        pol = txl.local_scalar(txl.u64)
-        txl.ptx.createpolicy.fractional.L2__evict_first.b64(pol, txl.float32(1.0))
-        for i in range(NI):
-            f = i * NW * 32 + tid
-            r = b * ROWS_PER_CTA + f // V
-            with txl.if_(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.then_():
-                txl.ptx.ld.global_.nc.s32(src[i], idx.ptr_to([r]))
-        for i in range(NI):
-            f = i * NW * 32 + tid
-            r = b * ROWS_PER_CTA + f // V
-            with txl.if_(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.then_():
-                if EVF["rows"]:
-                    txl.ptx["ld.global.nc.L1::no_allocate.L2::cache_hint.v4.b32"](
-                        w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3],
-                        x.ptr_to([txl.Cast("int64", src[i]) * (N // 2) + (f % V) * 4]), pol)
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(R + ROWS_PER_CTA - 1) // ROWS_PER_CTA, block=NUM_WARPS * 32))
+        cta_idx = txl.cta_id()
+        tidx = txl.thread_id()
+        VECS_PER_THREAD = (NUM_VECS * ROWS_PER_CTA + NUM_WARPS * 32 - 1) // (NUM_WARPS * 32)
+        words = txl.alloc_local([4 * VECS_PER_THREAD], txl.u32)
+        src_rows = txl.alloc_local([VECS_PER_THREAD], txl.i32)
+        evict_policy = txl.local_scalar(txl.u64)
+        txl.ptx.createpolicy.fractional.L2__evict_first.b64(evict_policy, txl.float32(1.0))
+        for i in range(VECS_PER_THREAD):
+            vec_idx = i * NUM_WARPS * 32 + tidx
+            row_idx = cta_idx * ROWS_PER_CTA + vec_idx // NUM_VECS
+            with txl.if_(txl.And(vec_idx < NUM_VECS * ROWS_PER_CTA, row_idx < R)), txl.then_():
+                txl.ptx.ld.global_.nc.s32(src_rows[i], idx.ptr_to([row_idx]))
+        for i in range(VECS_PER_THREAD):
+            vec_idx = i * NUM_WARPS * 32 + tidx
+            row_idx = cta_idx * ROWS_PER_CTA + vec_idx // NUM_VECS
+            with txl.if_(txl.And(vec_idx < NUM_VECS * ROWS_PER_CTA, row_idx < R)), txl.then_():
+                if EVICT_FIRST["rows"]:
+                    txl.ptx["ld.global.nc.L1::no_allocate.L2::cache_hint.v4.b32"](words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3], x.ptr_to([txl.Cast("int64", src_rows[i]) * (N // 2) + (vec_idx % NUM_VECS) * 4]), evict_policy)
                 else:
-                    txl.ptx.ld.global_.nc.v4.b32(w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3],
-                                                 x.ptr_to([txl.Cast("int64", src[i]) * (N // 2) + (f % V) * 4]))
-        for i in range(NI):
-            f = i * NW * 32 + tid
-            r = b * ROWS_PER_CTA + f // V
-            with txl.if_(txl.And(f < V * ROWS_PER_CTA, r < R)), txl.then_():
-                txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", r) * (N // 2) + (f % V) * 4]),
-                                          w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3])
+                    txl.ptx.ld.global_.nc.v4.b32(words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3], x.ptr_to([txl.Cast("int64", src_rows[i]) * (N // 2) + (vec_idx % NUM_VECS) * 4]))
+        for i in range(VECS_PER_THREAD):
+            vec_idx = i * NUM_WARPS * 32 + tidx
+            row_idx = cta_idx * ROWS_PER_CTA + vec_idx // NUM_VECS
+            with txl.if_(txl.And(vec_idx < NUM_VECS * ROWS_PER_CTA, row_idx < R)), txl.then_():
+                txl.ptx.st.global_.v4.b32(out.ptr_to([txl.Cast("int64", row_idx) * (N // 2) + (vec_idx % NUM_VECS) * 4]), words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3])
 
     return entry_function(gather_rows.compile(TARGET))
 
 
 def bf16_expert_gather_rows_sm100(x, idx):
+    """
+    bf16_expert_gather_rows on SM100.
+    """
     R, N = idx.shape[0], x.shape[1]
     out = torch.empty(R, N, dtype=torch.bfloat16, device=x.device)
     if R:
-        k = gather_rows_kernel(N)
-        k(x.view(-1).view(torch.uint32), idx, out.view(-1).view(torch.uint32), R)
+        fn = compile_gather_rows(N)
+        fn(x.view(-1).view(torch.uint32), idx, out.view(-1).view(torch.uint32), R)
     return out
 
 
-# ------------------------------------------------------------------------------------- segment_sum
-
 # (warps = chunk workers per CTA, bytes per lane per row, cp.async rows in flight per thread)
-SEG_CFG = {False: (16, 16, 16), True: (16, 8, 16)}
-SEG_F32X2 = False
+SEGMENT_SUM_CFG = {False: (16, 16, 16), True: (16, 8, 16)}
+USE_F32X2_ADD = False
+# two-launch split for these has_idx values: (warps per CTA, bytes per lane per row, rows in flight)
+SPLIT_SEGMENT_CFG = {True: (1, 16, 32), False: (1, 16, 32)}
+SPLIT_SEGMENT_MIN_BYTES = {True: 0, False: 32 << 20}  # no-idx: below this one launch (no second launch to hide)
+USE_PDL = True  # combine launched with programmatic dependent launch: its launch and cu prologue overlap the chunk tail
 
 
 @functools.cache
-def segment_sum_kernel(N: int, has_idx: bool):
-    W, VB, D = SEG_CFG[has_idx]
-    VE = VB // 2  # bf16 per lane
-    VW = VB // 4  # u32 words per lane
-    COLS = 32 * VE
-    NCB = (N + COLS - 1) // COLS
-    NT = W * 32
-    assert 256 % D == 0
+def compile_segment_sum(N: int, has_idx: bool):
+    """
+    One launch: CTA (segment, column block) gives each warp one 256-row chunk per round and adds the
+    chunk sums in order through shared memory.
+    """
+    NUM_WARPS, LANE_BYTES, RING_DEPTH = SEGMENT_SUM_CFG[has_idx]
+    LANE_ELEMS = LANE_BYTES // 2  # bf16 per lane
+    LANE_WORDS = LANE_BYTES // 4  # u32 words per lane
+    COLS = 32 * LANE_ELEMS
+    NUM_COL_BLOCKS = (N + COLS - 1) // COLS
+    THREADS = NUM_WARPS * 32
+    assert 256 % RING_DEPTH == 0
 
     @txl.kernel()
     def segment_sum(x: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), G: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=(W) * 32))
-        b = txl.cta_id()
-        g = b // NCB
-        cb = b % NCB
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NUM_COL_BLOCKS, block=NUM_WARPS * 32))
+        cta_idx = txl.cta_id()
+        group_idx, col_block = cta_idx // NUM_COL_BLOCKS, cta_idx % NUM_COL_BLOCKS
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
         smem = txl.smem_pool()
-        ring = smem.alloc([D * NT * VW], txl.u32)  # slot s of thread t at (s * NT + t) * VB
-        part = smem.alloc([W * COLS], txl.f32)
-        rows_s = smem.alloc([W * 256], txl.i32, align=16)
-        start = txl.local_scalar(txl.i32)
-        end = txl.local_scalar(txl.i32)
-        txl.ptx.ld.global_.nc.s32(start, cu.ptr_to([g]))
-        txl.ptx.ld.global_.nc.s32(end, cu.ptr_to([g + 1]))
-        nch = (end - start + 255) // 256
-        col = cb * COLS + lane * VE
-        colok = col < N
-        ccol = txl.Select(colok, col, 0)
-        acc = txl.alloc_local([VE], txl.f32)
-        acc2 = txl.alloc_local([VW], txl.u64)
-        tot = txl.local_scalar(txl.f32, init=txl.float32(0))
-        w = txl.alloc_local([VW], txl.u32)
-        rv = txl.local_scalar(txl.i32)
-        cpy = "cp.async.cg.shared.global" if VB == 16 else "cp.async.ca.shared.global"
+        s_ring = smem.alloc([RING_DEPTH * THREADS * LANE_WORDS], txl.u32)  # slot s of thread t at (s * THREADS + t) * LANE_BYTES
+        s_partial = smem.alloc([NUM_WARPS * COLS], txl.f32)
+        s_rows = smem.alloc([NUM_WARPS * 256], txl.i32, align=16)
+        seg_start = txl.local_scalar(txl.i32)
+        seg_end = txl.local_scalar(txl.i32)
+        txl.ptx.ld.global_.nc.s32(seg_start, cu.ptr_to([group_idx]))
+        txl.ptx.ld.global_.nc.s32(seg_end, cu.ptr_to([group_idx + 1]))
+        num_chunks = (seg_end - seg_start + 255) // 256
+        col = col_block * COLS + lane * LANE_ELEMS
+        col_ok = col < N
+        safe_col = txl.Select(col_ok, col, 0)
+        acc = txl.alloc_local([LANE_ELEMS], txl.f32)
+        acc_pairs = txl.alloc_local([LANE_WORDS], txl.u64)
+        acc_total = txl.local_scalar(txl.f32, init=txl.float32(0))
+        words = txl.alloc_local([LANE_WORDS], txl.u32)
+        src_idx = txl.local_scalar(txl.i32)
+        copy_op = "cp.async.cg.shared.global" if LANE_BYTES == 16 else "cp.async.ca.shared.global"
 
-        ivr = txl.alloc_local([D], txl.i32)  # grouped rows of the next D chunk rows (has_idx)
+        chunk_rows = txl.alloc_local([RING_DEPTH], txl.i32)  # grouped rows of the next RING_DEPTH chunk rows (has_idx)
 
-        def load_idx(i0):
-            # rows i0 .. i0 + D - 1 of this warp's chunk, read ahead of their issues
-            for q in range(D // 4):
-                txl.ptx.ld.shared.v4.b32(ivr[4 * q], ivr[4 * q + 1], ivr[4 * q + 2], ivr[4 * q + 3],
-                                         rows_s.ptr_to([warp * 256 + i0 + 4 * q]))
+        def load_chunk_rows(row_start):
+            # rows row_start .. row_start + RING_DEPTH - 1 of this warp's chunk, read ahead of their issues
+            for quad in range(RING_DEPTH // 4):
+                txl.ptx.ld.shared.v4.b32(chunk_rows[4 * quad], chunk_rows[4 * quad + 1], chunk_rows[4 * quad + 2], chunk_rows[4 * quad + 3], s_rows.ptr_to([warp * 256 + row_start + 4 * quad]))
 
-        def issue(i, slot, cs, ce):
-            r = cs + i
-            ok = txl.And(r < ce, colok)
+        def issue_row(i, slot, chunk_start, chunk_end):
+            row_idx = chunk_start + i
+            row_ok = txl.And(row_idx < chunk_end, col_ok)
             if has_idx:
-                txl.assign(rv, ivr[slot])
+                txl.assign(src_idx, chunk_rows[slot])
             else:
-                txl.assign(rv, r)
-            src_row = txl.Select(ok, rv, 0)
-            txl.ptx[cpy](
-                ring.ptr_to([(slot * NT + tid) * VW]),
-                x.ptr_to([txl.Cast("int64", src_row) * (N // 2) + ccol // 2]),
-                VB,
-                txl.ptx.pred(txl.Not(ok)),
-            )
+                txl.assign(src_idx, row_idx)
+            src_row = txl.Select(row_ok, src_idx, 0)
+            txl.ptx[copy_op](s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]), x.ptr_to([txl.Cast("int64", src_row) * (N // 2) + safe_col // 2]), LANE_BYTES, txl.ptx.pred(txl.Not(row_ok)))
 
-        def consume(slot):
-            if VW == 4:
-                txl.ptx.ld.shared.v4.b32(w[0], w[1], w[2], w[3], ring.ptr_to([(slot * NT + tid) * VW]))
+        def add_ring_slot(slot):
+            if LANE_WORDS == 4:
+                txl.ptx.ld.shared.v4.b32(words[0], words[1], words[2], words[3], s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]))
             else:
-                txl.ptx.ld.shared.v2.b32(w[0], w[1], ring.ptr_to([(slot * NT + tid) * VW]))
-            for p in range(VW):
-                lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
-                hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
-                if SEG_F32X2:
-                    txl.ptx["add.rn.f32x2"](acc2[p], acc2[p], txl.cuda.make_float2(lo, hi))
+                txl.ptx.ld.shared.v2.b32(words[0], words[1], s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]))
+            for pair in range(LANE_WORDS):
+                lo = txl.reinterpret(txl.shift_left(words[pair], txl.uint32(16)), ty="float32")
+                hi = txl.reinterpret(words[pair] & txl.uint32(0xFFFF0000), ty="float32")
+                if USE_F32X2_ADD:
+                    txl.ptx["add.rn.f32x2"](acc_pairs[pair], acc_pairs[pair], txl.cuda.make_float2(lo, hi))
                 else:
-                    txl.assign(acc[2 * p], acc[2 * p] + lo)
-                    txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
+                    txl.assign(acc[2 * pair], acc[2 * pair] + lo)
+                    txl.assign(acc[2 * pair + 1], acc[2 * pair + 1] + hi)
 
-        with txl.serial(0, (nch + W - 1) // W) as rnd:
-            c = rnd * W + warp
-            cs = start + c * 256
-            ce = txl.min(cs + 256, end)
-            for i in range(VE):
-                txl.assign(acc[i], txl.float32(0))
-            for p in range(VW):
-                txl.assign(acc2[p], txl.uint64(0))
-            with txl.if_(c < nch), txl.then_():
+        def sum_chunk(chunk_start, chunk_end):
+            """
+            Add the chunk's rows into acc in order, through the cp.async ring.
+            """
+            if has_idx:
+                for k in range(8):
+                    row_idx = chunk_start + k * 32 + lane
+                    grouped_row = txl.local_scalar(txl.i32, init=txl.int32(0))
+                    with txl.if_(row_idx < chunk_end), txl.then_():
+                        txl.ptx.ld.global_.nc.s32(grouped_row, idx.ptr_to([row_idx]))
+                    txl.ptx.st.shared.s32(s_rows.ptr_to([warp * 256 + k * 32 + lane]), grouped_row)
+                txl.ptx["bar.warp.sync"](txl.uint32(FULL_MASK))
+            if has_idx:
+                load_chunk_rows(0)
+            for j in range(RING_DEPTH):
+                issue_row(j, j, chunk_start, chunk_end)
+                txl.ptx["cp.async.commit_group"]()
+            # rows block * RING_DEPTH + j live in ring slot j: the slot index is static
+            with txl.serial(0, 256 // RING_DEPTH - 1) as block:
                 if has_idx:
-                    for q in range(8):
-                        r = cs + q * 32 + lane
-                        iv = txl.local_scalar(txl.i32, init=txl.int32(0))
-                        with txl.if_(r < ce), txl.then_():
-                            txl.ptx.ld.global_.nc.s32(iv, idx.ptr_to([r]))
-                        txl.ptx.st.shared.s32(rows_s.ptr_to([warp * 256 + q * 32 + lane]), iv)
-                    txl.ptx["bar.warp.sync"](txl.uint32(FULL))
-                if has_idx:
-                    load_idx(0)
-                for j in range(D):
-                    issue(j, j, cs, ce)
+                    load_chunk_rows((block + 1) * RING_DEPTH)
+                for j in range(RING_DEPTH):
+                    txl.ptx["cp.async.wait_group"](RING_DEPTH - 1)
+                    add_ring_slot(j)
+                    issue_row((block + 1) * RING_DEPTH + j, j, chunk_start, chunk_end)
                     txl.ptx["cp.async.commit_group"]()
-                # rows blk * D + j live in ring slot j: the slot index is static
-                with txl.serial(0, 256 // D - 1) as blk:
-                    if has_idx:
-                        load_idx((blk + 1) * D)
-                    for j in range(D):
-                        txl.ptx["cp.async.wait_group"](D - 1)
-                        consume(j)
-                        issue((blk + 1) * D + j, j, cs, ce)
-                        txl.ptx["cp.async.commit_group"]()
-                txl.ptx["cp.async.wait_group"](0)
-                for j in range(D):
-                    consume(j)
-            if SEG_F32X2:
-                for p in range(VW):
-                    txl.assign(acc[2 * p], txl.cuda.float2_x(acc2[p]))
-                    txl.assign(acc[2 * p + 1], txl.cuda.float2_y(acc2[p]))
-            for i in range(VE):
-                txl.ptx.st.shared.f32(part.ptr_to([warp * COLS + lane * VE + i]), acc[i])
+            txl.ptx["cp.async.wait_group"](0)
+            for j in range(RING_DEPTH):
+                add_ring_slot(j)
+
+        def add_round_sums(round_idx):
+            """
+            Thread tidx < COLS owns column col_block * COLS + tidx and adds this round's chunk
+            sums in order.
+            """
+            if USE_F32X2_ADD:
+                for pair in range(LANE_WORDS):
+                    txl.assign(acc[2 * pair], txl.cuda.float2_x(acc_pairs[pair]))
+                    txl.assign(acc[2 * pair + 1], txl.cuda.float2_y(acc_pairs[pair]))
+            for i in range(LANE_ELEMS):
+                txl.ptx.st.shared.f32(s_partial.ptr_to([warp * COLS + lane * LANE_ELEMS + i]), acc[i])
             txl.cuda.cta_sync()
-            # thread tid < COLS owns column cb * COLS + tid: add this round's chunk sums in order
-            with txl.if_(tid < COLS), txl.then_():
-                for q in range(W):
-                    pv = txl.local_scalar(txl.f32)
-                    txl.ptx.ld.shared.f32(pv, part.ptr_to([q * COLS + tid]))
-                    with txl.if_(rnd * W + q < nch), txl.then_():
-                        txl.assign(tot, tot + pv)
+            with txl.if_(tidx < COLS), txl.then_():
+                for warp_idx in range(NUM_WARPS):
+                    chunk_sum = txl.local_scalar(txl.f32)
+                    txl.ptx.ld.shared.f32(chunk_sum, s_partial.ptr_to([warp_idx * COLS + tidx]))
+                    with txl.if_(round_idx * NUM_WARPS + warp_idx < num_chunks), txl.then_():
+                        txl.assign(acc_total, acc_total + chunk_sum)
             txl.cuda.cta_sync()
-        oc = cb * COLS + tid
-        with txl.if_(txl.And(tid < COLS, oc < N)), txl.then_():
-            txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + oc]), tot)
+
+        with txl.serial(0, (num_chunks + NUM_WARPS - 1) // NUM_WARPS) as round_idx:
+            chunk_idx = round_idx * NUM_WARPS + warp
+            chunk_start = seg_start + chunk_idx * 256
+            chunk_end = txl.min(chunk_start + 256, seg_end)
+            for i in range(LANE_ELEMS):
+                txl.assign(acc[i], txl.float32(0))
+            for pair in range(LANE_WORDS):
+                txl.assign(acc_pairs[pair], txl.uint64(0))
+            with txl.if_(chunk_idx < num_chunks), txl.then_():
+                sum_chunk(chunk_start, chunk_end)
+            add_round_sums(round_idx)
+        out_col = col_block * COLS + tidx
+        with txl.if_(txl.And(tidx < COLS, out_col < N)), txl.then_():
+            txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", group_idx) * N + out_col]), acc_total)
 
     return entry_function(segment_sum.compile(TARGET))
 
 
-# two-launch split for these has_idx values: (warps per CTA, bytes per lane per row, rows in flight)
-SEG2_CFG = {True: (1, 16, 32), False: (1, 16, 32)}
-SEG2_MIN_BYTES = {True: 0, False: 32 << 20}  # no-idx: below this one launch (no second launch to hide)
-
-
-def chunk_of(cu, G, c, cs, ce, lane):
+def find_chunk_rows(cu, G, chunk_idx, chunk_start, chunk_end, lane):
     """
-    Warp-cooperative: rows [cs, ce) of global chunk c (chunks numbered segment-major, 256 rows each).
+    Warp-cooperative: rows [chunk_start, chunk_end) of global chunk chunk_idx (chunks numbered
+    segment-major, 256 rows each).
     """
-    base = txl.local_scalar(txl.i32, init=txl.int32(0))
-    s_ = txl.local_scalar(txl.i32)
-    e_ = txl.local_scalar(txl.i32)
-    n_ = txl.local_scalar(txl.i32)
-    inc = txl.local_scalar(txl.i32)
-    o = txl.local_scalar(txl.i32)
-    hit = txl.local_scalar(txl.u32)
-    with txl.serial(0, (G + 31) // 32) as rd:
-        gg = rd * 32 + lane
-        txl.assign(n_, txl.int32(0))
-        txl.assign(s_, txl.int32(0))
-        with txl.if_(gg < G), txl.then_():
-            txl.ptx.ld.global_.nc.s32(s_, cu.ptr_to([gg]))
-            txl.ptx.ld.global_.nc.s32(e_, cu.ptr_to([gg + 1]))
-            txl.assign(n_, (e_ - s_ + 255) // 256)
-        txl.assign(inc, n_)
-        for d in (1, 2, 4, 8, 16):
-            txl.ptx.shfl_sync.up.b32(o, inc, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-            txl.assign(inc, inc + txl.Select(lane >= d, o, txl.int32(0)))
-        first = base + inc - n_  # this lane's segment's first chunk
-        mine = txl.And(c >= first, c < base + inc)
-        txl.ptx.vote_sync.ballot.b32(hit, txl.ptx.pred(mine), txl.uint32(FULL))
-        with txl.if_(hit != txl.uint32(0)), txl.then_():
-            src = i322(txl.popcount((hit & (txl.uint32(0) - hit)) - txl.uint32(1)))
-            fs = txl.local_scalar(txl.i32)
-            ss = txl.local_scalar(txl.i32)
-            es = txl.local_scalar(txl.i32)
-            txl.ptx.shfl_sync.idx.b32(fs, first, u322(src), txl.uint32(31), txl.uint32(FULL))
-            txl.ptx.shfl_sync.idx.b32(ss, s_, u322(src), txl.uint32(31), txl.uint32(FULL))
-            txl.ptx.shfl_sync.idx.b32(es, e_, u322(src), txl.uint32(31), txl.uint32(FULL))
-            txl.assign(cs, ss + (c - fs) * 256)
-            txl.assign(ce, txl.min(ss + (c - fs) * 256 + 256, es))
-        tl = txl.local_scalar(txl.i32)
-        txl.ptx.shfl_sync.idx.b32(tl, inc, txl.uint32(31), txl.uint32(31), txl.uint32(FULL))
-        txl.assign(base, base + tl)
+    chunks_before = txl.local_scalar(txl.i32, init=txl.int32(0))
+    seg_start = txl.local_scalar(txl.i32)
+    seg_end = txl.local_scalar(txl.i32)
+    seg_chunks = txl.local_scalar(txl.i32)
+    chunks_incl = txl.local_scalar(txl.i32)
+    peer = txl.local_scalar(txl.i32)
+    owner_lanes = txl.local_scalar(txl.u32)
+    with txl.serial(0, (G + 31) // 32) as round_idx:
+        group_idx = round_idx * 32 + lane
+        txl.assign(seg_chunks, txl.int32(0))
+        txl.assign(seg_start, txl.int32(0))
+        with txl.if_(group_idx < G), txl.then_():
+            txl.ptx.ld.global_.nc.s32(seg_start, cu.ptr_to([group_idx]))
+            txl.ptx.ld.global_.nc.s32(seg_end, cu.ptr_to([group_idx + 1]))
+            txl.assign(seg_chunks, (seg_end - seg_start + 255) // 256)
+        txl.assign(chunks_incl, seg_chunks)
+        warp_inclusive_scan(chunks_incl, peer, lane)
+        first_chunk = chunks_before + chunks_incl - seg_chunks  # this lane's segment's first chunk
+        is_owner = txl.And(chunk_idx >= first_chunk, chunk_idx < chunks_before + chunks_incl)
+        txl.ptx.vote_sync.ballot.b32(owner_lanes, txl.ptx.pred(is_owner), txl.uint32(FULL_MASK))
+        with txl.if_(owner_lanes != txl.uint32(0)), txl.then_():
+            owner_lane = as_i32(txl.popcount((owner_lanes & (txl.uint32(0) - owner_lanes)) - txl.uint32(1)))
+            owner_first = txl.local_scalar(txl.i32)
+            owner_start = txl.local_scalar(txl.i32)
+            owner_end = txl.local_scalar(txl.i32)
+            txl.ptx.shfl_sync.idx.b32(owner_first, first_chunk, as_u32(owner_lane), txl.uint32(31), txl.uint32(FULL_MASK))
+            txl.ptx.shfl_sync.idx.b32(owner_start, seg_start, as_u32(owner_lane), txl.uint32(31), txl.uint32(FULL_MASK))
+            txl.ptx.shfl_sync.idx.b32(owner_end, seg_end, as_u32(owner_lane), txl.uint32(31), txl.uint32(FULL_MASK))
+            txl.assign(chunk_start, owner_start + (chunk_idx - owner_first) * 256)
+            txl.assign(chunk_end, txl.min(owner_start + (chunk_idx - owner_first) * 256 + 256, owner_end))
+        round_chunks = txl.local_scalar(txl.i32)
+        txl.ptx.shfl_sync.idx.b32(round_chunks, chunks_incl, txl.uint32(31), txl.uint32(31), txl.uint32(FULL_MASK))
+        txl.assign(chunks_before, chunks_before + round_chunks)
 
 
 @functools.cache
-def segment_chunks_kernel(N: int, has_idx: bool):
+def compile_segment_chunks(N: int, has_idx: bool):
     """
     Kernel 1 of 2: CTA (chunk, column group) writes the chunk's fp32 row sum (rows added in order).
     """
-    W, VB, D = SEG2_CFG[has_idx]
-    VE = VB // 2
-    VW = VB // 4
-    COLS = 32 * VE  # per warp
-    NCB = (N + W * COLS - 1) // (W * COLS)
-    NT = W * 32
-    assert 256 % D == 0
+    NUM_WARPS, LANE_BYTES, RING_DEPTH = SPLIT_SEGMENT_CFG[has_idx]
+    LANE_ELEMS = LANE_BYTES // 2
+    LANE_WORDS = LANE_BYTES // 4
+    COLS = 32 * LANE_ELEMS  # per warp
+    NUM_COL_BLOCKS = (N + NUM_WARPS * COLS - 1) // (NUM_WARPS * COLS)
+    THREADS = NUM_WARPS * 32
+    assert 256 % RING_DEPTH == 0
 
     @txl.kernel()
     def segment_chunks(x: txl.Tensor((txl.int64(),), txl.u32, data_alignment=1), idx: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), G: txl.int32, NC: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NC * NCB, block=(W) * 32))
-        if SEG_PDL:
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NC * NUM_COL_BLOCKS, block=NUM_WARPS * 32))
+        if USE_PDL:
             txl.ptx.griddepcontrol.launch_dependents()  # the combine may launch now; it waits for our writes
-        b = txl.cta_id()
-        c = b // NCB
-        cb = b % NCB
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
+        cta_idx = txl.cta_id()
+        chunk_idx, col_block = cta_idx // NUM_COL_BLOCKS, cta_idx % NUM_COL_BLOCKS
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
         smem = txl.smem_pool()
-        ring = smem.alloc([D * NT * VW], txl.u32)
-        rows_s = smem.alloc([256], txl.i32, align=16)
-        cs = txl.local_scalar(txl.i32, init=txl.int32(0))
-        ce = txl.local_scalar(txl.i32, init=txl.int32(0))
-        chunk_of(cu, G, c, cs, ce, lane)
+        s_ring = smem.alloc([RING_DEPTH * THREADS * LANE_WORDS], txl.u32)
+        s_rows = smem.alloc([256], txl.i32, align=16)
+        chunk_start = txl.local_scalar(txl.i32, init=txl.int32(0))
+        chunk_end = txl.local_scalar(txl.i32, init=txl.int32(0))
+        find_chunk_rows(cu, G, chunk_idx, chunk_start, chunk_end, lane)
         if has_idx:
-            with txl.serial(0, (256 + NT - 1) // NT) as q:
-                k_ = q * NT + tid
-                iv = txl.local_scalar(txl.i32, init=txl.int32(0))
-                with txl.if_(txl.And(k_ < 256, cs + k_ < ce)), txl.then_():
-                    txl.ptx.ld.global_.nc.s32(iv, idx.ptr_to([cs + k_]))
-                with txl.if_(k_ < 256), txl.then_():
-                    txl.ptx.st.shared.s32(rows_s.ptr_to([k_]), iv)
+            with txl.serial(0, (256 + THREADS - 1) // THREADS) as step:
+                row_offset = step * THREADS + tidx
+                grouped_row = txl.local_scalar(txl.i32, init=txl.int32(0))
+                with txl.if_(txl.And(row_offset < 256, chunk_start + row_offset < chunk_end)), txl.then_():
+                    txl.ptx.ld.global_.nc.s32(grouped_row, idx.ptr_to([chunk_start + row_offset]))
+                with txl.if_(row_offset < 256), txl.then_():
+                    txl.ptx.st.shared.s32(s_rows.ptr_to([row_offset]), grouped_row)
             txl.cuda.cta_sync()
-        col = (cb * W + warp) * COLS + lane * VE
-        colok = col < N
-        ccol = txl.Select(colok, col, 0)
-        acc = txl.alloc_local([VE], txl.f32)
-        w = txl.alloc_local([VW], txl.u32)
-        rv = txl.local_scalar(txl.i32)
-        cpy = "cp.async.cg.shared.global" if VB == 16 else "cp.async.ca.shared.global"
-        pol = txl.local_scalar(txl.u64)
-        txl.ptx.createpolicy.fractional.L2__evict_first.b64(pol, txl.float32(1.0))
-        ivr = txl.alloc_local([D], txl.i32)
+        col = (col_block * NUM_WARPS + warp) * COLS + lane * LANE_ELEMS
+        col_ok = col < N
+        safe_col = txl.Select(col_ok, col, 0)
+        acc = txl.alloc_local([LANE_ELEMS], txl.f32)
+        words = txl.alloc_local([LANE_WORDS], txl.u32)
+        src_idx = txl.local_scalar(txl.i32)
+        copy_op = "cp.async.cg.shared.global" if LANE_BYTES == 16 else "cp.async.ca.shared.global"
+        evict_policy = txl.local_scalar(txl.u64)
+        txl.ptx.createpolicy.fractional.L2__evict_first.b64(evict_policy, txl.float32(1.0))
+        chunk_rows = txl.alloc_local([RING_DEPTH], txl.i32)
 
-        def load_idx(i0):
-            for q in range(D // 4):
-                txl.ptx.ld.shared.v4.b32(ivr[4 * q], ivr[4 * q + 1], ivr[4 * q + 2], ivr[4 * q + 3], rows_s.ptr_to([i0 + 4 * q]))
+        def load_chunk_rows(row_start):
+            for quad in range(RING_DEPTH // 4):
+                txl.ptx.ld.shared.v4.b32(chunk_rows[4 * quad], chunk_rows[4 * quad + 1], chunk_rows[4 * quad + 2], chunk_rows[4 * quad + 3], s_rows.ptr_to([row_start + 4 * quad]))
 
-        def issue(i, slot):
-            r = cs + i
-            ok = txl.And(r < ce, colok)
+        def issue_row(i, slot):
+            row_idx = chunk_start + i
+            row_ok = txl.And(row_idx < chunk_end, col_ok)
             if has_idx:
-                txl.assign(rv, ivr[slot])
+                txl.assign(src_idx, chunk_rows[slot])
             else:
-                txl.assign(rv, r)
-            src_row = txl.Select(ok, rv, 0)
-            if EVF["seg"]:
-                txl.ptx[cpy + ".L2::cache_hint"](
-                    ring.ptr_to([(slot * NT + tid) * VW]),
-                    x.ptr_to([txl.Cast("int64", src_row) * (N // 2) + ccol // 2]),
-                    VB,
-                    txl.ptx.pred(txl.Not(ok)),
-                    pol,
-                )
+                txl.assign(src_idx, row_idx)
+            src_row = txl.Select(row_ok, src_idx, 0)
+            if EVICT_FIRST["seg"]:
+                txl.ptx[copy_op + ".L2::cache_hint"](s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]), x.ptr_to([txl.Cast("int64", src_row) * (N // 2) + safe_col // 2]), LANE_BYTES, txl.ptx.pred(txl.Not(row_ok)), evict_policy)
             else:
-                txl.ptx[cpy](
-                    ring.ptr_to([(slot * NT + tid) * VW]),
-                    x.ptr_to([txl.Cast("int64", src_row) * (N // 2) + ccol // 2]),
-                    VB,
-                    txl.ptx.pred(txl.Not(ok)),
-                )
+                txl.ptx[copy_op](s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]), x.ptr_to([txl.Cast("int64", src_row) * (N // 2) + safe_col // 2]), LANE_BYTES, txl.ptx.pred(txl.Not(row_ok)))
 
-        def consume(slot):
-            if VW == 4:
-                txl.ptx.ld.shared.v4.b32(w[0], w[1], w[2], w[3], ring.ptr_to([(slot * NT + tid) * VW]))
-            elif VW == 2:
-                txl.ptx.ld.shared.v2.b32(w[0], w[1], ring.ptr_to([(slot * NT + tid) * VW]))
+        def add_ring_slot(slot):
+            if LANE_WORDS == 4:
+                txl.ptx.ld.shared.v4.b32(words[0], words[1], words[2], words[3], s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]))
+            elif LANE_WORDS == 2:
+                txl.ptx.ld.shared.v2.b32(words[0], words[1], s_ring.ptr_to([(slot * THREADS + tidx) * LANE_WORDS]))
             else:
-                txl.ptx.ld.shared.b32(w[0], ring.ptr_to([slot * NT + tid]))
-            for p in range(VW):
-                lo = txl.reinterpret(txl.shift_left(w[p], txl.uint32(16)), ty="float32")
-                hi = txl.reinterpret(w[p] & txl.uint32(0xFFFF0000), ty="float32")
-                txl.assign(acc[2 * p], acc[2 * p] + lo)
-                txl.assign(acc[2 * p + 1], acc[2 * p + 1] + hi)
+                txl.ptx.ld.shared.b32(words[0], s_ring.ptr_to([slot * THREADS + tidx]))
+            for pair in range(LANE_WORDS):
+                add_bf16x2(acc, words, pair, pair)
 
-        for i in range(VE):
-            txl.assign(acc[i], txl.float32(0))
-        with txl.if_((cb * W + warp) * COLS < N), txl.then_():
+        def sum_chunk():
+            """
+            Add the chunk's real rows into acc in order through the cp.async ring; store the sums.
+            """
             if has_idx:
-                load_idx(0)
-            for j in range(D):
-                issue(j, j)
+                load_chunk_rows(0)
+            for j in range(RING_DEPTH):
+                issue_row(j, j)
                 txl.ptx["cp.async.commit_group"]()
-            with txl.serial(0, (ce - cs + D - 1) // D - 1) as blk:  # only the chunk's real rows
+            with txl.serial(0, (chunk_end - chunk_start + RING_DEPTH - 1) // RING_DEPTH - 1) as block:
                 if has_idx:
-                    load_idx((blk + 1) * D)
-                for j in range(D):
-                    txl.ptx["cp.async.wait_group"](D - 1)
-                    consume(j)
-                    issue((blk + 1) * D + j, j)
+                    load_chunk_rows((block + 1) * RING_DEPTH)
+                for j in range(RING_DEPTH):
+                    txl.ptx["cp.async.wait_group"](RING_DEPTH - 1)
+                    add_ring_slot(j)
+                    issue_row((block + 1) * RING_DEPTH + j, j)
                     txl.ptx["cp.async.commit_group"]()
             txl.ptx["cp.async.wait_group"](0)
-            for j in range(D):
-                consume(j)
-            with txl.if_(colok), txl.then_():
-                for i in range(VE):
-                    txl.ptx.st.global_.f32(part.ptr_to([txl.Cast("int64", c) * N + col + i]), acc[i])
+            for j in range(RING_DEPTH):
+                add_ring_slot(j)
+            with txl.if_(col_ok), txl.then_():
+                for i in range(LANE_ELEMS):
+                    txl.ptx.st.global_.f32(part.ptr_to([txl.Cast("int64", chunk_idx) * N + col + i]), acc[i])
+
+        for i in range(LANE_ELEMS):
+            txl.assign(acc[i], txl.float32(0))
+        with txl.if_((col_block * NUM_WARPS + warp) * COLS < N), txl.then_():
+            sum_chunk()
 
     return entry_function(segment_chunks.compile(TARGET))
 
 
-SEG_PDL = True  # combine launched with programmatic dependent launch: its launch and cu prologue overlap the chunk tail
-
-
 @functools.cache
-def segment_combine_kernel(N: int, pdl: bool):
+def compile_segment_combine(N: int, use_pdl: bool):
     """
     Kernel 2 of 2: out[g, col] = chunk sums of segment g added in order (0 for an empty segment).
     """
-    NCB = (N + 255) // 256
+    NUM_COL_BLOCKS = (N + 255) // 256
 
     @txl.kernel()
     def segment_combine(cu: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), part: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), G: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NCB, block=256, programmatic_stream_serialization=True if pdl else None))
-        b = txl.cta_id()
-        g = b // NCB
-        col = (b % NCB) * 256 + txl.thread_id()
-        base = txl.local_scalar(txl.i32, init=txl.int32(0))
-        s_ = txl.local_scalar(txl.i32)
-        e_ = txl.local_scalar(txl.i32)
-        with txl.serial(0, g) as q:
-            txl.ptx.ld.global_.nc.s32(s_, cu.ptr_to([q]))
-            txl.ptx.ld.global_.nc.s32(e_, cu.ptr_to([q + 1]))
-            txl.assign(base, base + (e_ - s_ + 255) // 256)
-        txl.ptx.ld.global_.nc.s32(s_, cu.ptr_to([g]))
-        txl.ptx.ld.global_.nc.s32(e_, cu.ptr_to([g + 1]))
-        if pdl:
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G * NUM_COL_BLOCKS, block=256, programmatic_stream_serialization=True if use_pdl else None))
+        cta_idx = txl.cta_id()
+        group_idx = cta_idx // NUM_COL_BLOCKS
+        col = (cta_idx % NUM_COL_BLOCKS) * 256 + txl.thread_id()
+        chunk_base = txl.local_scalar(txl.i32, init=txl.int32(0))
+        seg_start = txl.local_scalar(txl.i32)
+        seg_end = txl.local_scalar(txl.i32)
+        with txl.serial(0, group_idx) as prev_group:
+            txl.ptx.ld.global_.nc.s32(seg_start, cu.ptr_to([prev_group]))
+            txl.ptx.ld.global_.nc.s32(seg_end, cu.ptr_to([prev_group + 1]))
+            txl.assign(chunk_base, chunk_base + (seg_end - seg_start + 255) // 256)
+        txl.ptx.ld.global_.nc.s32(seg_start, cu.ptr_to([group_idx]))
+        txl.ptx.ld.global_.nc.s32(seg_end, cu.ptr_to([group_idx + 1]))
+        if use_pdl:
             txl.ptx.griddepcontrol.wait()  # the chunk kernel's partial sums are complete and visible
-        tot = txl.local_scalar(txl.f32, init=txl.float32(0))
-        pv = txl.alloc_local([8], txl.f32)
-        nc_ = (e_ - s_ + 255) // 256
+        acc_total = txl.local_scalar(txl.f32, init=txl.float32(0))
+        chunk_sums = txl.alloc_local([8], txl.f32)
+        num_chunks = (seg_end - seg_start + 255) // 256
         with txl.if_(col < N), txl.then_():
-            with txl.serial(0, (nc_ + 7) // 8) as k8:
-                for q in range(8):
-                    with txl.if_(k8 * 8 + q < nc_), txl.then_():
-                        txl.ptx.ld.global_.f32(pv[q], part.ptr_to([txl.Cast("int64", base + k8 * 8 + q) * N + col]))
-                for q in range(8):
-                    with txl.if_(k8 * 8 + q < nc_), txl.then_():
-                        txl.assign(tot, tot + pv[q])
-            txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", g) * N + col]), tot)
+            with txl.serial(0, (num_chunks + 7) // 8) as block:
+                for k in range(8):
+                    with txl.if_(block * 8 + k < num_chunks), txl.then_():
+                        txl.ptx.ld.global_.f32(chunk_sums[k], part.ptr_to([txl.Cast("int64", chunk_base + block * 8 + k) * N + col]))
+                for k in range(8):
+                    with txl.if_(block * 8 + k < num_chunks), txl.then_():
+                        txl.assign(acc_total, acc_total + chunk_sums[k])
+            txl.ptx.st.global_.f32(out.ptr_to([txl.Cast("int64", group_idx) * N + col]), acc_total)
 
     return entry_function(segment_combine.compile(TARGET))
 
 
 def bf16_expert_segment_sum_sm100(x, cu_host, cu, idx=None):
+    """
+    bf16_expert_segment_sum on SM100: two launches (chunk sums, then their combine) with an index or
+    past SPLIT_SEGMENT_MIN_BYTES, else one.
+    """
     G, N = len(cu_host) - 1, x.shape[1]
     out = torch.empty(G, N, dtype=torch.float32, device=x.device)
     has_idx = idx is not None
-    if G and has_idx in SEG2_CFG and cu_host[-1] * N * 2 >= SEG2_MIN_BYTES[has_idx]:
-        NC = sum((cu_host[g + 1] - cu_host[g] + 255) // 256 for g in range(G))
-        part = torch.empty(max(NC, 1) * N, dtype=torch.float32, device=x.device)
-        if NC:
-            segment_chunks_kernel(N, has_idx)(x.view(-1).view(torch.uint32), idx if has_idx else cu, cu, part, G, NC)
-        segment_combine_kernel(N, SEG_PDL and NC > 0)(cu, part, out.view(-1), G)
+    if G and has_idx in SPLIT_SEGMENT_CFG and cu_host[-1] * N * 2 >= SPLIT_SEGMENT_MIN_BYTES[has_idx]:
+        num_chunks = sum((cu_host[g + 1] - cu_host[g] + 255) // 256 for g in range(G))
+        part = torch.empty(max(num_chunks, 1) * N, dtype=torch.float32, device=x.device)
+        if num_chunks:
+            compile_segment_chunks(N, has_idx)(x.view(-1).view(torch.uint32), idx if has_idx else cu, cu, part, G, num_chunks)
+        compile_segment_combine(N, USE_PDL and num_chunks > 0)(cu, part, out.view(-1), G)
         return out
     if G:
-        k = segment_sum_kernel(N, idx is not None)
-        k(x.view(-1).view(torch.uint32), idx if idx is not None else cu, cu, out.view(-1), G)
+        fn = compile_segment_sum(N, idx is not None)
+        fn(x.view(-1).view(torch.uint32), idx if idx is not None else cu, cu, out.view(-1), G)
     return out
