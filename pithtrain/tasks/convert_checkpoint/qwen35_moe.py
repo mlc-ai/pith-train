@@ -16,11 +16,17 @@ import json
 import re
 from logging import Logger
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import torch
 import torch.distributed.checkpoint as dcp
+import torch.nn as nn
 from safetensors import safe_open
+from torch.distributed.tensor import DTensor
+
+from pithtrain.modules.checkpoint import find_moe
+
+from ._streaming import CopyOp, fused_expert_ops, generic_plan_param
 
 # HF keys that nest the text tower; stripped to canonical PithTrain keys.
 _TEXT_PREFIX = "model.language_model."
@@ -138,3 +144,22 @@ class Qwen35MoeConverter:
         if canon == "lm_head.weight":
             return canon
         return "language_model." + canon
+
+    def plan_param(
+        self,
+        local_fqn: str,
+        param: DTensor,
+        weight_map: Dict[str, str],
+        named_modules: Dict[str, nn.Module],
+    ) -> List[CopyOp]:
+        """Streaming load: text tower nested under ``language_model.``, fused experts."""
+        args = (local_fqn, param, weight_map, named_modules)
+        if find_moe(local_fqn, named_modules) is not None:
+            return fused_expert_ops(*args, lambda k: (self._renest(k),))
+        return generic_plan_param(*args, remap=self._renest)
+
+    def expected_unmapped(self, hf_keys: set) -> set:
+        """Streaming load: the vision tower and MTP head have no PithTrain counterpart."""
+        # hf_loader strips the ``model.`` prefix from every HF key.
+        drop = tuple(p.removeprefix("model.") for p in _DROP_PREFIXES)
+        return {k for k in hf_keys if k.startswith(drop)}

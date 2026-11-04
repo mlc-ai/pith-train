@@ -20,6 +20,7 @@ from pithtrain.modules.checkpoint import (
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
+from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
@@ -282,6 +283,10 @@ def launch(cfg: PretrainLMCfg) -> None:
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(cfg.training.save_location, step)
+        if training.fp8:
+            precompute_fp8_param_scales()
+    elif cfg.training.hf_import_path is not None:
+        load_hf_into_model(cfg.training.hf_import_path, training.model)
         if training.fp8:
             precompute_fp8_param_scales()
     step = step or 0

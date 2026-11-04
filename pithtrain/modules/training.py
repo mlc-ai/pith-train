@@ -170,6 +170,13 @@ class TrainingCfg(SlottedDefault):
     checkpoint or from init_weights.
     """
 
+    hf_import_path: Optional[Path] = None
+    """
+    A HuggingFace safetensors directory to stream the initial weights from, skipping hf2dcp.
+    Used only when save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS
+    (MXFP4) and Qwen3.5-MoE; not compatible with hsdp_replica > 1.
+    """
+
     save_interval: Optional[int] = None
     """
     Steps between checkpoint saves. When None, nothing is saved, but a checkpoint is still loaded
