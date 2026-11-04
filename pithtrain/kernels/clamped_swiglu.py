@@ -15,8 +15,8 @@ __all__ = ["clamped_swiglu_bwd", "clamped_swiglu_fwd"]
 def clamped_swiglu_fwd(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """
     Clamped SwiGLU of an interleaved gate_up: a new contiguous (M, N) tensor in gate_up's dtype,
-    (up_clamped + 1) * gate_clamped * sigmoid(alpha * gate_clamped) with gate = gate_up[:, 0::2], up
-    = gate_up[:, 1::2], gate_clamped = min(gate, limit), up_clamped = clamp(up, -limit, limit).
+    (up_clamped + 1) * gate_clamped * sigmoid(alpha * gate_clamped) with gate = gate_up[:, 0::2],
+    up = gate_up[:, 1::2], gate_clamped = min(gate, limit), up_clamped = clamp(up, -limit, limit).
 
     gate_up is contiguous (M, 2N), bf16, fp16, fp32 or fp64. alpha and limit are Python floats
     (gpt-oss: 1.702, 7.0). Computed in fp32 and rounded once to the input dtype. Deterministic.
@@ -38,9 +38,9 @@ def clamped_swiglu_bwd(grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: 
     like gate_up, gate gradients at even and up gradients at odd columns.
 
     grad_output is contiguous (M, N) in gate_up's dtype; gate_up is the saved contiguous (M, 2N)
-    forward input. The gate gradient is zero where gate > limit, the up gradient zero where |up| >
-    limit (the boundary itself passes the gradient, as torch.clamp does). fp32 arithmetic, rounded
-    once to the dtype. Deterministic.
+    forward input. The gate gradient is zero where gate > limit, the up gradient zero where
+    |up| > limit (the boundary itself passes the gradient, as torch.clamp does). fp32 arithmetic,
+    rounded once to the dtype. Deterministic.
     """
     match ARCH_MAJOR:
         case 9:

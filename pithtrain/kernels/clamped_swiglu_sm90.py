@@ -7,8 +7,8 @@ a fixed fp32 PTX sequence (ex2.approx, div.full.f32, .rn on every mul and add) a
 vector with one 16-byte store (backward: two). The thread holding the last partial vector, and every
 thread when a pointer is not 16-byte aligned, goes element by element.
 
-The PTX replay (make_fwd_op, make_bwd_op) is also the activation of the fused FP8 kernels in
-fp8_clamped_swiglu_quant_sm90.
+The PTX replay (make_fwd_op, make_bwd_op) is also the activation of the fused FP8
+kernels in fp8_clamped_swiglu_quant_sm90.
 """
 
 from __future__ import annotations
@@ -44,12 +44,14 @@ def f32(x: float) -> float:
 #   sigmoid(a * gc):  t = fma(-a, gc, 0);  t = t * log2e;  e = ex2.approx.f32 t;  d = e + 1;
 #                     s = div.full.f32(1, d)
 # fma(-a, gc, 0) == -(a * gc) rounded, so t * log2e == (a * gc) * -log2e (negation is
-# exact). The remaining sigmoid steps are the 5-instruction sequence of silu_mul_quant's
+# exact). The remaining sigmoid steps are the 5-instruction sequence of silu_mul_sm90's
 # SIGMOID_PTX, verified there for every fp32 d >= 1 (div.full) and every ex2 input.
 #   forward:  out = (uc + 1) * (gc * s)
 #   backward: grad_uc = (gc * s) * dh
 #             grad_gc = ((uc + 1) * dh * s) * fma(a * gc, 1 - s, 1)      (LLVM contraction)
 #             grad_g  = g <= L ? grad_gc : 0;   grad_u = -L <= u <= L ? grad_uc : 0
+
+
 def sigmoid_ptx(x: str) -> str:
     """
     PTX computing s = sigmoid(x) of the fp32 register x (uses t, s).
@@ -65,7 +67,7 @@ def sigmoid_ptx(x: str) -> str:
 
 def clamp_ptx(alpha: float, limit: float) -> str:
     """
-    gc, uc, ag = alpha * gc and s = sigmoid(ag) from g = $G, u = $U.
+    PTX computing gc, uc, ag = alpha * gc and s = sigmoid(ag) from g = $G, u = $U.
     """
     L, neg_L, A = ptx_f32(limit), ptx_f32(-limit), ptx_f32(alpha)
     return (
@@ -77,6 +79,9 @@ def clamp_ptx(alpha: float, limit: float) -> str:
 
 
 def make_fwd_op(alpha: float, limit: float):
+    """
+    A dsl_user_op fwd_op(gate, up) -> out, the fp32 clamped SwiGLU for this alpha and limit.
+    """
     clamp_text = clamp_ptx(alpha, limit).replace("$G", "$1").replace("$U", "$2")
 
     @dsl_user_op
@@ -96,6 +101,9 @@ def make_fwd_op(alpha: float, limit: float):
 
 
 def make_bwd_op(alpha: float, limit: float):
+    """
+    A dsl_user_op bwd_op(dh, gate, up) -> (grad_gate, grad_up) in fp32 for this alpha and limit.
+    """
     clamp_text = clamp_ptx(alpha, limit).replace("$G", "$3").replace("$U", "$4")
     L, neg_L = ptx_f32(limit), ptx_f32(-limit)
 
@@ -233,120 +241,120 @@ def encode(values: list, num_bytes: int, is_bf16: bool) -> list:
 class ClampedSwiGLU:
     """
     clamped_swiglu_fwd (backward False) or clamped_swiglu_bwd over num_elements outputs (M * N),
-    for one element type and alpha / limit. With aligned, every warp but the one holding the end of
-    the outputs moves 16-byte vectors; that warp, and every thread without aligned, goes element by
-    element.
+    for one element type and alpha / limit. With aligned, every warp but the one holding the end
+    of the outputs moves 16-byte vectors; that warp, and every thread without aligned, goes
+    element by element.
     """
 
     def __init__(self, backward: bool, dtype: torch.dtype, alpha: float, limit: float, aligned: bool) -> None:
         self.backward, self.aligned = backward, aligned
         self.num_bytes, self.is_bf16 = dtype.itemsize, dtype == torch.bfloat16
-        self.vec = 16 // self.num_bytes  # outputs per thread
+        self.outputs_per_thread = 16 // self.num_bytes
         self.fwd_op, self.bwd_op = make_fwd_op(alpha, limit), make_bwd_op(alpha, limit)
 
     @cute.jit
     def __call__(self, mDh: cute.Tensor, mGU: cute.Tensor, mOut: cute.Tensor, num_elements: Int64, stream):
-        per_cta = THREADS * self.vec
-        self.kernel(mDh, mGU, mOut, num_elements).launch(grid=[Int32((num_elements + per_cta - 1) // per_cta), 1, 1], block=[THREADS, 1, 1], stream=stream)
+        outputs_per_cta = THREADS * self.outputs_per_thread
+        self.kernel(mDh, mGU, mOut, num_elements).launch(grid=[Int32((num_elements + outputs_per_cta - 1) // outputs_per_cta), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, mDh: cute.Tensor, mGU: cute.Tensor, mOut: cute.Tensor, num_elements: Int64):
         tidx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
-        first = (Int64(bx) * THREADS + tidx) * self.vec
+        elem_start = (Int64(bx) * THREADS + tidx) * self.outputs_per_thread
         gate_up_base, out_base = mGU.iterator.toint(), mOut.iterator.toint()
         dh_base = gate_up_base
         if cutlass.const_expr(self.backward):
             dh_base = mDh.iterator.toint()
+
         if cutlass.const_expr(self.aligned):
-            warp_end = (Int64(bx) * THREADS + tidx - tidx % 32 + 32) * self.vec
+            warp_end = (Int64(bx) * THREADS + tidx - tidx % 32 + 32) * self.outputs_per_thread
             if warp_end <= num_elements:
-                self.apply_vector(first, dh_base, gate_up_base, out_base)
-            else:
-                if first < num_elements:
-                    self.apply_partial(first, num_elements, dh_base, gate_up_base, out_base)
+                self.apply_vector(elem_start, dh_base, gate_up_base, out_base)
+            elif elem_start < num_elements:
+                self.apply_partial(elem_start, num_elements, dh_base, gate_up_base, out_base)
         else:
-            if first < num_elements:
-                self.apply_elements(first, num_elements, dh_base, gate_up_base, out_base)
+            if elem_start < num_elements:
+                self.apply_elements(elem_start, num_elements, dh_base, gate_up_base, out_base)
 
     @cute.jit
-    def apply_vector(self, first: Int64, dh_base, gate_up_base, out_base):
+    def apply_vector(self, elem_start: Int64, dh_base, gate_up_base, out_base):
         """
-        The thread's vec outputs from first: 16-byte loads and stores only.
+        The thread's outputs_per_thread outputs from elem_start: 16-byte loads and stores only.
         """
         num_bytes, is_bf16 = self.num_bytes, self.is_bf16
-        gate_up_addr = gate_up_base + first * (2 * num_bytes)
+        gate_up_addr = gate_up_base + elem_start * (2 * num_bytes)
         gate_up = decode(list(ld_v4(gate_up_addr, Int32(1)) + ld_v4(gate_up_addr + 16, Int32(1))), num_bytes, is_bf16)
         if cutlass.const_expr(self.backward):
-            dh = decode(list(ld_v4(dh_base + first * num_bytes, Int32(1))), num_bytes, is_bf16)
-            grad = []
-            for k in cutlass.range_constexpr(self.vec):
-                grad.extend(self.bwd_op(dh[k], gate_up[2 * k], gate_up[2 * k + 1]))
-            words = encode(grad, num_bytes, is_bf16)
-            st_v4_args_last(out_base + first * (2 * num_bytes), tuple(words[0:4]), Int32(1))
-            st_v4_args_last(out_base + first * (2 * num_bytes) + 16, tuple(words[4:8]), Int32(1))
+            dhs = decode(list(ld_v4(dh_base + elem_start * num_bytes, Int32(1))), num_bytes, is_bf16)
+            grads = []
+            for k in cutlass.range_constexpr(self.outputs_per_thread):
+                grads.extend(self.bwd_op(dhs[k], gate_up[2 * k], gate_up[2 * k + 1]))
+            words = encode(grads, num_bytes, is_bf16)
+            st_v4_args_last(out_base + elem_start * (2 * num_bytes), tuple(words[0:4]), Int32(1))
+            st_v4_args_last(out_base + elem_start * (2 * num_bytes) + 16, tuple(words[4:8]), Int32(1))
         else:
-            h = [self.fwd_op(gate_up[2 * k], gate_up[2 * k + 1]) for k in range(self.vec)]
-            st_v4_args_last(out_base + first * num_bytes, tuple(encode(h, num_bytes, is_bf16)), Int32(1))
+            outs = [self.fwd_op(gate_up[2 * k], gate_up[2 * k + 1]) for k in range(self.outputs_per_thread)]
+            st_v4_args_last(out_base + elem_start * num_bytes, tuple(encode(outs, num_bytes, is_bf16)), Int32(1))
 
     @cute.jit
-    def apply_partial(self, first: Int64, num_elements: Int64, dh_base, gate_up_base, out_base):
+    def apply_partial(self, elem_start: Int64, num_elements: Int64, dh_base, gate_up_base, out_base):
         """
         The warp holding the end of the outputs: each thread's elements below num_elements, one
         gate/up pair (and one dh) load per element. Element 0 is loaded first and finished last; the
         others, only when there are more, load together under predicates before any of their
         (predicated) stores, so no store orders a later load and a 1-element tail runs little code.
         """
-        num_bytes, is_bf16, vec = self.num_bytes, self.is_bf16, self.vec
-        count = num_elements - first
-        gate_up0 = decode(list(ld_words(gate_up_base + first * (2 * num_bytes), Int32(1), num_bytes // 2)), num_bytes, is_bf16)
+        num_bytes, is_bf16, outputs_per_thread = self.num_bytes, self.is_bf16, self.outputs_per_thread
+        num_remaining = num_elements - elem_start
+        gate_up0 = decode(list(ld_words(gate_up_base + elem_start * (2 * num_bytes), Int32(1), num_bytes // 2)), num_bytes, is_bf16)
         dh0 = gate_up0[0]
         if cutlass.const_expr(self.backward):
-            dh0 = decode(list(ld_elem(dh_base + first * num_bytes, Int32(1), num_bytes)), num_bytes, is_bf16)[0]
-        if count > 1:
-            oks = [Int32(count > k) for k in range(vec)]
-            gate_up = [decode(list(ld_words(gate_up_base + (first + k) * (2 * num_bytes), oks[k], num_bytes // 2)), num_bytes, is_bf16) for k in range(1, vec)]
+            dh0 = decode(list(ld_elem(dh_base + elem_start * num_bytes, Int32(1), num_bytes)), num_bytes, is_bf16)[0]
+        if num_remaining > 1:
+            elem_ok = [Int32(num_remaining > k) for k in range(outputs_per_thread)]
+            gate_up = [decode(list(ld_words(gate_up_base + (elem_start + k) * (2 * num_bytes), elem_ok[k], num_bytes // 2)), num_bytes, is_bf16) for k in range(1, outputs_per_thread)]
             if cutlass.const_expr(self.backward):
-                dhs = [decode(list(ld_elem(dh_base + (first + k) * num_bytes, oks[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(1, vec)]
-            for k in cutlass.range_constexpr(1, vec):
+                dhs = [decode(list(ld_elem(dh_base + (elem_start + k) * num_bytes, elem_ok[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(1, outputs_per_thread)]
+            for k in cutlass.range_constexpr(1, outputs_per_thread):
                 if cutlass.const_expr(self.backward):
-                    self.store_pair_grad(out_base, first + k, dhs[k - 1], gate_up[k - 1], oks[k])
+                    self.store_pair_grad(out_base, elem_start + k, dhs[k - 1], gate_up[k - 1], elem_ok[k])
                 else:
-                    self.store_output(out_base, first + k, gate_up[k - 1], oks[k])
+                    self.store_output(out_base, elem_start + k, gate_up[k - 1], elem_ok[k])
         if cutlass.const_expr(self.backward):
-            self.store_pair_grad(out_base, first, dh0, gate_up0, Int32(1))
+            self.store_pair_grad(out_base, elem_start, dh0, gate_up0, Int32(1))
         else:
-            self.store_output(out_base, first, gate_up0, Int32(1))
+            self.store_output(out_base, elem_start, gate_up0, Int32(1))
 
-    def store_output(self, out_base, elem, gate_up: list, pred: Int32) -> None:
-        st_elem(out_base + elem * self.num_bytes, self.encode_one(self.fwd_op(gate_up[0], gate_up[1])), pred, self.num_bytes)
+    def store_output(self, out_base, elem_idx, gate_up: list, pred: Int32) -> None:
+        st_elem(out_base + elem_idx * self.num_bytes, self.encode_one(self.fwd_op(gate_up[0], gate_up[1])), pred, self.num_bytes)
 
-    def store_pair_grad(self, out_base, elem, dh, gate_up: list, pred: Int32) -> None:
+    def store_pair_grad(self, out_base, elem_idx, dh, gate_up: list, pred: Int32) -> None:
         grad_gate, grad_up = self.bwd_op(dh, gate_up[0], gate_up[1])
-        st_words(out_base + elem * (2 * self.num_bytes), encode([grad_gate, grad_up], self.num_bytes, self.is_bf16), pred)
+        st_words(out_base + elem_idx * (2 * self.num_bytes), encode([grad_gate, grad_up], self.num_bytes, self.is_bf16), pred)
 
     @cute.jit
-    def apply_elements(self, first: Int64, num_elements: Int64, dh_base, gate_up_base, out_base):
+    def apply_elements(self, elem_start: Int64, num_elements: Int64, dh_base, gate_up_base, out_base):
         """
-        The thread's outputs from first below num_elements, one element-sized load or store each;
-        every load is issued before the first store (a store may alias a later load, so it would
-        otherwise serialize the elements).
+        The thread's outputs from elem_start below num_elements, one element-sized load or store
+        each; every load is issued before the first store (a store may alias a later load, so it
+        would otherwise serialize the elements).
         """
-        num_bytes, is_bf16, vec = self.num_bytes, self.is_bf16, self.vec
-        elems = [first + k for k in range(vec)]
-        oks = [Int32(elem < num_elements) for elem in elems]
-        gates = [decode(list(ld_elem(gate_up_base + elems[k] * (2 * num_bytes), oks[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(vec)]
-        ups = [decode(list(ld_elem(gate_up_base + elems[k] * (2 * num_bytes) + num_bytes, oks[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(vec)]
+        num_bytes, is_bf16, outputs_per_thread = self.num_bytes, self.is_bf16, self.outputs_per_thread
+        elem_idxs = [elem_start + k for k in range(outputs_per_thread)]
+        elem_ok = [Int32(elem_idx < num_elements) for elem_idx in elem_idxs]
+        gates = [decode(list(ld_elem(gate_up_base + elem_idxs[k] * (2 * num_bytes), elem_ok[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(outputs_per_thread)]
+        ups = [decode(list(ld_elem(gate_up_base + elem_idxs[k] * (2 * num_bytes) + num_bytes, elem_ok[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(outputs_per_thread)]
         if cutlass.const_expr(self.backward):
-            dhs = [decode(list(ld_elem(dh_base + elems[k] * num_bytes, oks[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(vec)]
-            grads = [self.bwd_op(dhs[k], gates[k], ups[k]) for k in range(vec)]
-            for k in cutlass.range_constexpr(vec):
-                st_elem(out_base + elems[k] * (2 * num_bytes), self.encode_one(grads[k][0]), oks[k], num_bytes)
-                st_elem(out_base + elems[k] * (2 * num_bytes) + num_bytes, self.encode_one(grads[k][1]), oks[k], num_bytes)
+            dhs = [decode(list(ld_elem(dh_base + elem_idxs[k] * num_bytes, elem_ok[k], num_bytes)), num_bytes, is_bf16)[0] for k in range(outputs_per_thread)]
+            grads = [self.bwd_op(dhs[k], gates[k], ups[k]) for k in range(outputs_per_thread)]
+            for k in cutlass.range_constexpr(outputs_per_thread):
+                st_elem(out_base + elem_idxs[k] * (2 * num_bytes), self.encode_one(grads[k][0]), elem_ok[k], num_bytes)
+                st_elem(out_base + elem_idxs[k] * (2 * num_bytes) + num_bytes, self.encode_one(grads[k][1]), elem_ok[k], num_bytes)
         else:
-            outs = [self.fwd_op(gates[k], ups[k]) for k in range(vec)]
-            for k in cutlass.range_constexpr(vec):
-                st_elem(out_base + elems[k] * num_bytes, self.encode_one(outs[k]), oks[k], num_bytes)
+            outs = [self.fwd_op(gates[k], ups[k]) for k in range(outputs_per_thread)]
+            for k in cutlass.range_constexpr(outputs_per_thread):
+                st_elem(out_base + elem_idxs[k] * num_bytes, self.encode_one(outs[k]), elem_ok[k], num_bytes)
 
     def encode_one(self, value) -> tuple:
         """
@@ -362,12 +370,14 @@ compiled: dict = {}
 
 def get_kernel(backward: bool, dtype: torch.dtype, alpha: float, limit: float, aligned: bool, device: torch.device):
     """
-    The element count stays a runtime argument, so one compile serves every shape.
+    The compiled ClampedSwiGLU; the element count stays a runtime argument, so one compile
+    serves every shape.
     """
     key = ("clamped_swiglu", backward, dtype, alpha, limit, aligned, device.index)
     fn = compiled.get(key)
     if fn is None:
-        cute_type, align = DTYPES[dtype], 16 if aligned else dtype.itemsize
+        cute_type = DTYPES[dtype]
+        align = 16 if aligned else dtype.itemsize
         gate_up = fake(cute_type, (cute.sym_int(), cute.sym_int()), (cute.sym_int64(), 1), align)
         out = fake(cute_type, (cute.sym_int(), cute.sym_int()), (cute.sym_int64(), 1), 16)
         dh = fake(cute_type, (cute.sym_int(), cute.sym_int()), (cute.sym_int64(), 1), align) if backward else None
@@ -386,10 +396,12 @@ def clamped_swiglu_fwd_sm90(gate_up: torch.Tensor, alpha: float, limit: float) -
     assert gate_up.is_contiguous(), "gate_up must be contiguous"
     assert gate_up.dtype in DTYPES, f"gate_up dtype {gate_up.dtype} is not a supported float dtype"
     N = two_n // 2
+
     out = torch.empty((M, N), device=gate_up.device, dtype=gate_up.dtype)
     num_elements = M * N
     if num_elements == 0:
         return out
+
     fn = get_kernel(False, gate_up.dtype, f32(alpha), f32(limit), gate_up.data_ptr() % 16 == 0, gate_up.device)
     fn(None, gate_up, out, num_elements)
     return out
@@ -405,10 +417,12 @@ def clamped_swiglu_bwd_sm90(grad_output: torch.Tensor, gate_up: torch.Tensor, al
     assert grad_output.is_contiguous(), "grad_output must be contiguous"
     assert gate_up.is_contiguous(), "gate_up must be contiguous"
     assert gate_up.dtype in DTYPES, f"gate_up dtype {gate_up.dtype} is not a supported float dtype"
+
     grad_gate_up = torch.empty_like(gate_up)
     num_elements = grad_output.numel()
     if num_elements == 0:
         return grad_gate_up
+
     fn = get_kernel(True, gate_up.dtype, f32(alpha), f32(limit), gate_up.data_ptr() % 16 == 0 and grad_output.data_ptr() % 16 == 0, gate_up.device)
     fn(grad_output, gate_up, grad_gate_up, num_elements)
     return grad_gate_up
