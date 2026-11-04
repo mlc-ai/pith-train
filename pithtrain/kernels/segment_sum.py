@@ -31,9 +31,9 @@ def segment_sum(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch
     tiles' fp32 column sums are added in row order starting from zero. Inside a tile the order is
     fixed per architecture. On SM90 the tile is cut into 8 blocks of 16 rows; each column adds a
     block's rows one at a time in increasing row order from zero (rows past the group's end add
-    nothing), and the block sums b0..b7 are added as ((b0 + b1) + (b2 + b3)) + ((b4 + b5) + (b6 +
-    b7)). On SM100 it is the TIRx kernel's own fixed order. The result does not depend on the
-    other groups, on G or on M. No host synchronization on SM90.
+    nothing), and the block sums b0..b7 are added as
+    ((b0 + b1) + (b2 + b3)) + ((b4 + b5) + (b6 + b7)). On SM100 it is the TIRx kernel's own fixed
+    order. The result does not depend on the other groups, G or M. No host synchronization on SM90.
     """
     match ARCH_MAJOR:
         case 9:
@@ -44,4 +44,3 @@ def segment_sum(x: torch.Tensor, grouped_mm_offs: torch.Tensor, out_dtype: torch
             return segment_sum_sm100(x, grouped_mm_offs, out_dtype)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
-

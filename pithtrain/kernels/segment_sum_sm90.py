@@ -137,8 +137,8 @@ class Fold:
         if cutlass.const_expr(self.out_dtype is cutlass.Float32):
             st_f32(addr, value, pred)
         else:
-            cvt = "cvt.rn.bf16.f32" if cutlass.const_expr(self.out_dtype is cutlass.BFloat16) else "cvt.rn.f16.f32"
-            asm(None, [Int64(addr).ir_value(), Float32(value).ir_value(), Int32(pred).ir_value()], "{\n\t.reg .pred p;\n\t.reg .b16 h;\n\tsetp.ne.b32 p, $2, 0;\n\t" + cvt + " h, $1;\n\t@p st.global.b16 [$0], h;\n\t}", "l,f,r", side_effects=True)
+            convert_instr = "cvt.rn.bf16.f32" if cutlass.const_expr(self.out_dtype is cutlass.BFloat16) else "cvt.rn.f16.f32"
+            asm(None, [Int64(addr).ir_value(), Float32(value).ir_value(), Int32(pred).ir_value()], "{\n\t.reg .pred p;\n\t.reg .b16 h;\n\tsetp.ne.b32 p, $2, 0;\n\t" + convert_instr + " h, $1;\n\t@p st.global.b16 [$0], h;\n\t}", "l,f,r", side_effects=True)
 
 
 class BlockSegmentSum(Fold):
@@ -157,9 +157,9 @@ class SegmentSum(Fold):
     column chunk i % num_chunks (32 vectors of vec_bytes) of tile i / num_chunks, so that the CTAs
     running together read whole rows. Lane l of warp w adds column vector 32 * chunk + l over rows
     [16 w, 16 w + 16) of the tile one at a time in increasing row order from zero, and the WARPS
-    block sums are added by a fixed pairwise tree, ((b0 + b1) + (b2 + b3)) + ((b4 + b5) + (b6 +
-    b7)). Tile t's fp32 sums go to row t of tile_sums, and tile_start gets the number of tiles
-    before each group (G + 1 entries).
+    block sums are added by a fixed pairwise tree, ((b0 + b1) + (b2 + b3)) + ((b4 + b5) +
+    (b6 + b7)). Tile t's fp32 sums go to row t of tile_sums, and tile_start gets the number of
+    tiles before each group (G + 1 entries).
     """
 
     def __init__(self, x_dtype: type, vec_bytes: int, max_groups: int, out_dtype: type, offs_bytes: int, offs_signed: bool) -> None:
@@ -206,9 +206,9 @@ class SegmentSum(Fold):
             row_start, row_end = prev_end, cutlass.max(group_end, prev_end)
             num_group_tiles = (row_end - row_start + TILE - 1) // TILE
             tiles_through = num_group_tiles
-            for offset in cutlass.range_constexpr(5):
-                tiles_below = cute.arch.shuffle_sync_up(tiles_through, offset=1 << offset, mask_and_clamp=0)
-                tiles_through = tiles_through + tiles_below * Int32(lane >= (1 << offset))
+            for level in cutlass.range_constexpr(5):
+                tiles_below = cute.arch.shuffle_sync_up(tiles_through, offset=1 << level, mask_and_clamp=0)
+                tiles_through = tiles_through + tiles_below * Int32(lane >= (1 << level))
             sts_b32(s_warp_total + warp * 4, Uint32(tiles_through), Int32(lane == 31))
             cute.arch.sync_threads()
             warp_before, round_total = Int32(0), Int32(0)
@@ -337,7 +337,9 @@ class SegmentSum(Fold):
         return [self.f16_to_f32(word, half) for word in words for half in range(2)]
 
     def f16_to_f32(self, word, half: int):
-        # cvt.f32.f16 of the low (half 0) or high (half 1) fp16 of word
+        """
+        The low (half 0) or high (half 1) fp16 of word as fp32.
+        """
         return Float32(asm(T.f32(), [Uint32(word).ir_value()], "{\n\t.reg .b16 lo, hi;\n\tmov.b32 {lo, hi}, $1;\n\tcvt.f32.f16 $0, " + ("hi" if half else "lo") + ";\n\t}", "=f,r"))
 
 
