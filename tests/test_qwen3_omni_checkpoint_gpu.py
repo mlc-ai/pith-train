@@ -16,13 +16,13 @@ from torch import nn
 
 from pithtrain.contexts import distributed, training
 from pithtrain.modules.checkpoint import to_localized_model
-from pithtrain.tasks.convert_checkpoint import dcp2hf, hf2dcp
-from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import (
+from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     canonical_to_hf,
     hf_to_canonical,
     load_canonical,
     text_config,
 )
+from pithtrain.tasks.convert_checkpoint import dcp2hf, hf2dcp
 from tests.test_qwen3_omni_checkpoint import (
     LOGGER,
     make_cfg,

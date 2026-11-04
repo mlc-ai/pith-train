@@ -19,19 +19,18 @@ from torch.distributed.tensor import Replicate, Shard
 
 from pithtrain.modules.checkpoint import strip_prefix
 from pithtrain.modules.distributed_checkpoint import MANIFEST, VERSION, _write_tensor_file
-from pithtrain.modules.resume_semantics import _canonical_model_value, seal
-from pithtrain.modules.strict_checkpoint import _numpy_state
-
-from .qwen3_omni_moe import (
+from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     ConversionError,
     read_json,
     require_empty_destination,
     text_config,
     validate_tensors,
 )
-from .qwen3_omni_moe import (
+from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     parameter_shapes as text_parameter_shapes,
 )
+from pithtrain.modules.resume_semantics import _canonical_model_value, seal
+from pithtrain.modules.strict_checkpoint import _numpy_state
 
 
 def parameter_shapes(config):

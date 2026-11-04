@@ -39,7 +39,7 @@ SOURCE_FILES = (
     "pithtrain/tasks/pretrain_lm.py",
     "pithtrain/tasks/prepare_omni_data.py",
     "pithtrain/models/qwen3_omni_moe.py",
-    "pithtrain/tasks/convert_checkpoint/qwen3_omni_moe.py",
+    "pithtrain/modules/hf_converters/qwen3_omni_moe.py",
 )
 
 
@@ -258,7 +258,7 @@ def models():
 
     from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
     from pithtrain.modules.checkpoint import to_localized_model
-    from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import hf_to_canonical
+    from pithtrain.modules.hf_converters.qwen3_omni_moe import hf_to_canonical
 
     config = model_config()
     hf_config = copy.deepcopy(config)

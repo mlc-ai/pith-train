@@ -20,10 +20,8 @@ from torch.distributed.checkpoint import FileSystemReader
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import logging
-from pithtrain.modules.logging import LoggingCfg, setup_logging
-
-from ._registry import CONVERTERS
-from .qwen3_omni_moe import (
+from pithtrain.modules.hf_converters._registry import CONVERTERS
+from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     SIDECAR,
     ConversionError,
     Qwen3OmniTextConverter,
@@ -33,6 +31,7 @@ from .qwen3_omni_moe import (
     read_json,
     require_empty_destination,
 )
+from pithtrain.modules.logging import LoggingCfg, setup_logging
 
 
 @dataclass(init=False, slots=True)
@@ -131,7 +130,12 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
         raise ConversionError("Complete Thinker checkpoint requires omni_multimodal=True")
 
     if cfg.omni_restore_resume:
-        from .qwen3_omni_moe import hf_to_canonical, read_hf_text, text_config
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import (
+            hf_to_canonical,
+            read_hf_text,
+            text_config,
+        )
+
         from .strict_omni import restore_from_hf
 
         require_empty_destination(save_path)

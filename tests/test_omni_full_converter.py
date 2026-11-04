@@ -17,9 +17,9 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeForConditionalGeneration,
 )
 
+from pithtrain.modules.hf_converters.qwen3_omni_moe import ConversionError
 from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg, dcp2hf, hf2dcp
 from pithtrain.tasks.convert_checkpoint import qwen3_omni_full as full
-from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import ConversionError
 
 LOG = logging.getLogger(__name__)
 

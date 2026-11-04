@@ -11,6 +11,7 @@ from typing import Tuple
 import torch
 
 from pithtrain.kernels import (
+    fp8_channels_as_rows,
     fp8_gemm_nt,
     fp8_quant_act,
     fp8_quant_grad,
@@ -105,11 +106,11 @@ def swiglu_mlp_bwd(
     del dh
     dx = fp8_gemm_nt(dg_quant[0], dg_quant[1], wg_t, wg_t_scale, M, hidden, device, dtype)
     dx += fp8_gemm_nt(du_quant[0], du_quant[1], wu_t, wu_t_scale, M, hidden, device, dtype)
-    # One group of all M rows: the K-major per-channel half is the (inter, M) transpose.
-    dg_t = dg_quant[2].view(inter, M)
-    du_t = du_quant[2].view(inter, M)
-    dw_gate = fp8_gemm_nt(dg_t, dg_quant[3], x_t, x_t_scale, inter, hidden, device, dtype)
-    dw_up = fp8_gemm_nt(du_t, du_quant[3], x_t, x_t_scale, inter, hidden, device, dtype)
+    # One group of all M rows: the per-channel half is the (inter, M) transpose.
+    dg_t, dg_t_scale = fp8_channels_as_rows(dg_quant[2], dg_quant[3], M, inter)
+    du_t, du_t_scale = fp8_channels_as_rows(du_quant[2], du_quant[3], M, inter)
+    dw_gate = fp8_gemm_nt(dg_t, dg_t_scale, x_t, x_t_scale, inter, hidden, device, dtype)
+    dw_up = fp8_gemm_nt(du_t, du_t_scale, x_t, x_t_scale, inter, hidden, device, dtype)
     return dx, dw_gate, dw_up, dw_down
 
 

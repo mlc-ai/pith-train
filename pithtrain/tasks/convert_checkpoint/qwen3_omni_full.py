@@ -24,7 +24,8 @@ import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
 from torch.distributed.checkpoint import FileSystemReader
 
-from . import qwen3_omni_moe as text
+from pithtrain.modules.hf_converters import qwen3_omni_moe as text
+
 from . import qwen3_omni_thinker as thinker
 
 SIDECAR = "qwen3_omni_components.json"

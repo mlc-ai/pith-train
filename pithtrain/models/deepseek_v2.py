@@ -14,6 +14,7 @@ from pithtrain.kernels import (
     bf16_experts_supported,
     fp8_fused_experts_supported,
     fp8_quant_grouped,
+    stage_compile_options,
 )
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
@@ -348,7 +349,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -420,7 +421,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
 
     # Not fused with the next layer's forward_stage1 into one compiled region as qwen3_moe does:
     # for this model the fused region changes the forward bits at its layer boundaries.
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,

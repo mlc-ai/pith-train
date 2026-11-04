@@ -3,8 +3,8 @@
 import argparse
 from pathlib import Path
 
+from pithtrain.modules.hf_converters.qwen3_omni_moe import SIDECAR, Qwen3OmniTextConverter
 from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg, launch
-from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import SIDECAR, Qwen3OmniTextConverter
 
 
 def main():

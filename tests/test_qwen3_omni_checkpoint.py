@@ -18,8 +18,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from pithtrain.contexts import distributed
 from pithtrain.modules.checkpoint import to_canonical_model, to_localized_model
-from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg, dcp2hf, hf2dcp
-from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import (
+from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     SIDECAR,
     ConversionError,
     canonical_to_hf,
@@ -29,6 +28,7 @@ from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import (
     parameter_shapes,
     text_config,
 )
+from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg, dcp2hf, hf2dcp
 
 LOGGER = logging.getLogger(__name__)
 CONFIGS = Path(__file__).parent / "configs/qwen3_omni_text"
@@ -473,7 +473,7 @@ def test_duplicate_serialized_keys_are_rejected(config, tmp_path, location):
 
 @pytest.mark.parametrize("fault", ["integer", "mixed-gate", "mixed-down"])
 def test_dtype_preflight_never_reads_tensor_payload(config, tmp_path, monkeypatch, fault):
-    from pithtrain.tasks.convert_checkpoint import qwen3_omni_moe as converter
+    from pithtrain.modules.hf_converters import qwen3_omni_moe as converter
 
     src = tmp_path / "src"
     state = synthetic_hf(config, layout="split")
@@ -521,7 +521,7 @@ def test_mixed_canonical_experts_fail_for_both_export_layouts(config, layout):
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.float64])
 def test_dcp_dtype_preflight_never_allocates_or_loads(config, tmp_path, monkeypatch, dtype):
-    from pithtrain.tasks.convert_checkpoint import qwen3_omni_moe as converter
+    from pithtrain.modules.hf_converters import qwen3_omni_moe as converter
 
     canonical, _ = hf_to_canonical(synthetic_hf(config), config)
     canonical["layers.0.mlp.experts.1.down_proj"] = canonical[
@@ -541,8 +541,8 @@ def test_dcp_dtype_preflight_never_allocates_or_loads(config, tmp_path, monkeypa
 
 @pytest.mark.parametrize("operation", ["hf2dcp", "dcp2hf"])
 def test_nonempty_destination_is_checked_before_payload(config, tmp_path, monkeypatch, operation):
+    from pithtrain.modules.hf_converters import qwen3_omni_moe as converter
     from pithtrain.tasks.convert_checkpoint import _core
-    from pithtrain.tasks.convert_checkpoint import qwen3_omni_moe as converter
 
     src, dst = tmp_path / "src", tmp_path / "dst"
     write_hf(src, config, synthetic_hf(config))
