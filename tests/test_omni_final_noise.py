@@ -14,6 +14,9 @@ from tests.acceptance import omni_final_noise as new
 
 # Complete helper reviewed at 045a90b327e67c544664004b7544356a8efbbf94.
 REVIEWED_HELPER_SOURCE_SHA256 = "21f0ee7aecfe69524f9dfd0f5644d79036fbf18a86fbeedfbe973f8f90e595ab"
+REVIEWED_TRAINING_FUNCTIONS_SHA256 = (
+    "31e3f440b8f53518528080f2986e2fc6c72c9822c281b0d6f7892b8ee12791c4"
+)
 # D/4e source is intentionally outside that frozen review; this is a test input fingerprint.
 UNREVIEWED_LIVE_HELPER_SOURCE_SHA256 = (
     "bd7f0054bdb132f8452f58d999865c436d3e98d7629412ece76eab6e78549409"
@@ -372,10 +375,18 @@ def reviewed_binding(binding):
     """
     args, _ = binding
     path = "pithtrain/modules/training.py"
-    current = new.ROOT / path
+    # The reviewed feature functions as of e9e98c3d, which the historical evidence ran; main's
+    # #133 has since rewritten both in the live source.
+    functions = (
+        Path(__file__).parent / "fixtures/omni_final_noise/training_functions_e9e98c3.py.txt"
+    )
+    assert hashlib.sha256(functions.read_bytes()).hexdigest() == REVIEWED_TRAINING_FUNCTIONS_SHA256
     feature_nodes = {
-        name: new.function_node(current, name) for name in ("make_wsd_scheduler", "apply_fsdp")
+        node.name: node
+        for node in ast.parse(functions.read_text()).body
+        if isinstance(node, ast.FunctionDef)
     }
+    assert set(feature_nodes) == {"make_wsd_scheduler", "apply_fsdp"}
     originals = copy.deepcopy(feature_nodes)
     wsd = originals["make_wsd_scheduler"]
     wsd.body[-2:] = [ast.Return(value=copy.deepcopy(wsd.body[-1].value.args[0]))]

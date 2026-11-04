@@ -6,7 +6,6 @@ the production autograd/reduction interface without claiming CUDA equivalence.
 
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Tuple
 
 import pytest
@@ -27,47 +26,21 @@ def load_nodes(relative, names, namespace):
 
 
 class TorchKernel:
-    """Independent FP32 CE oracle for the wrapper's destructive kernel interface."""
+    """Independent FP32 CE oracle with the kernel library's cross_entropy_fwd_bwd contract."""
 
     def __init__(self):
         self.reductions = []
 
-    def __getitem__(self, grid):
-        def launch(**kwargs):
-            reduction = kwargs["REDUCTION"]
-            self.reductions.append(reduction)
-            with torch.enable_grad():
-                logits = kwargs["X_ptr"].detach().float().requires_grad_()
-                labels = kwargs["Y_ptr"]
-                per_row = F.cross_entropy(
-                    logits, labels, ignore_index=kwargs["ignore_idx"], reduction="none"
-                )
-                divisor = (labels != kwargs["ignore_idx"]).sum().clamp_min(1)
-                loss = per_row.sum() / (divisor if reduction == "mean" else 1)
-                gradient = torch.autograd.grad(loss, logits)[0]
-            kwargs["X_ptr"].copy_(gradient.to(kwargs["X_ptr"].dtype))
-            kwargs["loss_ptr"].copy_(per_row.detach())
-
-        return launch
-
-
-class TorchRegisterKernel:
-    """Same independent Torch oracle, adapted to the fused register ABI."""
-
-    def __init__(self, kernel):
-        self.kernel = kernel
-
-    def __getitem__(self, grid):
-        def launch(**kwargs):
-            return self.kernel[grid](
-                X_ptr=kwargs["X"],
-                Y_ptr=kwargs["Y"],
-                loss_ptr=kwargs["LOSS"],
-                ignore_idx=kwargs["IGNORE"],
-                REDUCTION="sum",
-            )
-
-        return launch
+    def __call__(self, inp, target, ignore_index, reduction="mean"):
+        self.reductions.append(reduction)
+        with torch.enable_grad():
+            logits = inp.detach().float().requires_grad_()
+            per_row = F.cross_entropy(logits, target, ignore_index=ignore_index, reduction="none")
+            divisor = (target != ignore_index).sum().clamp_min(1)
+            loss = per_row.sum() / (divisor if reduction == "mean" else 1)
+            gradient = torch.autograd.grad(loss, logits)[0]
+        inp.copy_(gradient.to(inp.dtype))
+        return loss.detach(), inp
 
 
 def wrapper():
@@ -75,15 +48,7 @@ def wrapper():
     namespace = load_nodes(
         "pithtrain/operators/cross_entropy.py",
         {"CrossEntropy", "cross_entropy"},
-        dict(
-            torch=torch,
-            triton=SimpleNamespace(
-                next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
-                cdiv=lambda n, d: (n + d - 1) // d,
-            ),
-            cross_entropy_fwd=kernel,
-            cross_entropy_register_sum=TorchRegisterKernel(kernel),
-        ),
+        dict(torch=torch, cross_entropy_fwd_bwd=kernel),
     )
     return namespace["cross_entropy"], kernel
 

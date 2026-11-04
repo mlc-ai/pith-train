@@ -65,8 +65,8 @@ class MediaAudit:
 
     def install_dispatch(self, stack, pipeline_module):
         for name, path in (
-            ("_forward_compute_chunk", "normal"),
-            ("_forward_backward_compute_chunk", "overlap"),
+            ("forward_compute_chunk", "normal"),
+            ("forward_backward_compute_chunk", "overlap"),
         ):
             original = getattr(pipeline_module.DualPipeV, name)
             stack.enter_context(

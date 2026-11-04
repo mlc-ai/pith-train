@@ -1,7 +1,3 @@
-"""
-Pretrain a language model.
-"""
-
 import gc
 import time
 from dataclasses import dataclass, field
@@ -16,6 +12,7 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
+from pithtrain.kernels import tune_kernels
 from pithtrain.modules.checkpoint import (
     find_checkpoint,
     initialize_checkpoint,
@@ -25,9 +22,11 @@ from pithtrain.modules.checkpoint import (
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.distributed_checkpoint import resume_contract
+from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
+from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
-from pithtrain.modules.optimizer import clip_grad_norm
+from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, model_class_for_config, setup_training
 from pithtrain.modules.training_data import (
     DensePretrainData,
@@ -39,27 +38,23 @@ from pithtrain.modules.training_data import (
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
 
+__all__ = [
+    "PretrainLMCfg",
+    "launch",
+    "setup_dataset",
+    "get_global_batch",
+    "objective",
+    "train_step",
+]
+
 
 @dataclass(init=False, slots=True)
 class PretrainLMCfg(SlottedDefault):
-    """
-    Configuration for pretraining a language model.
-    """
-
     distributed: DistributedCfg = field(default_factory=DistributedCfg)
-    """
-    Distributed training configuration.
-    """
 
     training: TrainingCfg = field(default_factory=TrainingCfg)
-    """
-    Model, optimizer, scheduler and checkpointing configuration.
-    """
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
-    """
-    Logging configuration.
-    """
 
     data: DataCfg = field(default_factory=DataCfg)
     """Dataset location, storage format, modalities and sampling configuration."""
@@ -120,13 +115,8 @@ def objective(
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Cross-entropy objective for language-model pretraining.
-
-    Labels are already next-token targets from MemmapDataset; do not shift them here.
-    Returns the loss summed over the tokens of this micro-batch, so gradients accumulate across
-    micro-batches; the training step divides by the global non-ignored token count for a correct
-    token-weighted mean. The second return value is the same loss detached, which the step
-    reduces the same way to log the training loss.
+    The loss is summed over the micro-batch's tokens, not averaged: train_step divides by the
+    global token count. Labels are already next-token targets; do not shift them here.
     """
     (logits,) = model_outputs
     (labels,) = objective_inputs
@@ -139,29 +129,25 @@ def objective(
 
 
 def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
-    """
-    Execute one step of training.
-    """
-    # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
-        # Pushed right after cudaProfilerStart so it is the earliest in-window NVTX per globalTid
-        # (enables pid to mesh-coord lookup); range, not mark, so nsys-ui renders on the thread row.
-        d, t, parts = distributed, cfg.training, list()
-        parts.append(f"rank={d.rank}")
+        # The first NVTX range in the profile window names each thread's mesh coordinates; a range,
+        # not a mark, so the nsys UI shows it on the thread row.
+        mesh, train_cfg, parts = distributed, cfg.training, list()
+        parts.append(f"rank={mesh.rank}")
         parts.append(
-            f"pp={d.pp_rank}/{d.pp_size} dp={d.dp_rank}/{d.dp_size} "
-            f"cp={d.cp_rank}/{d.cp_size} ep={d.ep_rank}/{d.ep_size}"
+            f"pp={mesh.pp_rank}/{mesh.pp_size} dp={mesh.dp_rank}/{mesh.dp_size} "
+            f"cp={mesh.cp_rank}/{mesh.cp_size} ep={mesh.ep_rank}/{mesh.ep_size}"
         )
-        parts.append(f"mbs={t.micro_batch_size} seq={t.sequence_length}")
+        parts.append(f"mbs={train_cfg.micro_batch_size} seq={train_cfg.sequence_length}")
         torch.cuda.nvtx.range_push("; ".join(parts))
     start = cfg.training.memory_profile_start
     if start is not None and step == start:
         torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
 
     device = torch.cuda.current_device()
-    t0 = time.time()
+    step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
 
@@ -173,53 +159,45 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
     global_batch_size = cfg.training.global_batch_size
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
-    # Gather the part of the global batch this rank owns, split into micro-batches.
     microbatches = get_global_batch(cfg, dataset, step, device)
 
     token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
     num_tokens = global_target_count(microbatches, token_group)
 
-    # Run the forward and backward pass. The objective hands back one detached loss per
-    # micro-batch on pipeline rank 0; every other rank gets an empty list.
+    # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
     objective_outputs = model.step(microbatches, objective)
 
-    # Reduce true loss sums/counts across this pipeline stage's DP x CP ranks.
-    # FSDP has already summed gradients over the parameter replica groups.
+    # Loss sums and target counts are reduced over this stage's DP x CP ranks, so ranks may hold
+    # unequal numbers of targets. FSDP reduces gradients with a plain sum, so dividing by the
+    # global target count gives the token-weighted mean.
     if distributed.pp_rank == 0:
         loss = global_loss_mean(torch.stack(objective_outputs).sum(), num_tokens, token_group)
-    scale = 1.0 / num_tokens
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad.mul_(scale)
+    scale_grads_(local_grads(model), 1.0 / num_tokens)
 
-    # Clip the gradients.
     gradient_norm = clip_grad_norm(
         model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
     )
 
-    # Take an optimization step (composed optimizers + their schedulers).
     for optimizer, scheduler in zip(optimizers, schedulers):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
     dataset.commit_step(step)
+    if training.fp8:
+        precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
 
-    # Measure the elapsed time in seconds.
-    t1 = time.time()
-    dt = torch.tensor(t1 - t0, device=device)
-    torch.distributed.all_reduce(dt, op=torch.distributed.ReduceOp.MAX)
-    elapsed = dt.item()
+    step_end_time = time.time()
+    elapsed_tensor = torch.tensor(step_end_time - step_start_time, device=device)
+    torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
+    elapsed = elapsed_tensor.item()
 
-    # Measure the peak GPU memory allocated.
     peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
     peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
     torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
 
-    # Collect the mean load balance loss (reduced across all ranks).
-    # The tracked values include the coefficient: lb_coef * E * dot(f, p).
-    # We divide it out so the logged metric is E * dot(f, p), where 1.0
-    # represents perfect balance (matches Megatron-LM convention).
+    # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
+    # is perfect balance (the Megatron-LM convention).
     moe_load_balance_coef = cfg.training.moe_load_balance_coef
     lb_total, lb_count = MoELoadBalanceLossTracker.get_total_count_and_clear()
     if moe_load_balance_coef > 0:
@@ -229,7 +207,6 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
     else:
         lb_loss = 0.0
 
-    # Print the loss and learning rate on rank 0.
     logger = logging.stdout
     if distributed.rank == 0:
         max_steps = cfg.training.max_steps
@@ -246,7 +223,6 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         logger.info(" | ".join(statements))
-        # Lazily initialize WandB on the first successful step.
         activate_wandb(cfg)
         if logging.wandb is not None:
             metrics = dict()
@@ -261,10 +237,8 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
             metrics["infra/step-time"] = elapsed
             wandb.log(metrics)
 
-    # Everything below counts completed steps, one more than the index of the step just run.
     completed = step + 1
 
-    # Stop the nsys and the memory profiler.
     stop = cfg.training.nsys_stop
     if stop is not None and completed == stop:
         torch.cuda.nvtx.range_pop()
@@ -277,10 +251,6 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
         torch.cuda.memory._dump_snapshot(str(path))
         torch.cuda.memory._record_memory_history(enabled=None)
 
-    # We should save the checkpoint if any of the following conditions is true:
-    # 1. The current step is a multiple of save_interval.
-    # 2. The current step is the last step (max_steps).
-    # Skip entirely if save_interval is None.
     if cfg.training.save_interval is not None:
         should_save = False
         should_save |= completed % cfg.training.save_interval == 0
@@ -298,21 +268,21 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
                 ),
             )
 
-    # Run deferred GC here so cyclic collection never fires mid-forward/backward.
+    # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
 
 
 @record
 def launch(cfg: PretrainLMCfg) -> None:
-    """
-    Launch the pretraining of a language model.
-    """
     initialize_from = getattr(cfg, "initialize_from", None)
     initialize_step = getattr(cfg, "initialize_step", 0)
     if type(initialize_step) is not int or initialize_step < 0:
         raise ValueError("initialize_step must be a nonnegative integer")
     if initialize_from is None and initialize_step != 0:
         raise ValueError("initialize_step requires initialize_from")
+    hf_import_path = getattr(cfg.training, "hf_import_path", None)
+    if initialize_from is not None and hf_import_path is not None:
+        raise ValueError("initialize_from and training.hf_import_path are mutually exclusive")
     step = find_checkpoint(cfg.training.save_location)
     if initialize_from is not None and step is not None:
         raise ValueError("Model initialization requires a new output run; omit it to resume")
@@ -333,11 +303,28 @@ def launch(cfg: PretrainLMCfg) -> None:
                 else {}
             ),
         )
+        if training.fp8:
+            precompute_fp8_param_scales()
     elif initialize_from is not None:
         initialize_checkpoint(initialize_from, initialize_step)
+        if training.fp8:
+            precompute_fp8_param_scales()
+    elif hf_import_path is not None:
+        load_hf_into_model(hf_import_path, training.model)
+        if training.fp8:
+            precompute_fp8_param_scales()
     step = step or 0
+    # Freeze the startup heap (model, datasets, compiled graphs) out of the collector, so the
+    # per-step gc.collect() in train_step scans only what the step allocated.
+    gc.collect()
+    gc.freeze()
     gc.disable()
+    # Install the cached kernel launch configs now; tune the ones the first step lacked after it.
+    tune_kernels()
+    first_step = step
     while step < cfg.training.max_steps:
         train_step(cfg, dataset, step)
+        if step == first_step:
+            tune_kernels()
         step += 1
     gc.enable()

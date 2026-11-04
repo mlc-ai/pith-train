@@ -1,6 +1,6 @@
 """CPU checks of dense batch contents and the shared checkpoint boundary.
 
-Only corpus shuffle placement and its barrier are mocked: the real memmap,
+Only corpus shuffle placement, its writer rank and barrier are mocked: the real memmap,
 shuffle, DP/CP slicing, batch adapter, and DCP serialization code execute.
 """
 
@@ -27,6 +27,7 @@ def text_corpus(tmp_path, monkeypatch, request):
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *args, **kwargs: 0)
     token_root = tmp_path / "tokens/train"
     token_root.mkdir(parents=True)
     inputs, labels = [], []

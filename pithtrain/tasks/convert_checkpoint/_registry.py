@@ -4,6 +4,10 @@ Each converter handles one model family when the generic path is
 insufficient (quantized weights, stacked experts with HF-side
 transposes). Converters are tried in order; the first whose detect_*
 returns True wins.
+
+``pithtrain.modules.hf_loader`` also dispatches over CONVERTERS, using two
+optional hooks: ``plan_param`` (default ``_streaming.generic_plan_param``) and
+``expected_unmapped``, the HF keys that are fine to leave unloaded.
 """
 
 from logging import Logger

@@ -51,7 +51,7 @@ def test_model_forward_clears_inference_records_and_reuses_for_training(
                 assert_layers_empty()
             return self.up(hidden), hidden, None
 
-        def forward_stage3(self, hidden, expert_idxs, expand_idx):
+        def forward_stage3(self, hidden, expert_idxs, expand_idx, expert_counts=None):
             return self.down(hidden).tanh()
 
         def forward_stage5(self, hidden, moe_local_idxs, topk_weight, residual):

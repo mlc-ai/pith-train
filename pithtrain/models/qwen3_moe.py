@@ -1,4 +1,6 @@
-"""Qwen/Qwen3-30B-A3B and Qwen/Qwen3-235B-A22B."""
+"""
+Qwen/Qwen3-30B-A3B and Qwen/Qwen3-235B-A22B.
+"""
 
 import torch
 import torch.nn.functional as F
@@ -6,15 +8,22 @@ from torch import nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from pithtrain.contexts import distributed, training
+from pithtrain.kernels import (
+    bf16_experts_supported,
+    fp8_fused_experts_supported,
+    fp8_quant_grouped,
+)
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
     replay_indices,
 )
+from pithtrain.modules.recompute import norm_recompute
 from pithtrain.operators.cp_sequence import zigzag_spans, zigzag_varlen_index
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import ring_attention_func, ring_attention_varlen_func
 from pithtrain.operators.silu_mul import silu_mul
@@ -25,6 +34,8 @@ from pithtrain.operators.token_scatter import (
 )
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
+
+__all__ = ["Qwen3MoeGate", "Qwen3MoeModel"]
 
 
 class Qwen3MoeRotaryEmbedding(nn.Module):
@@ -38,8 +49,8 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
         return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
     def set_cos_sin(self, config: Qwen3MoeConfig, inv_freq: torch.Tensor) -> None:
-        t = torch.arange(config.max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos", emb.cos().to(torch.bfloat16), persistent=False)
         self.register_buffer("sin", emb.sin().to(torch.bfloat16), persistent=False)
@@ -53,6 +64,7 @@ class Qwen3MoeExperts(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
+        self.top_k = getattr(config, "num_experts_per_tok", num_experts)
         self.gate_proj = training.GroupedLinear(num_experts, hidden_size, moe_intermediate_size)
         self.up_proj = training.GroupedLinear(num_experts, hidden_size, moe_intermediate_size)
         self.down_proj = training.GroupedLinear(num_experts, moe_intermediate_size, hidden_size)
@@ -63,12 +75,43 @@ class Qwen3MoeExperts(nn.Module):
         grouped_mm_offs: torch.Tensor,
         ks: list | None = None,
         ks_tensor: torch.Tensor | None = None,
+        quantized_input: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
-        gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
-        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
-        g = self.gate_proj(x, **kwargs)
-        u = self.up_proj(x, **kwargs)
-        return self.down_proj(silu_mul(g, u), **kwargs)
+        group_indices = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
+            args = (x, grouped_mm_offs, ks, ks_tensor, group_indices, quantized_input)
+            return fp8_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args)
+        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=group_indices)  # fmt: skip
+        use_shared_quant = training.fp8 and x.shape[0]
+        quantized_x = fp8_quant_grouped(x.detach(), grouped_mm_offs) if use_shared_quant else None  # fmt: skip
+        gate = self.gate_proj(x, **kwargs, quantized_input=quantized_x)
+        up = self.up_proj(x, **kwargs, quantized_input=quantized_x)
+        return self.down_proj(silu_mul(gate, up), **kwargs)
+
+    def uses_bf16_cute(self) -> bool:
+        return not training.fp8 and bf16_experts_supported(self.gate_proj.num_groups)
+
+    def forward_from_tokens(
+        self,
+        gathered: torch.Tensor,
+        expert_idxs: torch.Tensor,
+        expand_idx: torch.Tensor | None,
+        expert_counts: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Stage 3 from the received tokens on Hopper: returns (expert outputs, reverse_shuffle_idxs),
+        or the outputs in slot order with None for the BF16 CuTe experts. A method of its own,
+        registered with FSDP, so the FP8 input never meets FSDP's bf16 input cast.
+        """
+        if not training.fp8:
+            from pithtrain.operators.bf16_experts import bf16_swiglu_experts
+
+            args = (gathered, expert_idxs, expand_idx, self.top_k)
+            return bf16_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args), None
+        G = self.gate_proj.num_groups
+        x, reverse_shuffle_idxs, offs, ks, ks_tensor, quantized_input = fp8_scatter_quant(gathered, expert_idxs, G, expand_idx, expert_counts)  # fmt: skip
+        # self.forward, not self(...): calling the module re-enters FSDP's input cast.
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=quantized_input), reverse_shuffle_idxs  # fmt: skip
 
 
 class Qwen3MoeGate(nn.Module):
@@ -167,9 +210,10 @@ class Qwen3MoeAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
-        key_states = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
-        value_states = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        query_states = self.q_proj(hidden_states, quantized_hidden).view(B, S, self.num_heads, self.head_dim)  # fmt: skip
+        key_states = self.k_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
+        value_states = self.v_proj(hidden_states, quantized_hidden).view(B, S, self.num_kv_heads, self.head_dim)  # fmt: skip
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         query_states, key_states = self.apply_rotary_posemb(query_states, key_states, rotary_posemb)
@@ -194,13 +238,23 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
         replay_idx: torch.Tensor | None = None,
+    ):
+        H = self.input_layernorm.normalized_shape[0]
+        return norm_recompute(self.stage1_compute, H, hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
+
+    def stage1_compute(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None,
+        replay_idx: torch.Tensor | None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -218,27 +272,96 @@ class Qwen3MoeDecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
-        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
+        outs = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)
+        return self.stage1_dispatch(*outs)
+
+    def forward_stage5_stage1(
+        self,
+        prev_layer: "Qwen3MoeDecoderLayer",
+        moe_outs: torch.Tensor,
+        moe_local_idxs: torch.Tensor | None,
+        topk_weight: torch.Tensor | None,
+        residual: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+        """
+        prev_layer.forward_stage5 then self.forward_stage1 as one compiled region, so each layer
+        and micro-batch enters one compiled graph (and one compiled backward) instead of two.
+        """
+        replay_idx = replay_indices(self.mlp.gate, residual, self.mlp.num_experts_per_tok)
+        outs = self.forward_stage5_stage1_compute(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
+        return self.stage1_dispatch(*outs)
+
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    def forward_stage5_stage1_compute(
+        self,
+        prev_layer: "Qwen3MoeDecoderLayer",
+        moe_outs: torch.Tensor,
+        moe_local_idxs: torch.Tensor | None,
+        topk_weight: torch.Tensor | None,
+        residual: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None,
+        replay_idx: torch.Tensor | None,
+    ):
+        hidden_states = prev_layer.stage5_compute(moe_outs, moe_local_idxs, topk_weight, residual)
+        H = self.input_layernorm.normalized_shape[0]
+        return norm_recompute(self.stage1_compute, H, hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
+
+    def stage1_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weight: torch.Tensor,
+        lb_loss: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
         return dispatch_tokens, residual, routing
+
+    def keeps_stage3_input(self) -> bool:
+        """
+        Whether forward_stage3 keeps gathered_tokens for the backward (the BF16 CuTe experts read
+        them again in their weight gradient), so the pipeline must not free them.
+        """
+        return not training.fp8 and self.mlp.experts.uses_bf16_cute()
 
     def forward_stage3(
         self,
         gathered_tokens: torch.Tensor,
         expert_idxs: torch.Tensor | None = None,
         expand_idx: torch.Tensor | None = None,
+        expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
+        if training.fp8 and fp8_fused_experts_supported():
+            expand = expand_idx if distributed.ep_size > 1 else None
+            outs, reverse_shuffle_idxs = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            del gathered_tokens
+            return padded_index_gather(outs, reverse_shuffle_idxs)
+        if self.keeps_stage3_input():
+            expand = expand_idx if distributed.ep_size > 1 else None
+            return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, None)[0]  # fmt: skip
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)  # fmt: skip
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank, group_counts=expert_counts)  # fmt: skip
         del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         return padded_index_gather(outs, reverse_shuffle_idxs)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
     def forward_stage5(
+        self,
+        moe_outs: torch.Tensor,
+        moe_local_idxs: torch.Tensor | None,
+        topk_weight: torch.Tensor | None,
+        residual: torch.Tensor,
+    ):
+        return self.stage5_compute(moe_outs, moe_local_idxs, topk_weight, residual)
+
+    def stage5_compute(
         self,
         moe_outs: torch.Tensor,
         moe_local_idxs: torch.Tensor | None,
@@ -283,7 +406,6 @@ class Qwen3MoeModel(nn.Module):
                 stage_count = distributed.pp_size * 2
                 stage_index = stage_count - 1 - distributed.pp_rank
             case -1:
-                # non-pipelined reference: a single stage owns the whole model
                 stage_count = 1
                 stage_index = 0
             case _:
@@ -316,7 +438,7 @@ class Qwen3MoeModel(nn.Module):
             position_ids = index - cu_seqlens[torch.searchsorted(cu_seqlens, index, right=True) - 1]
         else:
             spans = zigzag_spans(cp_rank, cp_size, S * cp_size)
-            position_ids = torch.cat([torch.arange(s.start, s.stop, device=device) for s in spans])
+            position_ids = torch.cat([torch.arange(span.start, span.stop, device=device) for span in spans])  # fmt: skip
         cos, sin = self.rotary_emb(S * cp_size)
         return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
 

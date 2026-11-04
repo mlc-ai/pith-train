@@ -14,8 +14,8 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
 @pytest.fixture
 def attach():
-    # The operator module imports GPU GEMMs. Execute its actual accumulation helpers unchanged.
-    path = Path(__file__).resolve().parents[1] / "pithtrain/operators/wgrad_accumulation.py"
+    # The module imports the GPU kernel library. Execute its actual accumulation helpers unchanged.
+    path = Path(__file__).resolve().parents[1] / "pithtrain/modules/wgrad_accumulation.py"
     tree = ast.parse(path.read_text())
     nodes = [
         n
