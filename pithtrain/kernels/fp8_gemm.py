@@ -4,8 +4,6 @@ Every 1x128 activation scale is fp32 of logical shape (rows, ceil(K / 128)) with
 grouped and fused quantizations); the GEMMs take either.
 """
 
-from typing import Tuple
-
 import deep_gemm
 import torch
 
@@ -48,16 +46,16 @@ def fp8_channels_as_rows(x_ch: torch.Tensor, x_ch_scale: torch.Tensor, num_rows:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")
 
 
-def fp8_gemm_fwd(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def fp8_gemm_fwd(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward FP8 linear y = x @ W.T, returning (output, input_t_fp8, scale_input_t).
 
     - input_2d: x, bf16 (m, K), quantized rowwise 1x128.
-    - weight_fp8, scale_weight: W, e4m3 (n, K) with its 128x128 scale as
+    - weight_fp8, scale_weight: W, e4m3 (n, K) with its 128x128 scale, as
       fp8_quant_weight returns it.
     - output: fresh (m, n) in input_2d's dtype.
-    - input_t_fp8, scale_input_t: x.T (K, m) e4m3 quantized per 128x128 tile, scale fp32 (ceil(K /
-      128), ceil(m / 128)) row-major; the activation operand of fp8_gemm_bwd.
+    - input_t_fp8, scale_input_t: x.T (K, m) e4m3 quantized per 128x128 tile, scale fp32
+      (ceil(K / 128), ceil(m / 128)) row-major; the activation operand of fp8_gemm_bwd.
     """
     M, N = input_2d.shape[0], weight_fp8.shape[0]
     input_fp8, scale_input, input_t_fp8, scale_input_t = fp8_quant_act(input_2d)
@@ -65,7 +63,7 @@ def fp8_gemm_fwd(input_2d: torch.Tensor, weight_fp8: torch.Tensor, scale_weight:
     return output, input_t_fp8, scale_input_t
 
 
-def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight_t: torch.Tensor, input_t_fp8: torch.Tensor, scale_input_t: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def fp8_gemm_bwd(grad_2d: torch.Tensor, weight_t_fp8: torch.Tensor, scale_weight_t: torch.Tensor, input_t_fp8: torch.Tensor, scale_input_t: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Backward FP8 linear of y = x @ W.T, returning (grad_input, weight_grad).
 
@@ -173,15 +171,17 @@ def k_grouped_fp8_gemm_nt(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.T
 
     def call_run(group_start: int, group_end: int, row_start: int, row_end: int, chunk: tuple[int, int] | None) -> None:
         """
-        One k_grouped_call over groups [group_start, group_end), which span rows [row_start,
-        row_end); with chunk = (chunk_start, chunk_end), only those rows of the single group.
+        One k_grouped_call over groups [group_start, group_end), which span rows
+        [row_start, row_end); with chunk = (chunk_start, chunk_end), only those rows of the single
+        group.
         """
         operands = []
         for (data, scale), num_channels in zip((a, b), channels):
             if chunk is None:
                 data, scale = data[row_start * num_channels : row_end * num_channels], scale[:, row_start // 128 : row_end // 128]
             else:
-                group_rows, (chunk_start, chunk_end) = row_end - row_start, chunk
+                group_rows = row_end - row_start
+                chunk_start, chunk_end = chunk
                 data = data[row_start * num_channels : row_end * num_channels].view(num_channels, group_rows)[:, chunk_start:chunk_end].contiguous().view(-1)
                 scale = scale[:, (row_start + chunk_start) // 128 : (row_start + chunk_end) // 128]
             operands.append((data, scale))
@@ -224,16 +224,16 @@ def k_grouped_fp8_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tens
     match ARCH_MAJOR:
         case 9:
             G, N, K = d.shape
-            NA, KB = a[1].shape[0], b[1].shape[0]
-            if (NA, KB) == (N, K):
+            num_a_channels, num_b_channels = a[1].shape[0], b[1].shape[0]
+            if (num_a_channels, num_b_channels) == (N, K):
                 k_grouped_fp8_gemm_nt(a, b, d, ks, ks_tensor)
                 return
-            if NA % 256 != 0 and KB % 256 == 0:
-                d_padded = torch.zeros((G, KB, NA), device=d.device, dtype=torch.float32)
+            if num_a_channels % 256 != 0 and num_b_channels % 256 == 0:
+                d_padded = torch.zeros((G, num_b_channels, num_a_channels), device=d.device, dtype=torch.float32)
                 k_grouped_fp8_gemm_nt(b, a, d_padded, ks, ks_tensor)
                 d.add_(d_padded[:, :K, :N].transpose(1, 2))
             else:
-                d_padded = torch.zeros((G, NA, KB), device=d.device, dtype=torch.float32)
+                d_padded = torch.zeros((G, num_a_channels, num_b_channels), device=d.device, dtype=torch.float32)
                 k_grouped_fp8_gemm_nt(a, b, d_padded, ks, ks_tensor)
                 d.add_(d_padded[:, :N, :K])
         case 10:
@@ -271,8 +271,8 @@ def fp8_quant_grouped(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tup
     - input: bf16 (M, K) contiguous, rows grouped by expert, each group padded to a multiple of 128
       rows; grouped_mm_offs: int32 cumulative group ends (last = M). SM90 also takes fp16 or fp32
       input with any strides and base alignment, and int64 or non-contiguous offsets.
-    - x_fp8 e4m3 (M, K), x_scale fp32 (M, ceil(K / 128)): rowwise 1x128, the a
-      operand of fp8_grouped_gemm.
+    - x_fp8 e4m3 (M, K), x_scale fp32 (M, ceil(K / 128)): rowwise 1x128, the a operand of
+      fp8_grouped_gemm.
     - x_ch_fp8, x_ch_scale: per-channel (128 rows x 1 within each group), the operand of
       k_grouped_fp8_gemm. SM90: K-major per group (group g's (K, ks[g]) row-major block flat at
       offs[g-1] * K), scale (K, M / 128). SM100: (M, K), scale (M / 128, K).
@@ -295,8 +295,8 @@ def fp8_quant_grouped(input: torch.Tensor, grouped_mm_offs: torch.Tensor) -> tup
 
 def fp8_grouped_gemm(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor], n: int, grouped_mm_offs: torch.Tensor, group_indices: torch.Tensor | None = None) -> torch.Tensor:
     """
-    m-grouped FP8 GEMM into a fresh bf16 (M, n) tensor: rows [offs[g-1], offs[g]) are a_g @
-    b[g].T, fp32 accumulation.
+    m-grouped FP8 GEMM into a fresh bf16 (M, n) tensor: rows [offs[g-1], offs[g]) are
+    a_g @ b[g].T, fp32 accumulation.
 
     - a: (fp8 (M, K), 1x128 scale (M, ceil(K / 128))) as fp8_quant_grouped returns them.
     - b: (fp8 (G, n, K), 128x128 scale (G, ceil(n / 128), ceil(K / 128))) as
@@ -331,8 +331,8 @@ def fp8_group_indices(grouped_mm_offs: torch.Tensor, M: int) -> torch.Tensor | N
     The group-id hint of fp8_grouped_gemm, reusable by every m-grouped GEMM over the same rows;
     None on SM100, which takes none.
 
-    On SM90: int32 (M,) per-row group ids, e.g. grouped_mm_offs = [128, 256, 384, 512] gives [0,
-    ..., 1, ..., 2, ..., 3, ...]; rows at or past the last offset get the last group.
+    On SM90: int32 (M,) per-row group ids, e.g. grouped_mm_offs = [128, 256, 384, 512] gives
+    [0, ..., 1, ..., 2, ..., 3, ...]; rows at or past the last offset get the last group.
     """
     if ARCH_MAJOR != 9:
         return None
