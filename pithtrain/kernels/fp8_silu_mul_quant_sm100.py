@@ -20,9 +20,10 @@ is bit-identical for every bf16 input (checked exhaustively, including inf and N
 1 + e absorbs any subnormal e and the 0.25 pre-scale reproduces div.full's large-divisor path.
 
 gu_bwd with N % 128 != 0 (dg and du blocks offset by N % 128 columns) keeps one load and one
-sigmoid per element by walking short ranges of consecutive 128-column windows (body_runL): CTA c
-takes ranges c, c + G, ... so concurrent CTAs read adjacent columns of the same rows, carries
-du of the previous window in thread-private shared memory and recomputes it (halo) at range starts.
+sigmoid per element by walking short ranges of consecutive 128-column windows
+(body_interleaved_ranges): CTA c takes ranges c, c + G, ... so concurrent CTAs read adjacent
+columns of the same rows, carries du of the previous window in thread-private shared memory and
+recomputes it (halo) at range starts.
 
 N not a multiple of 8 falls back to a non-persistent kernel with narrower predicated loads.
 """
@@ -39,39 +40,39 @@ TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_con
 
 __all__ = ["fp8_silu_mul_fwd_sm100", "fp8_silu_mul_bwd_sm100", "fp8_silu_mul_gu_fwd_sm100", "fp8_silu_mul_gu_bwd_sm100"]
 
-def old_max(a, b):
+
+def max_fmaxf(a, b):
     """
-    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN operand
-    (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
+    txl.max as apache-tvm 0.27 emitted it: CUDA fmaxf for float32 operands, which drops a NaN
+    operand (tvm_tirx emits a NaN-propagating select for txl.max); txl.max otherwise.
     """
     return txl.call_pure_extern("fmaxf", a, b, ty=txl.float32) if is_f32(a, b) else txl.max(a, b)
 
 
-def old_min(a, b):
+def min_fminf(a, b):
     """
     txl.min as apache-tvm 0.27 emitted it: CUDA fminf for float32 operands, txl.min otherwise.
     """
     return txl.call_pure_extern("fminf", a, b, ty=txl.float32) if is_f32(a, b) else txl.min(a, b)
 
 
-def is_f32(*xs):
+def is_f32(*operands):
     """
     Whether any operand is a float32 expression (the other may be a Python float).
     """
-    return any(str(getattr(getattr(x, "ty", None), "dtype", "")) == "float32" for x in xs)
-
+    return any(str(getattr(getattr(operand, "ty", None), "dtype", "")) == "float32" for operand in operands)
 
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
-    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
-    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on
+    every call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
 BLOCK = 128
@@ -79,13 +80,14 @@ NEG_LOG2E = -1.4426950408889634
 FP8_MAX_RCP = 1.0 / 448.0
 FULL = 0xFFFFFFFF
 ABS2 = 0x7FFF7FFF
-# Persistent schedule (measured best on B200): 512-thread CTAs, a one-tile cp.async lookahead
-# (the tile is copied to registers before the next one is issued, so one ring slot suffices),
-# two CTAs per SM for the forward (64 registers), one for the heavier backward.
+# Persistent schedule: 512-thread CTAs, one resident per SM. Modes without a unit ring ("hu") use a
+# one-tile cp.async lookahead: the tile is copied to registers before the next one is issued, so
+# one ring slot suffices.
 CFG = {"threads": 512, "stages_fwd": 1, "occ_fwd": 1, "threads_bwd": 512, "stages_bwd": 1, "occ_bwd": 1,
        # cp.async unit ring per mode[:N]: a tile load is split into hp row parts, hu units in flight
        "hu": {"fwd": 3, "gu_fwd": 3, "bwd:1408": 2, "gu_bwd_pair:1408": 2, "bwd:512": 4, "gu_bwd_pair:512": 4},
        "hp": {"bwd:512": 4, "gu_bwd_pair:512": 4},
+       # modes whose tile coordinates keep the signed division (see tile_coords)
        "signed": ["bwd:1408", "gu_bwd_pair:1408", "bwd:512", "gu_bwd_pair:512"],
        # gu_bwd with N % 128 != 0: windows per interleaved range
        "run_l": 3}
@@ -95,15 +97,15 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
-def lo_f32(w):
-    return txl.reinterpret(txl.shift_left(w, txl.uint32(16)), ty="float32")
+def lo_f32(word):
+    return txl.reinterpret(txl.shift_left(word, txl.uint32(16)), ty="float32")
 
 
-def hi_f32(w):
-    return txl.reinterpret(txl.bitwise_and(w, txl.uint32(0xFFFF0000)), ty="float32")
+def hi_f32(word):
+    return txl.reinterpret(txl.bitwise_and(word, txl.uint32(0xFFFF0000)), ty="float32")
 
 
-def f2(a, b):
+def f32x2(a, b):
     return txl.cuda.make_float2(a, b)
 
 
@@ -113,928 +115,890 @@ class F32Pair:
     """
 
     def __init__(self):
-        self.r = txl.local_scalar("uint64")
+        self.reg = txl.local_scalar("uint64")
 
     @property
     def x(self):
-        return txl.cuda.float2_x(self.r)
+        return txl.cuda.float2_x(self.reg)
 
     @property
     def y(self):
-        return txl.cuda.float2_y(self.r)
+        return txl.cuda.float2_y(self.reg)
 
 
-def unpack(w):
-    p = F32Pair()
-    txl.ptx.mov.b64(p.r, f2(lo_f32(w), hi_f32(w)))
-    return p
+def unpack_bf16x2(word):
+    pair = F32Pair()
+    txl.ptx.mov.b64(pair.reg, f32x2(lo_f32(word), hi_f32(word)))
+    return pair
 
 
-def mul2(a, b):
-    p = F32Pair()
-    txl.ptx.mul.rn.f32x2(p.r, a, b)
-    return p
+def mul_f32x2(a, b):
+    pair = F32Pair()
+    txl.ptx.mul.rn.f32x2(pair.reg, a, b)
+    return pair
 
 
-def fma2(a, b, c):
-    p = F32Pair()
-    txl.ptx.fma.rn.f32x2(p.r, a, b, c)
-    return p
+def fma_f32x2(a, b, c):
+    pair = F32Pair()
+    txl.ptx.fma.rn.f32x2(pair.reg, a, b, c)
+    return pair
 
 
-def add2(a, b):
-    p = F32Pair()
-    txl.ptx.add.rn.f32x2(p.r, a, b)
-    return p
+def add_f32x2(a, b):
+    pair = F32Pair()
+    txl.ptx.add.rn.f32x2(pair.reg, a, b)
+    return pair
 
 
-def c2(v):
-    return f2(txl.float32(v), txl.float32(v))
+def splat_f32x2(value):
+    return f32x2(txl.float32(value), txl.float32(value))
 
 
-def sigmoid(g):
+def sigmoid_x4(gate):
     """
-    Packed sigmoid of the pair g, times 4 (see module docstring).
+    Packed sigmoid of the pair gate, times 4 (see module docstring).
     """
-    x = mul2(g.r, c2(NEG_LOG2E))
-    e0 = txl.local_scalar("float32")
-    e1 = txl.local_scalar("float32")
-    txl.ptx.ex2.approx.ftz.f32(e0, x.x)
-    txl.ptx.ex2.approx.ftz.f32(e1, x.y)
-    d = fma2(f2(e0, e1), c2(0.25), c2(0.25))
-    r0 = txl.local_scalar("float32")
-    r1 = txl.local_scalar("float32")
-    txl.ptx.rcp.approx.ftz.f32(r0, d.x)
-    txl.ptx.rcp.approx.ftz.f32(r1, d.y)
-    return f2(r0, r1)
+    scaled = mul_f32x2(gate.reg, splat_f32x2(NEG_LOG2E))
+    exp_lo, exp_hi = txl.local_scalar("float32"), txl.local_scalar("float32")
+    txl.ptx.ex2.approx.ftz.f32(exp_lo, scaled.x)
+    txl.ptx.ex2.approx.ftz.f32(exp_hi, scaled.y)
+    denom = fma_f32x2(f32x2(exp_lo, exp_hi), splat_f32x2(0.25), splat_f32x2(0.25))
+    rcp_lo, rcp_hi = txl.local_scalar("float32"), txl.local_scalar("float32")
+    txl.ptx.rcp.approx.ftz.f32(rcp_lo, denom.x)
+    txl.ptx.rcp.approx.ftz.f32(rcp_hi, denom.y)
+    return f32x2(rcp_lo, rcp_hi)
 
 
 def scale_rcp(amax):
     """
     E8M0 scale and its exact reciprocal (the recipe's E8M0 scale, native cvt).
     """
-    s16 = txl.local_scalar("uint16")
-    arg = txl.local_scalar("float32")
-    txl.ptx.mul.rn.f32(arg, old_max(amax, txl.float32(1e-4)), txl.float32(FP8_MAX_RCP))
-    txl.ptx.cvt.rp.satfinite.ue8m0x2.f32(s16, txl.float32(0.0), arg)
-    e = txl.bitwise_and(txl.cast(s16, "uint32"), txl.uint32(0xFF))
-    sb = txl.local_scalar("uint32")
-    txl.assign(sb, txl.Select(e == txl.uint32(0), txl.uint32(1 << 23), txl.shift_left(e, txl.uint32(23))))
-    return txl.reinterpret(sb, ty="float32"), txl.reinterpret(txl.uint32(254 << 23) - sb, ty="float32")
+    scale_e8m0x2 = txl.local_scalar("uint16")
+    scaled_amax = txl.local_scalar("float32")
+    txl.ptx.mul.rn.f32(scaled_amax, max_fmaxf(amax, txl.float32(1e-4)), txl.float32(FP8_MAX_RCP))
+    txl.ptx.cvt.rp.satfinite.ue8m0x2.f32(scale_e8m0x2, txl.float32(0.0), scaled_amax)
+    exponent = txl.bitwise_and(txl.cast(scale_e8m0x2, "uint32"), txl.uint32(0xFF))
+    scale_bits = txl.local_scalar("uint32")
+    txl.assign(scale_bits, txl.Select(exponent == txl.uint32(0), txl.uint32(1 << 23), txl.shift_left(exponent, txl.uint32(23))))
+    return txl.reinterpret(scale_bits, ty="float32"), txl.reinterpret(txl.uint32(254 << 23) - scale_bits, ty="float32")
 
 
-def quant2(dst16, xw, rcp2):
+def quantize_bf16x2(dst, word, rcp_bf16x2):
     """
     e4m3x2 of a bf16x2 word times a bf16x2 pair of powers of two.
 
     The bf16 product is exact wherever it is a normal number; where it is not, |x * rcp| is
     below 2^-126 and both this and the fp32 reference round it to a signed zero byte.
     """
-    y = txl.local_scalar("uint32")
-    txl.ptx["mul.rn.bf16x2"](y, xw, rcp2)
-    txl.ptx["cvt.rn.satfinite.e4m3x2.bf16x2"](dst16, y)
+    product = txl.local_scalar("uint32")
+    txl.ptx["mul.rn.bf16x2"](product, word, rcp_bf16x2)
+    txl.ptx["cvt.rn.satfinite.e4m3x2.bf16x2"](dst, product)
 
 
-def swiglu(mode_bwd, sel, N, ocol, wg, wu, wd, hw, W):
+def local_value(expr, dtype="int32"):
     """
-    bf16 SwiGLU (or gradients) of the packed words, written to hw[out][t].
+    expr held in a fresh local register of dtype.
     """
-    for t in range(W):
-        gp = unpack(wg[t])
-        up = unpack(wu[t])
-        s = sigmoid(gp)
-        sg = mul2(s, c2(0.25))
-        silu = mul2(sg.r, gp.r)
-        if not mode_bwd:
-            h = mul2(silu.r, up.r)
-            txl.ptx.cvt.rn.bf16x2.f32(hw[0][t], h.y, h.x)
+    value = txl.local_scalar(dtype)
+    txl.assign(value, expr)
+    return value
+
+
+def grad_up_word(word_idx, gate_words, grad_words):
+    """
+    bf16x2 word of du = silu(g) * dh for word word_idx (the du half of swiglu's backward).
+    """
+    gate = unpack_bf16x2(gate_words[word_idx])
+    grad_h = unpack_bf16x2(grad_words[word_idx])
+    sig = mul_f32x2(sigmoid_x4(gate), splat_f32x2(0.25))
+    grad_up = mul_f32x2(mul_f32x2(sig.reg, gate.reg).reg, grad_h.reg)
+    word = txl.local_scalar("uint32")
+    txl.ptx.cvt.rn.bf16x2.f32(word, grad_up.y, grad_up.x)
+    return word
+
+
+def swiglu(is_bwd, is_select, N, out_col, gate_words, up_words, grad_words, out_words, WORDS):
+    """
+    bf16 SwiGLU (or its gradients dg, du) of the packed words, written to out_words[out][word].
+    """
+    for word_idx in range(WORDS):
+        gate = unpack_bf16x2(gate_words[word_idx])
+        up = unpack_bf16x2(up_words[word_idx])
+        sig_x4 = sigmoid_x4(gate)
+        sig = mul_f32x2(sig_x4, splat_f32x2(0.25))
+        silu = mul_f32x2(sig.reg, gate.reg)
+        if not is_bwd:
+            h = mul_f32x2(silu.reg, up.reg)
+            txl.ptx.cvt.rn.bf16x2.f32(out_words[0][word_idx], h.y, h.x)
             continue
-        dp = unpack(wd[t])
-        nsg = mul2(s, c2(-0.25))
-        t2 = mul2(mul2(dp.r, up.r).r, sg.r)
-        a = add2(gp.r, c2(1.0))
-        b = fma2(nsg.r, gp.r, a.r)
-        dg = mul2(t2.r, b.r)
-        du = mul2(silu.r, dp.r)
-        if not sel:
-            txl.ptx.cvt.rn.bf16x2.f32(hw[0][t], dg.y, dg.x)
-            txl.ptx.cvt.rn.bf16x2.f32(hw[1][t], du.y, du.x)
+        grad_h = unpack_bf16x2(grad_words[word_idx])
+        neg_sig = mul_f32x2(sig_x4, splat_f32x2(-0.25))
+        grad_silu_sig = mul_f32x2(mul_f32x2(grad_h.reg, up.reg).reg, sig.reg)
+        gate_plus_one = add_f32x2(gate.reg, splat_f32x2(1.0))
+        dsilu_factor = fma_f32x2(neg_sig.reg, gate.reg, gate_plus_one.reg)
+        grad_gate = mul_f32x2(grad_silu_sig.reg, dsilu_factor.reg)
+        grad_up = mul_f32x2(silu.reg, grad_h.reg)
+        if not is_select:
+            txl.ptx.cvt.rn.bf16x2.f32(out_words[0][word_idx], grad_gate.y, grad_gate.x)
+            txl.ptx.cvt.rn.bf16x2.f32(out_words[1][word_idx], grad_up.y, grad_up.x)
         else:
-            c = ocol + 2 * (t % 4)
-            lo = txl.Select(c < N, dg.x, du.x)
-            hi = txl.Select(c + 1 < N, dg.y, du.y)
-            txl.ptx.cvt.rn.bf16x2.f32(hw[0][t], hi, lo)
+            col = out_col + 2 * (word_idx % 4)
+            lo = txl.Select(col < N, grad_gate.x, grad_up.x)
+            hi = txl.Select(col + 1 < N, grad_gate.y, grad_up.y)
+            txl.ptx.cvt.rn.bf16x2.f32(out_words[0][word_idx], hi, lo)
 
 
 @functools.cache
-def build(mode, N):
+def build_kernel(mode, N):
     """
-    mode: fwd | gu_fwd | bwd | gu_bwd_pair | gu_bwd_run | gu_bwd_sel. Returns the compiled executable.
+    The compiled kernel of mode (fwd | gu_fwd | bwd | gu_bwd_pair | gu_bwd_run | gu_bwd_sel) for
+    width N, with its launch facts (persistent, column tiles, occupancy, ranges per row block).
     """
-    vec = math.gcd(8, N)
-    persistent = vec == 8
-    run = mode == "gu_bwd_run"
-    NTHREADS = CFG["threads_bwd" if mode in ("bwd", "gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel") else "threads"] if persistent else 256
-    RPT = BLOCK // (NTHREADS // 16)  # rows per thread
-    RSTRIDE = NTHREADS // 16
-    NWARP = NTHREADS // 32
-    gu = mode in ("gu_fwd", "gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel")
-    bwd = mode in ("bwd", "gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel")
-    sel = mode == "gu_bwd_sel"
-    pair = mode in ("bwd", "gu_bwd_pair", "gu_bwd_run")
-    IN_W = 2 * N if gu else N
-    U_OFF = N if gu else 0
+    vec_width = math.gcd(8, N)
+    is_persistent = vec_width == 8
+    is_run = mode == "gu_bwd_run"
+    THREADS = CFG["threads_bwd" if mode in ("bwd", "gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel") else "threads"] if is_persistent else 256
+    ROWS_PER_THREAD = BLOCK // (THREADS // 16)
+    ROW_STRIDE, WARPS = THREADS // 16, THREADS // 32
+    is_gu = mode in ("gu_fwd", "gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel")
+    is_bwd = mode in ("bwd", "gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel")
+    is_select = mode == "gu_bwd_sel"
+    is_pair = mode in ("bwd", "gu_bwd_pair", "gu_bwd_run")
+    IN_WIDTH = 2 * N if is_gu else N
+    UP_OFFSET = N if is_gu else 0
     K = 2 * N if mode in ("gu_bwd_pair", "gu_bwd_run", "gu_bwd_sel") else N  # output width
-    KB = cdiv(K, BLOCK)
-    LIM = K if sel else N  # column limit of this kernel's tiles (run: windows walk the N input columns)
-    NT = cdiv(LIM, BLOCK)  # column tiles per row block
-    full = LIM % BLOCK == 0
+    NUM_OUT_BLOCKS = cdiv(K, BLOCK)
+    COL_LIMIT = K if is_select else N  # column limit of this kernel's tiles (run: windows walk the N input columns)
+    NUM_COL_TILES = cdiv(COL_LIMIT, BLOCK)  # column tiles per row block
+    is_full = COL_LIMIT % BLOCK == 0
     # run (gu_bwd, N % 128 = HR != 0): input windows of 128 columns; du blocks start HR columns into a
     # window, HS = 128 - HR columns of each du block come from the previous window
     HQ, HR = N // BLOCK, N % BLOCK
     HS = BLOCK - HR
-    n_out = 2 if pair else 1
-    n_in = 3 if bwd else 2
-    offs = [(0, 0), (N, N // BLOCK)] if mode == "gu_bwd_pair" else [(0, 0), (0, 0)]
-    STAGES = CFG["stages_bwd" if bwd else "stages_fwd"]
-    OCC = CFG["occ_bwd" if bwd else "occ_fwd"]
-    W = RPT * 4
+    num_out = 2 if is_pair else 1
+    num_in = 3 if is_bwd else 2
+    out_offsets = [(0, 0), (N, N // BLOCK)] if mode == "gu_bwd_pair" else [(0, 0), (0, 0)]
+    STAGES, OCCUPANCY = CFG["stages_bwd" if is_bwd else "stages_fwd"], CFG["occ_bwd" if is_bwd else "occ_fwd"]
+    WORDS = ROWS_PER_THREAD * 4
 
-    def out_geom(oi, cb, ocol, tid):
+    def default_geometry(out_idx, col_block, out_col, tidx):
         """
-        (store column, row-scale block, reducer column, row-scale guard) of output oi.
+        (store column, row-scale block, reducer column, row-scale guard) of output out_idx.
         """
-        col_off, blk_off = offs[oi]
-        return ocol + col_off, cb + blk_off, cb * BLOCK + 2 * tid + col_off, None
+        col_offset, block_offset = out_offsets[out_idx]
+        return out_col + col_offset, col_block + block_offset, col_block * BLOCK + 2 * tidx + col_offset, None
 
-    def quant_store(hw, outs, rb, cb, ocol0, row_base, sm, tid, lane, warp, cg, r0, buf, geo=None):
+    def quant_store(out_words, outs, row_block, col_block, out_col0, row_base, smem_bufs, tidx, lane, warp, col_group, buf_idx, geometry=None):
         """
-        geo: optional [(words, out tensors, (ocol, sblk, ccol, sguard))] overriding hw/outs/out_geom.
+        Quantize and store the thread's words of each output, row-wise and column-wise.
+        geometry: optional [(words, out tensors, geometry dict)] overriding out_words, outs and
+        default_geometry.
         """
-        part_sm, rcp_sm = sm
+        s_col_amax, s_col_rcp = smem_bufs
         peer = txl.local_scalar("uint32")
-        items = geo if geo is not None else [(hw[oi], outs[oi], None) for oi in range(n_out)]
-        for oi, (x, otens, g_) in enumerate(items):
-            q_t, s_t, c_t, cs_t = otens
-            xo = {}
-            if isinstance(g_, dict):
-                xo = g_
-                ocol, sblk, ccol, sguard = g_["ocol"], g_["sblk"], g_["ccol"], g_["sguard"]
+        items = geometry if geometry is not None else [(out_words[out_idx], outs[out_idx], None) for out_idx in range(num_out)]
+        for out_idx, (words, out_tensors, geom) in enumerate(items):
+            row_fp8, row_scale, col_fp8, col_scale = out_tensors
+            overrides = {}
+            if isinstance(geom, dict):
+                overrides = geom
+                out_col, scale_block, reducer_col, scale_ok = geom["ocol"], geom["sblk"], geom["ccol"], geom["sguard"]
             else:
-                ocol, sblk, ccol, sguard = g_ if g_ is not None else out_geom(oi, cb, ocol0, tid)
-            olim = xo.get("olim", LIM + offs[oi][0])
-            ofull = full and "olim" not in xo
-            slane = xo.get("slane", 0)
+                out_col, scale_block, reducer_col, scale_ok = geom if geom is not None else default_geometry(out_idx, col_block, out_col0, tidx)
+            out_limit = overrides.get("olim", COL_LIMIT + out_offsets[out_idx][0])
+            is_out_full = is_full and "olim" not in overrides
+            scale_lane = overrides.get("slane", 0)
             # |x| maxima on bf16x2 pairs; accumulators start at 0 so NaN is ignored
-            rmax = txl.alloc_local([RPT], "uint32")
-            cmax = txl.alloc_local([4], "uint32")
+            row_amax, col_amax = txl.alloc_local([ROWS_PER_THREAD], "uint32"), txl.alloc_local([4], "uint32")
             for k in range(4):
-                txl.assign(cmax[k], txl.uint32(0))
-            for i in range(RPT):
-                txl.assign(rmax[i], txl.uint32(0))
+                txl.assign(col_amax[k], txl.uint32(0))
+            for i in range(ROWS_PER_THREAD):
+                txl.assign(row_amax[i], txl.uint32(0))
                 for k in range(4):
-                    txl.ptx["max.xorsign.abs.bf16x2"](rmax[i], rmax[i], x[i * 4 + k])
-                    txl.ptx["max.xorsign.abs.bf16x2"](cmax[k], cmax[k], x[i * 4 + k])
-            for i in range(RPT):
-                txl.assign(rmax[i], txl.bitwise_and(rmax[i], txl.uint32(ABS2)))
+                    txl.ptx["max.xorsign.abs.bf16x2"](row_amax[i], row_amax[i], words[i * 4 + k])
+                    txl.ptx["max.xorsign.abs.bf16x2"](col_amax[k], col_amax[k], words[i * 4 + k])
+            for i in range(ROWS_PER_THREAD):
+                txl.assign(row_amax[i], txl.bitwise_and(row_amax[i], txl.uint32(ABS2)))
             for k in range(4):
-                txl.assign(cmax[k], txl.bitwise_and(cmax[k], txl.uint32(ABS2)))
-            # column partials of this warp (rows r0 and r0 ^ 1 of each 32-row band)
+                txl.assign(col_amax[k], txl.bitwise_and(col_amax[k], txl.uint32(ABS2)))
+            # column partials of this warp (rows row0 and row0 ^ 1 of each 32-row band)
             for k in range(4):
-                txl.ptx.shfl_sync.bfly.b32(peer, cmax[k], txl.uint32(16), txl.uint32(31), txl.uint32(FULL))
-                txl.ptx.max.bf16x2(cmax[k], cmax[k], peer)
+                txl.ptx.shfl_sync.bfly.b32(peer, col_amax[k], txl.uint32(16), txl.uint32(31), txl.uint32(FULL))
+                txl.ptx.max.bf16x2(col_amax[k], col_amax[k], peer)
             with txl.if_(lane < 16), txl.then_():
-                txl.ptx.st.shared.v4.b32(part_sm.ptr_to([buf, oi, warp, cg * 4]), cmax[0], cmax[1], cmax[2], cmax[3])
+                txl.ptx.st.shared.v4.b32(s_col_amax.ptr_to([buf_idx, out_idx, warp, col_group * 4]), col_amax[0], col_amax[1], col_amax[2], col_amax[3])
             # row maxima: fold the two column parities, two rows per bf16x2 word
-            rpk = txl.alloc_local([RPT // 2], "uint32")
-            for p in (range(RPT // 2) if "rw" not in xo else []):
-                lo2 = txl.local_scalar("uint32")
-                hi2 = txl.local_scalar("uint32")
-                txl.ptx["prmt.b32"](lo2, rmax[2 * p], rmax[2 * p + 1], txl.uint32(0x5410))
-                txl.ptx["prmt.b32"](hi2, rmax[2 * p], rmax[2 * p + 1], txl.uint32(0x7632))
-                txl.ptx.max.bf16x2(rpk[p], lo2, hi2)
-            for p in (range(RPT // 2) if "rw" not in xo else []):
-                for d in (1, 2, 4, 8):
-                    txl.ptx.shfl_sync.bfly.b32(peer, rpk[p], txl.uint32(d), txl.uint32(31), txl.uint32(FULL))
-                    txl.ptx.max.bf16x2(rpk[p], rpk[p], peer)
-            if "rw" in xo:
-                for p in range(RPT // 2):
-                    txl.assign(rpk[p], xo["rw"][p])
-            txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NTHREADS))
+            row_amax_pairs = txl.alloc_local([ROWS_PER_THREAD // 2], "uint32")
+            for pair_idx in (range(ROWS_PER_THREAD // 2) if "rw" not in overrides else []):
+                amax_lo, amax_hi = txl.local_scalar("uint32"), txl.local_scalar("uint32")
+                txl.ptx["prmt.b32"](amax_lo, row_amax[2 * pair_idx], row_amax[2 * pair_idx + 1], txl.uint32(0x5410))
+                txl.ptx["prmt.b32"](amax_hi, row_amax[2 * pair_idx], row_amax[2 * pair_idx + 1], txl.uint32(0x7632))
+                txl.ptx.max.bf16x2(row_amax_pairs[pair_idx], amax_lo, amax_hi)
+            for pair_idx in (range(ROWS_PER_THREAD // 2) if "rw" not in overrides else []):
+                for lane_mask in (1, 2, 4, 8):
+                    txl.ptx.shfl_sync.bfly.b32(peer, row_amax_pairs[pair_idx], txl.uint32(lane_mask), txl.uint32(31), txl.uint32(FULL))
+                    txl.ptx.max.bf16x2(row_amax_pairs[pair_idx], row_amax_pairs[pair_idx], peer)
+            if "rw" in overrides:
+                for pair_idx in range(ROWS_PER_THREAD // 2):
+                    txl.assign(row_amax_pairs[pair_idx], overrides["rw"][pair_idx])
+            txl.ptx.bar.sync(txl.uint32(0), txl.uint32(THREADS))
 
             # 64 reducer threads: one bf16x2 column pair each
-            with txl.if_(tid < BLOCK // 2), txl.then_():
-                acc = txl.local_scalar("uint32")
-                tmpw = txl.alloc_local([NWARP], "uint32")
-                for w_ in range(NWARP):
-                    txl.ptx.ld.shared.b32(tmpw[w_], part_sm.ptr_to([buf, oi, w_, tid]))
-                txl.assign(acc, tmpw[0])
-                for w_ in range(1, NWARP):
-                    txl.ptx.max.bf16x2(acc, acc, tmpw[w_])
-                s0, rc0 = scale_rcp(lo_f32(acc))
-                s1, rc1 = scale_rcp(hi_f32(acc))
-                sc0 = txl.local_scalar("float32")
-                sc1 = txl.local_scalar("float32")
-                txl.assign(sc0, s0)
-                txl.assign(sc1, s1)
-                txl.ptx.st.shared.v2.f32(rcp_sm.ptr_to([buf, oi, 2 * tid]), rc0, rc1)
-                if olim % 2 == 0:
-                    with txl.if_(ccol < olim), txl.then_():
-                        txl.ptx.st.global_.v2.f32(cs_t.ptr_to([rb, ccol]), sc0, sc1)
+            with txl.if_(tidx < BLOCK // 2), txl.then_():
+                acc_amax = txl.local_scalar("uint32")
+                warp_amax = txl.alloc_local([WARPS], "uint32")
+                for warp_idx in range(WARPS):
+                    txl.ptx.ld.shared.b32(warp_amax[warp_idx], s_col_amax.ptr_to([buf_idx, out_idx, warp_idx, tidx]))
+                txl.assign(acc_amax, warp_amax[0])
+                for warp_idx in range(1, WARPS):
+                    txl.ptx.max.bf16x2(acc_amax, acc_amax, warp_amax[warp_idx])
+                scale_lo, rcp_lo = scale_rcp(lo_f32(acc_amax))
+                scale_hi, rcp_hi = scale_rcp(hi_f32(acc_amax))
+                scale_lo_reg, scale_hi_reg = txl.local_scalar("float32"), txl.local_scalar("float32")
+                txl.assign(scale_lo_reg, scale_lo)
+                txl.assign(scale_hi_reg, scale_hi)
+                txl.ptx.st.shared.v2.f32(s_col_rcp.ptr_to([buf_idx, out_idx, 2 * tidx]), rcp_lo, rcp_hi)
+                if out_limit % 2 == 0:
+                    with txl.if_(reducer_col < out_limit), txl.then_():
+                        txl.ptx.st.global_.v2.f32(col_scale.ptr_to([row_block, reducer_col]), scale_lo_reg, scale_hi_reg)
                 else:
-                    with txl.if_(ccol < olim), txl.then_():
-                        txl.ptx.st.global_.f32(cs_t.ptr_to([rb, ccol]), sc0)
-                    with txl.if_(ccol + 1 < olim), txl.then_():
-                        txl.ptx.st.global_.f32(cs_t.ptr_to([rb, ccol + 1]), sc1)
+                    with txl.if_(reducer_col < out_limit), txl.then_():
+                        txl.ptx.st.global_.f32(col_scale.ptr_to([row_block, reducer_col]), scale_lo_reg)
+                    with txl.if_(reducer_col + 1 < out_limit), txl.then_():
+                        txl.ptx.st.global_.f32(col_scale.ptr_to([row_block, reducer_col + 1]), scale_hi_reg)
 
-            def pack(q, a, b):
-                return txl.bitwise_or(txl.cast(q[a], "uint32"), txl.shift_left(txl.cast(q[b], "uint32"), txl.uint32(16)))
+            def pack_u16x2(quant, lo_idx, hi_idx):
+                return txl.bitwise_or(txl.cast(quant[lo_idx], "uint32"), txl.shift_left(txl.cast(quant[hi_idx], "uint32"), txl.uint32(16)))
 
-            def store8(dst_t, row, q):
-                if vec == 8:
-                    if ofull:
-                        txl.ptx.st.global_.v2.b32(dst_t.ptr_to([row, ocol]), pack(q, 0, 1), pack(q, 2, 3))
+            def store_fp8x8(dst, row, quant):
+                if vec_width == 8:
+                    if is_out_full:
+                        txl.ptx.st.global_.v2.b32(dst.ptr_to([row, out_col]), pack_u16x2(quant, 0, 1), pack_u16x2(quant, 2, 3))
                     else:
-                        with txl.if_(ocol < olim), txl.then_():
-                            txl.ptx.st.global_.v2.b32(dst_t.ptr_to([row, ocol]), pack(q, 0, 1), pack(q, 2, 3))
-                elif vec == 4:
-                    for sv in range(2):
-                        with txl.if_(ocol + 4 * sv < olim), txl.then_():
-                            txl.ptx.st.global_.b32(dst_t.ptr_to([row, ocol + 4 * sv]), pack(q, 2 * sv, 2 * sv + 1))
-                elif vec == 2:
-                    for sv in range(4):
-                        with txl.if_(ocol + 2 * sv < olim), txl.then_():
-                            txl.ptx.st.global_.b16(dst_t.ptr_to([row, ocol + 2 * sv]), q[sv])
+                        with txl.if_(out_col < out_limit), txl.then_():
+                            txl.ptx.st.global_.v2.b32(dst.ptr_to([row, out_col]), pack_u16x2(quant, 0, 1), pack_u16x2(quant, 2, 3))
+                elif vec_width == 4:
+                    for sub in range(2):
+                        with txl.if_(out_col + 4 * sub < out_limit), txl.then_():
+                            txl.ptx.st.global_.b32(dst.ptr_to([row, out_col + 4 * sub]), pack_u16x2(quant, 2 * sub, 2 * sub + 1))
+                elif vec_width == 2:
+                    for sub in range(4):
+                        with txl.if_(out_col + 2 * sub < out_limit), txl.then_():
+                            txl.ptx.st.global_.b16(dst.ptr_to([row, out_col + 2 * sub]), quant[sub])
                 else:
-                    for sv in range(8):
-                        byte = txl.bitwise_and(txl.shift_right(txl.cast(q[sv // 2], "uint32"), txl.uint32(8 * (sv % 2))), txl.uint32(0xFF))
-                        with txl.if_(ocol + sv < olim), txl.then_():
-                            txl.ptx.st.global_.b8(dst_t.ptr_to([row, ocol + sv]), txl.cast(byte, "uint8"))
+                    for sub in range(8):
+                        byte = txl.bitwise_and(txl.shift_right(txl.cast(quant[sub // 2], "uint32"), txl.uint32(8 * (sub % 2))), txl.uint32(0xFF))
+                        with txl.if_(out_col + sub < out_limit), txl.then_():
+                            txl.ptx.st.global_.b8(dst.ptr_to([row, out_col + sub]), txl.cast(byte, "uint8"))
 
             # row blocks, while the reducers finish the column scales
-            for i in range(RPT):
-                row = row_base + RSTRIDE * i
-                w = rpk[i // 2]
-                rs, rr = scale_rcp(lo_f32(w) if i % 2 == 0 else hi_f32(w))
-                rr2 = txl.local_scalar("uint32")
-                txl.ptx["prmt.b32"](rr2, txl.reinterpret(rr, ty="uint32"), txl.reinterpret(rr, ty="uint32"), txl.uint32(0x7632))
-                with txl.if_(cg == slane if sguard is None else txl.And(cg == slane, sguard)), txl.then_():
-                    txl.ptx.st.global_.f32(s_t.ptr_to([row, sblk]), rs)
-                qr = txl.alloc_local([4], "uint16")
+            for i in range(ROWS_PER_THREAD):
+                row = row_base + ROW_STRIDE * i
+                amax_word = row_amax_pairs[i // 2]
+                row_scale_value, row_rcp = scale_rcp(lo_f32(amax_word) if i % 2 == 0 else hi_f32(amax_word))
+                row_rcp_bf16x2 = txl.local_scalar("uint32")
+                txl.ptx["prmt.b32"](row_rcp_bf16x2, txl.reinterpret(row_rcp, ty="uint32"), txl.reinterpret(row_rcp, ty="uint32"), txl.uint32(0x7632))
+                with txl.if_(col_group == scale_lane if scale_ok is None else txl.And(col_group == scale_lane, scale_ok)), txl.then_():
+                    txl.ptx.st.global_.f32(row_scale.ptr_to([row, scale_block]), row_scale_value)
+                row_quant = txl.alloc_local([4], "uint16")
                 for k in range(4):
-                    quant2(qr[k], x[i * 4 + k], rr2)
-                store8(q_t, row, qr)
-            txl.ptx.bar.sync(txl.uint32(0), txl.uint32(NTHREADS))
+                    quantize_bf16x2(row_quant[k], words[i * 4 + k], row_rcp_bf16x2)
+                store_fp8x8(row_fp8, row, row_quant)
+            txl.ptx.bar.sync(txl.uint32(0), txl.uint32(THREADS))
 
-            crcp = txl.alloc_local([8], "uint32")
-            txl.ptx.ld.shared.v4.b32(crcp[0], crcp[1], crcp[2], crcp[3], rcp_sm.ptr_to([buf, oi, cg * 8]))
-            txl.ptx.ld.shared.v4.b32(crcp[4], crcp[5], crcp[6], crcp[7], rcp_sm.ptr_to([buf, oi, cg * 8 + 4]))
-            crc2 = txl.alloc_local([4], "uint32")
+            col_rcp = txl.alloc_local([8], "uint32")
+            txl.ptx.ld.shared.v4.b32(col_rcp[0], col_rcp[1], col_rcp[2], col_rcp[3], s_col_rcp.ptr_to([buf_idx, out_idx, col_group * 8]))
+            txl.ptx.ld.shared.v4.b32(col_rcp[4], col_rcp[5], col_rcp[6], col_rcp[7], s_col_rcp.ptr_to([buf_idx, out_idx, col_group * 8 + 4]))
+            col_rcp_bf16x2 = txl.alloc_local([4], "uint32")
             for k in range(4):
-                txl.ptx["prmt.b32"](crc2[k], crcp[2 * k], crcp[2 * k + 1], txl.uint32(0x7632))
-            for i in range(RPT):
-                row = row_base + RSTRIDE * i
-                qc = txl.alloc_local([4], "uint16")
+                txl.ptx["prmt.b32"](col_rcp_bf16x2[k], col_rcp[2 * k], col_rcp[2 * k + 1], txl.uint32(0x7632))
+            for i in range(ROWS_PER_THREAD):
+                row = row_base + ROW_STRIDE * i
+                col_quant = txl.alloc_local([4], "uint16")
                 for k in range(4):
-                    quant2(qc[k], x[i * 4 + k], crc2[k])
-                store8(c_t, row, qc)
+                    quantize_bf16x2(col_quant[k], words[i * 4 + k], col_rcp_bf16x2[k])
+                store_fp8x8(col_fp8, row, col_quant)
 
-    def tile_coords(t, cg, r0):
+    def tile_coords(tile, col_group, row0):
         if f"{mode}:{N}" in CFG["signed"] or mode in CFG["signed"]:
-            # Preserve the older signed coordinate expression for the half-tile
-            # specialization.  Although it emits more address instructions, it
-            # changes register scheduling materially for this pipeline.
-            rb = t // NT
-            cb = t % NT
-            ocol = cb * BLOCK + cg * 8
-            return rb, cb, ocol, rb * BLOCK + r0
+            # The signed coordinate expression emits more address instructions, but schedules
+            # registers better for these pipelines.
+            row_block, col_block = tile // NUM_COL_TILES, tile % NUM_COL_TILES
+            out_col = col_block * BLOCK + col_group * 8
+            return row_block, col_block, out_col, row_block * BLOCK + row0
         # tile indices are non-negative: unsigned division, 64-bit row so per-row offsets fold into addresses
-        tu = txl.cast(t, "uint32")
-        rb = txl.cast(tu // txl.uint32(NT), "int32")
-        cb = txl.cast(tu % txl.uint32(NT), "int32")
-        ocol = cb * BLOCK + cg * 8
-        return rb, cb, ocol, txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
+        tile_u32 = txl.cast(tile, "uint32")
+        row_block = txl.cast(tile_u32 // txl.uint32(NUM_COL_TILES), "int32")
+        col_block = txl.cast(tile_u32 % txl.uint32(NUM_COL_TILES), "int32")
+        out_col = col_block * BLOCK + col_group * 8
+        return row_block, col_block, out_col, txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
 
-    def body_persistent(dh, g, u, outs, MB, G):
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        cg = tid & 15
-        r0 = tid >> 4
+    def body_persistent(dh, gate, up, outs, MB, G):
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        col_group, row0 = tidx & 15, tidx >> 4
         cta = txl.cta_id()
-        ntiles = MB * NT
+        num_tiles = MB * NUM_COL_TILES
         smem = txl.smem_pool()
-        # DeepSeek's N=1408 backward rows benefit from dividing each tile load into two
-        # independently pipelined 64-row units.  This exposes the second half's load
-        # while the first half is copied to registers, without changing tile ownership
-        # or the quantization protocol.  Other compile-time widths keep the unsplit
-        # schedule because the same split regressed qwen and dense rows.
-        HU = CFG["hu"].get(f"{mode}:{N}", CFG["hu"].get(mode, 0))
-        HP = CFG["hp"].get(f"{mode}:{N}", CFG["hp"].get(mode, 2))  # row parts per tile load
-        HR2 = RPT // HP
-        if HU:
-            ring = smem.alloc([HU, n_in, BLOCK // HP, BLOCK], "bfloat16", align=128)
+        # A unit ring (CFG["hu"], CFG["hp"]) splits each tile load into row parts pipelined
+        # independently, so a part's load overlaps the copy of the previous part to registers,
+        # without changing tile ownership or the quantization protocol. Widths not listed keep the
+        # whole-tile schedule, which the split slows down.
+        RING_UNITS = CFG["hu"].get(f"{mode}:{N}", CFG["hu"].get(mode, 0))
+        ROW_PARTS = CFG["hp"].get(f"{mode}:{N}", CFG["hp"].get(mode, 2))  # row parts per tile load
+        ROWS_PER_PART = ROWS_PER_THREAD // ROW_PARTS
+        if RING_UNITS:
+            s_ring = smem.alloc([RING_UNITS, num_in, BLOCK // ROW_PARTS, BLOCK], "bfloat16", align=128)
         else:
-            ring = smem.alloc([STAGES, n_in, BLOCK, BLOCK], "bfloat16", align=128)
-        sm = (smem.alloc([2, n_out, NWARP, BLOCK // 2], "uint32"), smem.alloc([2, n_out, BLOCK], "float32", align=16))
-        srcs = [g, u] + ([dh] if bwd else [])
+            s_ring = smem.alloc([STAGES, num_in, BLOCK, BLOCK], "bfloat16", align=128)
+        smem_bufs = (smem.alloc([2, num_out, WARPS, BLOCK // 2], "uint32"), smem.alloc([2, num_out, BLOCK], "float32", align=16))
+        sources = [gate, up] + ([dh] if is_bwd else [])
 
-        def issue_h(uu):
+        def issue_unit(unit):
             """
-            Issue half-tile unit uu = 2 * tile_step + row_half.
+            Issue ring unit unit = ROW_PARTS * tile_step + row_part.
             """
-            t = cta + (uu // HP) * G
-            hh = uu % HP
-            slot = uu % HU
-            with txl.if_(t < ntiles), txl.then_():
-                rb, cb, ocol, row_base = tile_coords(t, cg, r0)
-                inside = None if full else ocol < LIM
-                icol = txl.Select(ocol < N, ocol, ocol - N) if sel else ocol
-                if not full:
-                    icol = txl.Select(inside, icol, 0)
-                for i2 in range(HR2):
-                    rl = r0 + RSTRIDE * i2
-                    row = row_base + txl.cast(RSTRIDE * HR2 * hh, "int64") + RSTRIDE * i2
-                    for k, src in enumerate(srcs):
-                        col = icol + U_OFF if k == 1 else icol
-                        dst = ring.ptr_to([slot, k, rl, cg * 8])
-                        if inside is None:
+            tile = cta + (unit // ROW_PARTS) * G
+            part, slot = unit % ROW_PARTS, unit % RING_UNITS
+            with txl.if_(tile < num_tiles), txl.then_():
+                _, _, out_col, row_base = tile_coords(tile, col_group, row0)
+                col_ok = None if is_full else out_col < COL_LIMIT
+                in_col = txl.Select(out_col < N, out_col, out_col - N) if is_select else out_col
+                if not is_full:
+                    in_col = txl.Select(col_ok, in_col, 0)
+                for i in range(ROWS_PER_PART):
+                    local_row = row0 + ROW_STRIDE * i
+                    row = row_base + txl.cast(ROW_STRIDE * ROWS_PER_PART * part, "int64") + ROW_STRIDE * i
+                    for src_idx, src in enumerate(sources):
+                        col = in_col + UP_OFFSET if src_idx == 1 else in_col
+                        dst = s_ring.ptr_to([slot, src_idx, local_row, col_group * 8])
+                        if col_ok is None:
                             txl.ptx["cp.async.cg.shared.global"](dst, src.ptr_to([row, col]), 16, 16)
                         else:
-                            txl.ptx["cp.async.cg.shared.global"](dst, src.ptr_to([row, col]), 16, txl.ptx.pred(ocol >= LIM))
+                            txl.ptx["cp.async.cg.shared.global"](dst, src.ptr_to([row, col]), 16, txl.ptx.pred(out_col >= COL_LIMIT))
             txl.ptx["cp.async.commit_group"]()
 
-        def issue(j):
-            t = cta + j * G
-            slot = j % STAGES
-            with txl.if_(t < ntiles), txl.then_():
-                rb, cb, ocol, row_base = tile_coords(t, cg, r0)
-                inside = None if full else ocol < LIM
-                icol = txl.Select(ocol < N, ocol, ocol - N) if sel else ocol
-                if not full:
-                    icol = txl.Select(inside, icol, 0)
-                for i in range(RPT):
-                    rl = r0 + RSTRIDE * i
-                    row = row_base + RSTRIDE * i
-                    for k, src in enumerate(srcs):
-                        col = icol + U_OFF if k == 1 else icol
-                        dst = ring.ptr_to([slot, k, rl, cg * 8])
-                        if inside is None:
+        def issue_tile(step):
+            tile = cta + step * G
+            slot = step % STAGES
+            with txl.if_(tile < num_tiles), txl.then_():
+                _, _, out_col, row_base = tile_coords(tile, col_group, row0)
+                col_ok = None if is_full else out_col < COL_LIMIT
+                in_col = txl.Select(out_col < N, out_col, out_col - N) if is_select else out_col
+                if not is_full:
+                    in_col = txl.Select(col_ok, in_col, 0)
+                for i in range(ROWS_PER_THREAD):
+                    local_row = row0 + ROW_STRIDE * i
+                    row = row_base + ROW_STRIDE * i
+                    for src_idx, src in enumerate(sources):
+                        col = in_col + UP_OFFSET if src_idx == 1 else in_col
+                        dst = s_ring.ptr_to([slot, src_idx, local_row, col_group * 8])
+                        if col_ok is None:
                             txl.ptx["cp.async.cg.shared.global"](dst, src.ptr_to([row, col]), 16, 16)
                         else:
-                            txl.ptx["cp.async.cg.shared.global"](dst, src.ptr_to([row, col]), 16, txl.ptx.pred(ocol >= LIM))
+                            txl.ptx["cp.async.cg.shared.global"](dst, src.ptr_to([row, col]), 16, txl.ptx.pred(out_col >= COL_LIMIT))
             txl.ptx["cp.async.commit_group"]()
 
-        for p in range(HU if HU else STAGES):
-            (issue_h if HU else issue)(p)
-        j = txl.local_scalar("int32")
-        txl.assign(j, 0)
-        hw = [txl.alloc_local([W], "uint32") for _ in range(n_out)]
-        wg = txl.alloc_local([W], "uint32")
-        wu = txl.alloc_local([W], "uint32")
-        wd = txl.alloc_local([W], "uint32") if bwd else None
-        regs = [wg, wu] + ([wd] if bwd else [])
-        with txl.while_(cta + j * G < ntiles):
-            t = cta + j * G
-            if HU:
-                for hh in range(HP):
-                    uu = HP * j + hh
-                    txl.ptx["cp.async.wait_group"](HU - 1)
-                    for i2 in range(HR2):
-                        i = hh * HR2 + i2
-                        rl = r0 + RSTRIDE * i2
-                        for k in range(n_in):
-                            dst = regs[k]
-                            txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], ring.ptr_to([uu % HU, k, rl, cg * 8]))
-                    issue_h(uu + HU)
+        for prologue_idx in range(RING_UNITS if RING_UNITS else STAGES):
+            (issue_unit if RING_UNITS else issue_tile)(prologue_idx)
+        step = txl.local_scalar("int32")
+        txl.assign(step, 0)
+        out_words = [txl.alloc_local([WORDS], "uint32") for _ in range(num_out)]
+        gate_words, up_words = txl.alloc_local([WORDS], "uint32"), txl.alloc_local([WORDS], "uint32")
+        grad_words = txl.alloc_local([WORDS], "uint32") if is_bwd else None
+        word_bufs = [gate_words, up_words] + ([grad_words] if is_bwd else [])
+        with txl.while_(cta + step * G < num_tiles):
+            tile = cta + step * G
+            if RING_UNITS:
+                for part in range(ROW_PARTS):
+                    unit = ROW_PARTS * step + part
+                    txl.ptx["cp.async.wait_group"](RING_UNITS - 1)
+                    for i2 in range(ROWS_PER_PART):
+                        i = part * ROWS_PER_PART + i2
+                        local_row = row0 + ROW_STRIDE * i2
+                        for src_idx in range(num_in):
+                            dst = word_bufs[src_idx]
+                            txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], s_ring.ptr_to([unit % RING_UNITS, src_idx, local_row, col_group * 8]))
+                    issue_unit(unit + RING_UNITS)
             else:
-                slot = j % STAGES
+                slot = step % STAGES
                 txl.ptx["cp.async.wait_group"](STAGES - 1)
-                for i in range(RPT):
-                    rl = r0 + RSTRIDE * i
-                    for k in range(n_in):
-                        dst = regs[k]
-                        txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], ring.ptr_to([slot, k, rl, cg * 8]))
-                issue(j + STAGES)
-            rb, cb, ocol, row_base = tile_coords(t, cg, r0)
-            swiglu(bwd, sel, N, ocol, wg, wu, wd, hw, W)
-            quant_store(hw, outs, rb, cb, ocol, row_base, sm, tid, lane, warp, cg, r0, j % 2)
-            txl.assign(j, j + 1)
+                for i in range(ROWS_PER_THREAD):
+                    local_row = row0 + ROW_STRIDE * i
+                    for src_idx in range(num_in):
+                        dst = word_bufs[src_idx]
+                        txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], s_ring.ptr_to([slot, src_idx, local_row, col_group * 8]))
+                issue_tile(step + STAGES)
+            row_block, col_block, out_col, row_base = tile_coords(tile, col_group, row0)
+            swiglu(is_bwd, is_select, N, out_col, gate_words, up_words, grad_words, out_words, WORDS)
+            quant_store(out_words, outs, row_block, col_block, out_col, row_base, smem_bufs, tidx, lane, warp, col_group, step % 2)
+            txl.assign(step, step + 1)
         txl.ptx["cp.async.wait_group"](0)
 
-    def body_simple(dh, g, u, outs, MB, G):
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        cg = tid & 15
-        r0 = tid >> 4
-        rb, cb, ocol, row_base = tile_coords(txl.cta_id(), cg, r0)
+    def body_simple(dh, gate, up, outs, MB, G):
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        col_group, row0 = tidx & 15, tidx >> 4
+        row_block, col_block, out_col, row_base = tile_coords(txl.cta_id(), col_group, row0)
         smem = txl.smem_pool()
-        sm = (smem.alloc([1, n_out, NWARP, BLOCK // 2], "uint32"), smem.alloc([1, n_out, BLOCK], "float32", align=16))
-        hw = [txl.alloc_local([W], "uint32") for _ in range(n_out)]
-        wg = txl.alloc_local([W], "uint32")
-        wu = txl.alloc_local([W], "uint32")
-        wd = txl.alloc_local([W], "uint32") if bwd else None
+        smem_bufs = (smem.alloc([1, num_out, WARPS, BLOCK // 2], "uint32"), smem.alloc([1, num_out, BLOCK], "float32", align=16))
+        out_words = [txl.alloc_local([WORDS], "uint32") for _ in range(num_out)]
+        gate_words, up_words = txl.alloc_local([WORDS], "uint32"), txl.alloc_local([WORDS], "uint32")
+        grad_words = txl.alloc_local([WORDS], "uint32") if is_bwd else None
 
-        def load(dst, tensor, row, col, t0, pred, sv):
-            ptr = tensor.ptr_to([row, col])
-            kw = {} if pred is None else {"pred": pred}
-            if vec == 1:
-                t16 = txl.local_scalar("uint16")
-                txl.ptx.ld.global_.b16(t16, ptr, **kw)
-                val = txl.cast(t16, "uint32") if pred is None else txl.Select(pred, txl.cast(t16, "uint32"), txl.uint32(0))
-                if sv % 2 == 0:
-                    txl.assign(dst[t0], val)
+        def load_words(dst, tensor, row, col, word0, pred, sub):
+            addr = tensor.ptr_to([row, col])
+            pred_kwargs = {} if pred is None else {"pred": pred}
+            if vec_width == 1:
+                half = txl.local_scalar("uint16")
+                txl.ptx.ld.global_.b16(half, addr, **pred_kwargs)
+                value = txl.cast(half, "uint32") if pred is None else txl.Select(pred, txl.cast(half, "uint32"), txl.uint32(0))
+                if sub % 2 == 0:
+                    txl.assign(dst[word0], value)
                 else:
-                    txl.assign(dst[t0], txl.bitwise_or(dst[t0], txl.shift_left(val, txl.uint32(16))))
+                    txl.assign(dst[word0], txl.bitwise_or(dst[word0], txl.shift_left(value, txl.uint32(16))))
                 return
-            if vec == 4:
-                txl.ptx.ld.global_.v2.b32(dst[t0], dst[t0 + 1], ptr, **kw)
+            if vec_width == 4:
+                txl.ptx.ld.global_.v2.b32(dst[word0], dst[word0 + 1], addr, **pred_kwargs)
             else:
-                txl.ptx.ld.global_.b32(dst[t0], ptr, **kw)
+                txl.ptx.ld.global_.b32(dst[word0], addr, **pred_kwargs)
             if pred is not None:
                 # a skipped predicated load leaves its destination undefined
-                for t in range(t0, t0 + vec // 2):
-                    txl.assign(dst[t], txl.Select(pred, dst[t], txl.uint32(0)))
+                for word_idx in range(word0, word0 + vec_width // 2):
+                    txl.assign(dst[word_idx], txl.Select(pred, dst[word_idx], txl.uint32(0)))
 
-        for i in range(RPT):
-            row = row_base + RSTRIDE * i
-            for sv in range(8 // vec):
-                c = ocol + sv * vec
-                t0 = i * 4 + (sv * vec) // 2
-                inside = None if full else c < LIM
-                icol = txl.Select(c < N, c, c - N) if sel else c
-                load(wg, g, row, icol, t0, inside, sv)
-                load(wu, u, row, icol + U_OFF, t0, inside, sv)
-                if bwd:
-                    load(wd, dh, row, icol, t0, inside, sv)
-        swiglu(bwd, sel, N, ocol, wg, wu, wd, hw, W)
-        quant_store(hw, outs, rb, cb, ocol, row_base, sm, tid, lane, warp, cg, r0, 0)
+        for i in range(ROWS_PER_THREAD):
+            row = row_base + ROW_STRIDE * i
+            for sub in range(8 // vec_width):
+                col = out_col + sub * vec_width
+                word0 = i * 4 + (sub * vec_width) // 2
+                col_ok = None if is_full else col < COL_LIMIT
+                in_col = txl.Select(col < N, col, col - N) if is_select else col
+                load_words(gate_words, gate, row, in_col, word0, col_ok, sub)
+                load_words(up_words, up, row, in_col + UP_OFFSET, word0, col_ok, sub)
+                if is_bwd:
+                    load_words(grad_words, dh, row, in_col, word0, col_ok, sub)
+        swiglu(is_bwd, is_select, N, out_col, gate_words, up_words, grad_words, out_words, WORDS)
+        quant_store(out_words, outs, row_block, col_block, out_col, row_base, smem_bufs, tidx, lane, warp, col_group, 0)
 
-    def body_run(dh, g, u, outs, MB, G):
+    def body_window_range(dh, gate, up, outs, MB, G):
         """
-        gu_bwd, N % 128 = HR != 0. Each CTA walks one contiguous range of input windows k (a part of
-        a row block). Window k loads g, u, dh once and computes dg and du (one sigmoid). dg block k is
-        complete. du block HQ + k is du columns >= HS of window k - 1 followed by columns < HS of
-        window k: thread cg keeps its du chunk of window k - 1 (in shared memory, private to the thread)
-        and takes Select(8cg < HS, du_k, du_{k-1}), so the block is assembled without moving data
-        between threads. The first window of a range starting at k > 0 recomputes du of window k - 1
-        (columns >= HS) from a g/dh halo load; window HQ also loads du columns < HS of window 0 (aux)
-        for the block where dg ends and du starts, and outputs the partial last du block.
+        gu_bwd, N % 128 = HR != 0. Each CTA walks one contiguous range of input windows k (a part
+        of a row block). Window k loads g, u, dh once and computes dg and du (one sigmoid). dg
+        block k is complete. du block HQ + k is du columns >= HS of window k - 1 followed by
+        columns < HS of window k: each thread keeps its du chunk of window k - 1 (in shared
+        memory, private to the thread) and takes Select(thread_col < HS, du_k, du_{k-1}), so the
+        block is assembled without moving data between threads. The first window of a range
+        starting at k > 0 recomputes du of window k - 1 (columns >= HS) from a g/dh halo load;
+        window HQ also loads du columns < HS of window 0 (aux) for the block where dg ends and du
+        starts, and outputs the partial last du block.
         """
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        cg = tid & 15
-        r0 = tid >> 4
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        col_group, row0 = tidx & 15, tidx >> 4
         cta = txl.cta_id()
-        total = MB * NT
+        num_windows = MB * NUM_COL_TILES
         smem = txl.smem_pool()
-        ring = smem.alloc([5, BLOCK, BLOCK], "bfloat16", align=128)
-        sm = (smem.alloc([2, 2, NWARP, BLOCK // 2], "uint32"), smem.alloc([2, 2, BLOCK], "float32", align=16))
+        s_ring = smem.alloc([5, BLOCK, BLOCK], "bfloat16", align=128)
+        smem_bufs = (smem.alloc([2, 2, WARPS, BLOCK // 2], "uint32"), smem.alloc([2, 2, BLOCK], "float32", align=16))
         out = outs[0]
-        c8 = cg * 8
-        isL = c8 < HS
+        thread_col = col_group * 8
+        is_low_col = thread_col < HS
 
-        def lv(e, dt="int32"):
-            v = txl.local_scalar(dt)
-            txl.assign(v, e)
-            return v
+        # CTA cta owns the flattened windows flat = row_block * NUM_COL_TILES + window in
+        # [window_start, window_end): one contiguous range, at most a few row-block segments; a
+        # segment starting at window > 0 recomputes du of window - 1 (halo).
+        # G >= MB: each row block is cut into num_parts = G // MB parts of part_len windows (the host
+        # launches MB * num_parts CTAs); otherwise flat contiguous ranges of ceil(num_windows / G)
+        # windows. No range starts at window HQ (it would need both a halo and the window-0 aux load).
+        num_parts = local_value(G // MB)
+        part_len = local_value((NUM_COL_TILES + num_parts - 1) // max_fmaxf(num_parts, 1))
+        range_len = local_value((num_windows + G - 1) // G)
 
-        # CTA cta owns the flattened windows f = rb * NT + k in [f0, f1): one contiguous range, at most a
-        # few row-block segments; a segment starting at k > 0 recomputes du of window k - 1 (halo)
-        # G >= MB: each row block is cut into PP = G // MB parts of PL windows (the host launches MB * PP
-        # CTAs); otherwise flat contiguous ranges of ceil(total / G) windows. No range starts at window
-        # HQ (it would need both a halo and the window-0 aux load).
-        PP = lv(G // MB)
-        PL = lv((NT + PP - 1) // old_max(PP, 1))
-        per = lv((total + G - 1) // G)
-
-        def cut(part):
-            c = old_min(part * PL, NT)
+        def part_cut(part):
+            window = min_fminf(part * part_len, NUM_COL_TILES)
             if HQ > 0:
-                c = c + txl.Select(c == HQ, 1, 0)
-            return c
+                window = window + txl.Select(window == HQ, 1, 0)
+            return window
 
-        def start(c):
-            f = c * per
+        def range_start(cta_idx):
+            flat = cta_idx * range_len
             if HQ > 0:
-                f = f + txl.Select(f % NT == HQ, 1, 0)
-            return old_min(f, total)
+                flat = flat + txl.Select(flat % NUM_COL_TILES == HQ, 1, 0)
+            return min_fminf(flat, num_windows)
 
-        aligned = PP >= 1
-        rbc = cta // old_max(PP, 1)
-        pc = cta % old_max(PP, 1)
-        f0 = lv(txl.Select(aligned, rbc * NT + cut(pc), start(cta)))
-        f1 = lv(txl.Select(aligned, rbc * NT + cut(pc + 1), start(cta + 1)))
+        is_aligned = num_parts >= 1
+        cta_row_block, cta_part = cta // max_fmaxf(num_parts, 1), cta % max_fmaxf(num_parts, 1)
+        window_start = local_value(txl.Select(is_aligned, cta_row_block * NUM_COL_TILES + part_cut(cta_part), range_start(cta)))
+        window_end = local_value(txl.Select(is_aligned, cta_row_block * NUM_COL_TILES + part_cut(cta_part + 1), range_start(cta + 1)))
 
-        def win(f):
-            fu = lv(txl.cast(f, "uint32"), "uint32")
-            return lv(txl.cast(fu // txl.uint32(NT), "int32")), lv(txl.cast(fu % txl.uint32(NT), "int32"))
+        def split_window(flat):
+            flat_u32 = local_value(txl.cast(flat, "uint32"), "uint32")
+            return local_value(txl.cast(flat_u32 // txl.uint32(NUM_COL_TILES), "int32")), local_value(txl.cast(flat_u32 % txl.uint32(NUM_COL_TILES), "int32"))
 
-        def issue_main(f, ok_q):
-            with txl.if_(ok_q), txl.then_():
-                rb, k = win(f)
-                row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
-                ocol = k * BLOCK + c8
-                ok = ocol < N
-                col = txl.Select(ok, ocol, 0)
-                for i in range(RPT):
-                    rl = r0 + RSTRIDE * i
-                    row = row_base + RSTRIDE * i
-                    for kk, src, cc in ((0, g, col), (1, u, col + U_OFF), (2, dh, col)):
-                        txl.ptx["cp.async.cg.shared.global"](ring.ptr_to([kk, rl, c8]), src.ptr_to([row, cc]), 16, txl.ptx.pred(txl.Not(ok)))
+        def issue_main(flat, window_ok):
+            with txl.if_(window_ok), txl.then_():
+                row_block, window = split_window(flat)
+                row_base = txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
+                out_col = window * BLOCK + thread_col
+                col_ok = out_col < N
+                col = txl.Select(col_ok, out_col, 0)
+                for i in range(ROWS_PER_THREAD):
+                    local_row = row0 + ROW_STRIDE * i
+                    row = row_base + ROW_STRIDE * i
+                    for slot, src, src_col in ((0, gate, col), (1, up, col + UP_OFFSET), (2, dh, col)):
+                        txl.ptx["cp.async.cg.shared.global"](s_ring.ptr_to([slot, local_row, thread_col]), src.ptr_to([row, src_col]), 16, txl.ptx.pred(txl.Not(col_ok)))
             txl.ptx["cp.async.commit_group"]()
 
-        def aux_of(f, k):
-            # halo (first window of a segment, k > 0): window k - 1, columns >= HS; window HQ: window 0, columns < HS
-            halo_ = txl.And(f == f0, k > 0)
-            last = k == HQ
-            col = txl.Select(halo_, (k - 1) * BLOCK + c8, c8 - HR)
-            ok = txl.Select(halo_, txl.Not(isL), txl.And(last, c8 >= HR))
-            ok = txl.And(ok, col < N)
-            return txl.Select(ok, col, 0), ok, txl.Or(halo_, last)
+        def aux_coords(flat, window):
+            # halo (first window of a segment, window > 0): window - 1, columns >= HS; window HQ: window 0, columns < HS
+            is_halo = txl.And(flat == window_start, window > 0)
+            is_last = window == HQ
+            col = txl.Select(is_halo, (window - 1) * BLOCK + thread_col, thread_col - HR)
+            col_ok = txl.Select(is_halo, txl.Not(is_low_col), txl.And(is_last, thread_col >= HR))
+            col_ok = txl.And(col_ok, col < N)
+            return txl.Select(col_ok, col, 0), col_ok, txl.Or(is_halo, is_last)
 
-        def issue_aux(f, ok_q):
-            with txl.if_(ok_q), txl.then_():
-                rb, k = win(f)
-                row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
-                col, ok, need = aux_of(f, k)
-                col = lv(col)
-                okv = lv(txl.Select(ok, 1, 0))
-                ok = okv == 1
-                with txl.if_(need), txl.then_():
-                    for i in range(RPT):
-                        rl = r0 + RSTRIDE * i
-                        row = row_base + RSTRIDE * i
-                        for kk, src in ((3, g), (4, dh)):
-                            txl.ptx["cp.async.cg.shared.global"](ring.ptr_to([kk, rl, c8]), src.ptr_to([row, col]), 16, txl.ptx.pred(txl.Not(ok)))
+        def issue_aux(flat, window_ok):
+            with txl.if_(window_ok), txl.then_():
+                row_block, window = split_window(flat)
+                row_base = txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
+                col, col_ok, needs_aux = aux_coords(flat, window)
+                col = local_value(col)
+                col_ok_int = local_value(txl.Select(col_ok, 1, 0))
+                col_ok = col_ok_int == 1
+                with txl.if_(needs_aux), txl.then_():
+                    for i in range(ROWS_PER_THREAD):
+                        local_row = row0 + ROW_STRIDE * i
+                        row = row_base + ROW_STRIDE * i
+                        for slot, src in ((3, gate), (4, dh)):
+                            txl.ptx["cp.async.cg.shared.global"](s_ring.ptr_to([slot, local_row, thread_col]), src.ptr_to([row, col]), 16, txl.ptx.pred(txl.Not(col_ok)))
             txl.ptx["cp.async.commit_group"]()
 
-        def ld(regs, ks):
-            for i in range(RPT):
-                rl = r0 + RSTRIDE * i
-                for dst, kk in zip(regs, ks):
-                    txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], ring.ptr_to([kk, rl, c8]))
+        def load_slots(word_bufs, slots):
+            for i in range(ROWS_PER_THREAD):
+                local_row = row0 + ROW_STRIDE * i
+                for dst, slot in zip(word_bufs, slots):
+                    txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], s_ring.ptr_to([slot, local_row, thread_col]))
 
-        def du_only(t_, wg, wd):
-            gp = unpack(wg[t_])
-            dp = unpack(wd[t_])
-            sg = mul2(sigmoid(gp), c2(0.25))
-            du = mul2(mul2(sg.r, gp.r).r, dp.r)
-            dw = txl.local_scalar("uint32")
-            txl.ptx.cvt.rn.bf16x2.f32(dw, du.y, du.x)
-            return dw
+        def geometry_linear(window):  # dg block window, or (window == HQ) the block where dg ends and du starts: linear columns
+            return {"ocol": window * BLOCK + thread_col, "sblk": window, "ccol": window * BLOCK + 2 * tidx, "sguard": None, "olim": K}
 
-        def g_lin(k):  # dg block k, or (k == HQ) the block where dg ends and du starts: linear columns
-            return {"ocol": k * BLOCK + c8, "sblk": k, "ccol": k * BLOCK + 2 * tid, "sguard": None, "olim": K}
+        def geometry_grad_up(block):  # du block (> HQ): its columns start HR into a window
+            col_in_block = lambda col: txl.bitwise_and(col + HR, BLOCK - 1)
+            return {"ocol": block * BLOCK + col_in_block(thread_col), "sblk": block, "ccol": block * BLOCK + col_in_block(2 * tidx), "sguard": block < NUM_OUT_BLOCKS, "olim": K}
 
-        def g_du(b1):  # du block b1 (> HQ): its columns start HR into a window
-            pos = lambda c: txl.bitwise_and(c + HR, BLOCK - 1)
-            return {"ocol": b1 * BLOCK + pos(c8), "sblk": b1, "ccol": b1 * BLOCK + pos(2 * tid), "sguard": b1 < KB, "olim": K}
-
-        issue_main(f0, f0 < f1)
-        issue_aux(f0, f0 < f1)
-        fc = txl.local_scalar("int32")
-        txl.assign(fc, f0)
-        hw = [txl.alloc_local([W], "uint32") for _ in range(2)]  # dg / du_k
+        issue_main(window_start, window_start < window_end)
+        issue_aux(window_start, window_start < window_end)
+        flat = txl.local_scalar("int32")
+        txl.assign(flat, window_start)
+        out_words = [txl.alloc_local([WORDS], "uint32") for _ in range(2)]  # dg / du_k
         # du_{k-1} of this thread, kept in shared memory (only its owner reads or writes it)
-        prev_sm = smem.alloc([W // 4, NTHREADS, 4], "uint32", align=16)
+        s_prev_grad_up = smem.alloc([WORDS // 4, THREADS, 4], "uint32", align=16)
 
-        def prev_st(x):
-            for q4 in range(W // 4):
-                txl.ptx.st.shared.v4.b32(prev_sm.ptr_to([q4, tid, 0]), x[4 * q4], x[4 * q4 + 1], x[4 * q4 + 2], x[4 * q4 + 3])
+        def store_prev(words):
+            for quad in range(WORDS // 4):
+                txl.ptx.st.shared.v4.b32(s_prev_grad_up.ptr_to([quad, tidx, 0]), words[4 * quad], words[4 * quad + 1], words[4 * quad + 2], words[4 * quad + 3])
 
-        def prev_ld(x):
-            for q4 in range(W // 4):
-                txl.ptx.ld.shared.v4.b32(x[4 * q4], x[4 * q4 + 1], x[4 * q4 + 2], x[4 * q4 + 3], prev_sm.ptr_to([q4, tid, 0]))
+        def load_prev(words):
+            for quad in range(WORDS // 4):
+                txl.ptx.ld.shared.v4.b32(words[4 * quad], words[4 * quad + 1], words[4 * quad + 2], words[4 * quad + 3], s_prev_grad_up.ptr_to([quad, tidx, 0]))
 
-        wg = txl.alloc_local([W], "uint32")
-        wu = txl.alloc_local([W], "uint32")
-        wd = txl.alloc_local([W], "uint32")
-        par = txl.local_scalar("int32")
-        txl.assign(par, 0)
-        with txl.while_(fc < f1):
-            rb, k = win(fc)
-            row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
-            nf = lv(fc + 1)
+        gate_words, up_words, grad_words = txl.alloc_local([WORDS], "uint32"), txl.alloc_local([WORDS], "uint32"), txl.alloc_local([WORDS], "uint32")
+        with txl.while_(flat < window_end):
+            row_block, window = split_window(flat)
+            row_base = txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
+            next_flat = local_value(flat + 1)
             txl.ptx["cp.async.wait_group"](1)
-            ld([wg, wu, wd], [0, 1, 2])
-            issue_main(nf, nf < f1)
-            swiglu(True, False, N, 0, wg, wu, wd, [hw[0], hw[1]], W)
+            load_slots([gate_words, up_words, grad_words], [0, 1, 2])
+            issue_main(next_flat, next_flat < window_end)
+            swiglu(True, False, N, 0, gate_words, up_words, grad_words, [out_words[0], out_words[1]], WORDS)
             # du block HQ + k: du_k on lanes < HS, du_{k-1} (shared memory) on the others; du_k becomes
             # the next window's du_{k-1}
-            prev_ld(wu)
-            for t_ in range(W):
-                txl.assign(wu[t_], txl.Select(isL, hw[1][t_], wu[t_]))
-            prev_st(hw[1])
+            load_prev(up_words)
+            for word_idx in range(WORDS):
+                txl.assign(up_words[word_idx], txl.Select(is_low_col, out_words[1][word_idx], up_words[word_idx]))
+            store_prev(out_words[1])
             txl.ptx["cp.async.wait_group"](1)
-            acol, aok, need = aux_of(fc, k)
-            ld([wg, wd], [3, 4])
-            issue_aux(nf, nf < f1)
-            last = k == HQ
-            halo_ = txl.And(fc == f0, k > 0)
-            with txl.if_(need), txl.then_():
+            _, _, needs_aux = aux_coords(flat, window)
+            load_slots([gate_words, grad_words], [3, 4])
+            issue_aux(next_flat, next_flat < window_end)
+            is_last = window == HQ
+            is_halo = txl.And(flat == window_start, window > 0)
+            with txl.if_(needs_aux), txl.then_():
                 # halo: du_{k-1} for lanes >= HS; last window: du of window 0 (columns < HS) for the dg|du block
-                for t_ in range(W):
-                    dw = du_only(t_, wg, wd)
-                    txl.assign(wu[t_], txl.Select(txl.And(halo_, txl.Not(isL)), dw, wu[t_]))
-                    txl.assign(hw[0][t_], txl.Select(txl.And(last, c8 >= HR), dw, hw[0][t_]))
+                for word_idx in range(WORDS):
+                    word = grad_up_word(word_idx, gate_words, grad_words)
+                    txl.assign(up_words[word_idx], txl.Select(txl.And(is_halo, txl.Not(is_low_col)), word, up_words[word_idx]))
+                    txl.assign(out_words[0][word_idx], txl.Select(txl.And(is_last, thread_col >= HR), word, out_words[0][word_idx]))
             # (window 0 has no du block: its stores are masked off)
-            gd = g_du(k + HQ)
-            has = k > 0
-            gd = dict(gd, ocol=txl.Select(has, gd["ocol"], K), ccol=txl.Select(has, gd["ccol"], K), sguard=txl.And(gd["sguard"], has))
-            quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 0,
-                        geo=[(hw[0], out, g_lin(k)), (wu, out, gd)])
+            geom_du = geometry_grad_up(window + HQ)
+            has_du = window > 0
+            geom_du = dict(geom_du, ocol=txl.Select(has_du, geom_du["ocol"], K), ccol=txl.Select(has_du, geom_du["ccol"], K), sguard=txl.And(geom_du["sguard"], has_du))
+            quant_store(None, None, row_block, window, 0, row_base, smem_bufs, tidx, lane, warp, col_group, 0, geometry=[(out_words[0], out, geometry_linear(window)), (up_words, out, geom_du)])
             if HR > 64:
                 # window HQ: du columns >= HS (valid < HR) form the partial last block 2HQ + 1
-                with txl.if_(last), txl.then_():
-                    prev_ld(wg)
-                    for t_ in range(W):
-                        txl.assign(wg[t_], txl.Select(isL, txl.uint32(0), wg[t_]))
-                    quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 1,
-                                geo=[(wg, out, g_du(2 * HQ + 1))])
-            txl.assign(fc, nf)
+                with txl.if_(is_last), txl.then_():
+                    load_prev(gate_words)
+                    for word_idx in range(WORDS):
+                        txl.assign(gate_words[word_idx], txl.Select(is_low_col, txl.uint32(0), gate_words[word_idx]))
+                    quant_store(None, None, row_block, window, 0, row_base, smem_bufs, tidx, lane, warp, col_group, 1, geometry=[(gate_words, out, geometry_grad_up(2 * HQ + 1))])
+            txl.assign(flat, next_flat)
         txl.ptx["cp.async.wait_group"](0)
 
-    def body_runL(dh, g, u, outs, MB, G):
+    def body_interleaved_ranges(dh, gate, up, outs, MB, G):
         """
-        gu_bwd, N % 128 = HR != 0, short interleaved window ranges. Each row block's NT windows are cut
-        into R ranges of about RUN_L windows; CTA c walks ranges q = c, c + G, ... (consecutive CTAs take
-        adjacent ranges of the same rows, so concurrent loads share DRAM pages) with one continuous
-        cp.async pipeline across range boundaries. Per window as body_run: dg block k, and du block HQ + k
-        from du_k (lanes < HS) and the thread's carried du_{k-1} (lanes >= HS); the first window of a
-        range with k > 0 recomputes du_{k-1} from a g/dh halo load of window k - 1.
+        gu_bwd, N % 128 = HR != 0, short interleaved window ranges. Each row block's windows are
+        cut into RUN_R ranges of about RUN_L windows; CTA c walks ranges c, c + G, ...
+        (consecutive CTAs take adjacent ranges of the same rows, so concurrent loads share DRAM
+        pages) with one continuous cp.async pipeline across range boundaries. Per window as
+        body_window_range: dg block k, and du block HQ + k from du_k (lanes < HS) and the thread's
+        carried du_{k-1} (lanes >= HS); the first window of a range with k > 0 recomputes
+        du_{k-1} from a g/dh halo load of window k - 1.
         """
-        tid = txl.thread_id()
-        lane = tid & 31
-        warp = tid >> 5
-        cg = tid & 15
-        r0 = tid >> 4
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        col_group, row0 = tidx & 15, tidx >> 4
         cta = txl.cta_id()
-        Q = MB * RUN_R
+        num_ranges = MB * RUN_R
         smem = txl.smem_pool()
-        ring = smem.alloc([5, BLOCK, BLOCK], "bfloat16", align=128)
-        sm = (smem.alloc([2, 2, NWARP, BLOCK // 2], "uint32"), smem.alloc([2, 2, BLOCK], "float32", align=16))
+        s_ring = smem.alloc([5, BLOCK, BLOCK], "bfloat16", align=128)
+        smem_bufs = (smem.alloc([2, 2, WARPS, BLOCK // 2], "uint32"), smem.alloc([2, 2, BLOCK], "float32", align=16))
         out = outs[0]
-        c8 = cg * 8
-        isL = c8 < HS
+        thread_col = col_group * 8
+        is_low_col = thread_col < HS
 
-        def lv(e, dt="int32"):
-            v = txl.local_scalar(dt)
-            txl.assign(v, e)
-            return v
-
-        def cut(p):
-            c = old_min(p * RUN_L, NT)
+        def range_cut(part):
+            window = min_fminf(part * RUN_L, NUM_COL_TILES)
             if HQ > 0:
-                c = c + txl.Select(c == HQ, 1, 0)
-            return c
+                window = window + txl.Select(window == HQ, 1, 0)
+            return window
 
-        def rng(q):
-            qu = lv(txl.cast(q, "uint32"), "uint32")
-            rb = lv(txl.cast(qu // txl.uint32(RUN_R), "int32"))
-            p = lv(txl.cast(qu % txl.uint32(RUN_R), "int32"))
-            return rb, p
+        def split_range(range_idx):
+            range_u32 = local_value(txl.cast(range_idx, "uint32"), "uint32")
+            row_block = local_value(txl.cast(range_u32 // txl.uint32(RUN_R), "int32"))
+            part = local_value(txl.cast(range_u32 % txl.uint32(RUN_R), "int32"))
+            return row_block, part
 
-        def issue_main(rb, k, ok_q):
-            with txl.if_(ok_q), txl.then_():
-                row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
-                ocol = k * BLOCK + c8
-                ok = ocol < N
-                col = txl.Select(ok, ocol, 0)
-                for i in range(RPT):
-                    rl = r0 + RSTRIDE * i
-                    row = row_base + RSTRIDE * i
-                    for kk, src, cc in ((0, g, col), (1, u, col + U_OFF), (2, dh, col)):
-                        txl.ptx["cp.async.cg.shared.global"](ring.ptr_to([kk, rl, c8]), src.ptr_to([row, cc]), 16, txl.ptx.pred(txl.Not(ok)))
+        def issue_main(row_block, window, window_ok):
+            with txl.if_(window_ok), txl.then_():
+                row_base = txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
+                out_col = window * BLOCK + thread_col
+                col_ok = out_col < N
+                col = txl.Select(col_ok, out_col, 0)
+                for i in range(ROWS_PER_THREAD):
+                    local_row = row0 + ROW_STRIDE * i
+                    row = row_base + ROW_STRIDE * i
+                    for slot, src, src_col in ((0, gate, col), (1, up, col + UP_OFFSET), (2, dh, col)):
+                        txl.ptx["cp.async.cg.shared.global"](s_ring.ptr_to([slot, local_row, thread_col]), src.ptr_to([row, src_col]), 16, txl.ptx.pred(txl.Not(col_ok)))
             txl.ptx["cp.async.commit_group"]()
 
-        def aux_of(first, k):
-            # halo (first window of a range, k > 0): window k - 1, columns >= HS; window HQ: window 0, columns < HS
-            halo_ = txl.And(first == 1, k > 0)
-            last = k == HQ
-            col = txl.Select(halo_, (k - 1) * BLOCK + c8, c8 - HR)
-            ok = txl.Select(halo_, txl.Not(isL), txl.And(last, c8 >= HR))
-            ok = txl.And(ok, col < N)
-            return txl.Select(ok, col, 0), ok, txl.Or(halo_, last)
+        def aux_coords(is_first, window):
+            # halo (first window of a range, window > 0): window - 1, columns >= HS; window HQ: window 0, columns < HS
+            is_halo = txl.And(is_first == 1, window > 0)
+            is_last = window == HQ
+            col = txl.Select(is_halo, (window - 1) * BLOCK + thread_col, thread_col - HR)
+            col_ok = txl.Select(is_halo, txl.Not(is_low_col), txl.And(is_last, thread_col >= HR))
+            col_ok = txl.And(col_ok, col < N)
+            return txl.Select(col_ok, col, 0), col_ok, txl.Or(is_halo, is_last)
 
-        def issue_aux(rb, k, first, ok_q):
-            with txl.if_(ok_q), txl.then_():
-                row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
-                col, ok, need = aux_of(first, k)
-                col = lv(col)
-                okv = lv(txl.Select(ok, 1, 0))
-                ok = okv == 1
-                with txl.if_(need), txl.then_():
-                    for i in range(RPT):
-                        rl = r0 + RSTRIDE * i
-                        row = row_base + RSTRIDE * i
-                        for kk, src in ((3, g), (4, dh)):
-                            txl.ptx["cp.async.cg.shared.global"](ring.ptr_to([kk, rl, c8]), src.ptr_to([row, col]), 16, txl.ptx.pred(txl.Not(ok)))
+        def issue_aux(row_block, window, is_first, window_ok):
+            with txl.if_(window_ok), txl.then_():
+                row_base = txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
+                col, col_ok, needs_aux = aux_coords(is_first, window)
+                col = local_value(col)
+                col_ok_int = local_value(txl.Select(col_ok, 1, 0))
+                col_ok = col_ok_int == 1
+                with txl.if_(needs_aux), txl.then_():
+                    for i in range(ROWS_PER_THREAD):
+                        local_row = row0 + ROW_STRIDE * i
+                        row = row_base + ROW_STRIDE * i
+                        for slot, src in ((3, gate), (4, dh)):
+                            txl.ptx["cp.async.cg.shared.global"](s_ring.ptr_to([slot, local_row, thread_col]), src.ptr_to([row, col]), 16, txl.ptx.pred(txl.Not(col_ok)))
             txl.ptx["cp.async.commit_group"]()
 
-        def ld(regs, ks):
-            for i in range(RPT):
-                rl = r0 + RSTRIDE * i
-                for dst, kk in zip(regs, ks):
-                    txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], ring.ptr_to([kk, rl, c8]))
+        def load_slots(word_bufs, slots):
+            for i in range(ROWS_PER_THREAD):
+                local_row = row0 + ROW_STRIDE * i
+                for dst, slot in zip(word_bufs, slots):
+                    txl.ptx.ld.shared.v4.b32(dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], s_ring.ptr_to([slot, local_row, thread_col]))
 
-        def du_only(t_, wg, wd):
-            gp = unpack(wg[t_])
-            dp = unpack(wd[t_])
-            sg = mul2(sigmoid(gp), c2(0.25))
-            du = mul2(mul2(sg.r, gp.r).r, dp.r)
-            dw = txl.local_scalar("uint32")
-            txl.ptx.cvt.rn.bf16x2.f32(dw, du.y, du.x)
-            return dw
+        def geometry_linear(window):
+            return {"ocol": window * BLOCK + thread_col, "sblk": window, "ccol": window * BLOCK + 2 * tidx, "sguard": None, "olim": K}
 
-        def g_lin(k):
-            return {"ocol": k * BLOCK + c8, "sblk": k, "ccol": k * BLOCK + 2 * tid, "sguard": None, "olim": K}
+        def geometry_grad_up(block):
+            col_in_block = lambda col: txl.bitwise_and(col + HR, BLOCK - 1)
+            return {"ocol": block * BLOCK + col_in_block(thread_col), "sblk": block, "ccol": block * BLOCK + col_in_block(2 * tidx), "sguard": block < NUM_OUT_BLOCKS, "olim": K}
 
-        def g_du(b1):
-            pos = lambda c: txl.bitwise_and(c + HR, BLOCK - 1)
-            return {"ocol": b1 * BLOCK + pos(c8), "sblk": b1, "ccol": b1 * BLOCK + pos(2 * tid), "sguard": b1 < KB, "olim": K}
+        # walk state: range, window, range end, first window of its range, row block
+        range_idx, window, window_end = txl.local_scalar("int32"), txl.local_scalar("int32"), txl.local_scalar("int32")
+        is_first, cur_row_block = txl.local_scalar("int32"), txl.local_scalar("int32")
+        txl.assign(range_idx, cta)
+        row_block0, part0 = split_range(cta)
+        txl.assign(cur_row_block, row_block0)
+        txl.assign(window, range_cut(part0))
+        txl.assign(window_end, range_cut(part0 + 1))
+        txl.assign(is_first, 1)
+        issue_main(cur_row_block, window, range_idx < num_ranges)
+        issue_aux(cur_row_block, window, is_first, range_idx < num_ranges)
+        out_words = [txl.alloc_local([WORDS], "uint32") for _ in range(2)]
+        s_prev_grad_up = smem.alloc([WORDS // 4, THREADS, 4], "uint32", align=16)
 
-        # walk state: range q, window k, range end k1, first window of its range
-        q = txl.local_scalar("int32")
-        k = txl.local_scalar("int32")
-        k1 = txl.local_scalar("int32")
-        first = txl.local_scalar("int32")
-        rbv = txl.local_scalar("int32")
-        txl.assign(q, cta)
-        rb0, p0 = rng(cta)
-        txl.assign(rbv, rb0)
-        txl.assign(k, cut(p0))
-        txl.assign(k1, cut(p0 + 1))
-        txl.assign(first, 1)
-        issue_main(rbv, k, q < Q)
-        issue_aux(rbv, k, first, q < Q)
-        hw = [txl.alloc_local([W], "uint32") for _ in range(2)]
-        prev_sm = smem.alloc([W // 4, NTHREADS, 4], "uint32", align=16)
+        def store_prev(words):
+            for quad in range(WORDS // 4):
+                txl.ptx.st.shared.v4.b32(s_prev_grad_up.ptr_to([quad, tidx, 0]), words[4 * quad], words[4 * quad + 1], words[4 * quad + 2], words[4 * quad + 3])
 
-        def prev_st(x):
-            for q4 in range(W // 4):
-                txl.ptx.st.shared.v4.b32(prev_sm.ptr_to([q4, tid, 0]), x[4 * q4], x[4 * q4 + 1], x[4 * q4 + 2], x[4 * q4 + 3])
+        def load_prev(words):
+            for quad in range(WORDS // 4):
+                txl.ptx.ld.shared.v4.b32(words[4 * quad], words[4 * quad + 1], words[4 * quad + 2], words[4 * quad + 3], s_prev_grad_up.ptr_to([quad, tidx, 0]))
 
-        def prev_ld(x):
-            for q4 in range(W // 4):
-                txl.ptx.ld.shared.v4.b32(x[4 * q4], x[4 * q4 + 1], x[4 * q4 + 2], x[4 * q4 + 3], prev_sm.ptr_to([q4, tid, 0]))
-
-        wg = txl.alloc_local([W], "uint32")
-        wu = txl.alloc_local([W], "uint32")
-        wd = txl.alloc_local([W], "uint32")
-        with txl.while_(q < Q):
-            rb = rbv
-            row_base = txl.cast(rb, "int64") * BLOCK + txl.cast(r0, "int64")
+        gate_words, up_words, grad_words = txl.alloc_local([WORDS], "uint32"), txl.alloc_local([WORDS], "uint32"), txl.alloc_local([WORDS], "uint32")
+        with txl.while_(range_idx < num_ranges):
+            row_block = cur_row_block
+            row_base = txl.cast(row_block, "int64") * BLOCK + txl.cast(row0, "int64")
             # next window of this CTA's walk
-            cont = lv(txl.Select(k + 1 < k1, 1, 0))
-            nq = lv(txl.Select(cont == 1, q, q + G))
-            nrb, np_ = rng(nq)
-            nrb = lv(txl.Select(cont == 1, rb, nrb))
-            nk = lv(txl.Select(cont == 1, k + 1, cut(np_)))
-            nk1 = lv(txl.Select(cont == 1, k1, cut(np_ + 1)))
-            nfirst = lv(1 - cont)
+            is_same_range = local_value(txl.Select(window + 1 < window_end, 1, 0))
+            next_range = local_value(txl.Select(is_same_range == 1, range_idx, range_idx + G))
+            next_row_block, next_part = split_range(next_range)
+            next_row_block = local_value(txl.Select(is_same_range == 1, row_block, next_row_block))
+            next_window = local_value(txl.Select(is_same_range == 1, window + 1, range_cut(next_part)))
+            next_window_end = local_value(txl.Select(is_same_range == 1, window_end, range_cut(next_part + 1)))
+            next_is_first = local_value(1 - is_same_range)
             txl.ptx["cp.async.wait_group"](1)
-            ld([wg, wu, wd], [0, 1, 2])
-            issue_main(nrb, nk, nq < Q)
-            swiglu(True, False, N, 0, wg, wu, wd, [hw[0], hw[1]], W)
-            prev_ld(wu)
-            for t_ in range(W):
-                txl.assign(wu[t_], txl.Select(isL, hw[1][t_], wu[t_]))
-            prev_st(hw[1])
+            load_slots([gate_words, up_words, grad_words], [0, 1, 2])
+            issue_main(next_row_block, next_window, next_range < num_ranges)
+            swiglu(True, False, N, 0, gate_words, up_words, grad_words, [out_words[0], out_words[1]], WORDS)
+            load_prev(up_words)
+            for word_idx in range(WORDS):
+                txl.assign(up_words[word_idx], txl.Select(is_low_col, out_words[1][word_idx], up_words[word_idx]))
+            store_prev(out_words[1])
             txl.ptx["cp.async.wait_group"](1)
-            acol, aok, need = aux_of(first, k)
-            ld([wg, wd], [3, 4])
-            issue_aux(nrb, nk, nfirst, nq < Q)
-            last = k == HQ
-            halo_ = txl.And(first == 1, k > 0)
-            with txl.if_(need), txl.then_():
-                for t_ in range(W):
-                    dw = du_only(t_, wg, wd)
-                    txl.assign(wu[t_], txl.Select(txl.And(halo_, txl.Not(isL)), dw, wu[t_]))
-                    txl.assign(hw[0][t_], txl.Select(txl.And(last, c8 >= HR), dw, hw[0][t_]))
-            gd = g_du(k + HQ)
-            has = k > 0
-            gd = dict(gd, ocol=txl.Select(has, gd["ocol"], K), ccol=txl.Select(has, gd["ccol"], K), sguard=txl.And(gd["sguard"], has))
-            quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 0,
-                        geo=[(hw[0], out, g_lin(k)), (wu, out, gd)])
+            _, _, needs_aux = aux_coords(is_first, window)
+            load_slots([gate_words, grad_words], [3, 4])
+            issue_aux(next_row_block, next_window, next_is_first, next_range < num_ranges)
+            is_last = window == HQ
+            is_halo = txl.And(is_first == 1, window > 0)
+            with txl.if_(needs_aux), txl.then_():
+                for word_idx in range(WORDS):
+                    word = grad_up_word(word_idx, gate_words, grad_words)
+                    txl.assign(up_words[word_idx], txl.Select(txl.And(is_halo, txl.Not(is_low_col)), word, up_words[word_idx]))
+                    txl.assign(out_words[0][word_idx], txl.Select(txl.And(is_last, thread_col >= HR), word, out_words[0][word_idx]))
+            geom_du = geometry_grad_up(window + HQ)
+            has_du = window > 0
+            geom_du = dict(geom_du, ocol=txl.Select(has_du, geom_du["ocol"], K), ccol=txl.Select(has_du, geom_du["ccol"], K), sguard=txl.And(geom_du["sguard"], has_du))
+            quant_store(None, None, row_block, window, 0, row_base, smem_bufs, tidx, lane, warp, col_group, 0, geometry=[(out_words[0], out, geometry_linear(window)), (up_words, out, geom_du)])
             if HR > 64:
-                with txl.if_(last), txl.then_():
-                    prev_ld(wg)
-                    for t_ in range(W):
-                        txl.assign(wg[t_], txl.Select(isL, txl.uint32(0), wg[t_]))
-                    quant_store(None, None, rb, k, 0, row_base, sm, tid, lane, warp, cg, r0, 1,
-                                geo=[(wg, out, g_du(2 * HQ + 1))])
-            txl.assign(q, nq)
-            txl.assign(rbv, nrb)
-            txl.assign(k, nk)
-            txl.assign(k1, nk1)
-            txl.assign(first, nfirst)
+                with txl.if_(is_last), txl.then_():
+                    load_prev(gate_words)
+                    for word_idx in range(WORDS):
+                        txl.assign(gate_words[word_idx], txl.Select(is_low_col, txl.uint32(0), gate_words[word_idx]))
+                    quant_store(None, None, row_block, window, 0, row_base, smem_bufs, tidx, lane, warp, col_group, 1, geometry=[(gate_words, out, geometry_grad_up(2 * HQ + 1))])
+            txl.assign(range_idx, next_range)
+            txl.assign(cur_row_block, next_row_block)
+            txl.assign(window, next_window)
+            txl.assign(window_end, next_window_end)
+            txl.assign(is_first, next_is_first)
         txl.ptx["cp.async.wait_group"](0)
 
     RUN_L = CFG["run_l"]
-    if run and RUN_L:
-        cuts = sorted({min(p * RUN_L, NT) + (1 if HQ > 0 and min(p * RUN_L, NT) == HQ else 0) for p in range(NT // RUN_L + 2)})
+    if is_run and RUN_L:
+        cuts = sorted({min(part * RUN_L, NUM_COL_TILES) + (1 if HQ > 0 and min(part * RUN_L, NUM_COL_TILES) == HQ else 0) for part in range(NUM_COL_TILES // RUN_L + 2)})
         RUN_R = len(cuts) - 1  # non-empty ranges per row block (the formula is monotone; empty ones only at the end)
-        assert all(cuts[i] == min(i * RUN_L, NT) + (1 if HQ > 0 and min(i * RUN_L, NT) == HQ else 0) for i in range(RUN_R + 1))
-    body = ((body_runL if RUN_L else body_run) if run else body_persistent) if persistent else body_simple
+        assert all(cuts[i] == min(i * RUN_L, NUM_COL_TILES) + (1 if HQ > 0 and min(i * RUN_L, NUM_COL_TILES) == HQ else 0) for i in range(RUN_R + 1))
+    body = ((body_interleaved_ranges if RUN_L else body_window_range) if is_run else body_persistent) if is_persistent else body_simple
 
-    def T(dt, shape):
-        return txl.Tensor(shape, dt, data_alignment=1)
+    def tensor_arg(dtype, shape):
+        return txl.Tensor(shape, dtype, data_alignment=1)
 
-    var_M = txl.Var("M", "int32")
-    var_MB = txl.Var("MB", "int32")
-    QT = (var_M, K)
-    ST = (var_M, KB)
-    CST = (var_MB, K)
-    kattrs = txl.cuda.KernelAttributes(min_blocks_per_sm=OCC) if persistent else None
+    var_M, var_MB = txl.Var("M", "int32"), txl.Var("MB", "int32")
+    FP8_SHAPE, SCALE_SHAPE, COL_SCALE_SHAPE = (var_M, K), (var_M, NUM_OUT_BLOCKS), (var_MB, K)
+    kernel_attrs = txl.cuda.KernelAttributes(min_blocks_per_sm=OCCUPANCY) if is_persistent else None
 
     if mode in ("fwd", "gu_fwd"):
 
         @txl.kernel()
         def kern(
-            g: T("bfloat16", (var_M, IN_W)),
-            u: T("bfloat16", (var_M, IN_W)),
-            q0: T("float8_e4m3fn", QT),
-            s0: T("float32", ST),
-            c0: T("float8_e4m3fn", QT),
-            cs0: T("float32", CST),
+            g: tensor_arg("bfloat16", (var_M, IN_WIDTH)),
+            u: tensor_arg("bfloat16", (var_M, IN_WIDTH)),
+            q0: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            s0: tensor_arg("float32", SCALE_SHAPE),
+            c0: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            cs0: tensor_arg("float32", COL_SCALE_SHAPE),
             M: var_M,
             MB: var_MB,
             G: txl.int32,
         ):
-            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=NWARP * 32), kernel_attrs=kattrs)
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=WARPS * 32), kernel_attrs=kernel_attrs)
             body(None, g, u, [(q0, s0, c0, cs0)], MB, G)
 
     elif mode == "bwd":
 
         @txl.kernel()
         def kern(
-            dh: T("bfloat16", (var_M, N)),
-            g: T("bfloat16", (var_M, N)),
-            u: T("bfloat16", (var_M, N)),
-            q0: T("float8_e4m3fn", QT),
-            s0: T("float32", ST),
-            c0: T("float8_e4m3fn", QT),
-            cs0: T("float32", CST),
-            q1: T("float8_e4m3fn", QT),
-            s1: T("float32", ST),
-            c1: T("float8_e4m3fn", QT),
-            cs1: T("float32", CST),
+            dh: tensor_arg("bfloat16", (var_M, N)),
+            g: tensor_arg("bfloat16", (var_M, N)),
+            u: tensor_arg("bfloat16", (var_M, N)),
+            q0: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            s0: tensor_arg("float32", SCALE_SHAPE),
+            c0: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            cs0: tensor_arg("float32", COL_SCALE_SHAPE),
+            q1: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            s1: tensor_arg("float32", SCALE_SHAPE),
+            c1: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            cs1: tensor_arg("float32", COL_SCALE_SHAPE),
             M: var_M,
             MB: var_MB,
             G: txl.int32,
         ):
-            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=NWARP * 32), kernel_attrs=kattrs)
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=WARPS * 32), kernel_attrs=kernel_attrs)
             body(dh, g, u, [(q0, s0, c0, cs0), (q1, s1, c1, cs1)], MB, G)
 
     else:
 
         @txl.kernel()
         def kern(
-            dh: T("bfloat16", (var_M, N)),
-            g: T("bfloat16", (var_M, 2 * N)),
-            u: T("bfloat16", (var_M, 2 * N)),
-            q0: T("float8_e4m3fn", QT),
-            s0: T("float32", ST),
-            c0: T("float8_e4m3fn", QT),
-            cs0: T("float32", CST),
+            dh: tensor_arg("bfloat16", (var_M, N)),
+            g: tensor_arg("bfloat16", (var_M, 2 * N)),
+            u: tensor_arg("bfloat16", (var_M, 2 * N)),
+            q0: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            s0: tensor_arg("float32", SCALE_SHAPE),
+            c0: tensor_arg("float8_e4m3fn", FP8_SHAPE),
+            cs0: tensor_arg("float32", COL_SCALE_SHAPE),
             M: var_M,
             MB: var_MB,
             G: txl.int32,
         ):
-            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=NWARP * 32), kernel_attrs=kattrs)
-            o = (q0, s0, c0, cs0)
-            body(dh, g, u, [o, o] if pair else [o], MB, G)
+            txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=WARPS * 32), kernel_attrs=kernel_attrs)
+            outs = (q0, s0, c0, cs0)
+            body(dh, g, u, [outs, outs] if is_pair else [outs], MB, G)
 
-    ex = entry_function(kern.compile(TARGET))
-    return ex, persistent, NT, OCC, (RUN_R if run and RUN_L else 0)
+    fn = entry_function(kern.compile(TARGET))
+    return fn, is_persistent, NUM_COL_TILES, OCCUPANCY, (RUN_R if is_run and RUN_L else 0)
 
 
 @functools.cache
-def num_sms(device_index):
+def device_sm_count(device_index):
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def grid2(ntiles, occ, sms):
-    capacity = occ * sms
-    if occ == 1:
+def persistent_grid(num_tiles, occupancy, num_sms):
+    capacity = occupancy * num_sms
+    if occupancy == 1:
         # one resident CTA per SM: equalize per-CTA tile counts instead of a short final wave
-        return cdiv(ntiles, cdiv(ntiles, capacity))
-    return min(ntiles, capacity)
+        return cdiv(num_tiles, cdiv(num_tiles, capacity))
+    return min(num_tiles, capacity)
 
 
 def launch(mode, N, M, device, *args):
-    ex, persistent, nt, occ, run_r = build(mode, N)
+    fn, is_persistent, num_col_tiles, occupancy, num_run_ranges = build_kernel(mode, N)
     MB = M // BLOCK
-    G = grid2(MB * nt, occ, num_sms(device.index)) if persistent else MB * nt
-    if run_r:
-        G = grid2(MB * run_r, 1, num_sms(device.index))
+    G = persistent_grid(MB * num_col_tiles, occupancy, device_sm_count(device.index)) if is_persistent else MB * num_col_tiles
+    if num_run_ranges:
+        G = persistent_grid(MB * num_run_ranges, 1, device_sm_count(device.index))
     elif mode == "gu_bwd_run":
-        sms = num_sms(device.index)
-        G = MB * (sms // MB) if MB <= sms else G  # whole row-block parts (see body_run)
-    ex(*args, M, MB, G)
+        num_sms = device_sm_count(device.index)
+        G = MB * (num_sms // MB) if MB <= num_sms else G  # whole row-block parts (see body_window_range)
+    fn(*args, M, MB, G)
 
 
 def empty_quant(M, K, device):
@@ -1047,6 +1011,9 @@ def empty_quant(M, K, device):
 
 
 def fp8_silu_mul_fwd_sm100(g, u, grouped_mm_offs):
+    """
+    SM100 fp8_silu_mul_fwd; grouped_mm_offs is unused (groups are 128-row aligned).
+    """
     M, N = g.shape
     out = empty_quant(M, N, g.device)
     if M == 0 or N == 0:
@@ -1056,15 +1023,21 @@ def fp8_silu_mul_fwd_sm100(g, u, grouped_mm_offs):
 
 
 def fp8_silu_mul_bwd_sm100(dh, g, u, grouped_mm_offs):
+    """
+    SM100 fp8_silu_mul_bwd; grouped_mm_offs is unused (groups are 128-row aligned).
+    """
     M, N = g.shape
-    a, b = empty_quant(M, N, g.device), empty_quant(M, N, g.device)
+    grad_gate_out, grad_up_out = empty_quant(M, N, g.device), empty_quant(M, N, g.device)
     if M == 0 or N == 0:
-        return a, b
-    launch("bwd", N, M, g.device, dh, g, u, *a, *b)
-    return a, b
+        return grad_gate_out, grad_up_out
+    launch("bwd", N, M, g.device, dh, g, u, *grad_gate_out, *grad_up_out)
+    return grad_gate_out, grad_up_out
 
 
 def fp8_silu_mul_gu_fwd_sm100(gu, grouped_mm_offs):
+    """
+    SM100 fp8_silu_mul_gu_fwd; grouped_mm_offs is unused (groups are 128-row aligned).
+    """
     M, N = gu.shape[0], gu.shape[1] // 2
     out = empty_quant(M, N, gu.device)
     if M == 0 or N == 0:
@@ -1074,6 +1047,9 @@ def fp8_silu_mul_gu_fwd_sm100(gu, grouped_mm_offs):
 
 
 def fp8_silu_mul_gu_bwd_sm100(dh, gu, grouped_mm_offs):
+    """
+    SM100 fp8_silu_mul_gu_bwd; grouped_mm_offs is unused (groups are 128-row aligned).
+    """
     M, N = gu.shape[0], gu.shape[1] // 2
     out = empty_quant(M, 2 * N, gu.device)
     if M == 0 or N == 0:
