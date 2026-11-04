@@ -2,8 +2,8 @@
 causal_conv1d_sm100: the causal depthwise conv1d of the Qwen3.5 Gated DeltaNet (forward y, backward
 dx and dw) on SM100, as TIRx-lite kernels. Contracts as in the picker causal_conv1d.
 
-Tiles are T = 128 tokens x CB = 64 channels. Every output runs the K-tap fp32 fma chain in tap order
-from 0.0, rounded once (bit-identical to ATen).
+Tiles are T = 128 tokens x TILE_CHANNELS = 64 channels. Every output runs the K-tap fp32 fma chain
+in tap order from 0.0, rounded once (bit-identical to ATen).
 
 TMA path (C % 8 == 0, K <= 8, 16-byte aligned tensors, and S % 8 == 0 where a channels-first tensor
 is involved): persistent CTAs, one producer warp streams tiles into a shared-memory ring with TMA
@@ -13,11 +13,11 @@ the ring and write the results to a double-buffered staging tile that one thread
   K - 1 row halo box, evict-last L2 hints), lane = channel pair with f32x2 FMAs; y staging is two
   128B-swizzled [64 ch][64 tok] boxes, stored into y viewed as (B, C, S).
 - backward: 2-CTA clusters per channel slice, g rows [s0 - offset, +T + K - 1) (channels-last, or
-  [ch][CF_P tok] for g in the output's channels-first layout) and x rows [s0 - (K - 1), +T + K - 1);
-  dx staging [T][slice]. BF16 w on channels-last g computes with fma.rn.f32.bf16 straight from the
-  staged halves. dw: per thread a sequential fma over its tokens, the token groups summed in order,
-  then the cluster's ranks summed in order through DSMEM. Same order in every path, so dx / dw bits
-  do not depend on g's layout.
+  [ch][CHANNELS_FIRST_PITCH tok] for g in the output's channels-first layout) and x rows
+  [s0 - (K - 1), +T + K - 1); dx staging [T][slice]. BF16 w on channels-last g computes with
+  fma.rn.f32.bf16 straight from the staged halves. dw: per thread a sequential fma over its tokens,
+  the token groups summed in order, then the cluster's ranks summed in order through DSMEM. Same
+  order in every path, so dx / dw bits do not depend on g's layout.
 Plain path (any C, S, K, strides of g): the same tiles and arithmetic with plain loads / stores, dw
 partials summed in the TMA path's order by a second kernel.
 Inputs outside the contract the kernels read directly (w of another float dtype, non-contiguous x
@@ -39,501 +39,500 @@ __all__ = ["causal_conv1d_bwd_sm100", "causal_conv1d_fwd_sm100"]
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
-    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
-    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on
+    every call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
 T = 128  # tokens (rows) per tile
-CB = 64  # channels per tile
-TG = 32  # tokens per compute thread (scalar fallback kernels)
-TG2 = 16  # tokens per compute thread (packed TMA kernels: 2 channels x TG2 tokens)
-NTG = 8  # dw token groups per tile (T // TG2), the same in every path
-NCW = 8  # compute warps
-NC = NCW * 32  # compute threads
-NS_BWD = 2
+TILE_CHANNELS = 64  # channels per tile
+TOKENS_PER_THREAD = 32  # tokens per compute thread (scalar kernels)
+PACKED_TOKENS_PER_THREAD = 16  # tokens per compute thread (packed TMA kernels: 2 channels x 16 tokens)
+NUM_TOKEN_GROUPS = 8  # dw token groups per tile (T // PACKED_TOKENS_PER_THREAD), the same in every path
+NUM_COMPUTE_WARPS = 8
+NUM_COMPUTE_THREADS = NUM_COMPUTE_WARPS * 32
+PRODUCER_WARP = NUM_COMPUTE_WARPS  # the TMA kernels' producer warp follows the compute warps
+NUM_STAGES_BWD = 2
+NUM_DX_BUFS = 2  # dx staging buffers of the TMA backward
 CTAS_PER_SM = 2
 NUM_SMS = 148
-WARP_ARRIVE = False  # one empty arrival per thread (per-warp arrivals measured noise-level)
-EMPTY_COUNT = NCW if WARP_ARRIVE else NC
-CLM = True  # packed channels-last backward with native BF16-input FP32 FMAs (fma.rn.f32.bf16)
-FWM = False  # forward mixed FMAs measured noise / slower at S=8192
-FWO = True  # forward: convert (and shuffle) before the staging barrier
-CF_P = 152  # channels-first g tile pitch (tokens): >= 3 * TG + 48, and 76 words = 12 mod 32 banks, so the
-# 16B reads of 8 lanes (8 channels) along tokens hit distinct bank quads
+USE_WARP_ARRIVE = False  # one empty-barrier arrival per warp after warp_sync instead of one per thread
+EMPTY_ARRIVALS = NUM_COMPUTE_WARPS if USE_WARP_ARRIVE else NUM_COMPUTE_THREADS
+USE_BF16_FMA_BWD = True  # packed channels-last backward with native BF16-input FP32 FMAs (fma.rn.f32.bf16)
+USE_BF16_FMA_FWD = False  # forward with native BF16-input FP32 FMAs instead of the f32x2 path
+CONVERT_BEFORE_STAGING = True  # forward: convert (and shuffle) before the staging barrier
+# Channels-first g tile pitch (tokens): >= 3 * TOKENS_PER_THREAD + 48, and 76 words = 12 mod 32
+# banks, so the 16B reads of 8 lanes (8 channels) along tokens hit distinct bank quads.
+CHANNELS_FIRST_PITCH = 152
+CLUSTER_SIZE = 2  # CTAs per backward cluster; also the dw rank order of every backward path
+USE_PACKED_CF = False  # channels-first backward with the packed channel-pair layout instead of one channel per thread
 
-WDT = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
+WEIGHT_DTYPE_NAME = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
 
 
 def cdiv(a, b):
     return (a + b - 1) // b
 
 
-def i64(e):
-    return txl.Cast("int64", e)
+def round_up(a, b):
+    return cdiv(a, b) * b
 
 
-def vec_width(C):
-    for v in (8, 4, 2, 1):
-        if C % v == 0:
-            return v
+def as_int64(value):
+    return txl.Cast("int64", value)
+
+
+def vector_width(C):
+    """
+    Widest bf16 vector (8, 4, 2 or 1 elements) that divides C.
+    """
+    for width in (8, 4, 2, 1):
+        if C % width == 0:
+            return width
     return 1
 
 
-# ------------------------------------------------------------------------------------------
-# shared helpers
-# ------------------------------------------------------------------------------------------
+# Building blocks shared by the kernels.
 
 
-def load_w_f32(dst, w, idx, wdt, valid):
+def load_w_f32(dst, w, idx, w_dtype, valid):
     """
     dst = float32(w[idx]) if valid else 0.
     """
     txl.assign(dst, txl.float32(0.0))
     with txl.if_(valid), txl.then_():
-        if wdt == "float32":
+        if w_dtype == "float32":
             txl.ptx.ld.global_.f32(dst, w.ptr_to([idx]))
         else:
-            h = txl.local_scalar("uint16")
-            txl.ptx.ld.global_.b16(h, w.ptr_to([idx]))
-            if wdt == "bfloat16":
-                txl.ptx.cvt.f32.bf16(dst, h)
+            w_bits = txl.local_scalar("uint16")
+            txl.ptx.ld.global_.b16(w_bits, w.ptr_to([idx]))
+            if w_dtype == "bfloat16":
+                txl.ptx.cvt.f32.bf16(dst, w_bits)
             else:
-                txl.ptx.cvt.f32.f16(dst, h)
+                txl.ptx.cvt.f32.f16(dst, w_bits)
 
 
 def load_w_bf16(dst, w, idx, valid):
+    """
+    dst = the bf16 bits of w[idx] if valid else 0.
+    """
     txl.assign(dst, txl.uint16(0))
     with txl.if_(valid), txl.then_():
         txl.ptx.ld.global_.b16(dst, w.ptr_to([idx]))
 
 
-def ld_s_bf16(dst, sptr):
-    h = txl.local_scalar("uint16")
-    txl.ptx["ld.shared.b16"](h, sptr)
-    txl.ptx.cvt.f32.bf16(dst, h)
+def load_shared_bf16(dst, s_ptr):
+    """
+    dst = float32 of the bf16 at s_ptr in shared memory.
+    """
+    bits = txl.local_scalar("uint16")
+    txl.ptx["ld.shared.b16"](bits, s_ptr)
+    txl.ptx.cvt.f32.bf16(dst, bits)
 
 
-def cvta(ptr):
+def shared_addr(ptr):
     return txl.cuda.cvta_generic_to_shared(ptr)
 
 
-def tmap_ptr(m):
-    return txl.reinterpret(txl.address_of(m), ty=txl.handle().ty)
+def tensor_map_ptr(tensor_map):
+    return txl.reinterpret(txl.address_of(tensor_map), ty=txl.handle().ty)
 
 
-def load_policy():
-    pol = txl.local_scalar("uint64")
-    txl.ptx.createpolicy.fractional.L2__evict_last.b64(pol, txl.float32(1.0))
-    return pol
+def evict_last_policy():
+    policy = txl.local_scalar("uint64")
+    txl.ptx.createpolicy.fractional.L2__evict_last.b64(policy, txl.float32(1.0))
+    return policy
 
 
-def tma_load(dst, tmap, c0, c1, c2, mbar, pol):
+def tma_load(dst, tensor_map, coord0, coord1, coord2, mbar, policy):
     name = "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
-    txl.ptx[name + ".L2::cache_hint"](dst, tmap, c0, c1, c2, mbar, pol)
+    txl.ptx[name + ".L2::cache_hint"](dst, tensor_map, coord0, coord1, coord2, mbar, policy)
 
 
-def tma_store(tmap, c0, c1, c2, src):
-    txl.ptx["cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"](tmap, c0, c1, c2, src)
+def tma_store(tensor_map, coord0, coord1, coord2, src):
+    txl.ptx["cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"](tensor_map, coord0, coord1, coord2, src)
 
 
-def bar_named(i, n):
-    txl.ptx.bar.sync(txl.uint32(i), txl.uint32(n))
+def named_barrier(barrier_idx, num_threads):
+    txl.ptx.bar.sync(txl.uint32(barrier_idx), txl.uint32(num_threads))
 
 
-def taps_fwd(out, wk, xv, K):
+def compute_y_taps(out, w_taps, x_vals, K):
+    """
+    out[j] = sum over k in order of w_taps[k] * x_vals[j + k], fp32 fma from 0.
+    """
     acc = txl.local_scalar("float32")
-    for j in range(TG):
+    for j in range(TOKENS_PER_THREAD):
         txl.assign(acc, txl.float32(0.0))
         for k in range(K):
-            txl.ptx.fma.rn.f32(acc, wk[k], xv[j + k], acc)
+            txl.ptx.fma.rn.f32(acc, w_taps[k], x_vals[j + k], acc)
         txl.assign(out[j], acc)
 
 
-def taps_dx(out, wk, gv, K):
+def compute_dx_taps(out, w_taps, g_vals, K):
+    """
+    out[i] = sum over k in order of w_taps[k] * g_vals[i + K - 1 - k], fp32 fma from 0.
+    """
     acc = txl.local_scalar("float32")
-    for i in range(TG):
+    for i in range(TOKENS_PER_THREAD):
         txl.assign(acc, txl.float32(0.0))
         for k in range(K):
-            txl.ptx.fma.rn.f32(acc, wk[k], gv[i + K - 1 - k], acc)
+            txl.ptx.fma.rn.f32(acc, w_taps[k], g_vals[i + K - 1 - k], acc)
         txl.assign(out[i], acc)
 
 
-class Sub:
+class LocalWindow:
     """
-    pw[base + k] window of a local array.
+    array[start + k] window of a local array.
     """
 
-    def __init__(self, a, base):
-        self.a, self.base = a, base
+    def __init__(self, array, start):
+        self.array, self.start = array, start
 
     def __getitem__(self, k):
-        return self.a[self.base + k]
+        return self.array[self.start + k]
 
 
-def partial_dw(pw, gv, xv, K, i0=0, n=TG):
+def compute_dw_partials(dw_part, g_vals, x_vals, K, token_start, num_tokens):
+    """
+    dw_part[k] = sum over the tokens in order of g_vals[i] * x_vals[i + k], fp32 fma from 0.
+    """
     for k in range(K):
-        txl.assign(pw[k], txl.float32(0.0))
-        for i in range(i0, i0 + n):
-            txl.ptx.fma.rn.f32(pw[k], gv[i], xv[i + k], pw[k])
+        txl.assign(dw_part[k], txl.float32(0.0))
+        for i in range(token_start, token_start + num_tokens):
+            txl.ptx.fma.rn.f32(dw_part[k], g_vals[i], x_vals[i + k], dw_part[k])
 
 
-def taps_dx_mixed(out, wk, gv, K):
+def compute_dx_taps_bf16(out, w_taps, g_vals, K):
+    """
+    compute_dx_taps on bf16 w and g bits with fma.rn.f32.bf16.
+    """
     acc = txl.local_scalar("float32")
-    for i in range(TG):
+    for i in range(TOKENS_PER_THREAD):
         txl.assign(acc, txl.float32(0.0))
         for k in range(K):
-            txl.ptx["fma.rn.f32.bf16"](acc, wk[k], gv[i + K - 1 - k], acc)
+            txl.ptx["fma.rn.f32.bf16"](acc, w_taps[k], g_vals[i + K - 1 - k], acc)
         txl.assign(out[i], acc)
 
 
-def partial_dw_mixed(pw, gv, xv, K, i0=0, n=TG):
+def compute_dw_partials_bf16(dw_part, g_vals, x_vals, K, token_start, num_tokens):
+    """
+    compute_dw_partials on bf16 g and x bits with fma.rn.f32.bf16.
+    """
     for k in range(K):
-        txl.assign(pw[k], txl.float32(0.0))
-        for i in range(i0, i0 + n):
-            txl.ptx["fma.rn.f32.bf16"](pw[k], gv[i], xv[i + k], pw[k])
+        txl.assign(dw_part[k], txl.float32(0.0))
+        for i in range(token_start, token_start + num_tokens):
+            txl.ptx["fma.rn.f32.bf16"](dw_part[k], g_vals[i], x_vals[i + k], dw_part[k])
 
 
-# packed (f32x2) helpers: one thread owns channels (c, c + 1), lanes .x / .y
+# Packed (f32x2) building blocks: one thread owns channels (ch, ch + 1), elements .x / .y.
 
 
 def bf16x2_to_f32x2(word):
-    lo = txl.reinterpret(word << txl.uint32(16), ty='float32')
-    hi = txl.reinterpret(word & txl.uint32(0xFFFF0000), ty='float32')
+    lo = txl.reinterpret(word << txl.uint32(16), ty="float32")
+    hi = txl.reinterpret(word & txl.uint32(0xFFFF0000), ty="float32")
     return txl.cuda.make_float2(lo, hi)
 
 
-def f2(v, e):
-    return txl.cuda.float2_x(v) if e == 0 else txl.cuda.float2_y(v)
+def float2_elem(value, elem):
+    return txl.cuda.float2_x(value) if elem == 0 else txl.cuda.float2_y(value)
 
 
-def load_w_pair(wk, wf, w, c, C, K, wdt):
+def load_w_pair(w_taps, w_pair, w, ch, C, K, w_dtype):
+    """
+    w_taps[k] = float2(w[ch][k], w[ch + 1][k]), channels past C read as zero.
+    """
     for k in range(K):
-        for e in range(2):
-            load_w_f32(wf[e], w, (c + e) * K + k, wdt, c + e < C)
-        txl.assign(wk[k], txl.cuda.make_float2(wf[0], wf[1]))
+        for elem in range(2):
+            load_w_f32(w_pair[elem], w, (ch + elem) * K + k, w_dtype, ch + elem < C)
+        txl.assign(w_taps[k], txl.cuda.make_float2(w_pair[0], w_pair[1]))
 
 
-def taps2(out, wk, v, K, rev):
+def compute_taps_packed(out, w_taps, vals, K, reverse):
     """
-    out[i] = sum over k in order of wk[k] * v[i + k] (rev: v[i + K - 1 - k]), fp32 fma from 0.
+    out[i] = sum over k in order of w_taps[k] * vals[i + k] (reverse: vals[i + K - 1 - k]), fp32 fma
+    from 0.
     """
-    for i in range(TG2):
+    for i in range(PACKED_TOKENS_PER_THREAD):
         txl.assign(out[i], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
         for k in range(K):
-            txl.ptx["fma.rn.f32x2"](out[i], wk[k], v[i + (K - 1 - k if rev else k)], out[i])
+            txl.ptx["fma.rn.f32x2"](out[i], w_taps[k], vals[i + (K - 1 - k if reverse else k)], out[i])
 
 
-def release(empty, stage, lane):
+def release_stage(s_empty, stage, lane):
     """
     Consumer release of a ring stage: one arrival per thread, or one per warp after warp_sync.
     """
-    if WARP_ARRIVE:
+    if USE_WARP_ARRIVE:
         txl.cuda.warp_sync()
         with txl.if_(lane == 0), txl.then_():
-            txl.ptx["mbarrier.arrive.shared.b64"](cvta(empty.ptr_to([stage])), txl.uint32(1))
+            txl.ptx["mbarrier.arrive.shared.b64"](shared_addr(s_empty.ptr_to([stage])), txl.uint32(1))
     else:
-        txl.ptx["mbarrier.arrive.shared.b64"](cvta(empty.ptr_to([stage])), txl.uint32(1))
+        txl.ptx["mbarrier.arrive.shared.b64"](shared_addr(s_empty.ptr_to([stage])), txl.uint32(1))
 
 
-def shfl_idx_u32(dst, src, source_lane):
-    txl.ptx.shfl_sync.idx.b32(
-        dst, src, txl.Cast("uint32", source_lane), txl.uint32(0x1F), txl.uint32(0xFFFFFFFF)
-    )
+def shuffle_idx_u32(dst, src, src_lane):
+    txl.ptx.shfl_sync.idx.b32(dst, src, txl.Cast("uint32", src_lane), txl.uint32(0x1F), txl.uint32(0xFFFFFFFF))
 
 
-def partial_dw2(pw, gv, xv, K):
+def compute_dw_partials_packed(dw_part, g_vals, x_vals, K):
+    """
+    compute_dw_partials over the packed thread's PACKED_TOKENS_PER_THREAD tokens, f32x2.
+    """
     for k in range(K):
-        txl.assign(pw[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
-        for i in range(TG2):
-            txl.ptx["fma.rn.f32x2"](pw[k], gv[i], xv[i + k], pw[k])
-
-
-# ------------------------------------------------------------------------------------------
-# TMA forward
-# ------------------------------------------------------------------------------------------
+        txl.assign(dw_part[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
+        for i in range(PACKED_TOKENS_PER_THREAD):
+            txl.ptx["fma.rn.f32x2"](dw_part[k], g_vals[i], x_vals[i + k], dw_part[k])
 
 
 @functools.cache
-def fwd_tma(C, K, wdt, shuffle_store):
-    FT = 256
-    R = FT + K - 1
-    NCB = cdiv(C, CB)
+def build_fwd_tma(C, K, w_dtype, shuffle_store):
+    """
+    TMA forward: 256-token tiles of a TILE_CHANNELS slice, y stored channels-first.
+    """
+    FWD_TILE_TOKENS = 256
+    STAGE_ROWS = FWD_TILE_TOKENS + K - 1
+    NUM_CH_TILES = cdiv(C, TILE_CHANNELS)
     # Two 259x64 input stages plus the 32 KiB output ring fit two CTAs per SM.
-    NS = 2
-    XBYTES = R * CB * 2
-    G = NUM_SMS * CTAS_PER_SM
+    NUM_STAGES = 2
+    X_STAGE_BYTES = STAGE_ROWS * TILE_CHANNELS * 2
+    NUM_CTAS = NUM_SMS * CTAS_PER_SM
 
-    def host_prelude(p):
-        xmh = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            xmh, "bfloat16", 3, txl.handle_add_byte_offset(p["x"].data, 0),
-            C, p["L"], p["B"],
-            C * 2, i64(p["L"]) * (C * 2),
-            CB, FT, 1,
-            1, 1, 1,
-            0, 0, 3, 0,
-        )
-        xmt = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            xmt, "bfloat16", 3, txl.handle_add_byte_offset(p["x"].data, 0),
-            C, p["L"], p["B"],
-            C * 2, i64(p["L"]) * (C * 2),
-            CB, K - 1, 1,
-            1, 1, 1,
-            0, 0, 3, 0,
-        )
-        ym = txl.stack_alloca("tensormap", 1)
-        txl.cu_tensor_map_encode_tiled(
-            ym, "bfloat16", 3, txl.handle_add_byte_offset(p["y"].data, 0),
-            p["S"], C, p["B"],
-            i64(p["S"]) * 2, i64(p["S"]) * (C * 2),
-            64, CB, 1,
-            1, 1, 1,
-            0, 3, 3, 0,
-        )
-        return (xmh, xmt, ym)
+    def encode_tensor_maps(args):
+        x_head_map = txl.stack_alloca("tensormap", 1)
+        txl.cu_tensor_map_encode_tiled(x_head_map, "bfloat16", 3, txl.handle_add_byte_offset(args["x"].data, 0), C, args["L"], args["B"], C * 2, as_int64(args["L"]) * (C * 2), TILE_CHANNELS, FWD_TILE_TOKENS, 1, 1, 1, 1, 0, 0, 3, 0)
+        x_halo_map = txl.stack_alloca("tensormap", 1)
+        txl.cu_tensor_map_encode_tiled(x_halo_map, "bfloat16", 3, txl.handle_add_byte_offset(args["x"].data, 0), C, args["L"], args["B"], C * 2, as_int64(args["L"]) * (C * 2), TILE_CHANNELS, K - 1, 1, 1, 1, 1, 0, 0, 3, 0)
+        y_map = txl.stack_alloca("tensormap", 1)
+        txl.cu_tensor_map_encode_tiled(y_map, "bfloat16", 3, txl.handle_add_byte_offset(args["y"].data, 0), args["S"], C, args["B"], as_int64(args["S"]) * 2, as_int64(args["S"]) * (C * 2), 64, TILE_CHANNELS, 1, 1, 1, 1, 0, 3, 3, 0)
+        return (x_head_map, x_halo_map, y_map)
 
     @txl.kernel()
-    def conv_fwd_tma(
-        x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
-        w: txl.Tensor((txl.int64(),), wdt, data_alignment=1),
-        y: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
-        L: txl.int32,
-        S: txl.int32,
-        offset: txl.int32,
-        B: txl.int32,
-    ):
-        host = host_prelude(dict(x=x, y=y, L=L, S=S, B=B))
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=(NCW + 1) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=CTAS_PER_SM))
-        xmh, xmt, ym = host
-        cta = txl.cta_id()
-        tid = txl.thread_id()
+    def conv_fwd_tma(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), w_dtype, data_alignment=1), y: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
+        tensor_maps = encode_tensor_maps(dict(x=x, y=y, L=L, S=S, B=B))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_CTAS, block=(NUM_COMPUTE_WARPS + 1) * 32), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=CTAS_PER_SM))
+        x_head_map, x_halo_map, y_map = tensor_maps
+        cta_idx = txl.cta_id()
+        tidx = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
-        nbt = (S + FT - 1) // FT
-        ntiles = nbt * NCB * B
+        num_token_tiles = (S + FWD_TILE_TOKENS - 1) // FWD_TILE_TOKENS
+        num_tiles = num_token_tiles * NUM_CH_TILES * B
 
         smem = txl.smem_pool()
-        ys = smem.alloc([2 * 2 * CB * 64], "bfloat16", align=1024)
-        xs = smem.alloc([NS * R * CB], "bfloat16", align=128)
-        full = smem.alloc([NS], "uint64", align=8)
-        empty = smem.alloc([NS], "uint64", align=8)
+        s_y = smem.alloc([2 * 2 * TILE_CHANNELS * 64], "bfloat16", align=1024)
+        s_x = smem.alloc([NUM_STAGES * STAGE_ROWS * TILE_CHANNELS], "bfloat16", align=128)
+        s_full = smem.alloc([NUM_STAGES], "uint64", align=8)
+        s_empty = smem.alloc([NUM_STAGES], "uint64", align=8)
 
-        with txl.if_(tid == 0), txl.then_():
-            for s in range(NS):
-                txl.ptx["mbarrier.init.shared.b64"](cvta(full.ptr_to([s])), txl.uint32(1))
-                txl.ptx["mbarrier.init.shared.b64"](cvta(empty.ptr_to([s])), txl.uint32(EMPTY_COUNT))
+        with txl.if_(tidx == 0), txl.then_():
+            for stage_idx in range(NUM_STAGES):
+                txl.ptx["mbarrier.init.shared.b64"](shared_addr(s_full.ptr_to([stage_idx])), txl.uint32(1))
+                txl.ptx["mbarrier.init.shared.b64"](shared_addr(s_empty.ptr_to([stage_idx])), txl.uint32(EMPTY_ARRIVALS))
             txl.ptx["fence.mbarrier_init.release.cluster"]()
             txl.ptx["fence.proxy.async.shared::cta"]()
-        bar_named(0, (NCW + 1) * 32)
+        named_barrier(0, (NUM_COMPUTE_WARPS + 1) * 32)
 
         stage = txl.local_scalar("int32", init=txl.int32(0))
         phase = txl.local_scalar("int32", init=txl.int32(0))
-        tile = txl.local_scalar("int32", init=cta)
+        tile_idx = txl.local_scalar("int32", init=cta_idx)
 
-        def advance():
+        def advance_tile():
             txl.assign(stage, stage + 1)
-            with txl.if_(stage == NS), txl.then_():
+            with txl.if_(stage == NUM_STAGES), txl.then_():
                 txl.assign(stage, txl.int32(0))
                 txl.assign(phase, phase ^ 1)
-            txl.assign(tile, tile + G)
+            txl.assign(tile_idx, tile_idx + NUM_CTAS)
 
-        def decode(tl):
+        def decode_tile(tile):
             # Token tile fastest: adjacent CTAs write adjacent token ranges of
             # the same channels-first output rows.
-            bt = tl % nbt
-            rest = tl // nbt
-            return rest % NCB, bt, rest // NCB
+            token_tile_idx = tile % num_token_tiles
+            rest = tile // num_token_tiles
+            return rest % NUM_CH_TILES, token_tile_idx, rest // NUM_CH_TILES
 
-        with txl.if_(warp == NCW):
-            with txl.then_():
-                with txl.if_(lane == 0), txl.then_():
-                    txl.ptx.prefetch.tensormap(txl.address_of(xmh))
-                    txl.ptx.prefetch.tensormap(txl.address_of(xmt))
-                    txl.ptx.prefetch.tensormap(txl.address_of(ym))
-                    lpol = load_policy()
-                    with txl.while_(tile < ntiles):
-                        cb, bt, bb = decode(tile)
-                        txl.cuda.mbarrier_wait(empty.ptr_to([stage]), phase ^ 1)
-                        # order the compute warps' generic reads of this stage before the TMA rewrite
-                        txl.ptx["fence.proxy.async.shared::cta"]()
-                        txl.ptx["mbarrier.arrive.expect_tx.shared.b64"](
-                            cvta(full.ptr_to([stage])), txl.uint32(XBYTES)
-                        )
-                        xrow = bt * FT + offset - (K - 1)
-                        fb = cvta(full.ptr_to([stage]))
-                        tma_load(cvta(xs.ptr_to([stage * (R * CB)])), tmap_ptr(xmh),
-                                  cb * CB, xrow, bb, fb, lpol)
-                        tma_load(cvta(xs.ptr_to([stage * (R * CB) + FT * CB])), tmap_ptr(xmt),
-                                  cb * CB, xrow + FT, bb, fb, lpol)
-                        advance()
-            with txl.else_():
-                # lane = channel pair (2 * lane, 2 * lane + 1), warp = token group of TG2 tokens
-                c2 = 2 * lane
-                tg = warp
-                wk = txl.alloc_local([K], "uint64")
-                wf = txl.alloc_local([2], "float32")
-                xv = txl.alloc_local([TG2 + K - 1], "uint64")
-                out = txl.alloc_local([TG2], "uint64")
-                xw = txl.local_scalar("uint32")
-                if shuffle_store:
-                    pka = txl.alloc_local([4], "uint32")
-                    pkb = txl.alloc_local([4], "uint32")
-                    sp = txl.alloc_local([4], "uint32")
-                    sa = txl.local_scalar("uint32")
-                    sb = txl.local_scalar("uint32")
+        def load_loop():
+            with txl.if_(lane == 0), txl.then_():
+                txl.ptx.prefetch.tensormap(txl.address_of(x_head_map))
+                txl.ptx.prefetch.tensormap(txl.address_of(x_halo_map))
+                txl.ptx.prefetch.tensormap(txl.address_of(y_map))
+                policy = evict_last_policy()
+                with txl.while_(tile_idx < num_tiles):
+                    ch_tile_idx, token_tile_idx, batch_idx = decode_tile(tile_idx)
+                    txl.cuda.mbarrier_wait(s_empty.ptr_to([stage]), phase ^ 1)
+                    # order the compute warps' generic reads of this stage before the TMA rewrite
+                    txl.ptx["fence.proxy.async.shared::cta"]()
+                    txl.ptx["mbarrier.arrive.expect_tx.shared.b64"](shared_addr(s_full.ptr_to([stage])), txl.uint32(X_STAGE_BYTES))
+                    x_row = token_tile_idx * FWD_TILE_TOKENS + offset - (K - 1)
+                    full_addr = shared_addr(s_full.ptr_to([stage]))
+                    tma_load(shared_addr(s_x.ptr_to([stage * (STAGE_ROWS * TILE_CHANNELS)])), tensor_map_ptr(x_head_map), ch_tile_idx * TILE_CHANNELS, x_row, batch_idx, full_addr, policy)
+                    tma_load(shared_addr(s_x.ptr_to([stage * (STAGE_ROWS * TILE_CHANNELS) + FWD_TILE_TOKENS * TILE_CHANNELS])), tensor_map_ptr(x_halo_map), ch_tile_idx * TILE_CHANNELS, x_row + FWD_TILE_TOKENS, batch_idx, full_addr, policy)
+                    advance_tile()
+
+        def compute_loop():
+            # lane = channel pair (2 * lane, 2 * lane + 1), warp = token group of PACKED_TOKENS_PER_THREAD tokens
+            pair_ch = 2 * lane
+            token_group = warp
+            w_taps = txl.alloc_local([K], "uint64")
+            w_pair = txl.alloc_local([2], "float32")
+            x_vals = txl.alloc_local([PACKED_TOKENS_PER_THREAD + K - 1], "uint64")
+            out = txl.alloc_local([PACKED_TOKENS_PER_THREAD], "uint64")
+            x_word = txl.local_scalar("uint32")
+            if shuffle_store:
+                packed_ch0 = txl.alloc_local([4], "uint32")
+                packed_ch1 = txl.alloc_local([4], "uint32")
+                shuffled = txl.alloc_local([4], "uint32")
+                from_ch0 = txl.local_scalar("uint32")
+                from_ch1 = txl.local_scalar("uint32")
+            else:
+                packed = txl.alloc_local([4], "uint32")
+            if shuffle_store:
+                shuffled_all = txl.alloc_local([16], "uint32")
+            else:
+                packed_all = txl.alloc_local([16], "uint32")
+            use_bf16_fma = USE_BF16_FMA_FWD and w_dtype == "bfloat16"
+            if use_bf16_fma:
+                w_taps_bf16 = [txl.alloc_local([K], "uint16") for _ in range(2)]
+                x_halves = [txl.alloc_local([PACKED_TOKENS_PER_THREAD + K - 1], "uint16") for _ in range(2)]
+                acc_ch0 = txl.local_scalar("float32")
+                acc_ch1 = txl.local_scalar("float32")
+            tile_count = txl.local_scalar("int32", init=txl.int32(0))
+
+            def load_weights(ch_tile_idx):
+                if use_bf16_fma:
+                    for elem in range(2):
+                        for k in range(K):
+                            load_w_bf16(w_taps_bf16[elem][k], w, (ch_tile_idx * TILE_CHANNELS + pair_ch + elem) * K + k, ch_tile_idx * TILE_CHANNELS + pair_ch + elem < C)
                 else:
-                    pk = txl.alloc_local([4], "uint32")
-                if shuffle_store:
-                    spa = txl.alloc_local([16], "uint32")
-                else:
-                    pka2 = txl.alloc_local([16], "uint32")
-                fwm = FWM and wdt == "bfloat16"
-                if fwm:
-                    wkb = [txl.alloc_local([K], "uint16") for _ in range(2)]
-                    xh = [txl.alloc_local([TG2 + K - 1], "uint16") for _ in range(2)]
-                    oa = txl.local_scalar("float32")
-                    ob = txl.local_scalar("float32")
-                it = txl.local_scalar("int32", init=txl.int32(0))
-                with txl.while_(tile < ntiles):
-                    cb, bt, bb = decode(tile)
-                    if fwm:
-                        for e in range(2):
-                            for k in range(K):
-                                load_w_bf16(wkb[e][k], w, (cb * CB + c2 + e) * K + k, cb * CB + c2 + e < C)
+                    load_w_pair(w_taps, w_pair, w, ch_tile_idx * TILE_CHANNELS + pair_ch, C, K, w_dtype)
+
+            def load_x_rows(x_stage_base):
+                for j in range(PACKED_TOKENS_PER_THREAD + K - 1):
+                    txl.ptx["ld.shared.b32"](x_word, s_x.ptr_to([x_stage_base + (token_group * PACKED_TOKENS_PER_THREAD + j) * TILE_CHANNELS + pair_ch]))
+                    if use_bf16_fma:
+                        txl.assign(x_halves[0][j], txl.Cast("uint16", x_word))
+                        txl.assign(x_halves[1][j], txl.Cast("uint16", x_word >> txl.uint32(16)))
                     else:
-                        load_w_pair(wk, wf, w, cb * CB + c2, C, K, wdt)
-                    txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
-                    for ft in range(2):
-                        base = stage * (R * CB) + ft * T * CB
-                        for j in range(TG2 + K - 1):
-                            txl.ptx["ld.shared.b32"](xw, xs.ptr_to([base + (tg * TG2 + j) * CB + c2]))
-                            if fwm:
-                                txl.assign(xh[0][j], txl.Cast("uint16", xw))
-                                txl.assign(xh[1][j], txl.Cast("uint16", xw >> txl.uint32(16)))
-                            else:
-                                txl.assign(xv[j], bf16x2_to_f32x2(xw))
-                        if ft == 1:
-                            release(empty, stage, lane)
-                        if fwm:
-                            for i in range(TG2):
-                                txl.assign(oa, txl.float32(0.0))
-                                txl.assign(ob, txl.float32(0.0))
-                                for k in range(K):
-                                    txl.ptx["fma.rn.f32.bf16"](oa, wkb[0][k], xh[0][i + k], oa)
-                                    txl.ptx["fma.rn.f32.bf16"](ob, wkb[1][k], xh[1][i + k], ob)
-                                txl.assign(out[i], txl.cuda.make_float2(oa, ob))
-                        else:
-                            taps2(out, wk, xv, K, False)
-                        b = it % 2
-                        h = tg // 4
-                        with txl.if_(tid == 0), txl.then_():
-                            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(1))
-                        if FWO:
-                            # convert (and shuffle) while thread 0 waits for the old bulk store to drain
-                            if shuffle_store:
-                                for qq in range(TG2 // 8):
-                                    for p in range(4):
-                                        txl.ptx["cvt.rn.bf16x2.f32"](
-                                            pka[p], f2(out[qq * 8 + 2 * p + 1], 0), f2(out[qq * 8 + 2 * p], 0)
-                                        )
-                                        txl.ptx["cvt.rn.bf16x2.f32"](
-                                            pkb[p], f2(out[qq * 8 + 2 * p + 1], 1), f2(out[qq * 8 + 2 * p], 1)
-                                        )
-                                    for cg in range(2):
-                                        src_l = cg * 16 + (lane >> 1)
-                                        for p in range(4):
-                                            shfl_idx_u32(sa, pka[p], src_l)
-                                            shfl_idx_u32(sb, pkb[p], src_l)
-                                            txl.assign(spa[(qq * 2 + cg) * 4 + p], txl.Select((lane & 1) == 0, sa, sb))
-                                bar_named(1, NC)
-                                for qq in range(TG2 // 8):
-                                    for cg in range(2):
-                                        ch = cg * 32 + lane
-                                        q = (tg % 4) * (TG2 // 8) + qq
-                                        off = ((b * 2 + h) * CB + ch) * 64 + ((q ^ (ch % 8)) * 8)
-                                        o4 = (qq * 2 + cg) * 4
-                                        txl.ptx["st.shared.v4.b32"](ys.ptr_to([off]), spa[o4], spa[o4 + 1], spa[o4 + 2], spa[o4 + 3])
-                            else:
-                                for e in range(2):
-                                    for qq in range(TG2 // 8):
-                                        for p in range(4):
-                                            txl.ptx["cvt.rn.bf16x2.f32"](
-                                                pka2[(e * 2 + qq) * 4 + p], f2(out[qq * 8 + 2 * p + 1], e), f2(out[qq * 8 + 2 * p], e)
-                                            )
-                                bar_named(1, NC)
-                                for e in range(2):
-                                    ch = c2 + e
-                                    for qq in range(TG2 // 8):
-                                        q = (tg % 4) * (TG2 // 8) + qq
-                                        off = ((b * 2 + h) * CB + ch) * 64 + ((q ^ (ch % 8)) * 8)
-                                        o4 = (e * 2 + qq) * 4
-                                        txl.ptx["st.shared.v4.b32"](ys.ptr_to([off]), pka2[o4], pka2[o4 + 1], pka2[o4 + 2], pka2[o4 + 3])
-                        else:
-                            bar_named(1, NC)
-                            # token chunk q (8 tokens) of half h: physical chunk q ^ (ch % 8) (128B swizzle)
-                            if shuffle_store:
-                                for qq in range(TG2 // 8):
-                                    for p in range(4):
-                                        txl.ptx["cvt.rn.bf16x2.f32"](
-                                            pka[p], f2(out[qq * 8 + 2 * p + 1], 0), f2(out[qq * 8 + 2 * p], 0)
-                                        )
-                                        txl.ptx["cvt.rn.bf16x2.f32"](
-                                            pkb[p], f2(out[qq * 8 + 2 * p + 1], 1), f2(out[qq * 8 + 2 * p], 1)
-                                        )
-                                    for cg in range(2):
-                                        src = cg * 16 + (lane >> 1)
-                                        for p in range(4):
-                                            shfl_idx_u32(sa, pka[p], src)
-                                            shfl_idx_u32(sb, pkb[p], src)
-                                            txl.assign(sp[p], txl.Select((lane & 1) == 0, sa, sb))
-                                        ch = cg * 32 + lane
-                                        q = (tg % 4) * (TG2 // 8) + qq
-                                        off = ((b * 2 + h) * CB + ch) * 64 + ((q ^ (ch % 8)) * 8)
-                                        txl.ptx["st.shared.v4.b32"](ys.ptr_to([off]), sp[0], sp[1], sp[2], sp[3])
-                            else:
-                                for e in range(2):
-                                    ch = c2 + e
-                                    for qq in range(TG2 // 8):
-                                        q = (tg % 4) * (TG2 // 8) + qq
-                                        for p in range(4):
-                                            txl.ptx["cvt.rn.bf16x2.f32"](
-                                                pk[p], f2(out[qq * 8 + 2 * p + 1], e), f2(out[qq * 8 + 2 * p], e)
-                                            )
-                                        off = ((b * 2 + h) * CB + ch) * 64 + ((q ^ (ch % 8)) * 8)
-                                        txl.ptx["st.shared.v4.b32"](ys.ptr_to([off]), pk[0], pk[1], pk[2], pk[3])
-                        txl.ptx["fence.proxy.async.shared::cta"]()
-                        bar_named(1, NC)
-                        with txl.if_(tid == 0), txl.then_():
-                            for hh in range(2):
-                                tma_store(
-                                    tmap_ptr(ym), bt * FT + ft * T + hh * 64, cb * CB, bb,
-                                    cvta(ys.ptr_to([(b * 2 + hh) * CB * 64])),
-                                )
-                            txl.ptx["cp.async.bulk.commit_group"]()
-                        txl.assign(it, it + 1)
-                    advance()
-                with txl.if_(tid == 0), txl.then_():
-                    txl.ptx["cp.async.bulk.wait_group"](txl.int32(0))
+                        txl.assign(x_vals[j], bf16x2_to_f32x2(x_word))
+
+            def compute_y():
+                if use_bf16_fma:
+                    for i in range(PACKED_TOKENS_PER_THREAD):
+                        txl.assign(acc_ch0, txl.float32(0.0))
+                        txl.assign(acc_ch1, txl.float32(0.0))
+                        for k in range(K):
+                            txl.ptx["fma.rn.f32.bf16"](acc_ch0, w_taps_bf16[0][k], x_halves[0][i + k], acc_ch0)
+                            txl.ptx["fma.rn.f32.bf16"](acc_ch1, w_taps_bf16[1][k], x_halves[1][i + k], acc_ch1)
+                        txl.assign(out[i], txl.cuda.make_float2(acc_ch0, acc_ch1))
+                else:
+                    compute_taps_packed(out, w_taps, x_vals, K, False)
+
+            def stage_y(y_buf, token_half):
+                """
+                Convert out to bf16 and write it to staging buffer y_buf, token chunk chunk_idx (8
+                tokens) of half token_half at physical chunk chunk_idx ^ (ch % 8) (128B swizzle).
+                """
+                if CONVERT_BEFORE_STAGING:
+                    # convert (and shuffle) while thread 0 waits for the old bulk store to drain
+                    if shuffle_store:
+                        for chunk in range(PACKED_TOKENS_PER_THREAD // 8):
+                            for word in range(4):
+                                txl.ptx["cvt.rn.bf16x2.f32"](packed_ch0[word], float2_elem(out[chunk * 8 + 2 * word + 1], 0), float2_elem(out[chunk * 8 + 2 * word], 0))
+                                txl.ptx["cvt.rn.bf16x2.f32"](packed_ch1[word], float2_elem(out[chunk * 8 + 2 * word + 1], 1), float2_elem(out[chunk * 8 + 2 * word], 1))
+                            for ch_group in range(2):
+                                src_lane = ch_group * 16 + (lane >> 1)
+                                for word in range(4):
+                                    shuffle_idx_u32(from_ch0, packed_ch0[word], src_lane)
+                                    shuffle_idx_u32(from_ch1, packed_ch1[word], src_lane)
+                                    txl.assign(shuffled_all[(chunk * 2 + ch_group) * 4 + word], txl.Select((lane & 1) == 0, from_ch0, from_ch1))
+                        named_barrier(1, NUM_COMPUTE_THREADS)
+                        for chunk in range(PACKED_TOKENS_PER_THREAD // 8):
+                            for ch_group in range(2):
+                                ch = ch_group * 32 + lane
+                                chunk_idx = (token_group % 4) * (PACKED_TOKENS_PER_THREAD // 8) + chunk
+                                y_off = ((y_buf * 2 + token_half) * TILE_CHANNELS + ch) * 64 + ((chunk_idx ^ (ch % 8)) * 8)
+                                word_start = (chunk * 2 + ch_group) * 4
+                                txl.ptx["st.shared.v4.b32"](s_y.ptr_to([y_off]), shuffled_all[word_start], shuffled_all[word_start + 1], shuffled_all[word_start + 2], shuffled_all[word_start + 3])
+                    else:
+                        for elem in range(2):
+                            for chunk in range(PACKED_TOKENS_PER_THREAD // 8):
+                                for word in range(4):
+                                    txl.ptx["cvt.rn.bf16x2.f32"](packed_all[(elem * 2 + chunk) * 4 + word], float2_elem(out[chunk * 8 + 2 * word + 1], elem), float2_elem(out[chunk * 8 + 2 * word], elem))
+                        named_barrier(1, NUM_COMPUTE_THREADS)
+                        for elem in range(2):
+                            ch = pair_ch + elem
+                            for chunk in range(PACKED_TOKENS_PER_THREAD // 8):
+                                chunk_idx = (token_group % 4) * (PACKED_TOKENS_PER_THREAD // 8) + chunk
+                                y_off = ((y_buf * 2 + token_half) * TILE_CHANNELS + ch) * 64 + ((chunk_idx ^ (ch % 8)) * 8)
+                                word_start = (elem * 2 + chunk) * 4
+                                txl.ptx["st.shared.v4.b32"](s_y.ptr_to([y_off]), packed_all[word_start], packed_all[word_start + 1], packed_all[word_start + 2], packed_all[word_start + 3])
+                else:
+                    named_barrier(1, NUM_COMPUTE_THREADS)
+                    if shuffle_store:
+                        for chunk in range(PACKED_TOKENS_PER_THREAD // 8):
+                            for word in range(4):
+                                txl.ptx["cvt.rn.bf16x2.f32"](packed_ch0[word], float2_elem(out[chunk * 8 + 2 * word + 1], 0), float2_elem(out[chunk * 8 + 2 * word], 0))
+                                txl.ptx["cvt.rn.bf16x2.f32"](packed_ch1[word], float2_elem(out[chunk * 8 + 2 * word + 1], 1), float2_elem(out[chunk * 8 + 2 * word], 1))
+                            for ch_group in range(2):
+                                src_lane = ch_group * 16 + (lane >> 1)
+                                for word in range(4):
+                                    shuffle_idx_u32(from_ch0, packed_ch0[word], src_lane)
+                                    shuffle_idx_u32(from_ch1, packed_ch1[word], src_lane)
+                                    txl.assign(shuffled[word], txl.Select((lane & 1) == 0, from_ch0, from_ch1))
+                                ch = ch_group * 32 + lane
+                                chunk_idx = (token_group % 4) * (PACKED_TOKENS_PER_THREAD // 8) + chunk
+                                y_off = ((y_buf * 2 + token_half) * TILE_CHANNELS + ch) * 64 + ((chunk_idx ^ (ch % 8)) * 8)
+                                txl.ptx["st.shared.v4.b32"](s_y.ptr_to([y_off]), shuffled[0], shuffled[1], shuffled[2], shuffled[3])
+                    else:
+                        for elem in range(2):
+                            ch = pair_ch + elem
+                            for chunk in range(PACKED_TOKENS_PER_THREAD // 8):
+                                chunk_idx = (token_group % 4) * (PACKED_TOKENS_PER_THREAD // 8) + chunk
+                                for word in range(4):
+                                    txl.ptx["cvt.rn.bf16x2.f32"](packed[word], float2_elem(out[chunk * 8 + 2 * word + 1], elem), float2_elem(out[chunk * 8 + 2 * word], elem))
+                                y_off = ((y_buf * 2 + token_half) * TILE_CHANNELS + ch) * 64 + ((chunk_idx ^ (ch % 8)) * 8)
+                                txl.ptx["st.shared.v4.b32"](s_y.ptr_to([y_off]), packed[0], packed[1], packed[2], packed[3])
+
+            def store_y(sub_tile, y_buf, ch_tile_idx, token_tile_idx, batch_idx):
+                txl.ptx["fence.proxy.async.shared::cta"]()
+                named_barrier(1, NUM_COMPUTE_THREADS)
+                with txl.if_(tidx == 0), txl.then_():
+                    for store_half in range(2):
+                        tma_store(tensor_map_ptr(y_map), token_tile_idx * FWD_TILE_TOKENS + sub_tile * T + store_half * 64, ch_tile_idx * TILE_CHANNELS, batch_idx, shared_addr(s_y.ptr_to([(y_buf * 2 + store_half) * TILE_CHANNELS * 64])))
+                    txl.ptx["cp.async.bulk.commit_group"]()
+
+            with txl.while_(tile_idx < num_tiles):
+                ch_tile_idx, token_tile_idx, batch_idx = decode_tile(tile_idx)
+                load_weights(ch_tile_idx)
+                txl.cuda.mbarrier_wait(s_full.ptr_to([stage]), phase)
+                for sub_tile in range(2):
+                    x_stage_base = stage * (STAGE_ROWS * TILE_CHANNELS) + sub_tile * T * TILE_CHANNELS
+                    load_x_rows(x_stage_base)
+                    if sub_tile == 1:
+                        release_stage(s_empty, stage, lane)
+                    compute_y()
+                    y_buf = tile_count % 2
+                    token_half = token_group // 4
+                    with txl.if_(tidx == 0), txl.then_():
+                        txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(1))
+                    stage_y(y_buf, token_half)
+                    store_y(sub_tile, y_buf, ch_tile_idx, token_tile_idx, batch_idx)
+                    txl.assign(tile_count, tile_count + 1)
+                advance_tile()
+            with txl.if_(tidx == 0), txl.then_():
+                txl.ptx["cp.async.bulk.wait_group"](txl.int32(0))
+
+        with txl.if_(warp == PRODUCER_WARP):
+            with txl.then_():
+                load_loop()
+            with txl.else_():
+                compute_loop()
 
     return entry_function(conv_fwd_tma.compile(TARGET))
-
-
-# ------------------------------------------------------------------------------------------
-# TMA backward
-# ------------------------------------------------------------------------------------------
-
-
-KF = 2  # CTAs per backward cluster; also the dw rank order of every backward path
-
-
-def kfac(NCB):
-    return KF
 
 
 def cluster_sync():
@@ -541,811 +540,819 @@ def cluster_sync():
     txl.ptx.barrier.cluster.wait.acquire()
 
 
-def bwd_plan(C, cf):
+def plan_bwd_slices(C, channels_first):
     """
-    Channel slices of the TMA backward, one per KF-CTA cluster: NCL clusters, the first `extra`
-    (base + step) 8-channel units wide and the rest `base` units. For the timed C=8192 case, use
-    64/48-channel slices: both row widths are 32-byte-sector aligned, unlike the nearly even
-    56/48 split. Other valid channel counts retain the nearly even plan.
+    Channel slices of the TMA backward, one per CLUSTER_SIZE-CTA cluster: (num_clusters,
+    base_units, step_units, num_wide), the first num_wide clusters (base_units + step_units)
+    8-channel units wide and the rest base_units. For C=8192 the plan uses 64/48-channel slices:
+    both row widths are 32-byte-sector aligned, unlike the nearly even 56/48 split. Other valid
+    channel counts retain the nearly even plan.
     """
-    units = C // 8
+    num_units = C // 8
     # Contiguous g keeps fixed 64-channel blocks; only channels-first g uses the 296-CTA balanced
     # partition.
-    if C == 8192 and not cf:
+    if C == 8192 and not channels_first:
         return 128, 8, 1, 0
-    ncl = max(min(NUM_SMS * CTAS_PER_SM // KF, units), cdiv(units, CB // 8))
-    if C == 8192 and ncl == NUM_SMS:
-        return ncl, 6, 2, 68
+    num_clusters = max(min(NUM_SMS * CTAS_PER_SM // CLUSTER_SIZE, num_units), cdiv(num_units, TILE_CHANNELS // 8))
+    if C == 8192 and num_clusters == NUM_SMS:
+        return num_clusters, 6, 2, 68
     if C == 512:
         return 10, 6, 2, 2
-    base, extra = divmod(units, ncl)
-    return ncl, base, 1, extra
+    base_units, num_wide = divmod(num_units, num_clusters)
+    return num_clusters, base_units, 1, num_wide
 
 
-def rup(a, b):
-    return cdiv(a, b) * b
+class BwdContext:
+    """
+    What the TMA backward's compute loops share with the kernel entry: the shared-memory buffers
+    and ring barriers, the ring and row-tile counters, the CTA's channel slice and its thread
+    coordinates, and the entry's store_dx / advance_tile steps.
+    """
+
+    def __init__(self, s_g, s_x, s_dx, s_dw_groups, w, w_dtype, C, K, ch_start, num_ch, g_shift, tidx, warp, lane, s_full, s_empty, stage, phase, row_tile_idx, num_row_tiles, num_token_tiles, g_stage_size, x_stage_size, width_max, store_dx, advance_tile):
+        self.s_g, self.s_x, self.s_dx, self.s_dw_groups = s_g, s_x, s_dx, s_dw_groups
+        self.w, self.w_dtype, self.C, self.K = w, w_dtype, C, K
+        self.ch_start, self.num_ch, self.g_shift = ch_start, num_ch, g_shift
+        self.tidx, self.warp, self.lane = tidx, warp, lane
+        self.s_full, self.s_empty, self.stage, self.phase = s_full, s_empty, stage, phase
+        self.row_tile_idx, self.num_row_tiles, self.num_token_tiles = row_tile_idx, num_row_tiles, num_token_tiles
+        self.g_stage_size, self.x_stage_size, self.width_max = g_stage_size, x_stage_size, width_max
+        self.store_dx, self.advance_tile = store_dx, advance_tile
 
 
 @functools.cache
-def bwd_tma(C, K, wdt, cf):
-    R = T + K - 1
-    NCL, base, step, extra = bwd_plan(C, cf)
-    G = NCL * KF
-    WA, WB = (base + step) * 8, base * 8  # slice widths: clusters < extra, the others
-    WS = [WA, WB] if extra else [WB]
-    WMAX = WS[0]
-    NS = NS_BWD
-    GSZ = rup(WMAX * CF_P if cf else R * WMAX, 64)  # elements of one g stage (128B-aligned stride)
-    XSZ = rup(R * WMAX, 64)
-    assert 3 * TG + 48 <= CF_P and TG + K - 1 + 7 <= 48 and WMAX <= CB
+def build_bwd_tma(C, K, w_dtype, channels_first):
+    """
+    TMA backward: 2-CTA clusters over channel slices, dx stored with TMA, dw summed in order.
+    """
+    STAGE_ROWS = T + K - 1
+    NUM_CLUSTERS, base_units, step_units, num_wide = plan_bwd_slices(C, channels_first)
+    NUM_CTAS = NUM_CLUSTERS * CLUSTER_SIZE
+    WIDTH_WIDE, WIDTH_NARROW = (base_units + step_units) * 8, base_units * 8  # slice widths: clusters < num_wide, the others
+    WIDTHS = [WIDTH_WIDE, WIDTH_NARROW] if num_wide else [WIDTH_NARROW]
+    WIDTH_MAX = WIDTHS[0]
+    NUM_STAGES = NUM_STAGES_BWD
+    G_STAGE_SIZE = round_up(WIDTH_MAX * CHANNELS_FIRST_PITCH if channels_first else STAGE_ROWS * WIDTH_MAX, 64)  # elements of one g stage (128B-aligned stride)
+    X_STAGE_SIZE = round_up(STAGE_ROWS * WIDTH_MAX, 64)
+    assert 3 * TOKENS_PER_THREAD + 48 <= CHANNELS_FIRST_PITCH and TOKENS_PER_THREAD + K - 1 + 7 <= 48 and WIDTH_MAX <= TILE_CHANNELS
 
-    def txbytes(W):
-        return ((W * CF_P if cf else R * W) + R * W) * 2
+    def stage_tx_bytes(width):
+        return ((width * CHANNELS_FIRST_PITCH if channels_first else STAGE_ROWS * width) + STAGE_ROWS * width) * 2
 
-    def host_prelude(p):
-        maps = []
-        for W in WS:
-            gm = txl.stack_alloca("tensormap", 1)
-            if cf:
-                txl.cu_tensor_map_encode_tiled(
-                    gm, "bfloat16", 3, txl.handle_add_byte_offset(p["g"].data, 0),
-                    p["S"], C, p["B"],
-                    i64(p["S"]) * 2, i64(p["S"]) * (C * 2),
-                    CF_P, W, 1,
-                    1, 1, 1,
-                    0, 0, 3, 0,
-                )
+    def encode_tensor_maps(args):
+        tensor_maps = []
+        for width in WIDTHS:
+            g_map = txl.stack_alloca("tensormap", 1)
+            if channels_first:
+                txl.cu_tensor_map_encode_tiled(g_map, "bfloat16", 3, txl.handle_add_byte_offset(args["g"].data, 0), args["S"], C, args["B"], as_int64(args["S"]) * 2, as_int64(args["S"]) * (C * 2), CHANNELS_FIRST_PITCH, width, 1, 1, 1, 1, 0, 0, 3, 0)
             else:
-                txl.cu_tensor_map_encode_tiled(
-                    gm, "bfloat16", 3, txl.handle_add_byte_offset(p["g"].data, 0),
-                    C, p["S"], p["B"],
-                    C * 2, i64(p["S"]) * (C * 2),
-                    W, R, 1,
-                    1, 1, 1,
-                    0, 0, 3, 0,
-                )
-            xm = txl.stack_alloca("tensormap", 1)
-            txl.cu_tensor_map_encode_tiled(
-                xm, "bfloat16", 3, txl.handle_add_byte_offset(p["x"].data, 0),
-                C, p["L"], p["B"],
-                C * 2, i64(p["L"]) * (C * 2),
-                W, R, 1,
-                1, 1, 1,
-                0, 0, 3, 0,
-            )
-            dm = txl.stack_alloca("tensormap", 1)
-            txl.cu_tensor_map_encode_tiled(
-                dm, "bfloat16", 3, txl.handle_add_byte_offset(p["dx"].data, 0),
-                C, p["L"], p["B"],
-                C * 2, i64(p["L"]) * (C * 2),
-                W, T, 1,
-                1, 1, 1,
-                0, 0, 3, 0,
-            )
-            maps += [gm, xm, dm]
-        return tuple(maps)
+                txl.cu_tensor_map_encode_tiled(g_map, "bfloat16", 3, txl.handle_add_byte_offset(args["g"].data, 0), C, args["S"], args["B"], C * 2, as_int64(args["S"]) * (C * 2), width, STAGE_ROWS, 1, 1, 1, 1, 0, 0, 3, 0)
+            x_map = txl.stack_alloca("tensormap", 1)
+            txl.cu_tensor_map_encode_tiled(x_map, "bfloat16", 3, txl.handle_add_byte_offset(args["x"].data, 0), C, args["L"], args["B"], C * 2, as_int64(args["L"]) * (C * 2), width, STAGE_ROWS, 1, 1, 1, 1, 0, 0, 3, 0)
+            dx_map = txl.stack_alloca("tensormap", 1)
+            txl.cu_tensor_map_encode_tiled(dx_map, "bfloat16", 3, txl.handle_add_byte_offset(args["dx"].data, 0), C, args["L"], args["B"], C * 2, as_int64(args["L"]) * (C * 2), width, T, 1, 1, 1, 1, 0, 0, 3, 0)
+            tensor_maps += [g_map, x_map, dx_map]
+        return tuple(tensor_maps)
 
     @txl.kernel()
-    def conv_bwd_tma(
-        g: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
-        x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
-        w: txl.Tensor((txl.int64(),), wdt, data_alignment=1),
-        dx: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1),
-        dw: txl.Tensor((txl.int64(),), wdt, data_alignment=1),
-        L: txl.int32,
-        S: txl.int32,
-        offset: txl.int32,
-        B: txl.int32,
-    ):
-        host = host_prelude(dict(g=g, x=x, dx=dx, L=L, S=S, B=B))
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=G, block=(NCW + 1) * 32, cluster=(KF,), preferred_cluster=[KF]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=CTAS_PER_SM))
-        maps = [host[3 * i:3 * i + 3] for i in range(len(WS))]
-        cta = txl.cta_id()
-        rank = txl.Cast("int32", txl.cuda.mov_sreg(32, "cluster_ctarank"))
-        tid = txl.thread_id()
+    def conv_bwd_tma(g: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), w_dtype, data_alignment=1), dx: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dw: txl.Tensor((txl.int64(),), w_dtype, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
+        tensor_maps = encode_tensor_maps(dict(g=g, x=x, dx=dx, L=L, S=S, B=B))
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=NUM_CTAS, block=(NUM_COMPUTE_WARPS + 1) * 32, cluster=(CLUSTER_SIZE,), preferred_cluster=[CLUSTER_SIZE]), kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=CTAS_PER_SM))
+        maps_by_width = [tensor_maps[3 * i:3 * i + 3] for i in range(len(WIDTHS))]
+        cta_idx = txl.cta_id()
+        cluster_rank = txl.Cast("int32", txl.cuda.mov_sreg(32, "cluster_ctarank"))
+        tidx = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
-        ci = cta // KF
-        if extra:
-            wide = ci < extra
-            c0 = 8 * (ci * base + txl.min(ci, txl.int32(extra)) * step)
-            nch = txl.Select(wide, txl.int32(WA), txl.int32(WB))
+        cluster_idx = cta_idx // CLUSTER_SIZE
+        if num_wide:
+            is_wide = cluster_idx < num_wide
+            ch_start = 8 * (cluster_idx * base_units + txl.min(cluster_idx, txl.int32(num_wide)) * step_units)
+            num_ch = txl.Select(is_wide, txl.int32(WIDTH_WIDE), txl.int32(WIDTH_NARROW))
         else:
-            c0 = 8 * base * ci
-            nch = txl.int32(WB)
+            ch_start = 8 * base_units * cluster_idx
+            num_ch = txl.int32(WIDTH_NARROW)
 
-        def by_width(fn):
+        def for_slice_width(body):
             """
-            fn(W, maps of width W) under the slice-width branch of this CTA.
+            body(width, maps of that width) under the slice-width branch of this CTA.
             """
-            if extra:
-                with txl.if_(wide):
+            if num_wide:
+                with txl.if_(is_wide):
                     with txl.then_():
-                        fn(WA, maps[0])
+                        body(WIDTH_WIDE, maps_by_width[0])
                     with txl.else_():
-                        fn(WB, maps[1])
+                        body(WIDTH_NARROW, maps_by_width[1])
             else:
-                fn(WB, maps[0])
+                body(WIDTH_NARROW, maps_by_width[0])
 
-        nbs = (L + T - 1) // T
-        nrt = nbs * B  # row tiles of this channel slice, u = bb * nbs + bs
-        # TMA needs a 16B-aligned inner coordinate: (bs * T - offset) minus its 8-aligned floor
-        dlt = (8 - (offset & 7)) & 7
+        num_token_tiles = (L + T - 1) // T
+        num_row_tiles = num_token_tiles * B  # row tiles of this channel slice, row_tile_idx = batch_idx * num_token_tiles + token_tile_idx
+        # TMA needs a 16B-aligned inner coordinate: (token_tile_idx * T - offset) minus its 8-aligned floor
+        g_shift = (8 - (offset & 7)) & 7
 
         smem = txl.smem_pool()
-        NDX = 2  # dx staging buffers
-        dxs = smem.alloc([NDX * T * WMAX], "bfloat16", align=1024)
-        gs = smem.alloc([NS * GSZ], "bfloat16", align=128)
-        xs = smem.alloc([NS * XSZ], "bfloat16", align=128)
-        red = smem.alloc([NTG * K * CB], "float32", align=16)
-        red2 = smem.alloc([K * CB], "float32", align=16)
-        full = smem.alloc([NS], "uint64", align=8)
-        empty = smem.alloc([NS], "uint64", align=8)
+        s_dx = smem.alloc([NUM_DX_BUFS * T * WIDTH_MAX], "bfloat16", align=1024)
+        s_g = smem.alloc([NUM_STAGES * G_STAGE_SIZE], "bfloat16", align=128)
+        s_x = smem.alloc([NUM_STAGES * X_STAGE_SIZE], "bfloat16", align=128)
+        s_dw_groups = smem.alloc([NUM_TOKEN_GROUPS * K * TILE_CHANNELS], "float32", align=16)
+        s_dw = smem.alloc([K * TILE_CHANNELS], "float32", align=16)
+        s_full = smem.alloc([NUM_STAGES], "uint64", align=8)
+        s_empty = smem.alloc([NUM_STAGES], "uint64", align=8)
 
-        with txl.if_(tid == 0), txl.then_():
-            for s in range(NS):
-                txl.ptx["mbarrier.init.shared.b64"](cvta(full.ptr_to([s])), txl.uint32(1))
-                txl.ptx["mbarrier.init.shared.b64"](cvta(empty.ptr_to([s])), txl.uint32(EMPTY_COUNT))
+        with txl.if_(tidx == 0), txl.then_():
+            for stage_idx in range(NUM_STAGES):
+                txl.ptx["mbarrier.init.shared.b64"](shared_addr(s_full.ptr_to([stage_idx])), txl.uint32(1))
+                txl.ptx["mbarrier.init.shared.b64"](shared_addr(s_empty.ptr_to([stage_idx])), txl.uint32(EMPTY_ARRIVALS))
             txl.ptx["fence.mbarrier_init.release.cluster"]()
             txl.ptx["fence.proxy.async.shared::cta"]()
-        bar_named(0, (NCW + 1) * 32)
+        named_barrier(0, (NUM_COMPUTE_WARPS + 1) * 32)
 
         stage = txl.local_scalar("int32", init=txl.int32(0))
         phase = txl.local_scalar("int32", init=txl.int32(0))
-        u = txl.local_scalar("int32", init=rank)
+        row_tile_idx = txl.local_scalar("int32", init=cluster_rank)
 
-        def advance():
+        def advance_tile():
             txl.assign(stage, stage + 1)
-            with txl.if_(stage == NS), txl.then_():
+            with txl.if_(stage == NUM_STAGES), txl.then_():
                 txl.assign(stage, txl.int32(0))
                 txl.assign(phase, phase ^ 1)
-            txl.assign(u, u + KF)
+            txl.assign(row_tile_idx, row_tile_idx + CLUSTER_SIZE)
 
-        with txl.if_(warp == NCW):
+        def load_loop():
+            with txl.if_(lane == 0), txl.then_():
+                for maps in maps_by_width:
+                    for tensor_map in maps:
+                        txl.ptx.prefetch.tensormap(txl.address_of(tensor_map))
+                policy = evict_last_policy()
+                with txl.while_(row_tile_idx < num_row_tiles):
+                    token_tile_idx = row_tile_idx % num_token_tiles
+                    batch_idx = row_tile_idx // num_token_tiles
+                    txl.cuda.mbarrier_wait(s_empty.ptr_to([stage]), phase ^ 1)
+                    # order the compute warps' generic reads of this stage before the TMA rewrite
+                    txl.ptx["fence.proxy.async.shared::cta"]()
+                    full_addr = shared_addr(s_full.ptr_to([stage]))
+
+                    def issue_loads(width, maps):
+                        g_map, x_map, _ = maps
+                        txl.ptx["mbarrier.arrive.expect_tx.shared.b64"](full_addr, txl.uint32(stage_tx_bytes(width)))
+                        if channels_first:
+                            # [width ch][CHANNELS_FIRST_PITCH tok] box from the 16B-aligned token below
+                            # token_tile_idx * T - offset: tile token j + g_shift = g row token_tile_idx * T - offset + j
+                            g_coords = (token_tile_idx * T - offset - g_shift, ch_start, batch_idx)
+                        else:
+                            g_coords = (ch_start, token_tile_idx * T - offset, batch_idx)
+                        tma_load(shared_addr(s_g.ptr_to([stage * G_STAGE_SIZE])), tensor_map_ptr(g_map), g_coords[0], g_coords[1], g_coords[2], full_addr, policy)
+                        tma_load(shared_addr(s_x.ptr_to([stage * X_STAGE_SIZE])), tensor_map_ptr(x_map), ch_start, token_tile_idx * T - (K - 1), batch_idx, full_addr, policy)
+
+                    for_slice_width(issue_loads)
+                    advance_tile()
+
+        def store_dx(dx_buf, token_tile_idx, batch_idx):
+            with txl.if_(tidx == 0), txl.then_():
+                for_slice_width(lambda width, maps: tma_store(tensor_map_ptr(maps[2]), ch_start, token_tile_idx * T, batch_idx, shared_addr(s_dx.ptr_to([dx_buf * T * WIDTH_MAX]))))
+                txl.ptx["cp.async.bulk.commit_group"]()
+
+        def reduce_dw_token_groups():
+            """
+            s_dw = the token groups' dw partials summed in order.
+            """
+            named_barrier(1, NUM_COMPUTE_THREADS)
+            acc_dw = txl.local_scalar("float32")
+            partial = txl.local_scalar("float32")
+            for i in range(cdiv(K * TILE_CHANNELS, NUM_COMPUTE_THREADS)):
+                idx = i * NUM_COMPUTE_THREADS + tidx
+                with txl.if_(idx < K * TILE_CHANNELS), txl.then_():
+                    txl.assign(acc_dw, txl.float32(0.0))
+                    for group_idx in range(NUM_TOKEN_GROUPS):
+                        txl.ptx["ld.shared.f32"](partial, s_dw_groups.ptr_to([group_idx * K * TILE_CHANNELS + idx]))
+                        txl.assign(acc_dw, acc_dw + partial)
+                    txl.ptx["st.shared.f32"](s_dw.ptr_to([idx]), acc_dw)
+
+        def compute_loop():
+            ctx = BwdContext(s_g, s_x, s_dx, s_dw_groups, w, w_dtype, C, K, ch_start, num_ch, g_shift, tidx, warp, lane, s_full, s_empty, stage, phase, row_tile_idx, num_row_tiles, num_token_tiles, G_STAGE_SIZE, X_STAGE_SIZE, WIDTH_MAX, store_dx, advance_tile)
+            if channels_first:
+                (bwd_compute_loop_cf_packed if USE_PACKED_CF else bwd_compute_loop_cf)(ctx)
+            else:
+                bwd_compute_loop_cl(ctx)
+            reduce_dw_token_groups()
+            with txl.if_(tidx == 0), txl.then_():
+                txl.ptx["cp.async.bulk.wait_group"](txl.int32(0))
+
+        def reduce_dw_cluster():
+            """
+            dw of the slice = the cluster's ranks' s_dw summed in rank order, by rank 0.
+            """
+            with txl.if_((cluster_rank == 0) & (tidx < NUM_COMPUTE_THREADS)), txl.then_():
+                acc_dw = txl.local_scalar("float32")
+                partial = txl.local_scalar("float32")
+                remote_addr = txl.local_scalar("uint32")
+                for i in range(cdiv(K * TILE_CHANNELS, NUM_COMPUTE_THREADS)):
+                    idx = i * NUM_COMPUTE_THREADS + tidx
+                    tap = idx // TILE_CHANNELS
+                    ch = idx % TILE_CHANNELS
+                    with txl.if_((idx < K * TILE_CHANNELS) & (ch < num_ch)), txl.then_():
+                        txl.assign(acc_dw, txl.float32(0.0))
+                        for rank_idx in range(CLUSTER_SIZE):
+                            txl.ptx.mapa.shared__cluster.u32(remote_addr, shared_addr(s_dw.ptr_to([idx])), txl.uint32(rank_idx))
+                            txl.ptx["ld.shared::cluster.f32"](partial, remote_addr)
+                            txl.assign(acc_dw, acc_dw + partial)
+                        store_dw_elem(dw, (ch_start + ch) * K + tap, acc_dw, w_dtype)
+
+        with txl.if_(warp == PRODUCER_WARP):
             with txl.then_():
-                with txl.if_(lane == 0), txl.then_():
-                    for mp in maps:
-                        for m in mp:
-                            txl.ptx.prefetch.tensormap(txl.address_of(m))
-                    lpol = load_policy()
-                    with txl.while_(u < nrt):
-                        bs = u % nbs
-                        bb = u // nbs
-                        txl.cuda.mbarrier_wait(empty.ptr_to([stage]), phase ^ 1)
-                        # order the compute warps' generic reads of this stage before the TMA rewrite
-                        txl.ptx["fence.proxy.async.shared::cta"]()
-                        fb = cvta(full.ptr_to([stage]))
-
-                        def issue(W, mp):
-                            gm, xm, _ = mp
-                            txl.ptx["mbarrier.arrive.expect_tx.shared.b64"](fb, txl.uint32(txbytes(W)))
-                            if cf:
-                                # [W ch][CF_P tok] box from the 16B-aligned token below bs * T - offset:
-                                # tile token j + dlt = g row bs * T - offset + j
-                                gc = (bs * T - offset - dlt, c0, bb)
-                            else:
-                                gc = (c0, bs * T - offset, bb)
-                            tma_load(cvta(gs.ptr_to([stage * GSZ])), tmap_ptr(gm), gc[0], gc[1], gc[2], fb, lpol)
-                            tma_load(cvta(xs.ptr_to([stage * XSZ])), tmap_ptr(xm), c0, bs * T - (K - 1), bb, fb, lpol)
-
-                        by_width(issue)
-                        advance()
+                load_loop()
             with txl.else_():
-
-                def store_dx(b, bs, bb):
-                    with txl.if_(tid == 0), txl.then_():
-                        by_width(lambda W, mp: tma_store(
-                            tmap_ptr(mp[2]), c0, bs * T, bb, cvta(dxs.ptr_to([b * T * WMAX]))))
-                        txl.ptx["cp.async.bulk.commit_group"]()
-
-                if cf:
-                    (bwd_cf2_compute if CF2 else bwd_cf_compute)(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lane, full, empty,
-                                    stage, phase, u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance)
-                else:
-                    bwd_cl_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, tid, warp, lane, full, empty,
-                                    stage, phase, u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance)
-                bar_named(1, NC)
-                r = txl.local_scalar("float32")
-                rv = txl.local_scalar("float32")
-                for i in range(cdiv(K * CB, NC)):
-                    idx = i * NC + tid
-                    with txl.if_(idx < K * CB), txl.then_():
-                        txl.assign(r, txl.float32(0.0))
-                        for q in range(NTG):
-                            txl.ptx["ld.shared.f32"](rv, red.ptr_to([q * K * CB + idx]))
-                            txl.assign(r, r + rv)
-                        txl.ptx["st.shared.f32"](red2.ptr_to([idx]), r)
-                with txl.if_(tid == 0), txl.then_():
-                    txl.ptx["cp.async.bulk.wait_group"](txl.int32(0))
-        # the cluster's ranks in order, by rank 0
+                compute_loop()
         cluster_sync()
-        with txl.if_((rank == 0) & (tid < NC)), txl.then_():
-            r = txl.local_scalar("float32")
-            rv = txl.local_scalar("float32")
-            pa = txl.local_scalar("uint32")
-            for i in range(cdiv(K * CB, NC)):
-                idx = i * NC + tid
-                k = idx // CB
-                c = idx % CB
-                with txl.if_((idx < K * CB) & (c < nch)), txl.then_():
-                    txl.assign(r, txl.float32(0.0))
-                    for q in range(KF):
-                        txl.ptx.mapa.shared__cluster.u32(pa, cvta(red2.ptr_to([idx])), txl.uint32(q))
-                        txl.ptx["ld.shared::cluster.f32"](rv, pa)
-                        txl.assign(r, r + rv)
-                    store_w(dw, (c0 + c) * K + k, r, wdt)
+        reduce_dw_cluster()
         cluster_sync()
 
     return entry_function(conv_bwd_tma.compile(TARGET))
 
 
-def bwd_cl_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, tid, warp, lane, full, empty, stage, phase,
-                    u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance):
+def bwd_compute_loop_cl(ctx):
     """
-    Compute warps for channels-last g: lane = channel pair c2, warp = token group of TG2 tokens,
-    packed f32x2 arithmetic. Tiles are [rows][nch] (pitch nch).
+    Compute warps for channels-last g: lane = channel pair pair_ch, warp = token group of
+    PACKED_TOKENS_PER_THREAD tokens, packed f32x2 arithmetic. Tiles are [rows][num_ch] (pitch
+    num_ch).
     """
-    if CLM and wdt == "bfloat16":
-        return bwd_clm_compute(gs, xs, dxs, red, w, C, K, c0, nch, tid, warp, lane, full, empty, stage, phase,
-                                u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance)
-    c2 = 2 * lane
-    tg = warp
-    act = c2 < nch
-    wk = txl.alloc_local([K], "uint64")
-    wf = txl.alloc_local([2], "float32")
-    gv = txl.alloc_local([TG2 + K - 1], "uint64")
-    xv = txl.alloc_local([TG2 + K - 1], "uint64")
-    out = txl.alloc_local([TG2], "uint64")
-    pw = txl.alloc_local([K], "uint64")
-    pacc = txl.alloc_local([K], "uint64")
-    hv = txl.alloc_local([TG2], "uint32")
-    wa = txl.local_scalar("uint32")
-    wb = txl.local_scalar("uint32")
-    load_w_pair(wk, wf, w, c0 + c2, C, K, wdt)
+    if USE_BF16_FMA_BWD and ctx.w_dtype == "bfloat16":
+        return bwd_compute_loop_cl_bf16(ctx)
+    s_g, s_x, s_dx, s_dw_groups = ctx.s_g, ctx.s_x, ctx.s_dx, ctx.s_dw_groups
+    w, w_dtype, C, K = ctx.w, ctx.w_dtype, ctx.C, ctx.K
+    ch_start, num_ch, tidx, warp, lane = ctx.ch_start, ctx.num_ch, ctx.tidx, ctx.warp, ctx.lane
+    s_full, s_empty, stage, phase = ctx.s_full, ctx.s_empty, ctx.stage, ctx.phase
+    row_tile_idx, num_row_tiles, num_token_tiles = ctx.row_tile_idx, ctx.num_row_tiles, ctx.num_token_tiles
+    g_stage_size, x_stage_size, width_max = ctx.g_stage_size, ctx.x_stage_size, ctx.width_max
+    pair_ch = 2 * lane
+    token_group = warp
+    ch_ok = pair_ch < num_ch
+    w_taps = txl.alloc_local([K], "uint64")
+    w_pair = txl.alloc_local([2], "float32")
+    g_vals = txl.alloc_local([PACKED_TOKENS_PER_THREAD + K - 1], "uint64")
+    x_vals = txl.alloc_local([PACKED_TOKENS_PER_THREAD + K - 1], "uint64")
+    out = txl.alloc_local([PACKED_TOKENS_PER_THREAD], "uint64")
+    dw_part = txl.alloc_local([K], "uint64")
+    acc_dw = txl.alloc_local([K], "uint64")
+    dx_words = txl.alloc_local([PACKED_TOKENS_PER_THREAD], "uint32")
+    g_word = txl.local_scalar("uint32")
+    x_word = txl.local_scalar("uint32")
+    load_w_pair(w_taps, w_pair, w, ch_start + pair_ch, C, K, w_dtype)
     for k in range(K):
-        txl.assign(pacc[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
-    it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.while_(u < nrt):
-        bs = u % nbs
-        bb = u // nbs
-        txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
+        txl.assign(acc_dw[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
+    tile_count = txl.local_scalar("int32", init=txl.int32(0))
+    with txl.while_(row_tile_idx < num_row_tiles):
+        token_tile_idx = row_tile_idx % num_token_tiles
+        batch_idx = row_tile_idx // num_token_tiles
+        txl.cuda.mbarrier_wait(s_full.ptr_to([stage]), phase)
         # lanes past the slice width read (and discard) the slice's last pair: no reads past the tile
-        cl = txl.min(c2, nch - 2)
-        gb = stage * GSZ + cl
-        xb = stage * XSZ + cl
-        for j in range(TG2 + K - 1):
-            txl.ptx["ld.shared.b32"](wa, gs.ptr_to([gb + (tg * TG2 + j) * nch]))
-            txl.assign(gv[j], bf16x2_to_f32x2(wa))
-            txl.ptx["ld.shared.b32"](wb, xs.ptr_to([xb + (tg * TG2 + j) * nch]))
-            txl.assign(xv[j], bf16x2_to_f32x2(wb))
-        release(empty, stage, lane)
-        taps2(out, wk, gv, K, True)
-        partial_dw2(pw, gv, xv, K)
+        read_ch = txl.min(pair_ch, num_ch - 2)
+        g_base = stage * g_stage_size + read_ch
+        x_base = stage * x_stage_size + read_ch
+        for j in range(PACKED_TOKENS_PER_THREAD + K - 1):
+            txl.ptx["ld.shared.b32"](g_word, s_g.ptr_to([g_base + (token_group * PACKED_TOKENS_PER_THREAD + j) * num_ch]))
+            txl.assign(g_vals[j], bf16x2_to_f32x2(g_word))
+            txl.ptx["ld.shared.b32"](x_word, s_x.ptr_to([x_base + (token_group * PACKED_TOKENS_PER_THREAD + j) * num_ch]))
+            txl.assign(x_vals[j], bf16x2_to_f32x2(x_word))
+        release_stage(s_empty, stage, lane)
+        compute_taps_packed(out, w_taps, g_vals, K, True)
+        compute_dw_partials_packed(dw_part, g_vals, x_vals, K)
         for k in range(K):
-            txl.ptx["add.rn.f32x2"](pacc[k], pacc[k], pw[k])
-        b = it % NDX
+            txl.ptx["add.rn.f32x2"](acc_dw[k], acc_dw[k], dw_part[k])
+        dx_buf = tile_count % NUM_DX_BUFS
         # thread 0 owns the bulk-store group: its read-completion wait overlaps the others' conversion
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
-        for i in range(TG2):
-            txl.ptx["cvt.rn.bf16x2.f32"](hv[i], f2(out[i], 1), f2(out[i], 0))
-        bar_named(1, NC)
-        with txl.if_(act), txl.then_():
-            for i in range(TG2):
-                txl.ptx["st.shared.b32"](dxs.ptr_to([b * T * WMAX + (tg * TG2 + i) * nch + c2]), hv[i])
+        with txl.if_(tidx == 0), txl.then_():
+            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NUM_DX_BUFS - 1))
+        for i in range(PACKED_TOKENS_PER_THREAD):
+            txl.ptx["cvt.rn.bf16x2.f32"](dx_words[i], float2_elem(out[i], 1), float2_elem(out[i], 0))
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        with txl.if_(ch_ok), txl.then_():
+            for i in range(PACKED_TOKENS_PER_THREAD):
+                txl.ptx["st.shared.b32"](s_dx.ptr_to([dx_buf * T * width_max + (token_group * PACKED_TOKENS_PER_THREAD + i) * num_ch + pair_ch]), dx_words[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
-        bar_named(1, NC)
-        store_dx(b, bs, bb)
-        txl.assign(it, it + 1)
-        advance()
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        ctx.store_dx(dx_buf, token_tile_idx, batch_idx)
+        txl.assign(tile_count, tile_count + 1)
+        ctx.advance_tile()
     # per (token group, tap, channel); summed over the groups in order by the caller
     for k in range(K):
-        for e in range(2):
-            txl.ptx["st.shared.f32"](red.ptr_to([(tg * K + k) * CB + c2 + e]), f2(pacc[k], e))
+        for elem in range(2):
+            txl.ptx["st.shared.f32"](s_dw_groups.ptr_to([(token_group * K + k) * TILE_CHANNELS + pair_ch + elem]), float2_elem(acc_dw[k], elem))
 
 
-def bwd_clm_compute(gs, xs, dxs, red, w, C, K, c0, nch, tid, warp, lane, full, empty, stage, phase,
-                     u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance):
+def bwd_compute_loop_cl_bf16(ctx):
     """
-    Packed channels-last layout (lane = channel pair, warp = TG2-token group) with scalar
-    fma.rn.f32.bf16 on the staged BF16 halves: no BF16->FP32 conversions, same per-channel
-    order.
+    Packed channels-last layout (lane = channel pair, warp = PACKED_TOKENS_PER_THREAD-token group)
+    with scalar fma.rn.f32.bf16 on the staged BF16 halves: no BF16->FP32 conversions, same
+    per-channel order.
     """
-    c2 = 2 * lane
-    tg = warp
-    act = c2 < nch
-    NR = TG2 + K - 1
-    wk = [txl.alloc_local([K], "uint16") for _ in range(2)]
-    gv = [txl.alloc_local([NR], "uint16") for _ in range(2)]
-    xv = [txl.alloc_local([NR], "uint16") for _ in range(2)]
-    out = [txl.alloc_local([TG2], "float32") for _ in range(2)]
-    pw = [txl.alloc_local([K], "float32") for _ in range(2)]
-    pacc = [txl.alloc_local([K], "float32") for _ in range(2)]
-    hv = txl.alloc_local([TG2], "uint32")
-    wa = txl.local_scalar("uint32")
-    wb = txl.local_scalar("uint32")
-    for e in range(2):
+    s_g, s_x, s_dx, s_dw_groups = ctx.s_g, ctx.s_x, ctx.s_dx, ctx.s_dw_groups
+    w, C, K = ctx.w, ctx.C, ctx.K
+    ch_start, num_ch, tidx, warp, lane = ctx.ch_start, ctx.num_ch, ctx.tidx, ctx.warp, ctx.lane
+    s_full, s_empty, stage, phase = ctx.s_full, ctx.s_empty, ctx.stage, ctx.phase
+    row_tile_idx, num_row_tiles, num_token_tiles = ctx.row_tile_idx, ctx.num_row_tiles, ctx.num_token_tiles
+    g_stage_size, x_stage_size, width_max = ctx.g_stage_size, ctx.x_stage_size, ctx.width_max
+    pair_ch = 2 * lane
+    token_group = warp
+    ch_ok = pair_ch < num_ch
+    num_vals = PACKED_TOKENS_PER_THREAD + K - 1
+    w_taps = [txl.alloc_local([K], "uint16") for _ in range(2)]
+    g_vals = [txl.alloc_local([num_vals], "uint16") for _ in range(2)]
+    x_vals = [txl.alloc_local([num_vals], "uint16") for _ in range(2)]
+    out = [txl.alloc_local([PACKED_TOKENS_PER_THREAD], "float32") for _ in range(2)]
+    dw_part = [txl.alloc_local([K], "float32") for _ in range(2)]
+    acc_dw = [txl.alloc_local([K], "float32") for _ in range(2)]
+    dx_words = txl.alloc_local([PACKED_TOKENS_PER_THREAD], "uint32")
+    g_word = txl.local_scalar("uint32")
+    x_word = txl.local_scalar("uint32")
+    for elem in range(2):
         for k in range(K):
-            load_w_bf16(wk[e][k], w, (c0 + c2 + e) * K + k, c0 + c2 + e < C)
-            txl.assign(pacc[e][k], txl.float32(0.0))
-    it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.while_(u < nrt):
-        bs = u % nbs
-        bb = u // nbs
-        txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
-        cl = txl.min(c2, nch - 2)
-        gb = stage * GSZ + cl
-        xb = stage * XSZ + cl
-        for j in range(NR):
-            txl.ptx["ld.shared.b32"](wa, gs.ptr_to([gb + (tg * TG2 + j) * nch]))
-            txl.assign(gv[0][j], txl.Cast("uint16", wa))
-            txl.assign(gv[1][j], txl.Cast("uint16", wa >> txl.uint32(16)))
-            txl.ptx["ld.shared.b32"](wb, xs.ptr_to([xb + (tg * TG2 + j) * nch]))
-            txl.assign(xv[0][j], txl.Cast("uint16", wb))
-            txl.assign(xv[1][j], txl.Cast("uint16", wb >> txl.uint32(16)))
-        release(empty, stage, lane)
-        for e in range(2):
-            for i in range(TG2):
-                txl.assign(out[e][i], txl.float32(0.0))
+            load_w_bf16(w_taps[elem][k], w, (ch_start + pair_ch + elem) * K + k, ch_start + pair_ch + elem < C)
+            txl.assign(acc_dw[elem][k], txl.float32(0.0))
+    tile_count = txl.local_scalar("int32", init=txl.int32(0))
+    with txl.while_(row_tile_idx < num_row_tiles):
+        token_tile_idx = row_tile_idx % num_token_tiles
+        batch_idx = row_tile_idx // num_token_tiles
+        txl.cuda.mbarrier_wait(s_full.ptr_to([stage]), phase)
+        read_ch = txl.min(pair_ch, num_ch - 2)
+        g_base = stage * g_stage_size + read_ch
+        x_base = stage * x_stage_size + read_ch
+        for j in range(num_vals):
+            txl.ptx["ld.shared.b32"](g_word, s_g.ptr_to([g_base + (token_group * PACKED_TOKENS_PER_THREAD + j) * num_ch]))
+            txl.assign(g_vals[0][j], txl.Cast("uint16", g_word))
+            txl.assign(g_vals[1][j], txl.Cast("uint16", g_word >> txl.uint32(16)))
+            txl.ptx["ld.shared.b32"](x_word, s_x.ptr_to([x_base + (token_group * PACKED_TOKENS_PER_THREAD + j) * num_ch]))
+            txl.assign(x_vals[0][j], txl.Cast("uint16", x_word))
+            txl.assign(x_vals[1][j], txl.Cast("uint16", x_word >> txl.uint32(16)))
+        release_stage(s_empty, stage, lane)
+        for elem in range(2):
+            for i in range(PACKED_TOKENS_PER_THREAD):
+                txl.assign(out[elem][i], txl.float32(0.0))
                 for k in range(K):
-                    txl.ptx["fma.rn.f32.bf16"](out[e][i], wk[e][k], gv[e][i + K - 1 - k], out[e][i])
-        for e in range(2):
+                    txl.ptx["fma.rn.f32.bf16"](out[elem][i], w_taps[elem][k], g_vals[elem][i + K - 1 - k], out[elem][i])
+        for elem in range(2):
             for k in range(K):
-                txl.assign(pw[e][k], txl.float32(0.0))
-                for i in range(TG2):
-                    txl.ptx["fma.rn.f32.bf16"](pw[e][k], gv[e][i], xv[e][i + k], pw[e][k])
-                txl.assign(pacc[e][k], pacc[e][k] + pw[e][k])
-        b = it % NDX
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
-        for i in range(TG2):
-            txl.ptx["cvt.rn.bf16x2.f32"](hv[i], out[1][i], out[0][i])
-        bar_named(1, NC)
-        with txl.if_(act), txl.then_():
-            for i in range(TG2):
-                txl.ptx["st.shared.b32"](dxs.ptr_to([b * T * WMAX + (tg * TG2 + i) * nch + c2]), hv[i])
+                txl.assign(dw_part[elem][k], txl.float32(0.0))
+                for i in range(PACKED_TOKENS_PER_THREAD):
+                    txl.ptx["fma.rn.f32.bf16"](dw_part[elem][k], g_vals[elem][i], x_vals[elem][i + k], dw_part[elem][k])
+                txl.assign(acc_dw[elem][k], acc_dw[elem][k] + dw_part[elem][k])
+        dx_buf = tile_count % NUM_DX_BUFS
+        with txl.if_(tidx == 0), txl.then_():
+            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NUM_DX_BUFS - 1))
+        for i in range(PACKED_TOKENS_PER_THREAD):
+            txl.ptx["cvt.rn.bf16x2.f32"](dx_words[i], out[1][i], out[0][i])
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        with txl.if_(ch_ok), txl.then_():
+            for i in range(PACKED_TOKENS_PER_THREAD):
+                txl.ptx["st.shared.b32"](s_dx.ptr_to([dx_buf * T * width_max + (token_group * PACKED_TOKENS_PER_THREAD + i) * num_ch + pair_ch]), dx_words[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
-        bar_named(1, NC)
-        store_dx(b, bs, bb)
-        txl.assign(it, it + 1)
-        advance()
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        ctx.store_dx(dx_buf, token_tile_idx, batch_idx)
+        txl.assign(tile_count, tile_count + 1)
+        ctx.advance_tile()
     for k in range(K):
-        for e in range(2):
-            txl.ptx["st.shared.f32"](red.ptr_to([(tg * K + k) * CB + c2 + e]), pacc[e][k])
+        for elem in range(2):
+            txl.ptx["st.shared.f32"](s_dw_groups.ptr_to([(token_group * K + k) * TILE_CHANNELS + pair_ch + elem]), acc_dw[elem][k])
 
-def bwd_cf_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lane, full, empty, stage, phase,
-                    u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance):
+
+def bwd_compute_loop_cf(ctx):
     """
     Compute warps for g in the output's channels-first layout, read in place (no transpose).
 
-    Thread = channel ch, tokens [tq * TG, +TG) = dw token groups 2 tq and 2 tq + 1; g is read
-    along tokens with 16B loads from the [nch][CF_P] tile (48 tokens from the aligned tq * TG,
-    then shifted by the runtime dlt in registers: two word selects and a byte permute), x per
-    token from the channels-last tile. Same per-channel arithmetic order as the packed
-    channels-last path.
+    Thread = channel ch, tokens [token_group * TOKENS_PER_THREAD, +TOKENS_PER_THREAD) = dw token
+    groups 2 token_group and 2 token_group + 1; g is read along tokens with 16B loads from the
+    [num_ch][CHANNELS_FIRST_PITCH] tile (48 tokens from the aligned token_group *
+    TOKENS_PER_THREAD, then shifted by the runtime g_shift in registers: two word selects and a
+    byte permute), x per token from the channels-last tile. Same per-channel arithmetic order as
+    the packed channels-last path.
     """
+    s_g, s_x, s_dx, s_dw_groups = ctx.s_g, ctx.s_x, ctx.s_dx, ctx.s_dw_groups
+    w, w_dtype, C, K = ctx.w, ctx.w_dtype, ctx.C, ctx.K
+    ch_start, num_ch, g_shift = ctx.ch_start, ctx.num_ch, ctx.g_shift
+    tidx, warp, lane = ctx.tidx, ctx.warp, ctx.lane
+    s_full, s_empty, stage, phase = ctx.s_full, ctx.s_empty, ctx.stage, ctx.phase
+    row_tile_idx, num_row_tiles, num_token_tiles = ctx.row_tile_idx, ctx.num_row_tiles, ctx.num_token_tiles
+    g_stage_size, x_stage_size, width_max = ctx.g_stage_size, ctx.x_stage_size, ctx.width_max
     ch = lane + 32 * (warp % 2)
-    tq = warp // 2
-    act = ch < nch
-    NW = 24  # g words per thread: tokens [tq * TG, +48)
-    NV = cdiv(TG + K - 1, 2)  # words after the shift
-    mixed = wdt == "bfloat16"
-    wk = txl.alloc_local([K], "uint16" if mixed else "float32")
-    gw = txl.alloc_local([NW], "uint32")
-    ga = txl.alloc_local([NV + 2], "uint32")
-    gq = txl.alloc_local([NV + 1], "uint32")
-    s4 = (dlt & 4) != 0
-    s2 = (dlt & 2) != 0
-    sel = txl.Select((dlt & 1) != 0, txl.uint32(0x5432), txl.uint32(0x3210))
-    gv = txl.alloc_local([TG + K - 1], "uint16" if mixed else "float32")
-    xv = txl.alloc_local([TG + K - 1], "uint16" if mixed else "float32")
-    out = txl.alloc_local([TG], "float32")
-    pw = txl.alloc_local([K], "float32")
-    pacc = txl.alloc_local([2 * K], "float32")
-    hv = txl.alloc_local([TG], "uint16")
+    token_group = warp // 2
+    ch_ok = ch < num_ch
+    NUM_G_WORDS = 24  # g words per thread: tokens [token_group * TOKENS_PER_THREAD, +48)
+    NUM_SHIFTED_WORDS = cdiv(TOKENS_PER_THREAD + K - 1, 2)  # words after the shift
+    use_bf16_fma = w_dtype == "bfloat16"
+    w_taps = txl.alloc_local([K], "uint16" if use_bf16_fma else "float32")
+    g_words = txl.alloc_local([NUM_G_WORDS], "uint32")
+    g_words_shift4 = txl.alloc_local([NUM_SHIFTED_WORDS + 2], "uint32")
+    g_words_shift2 = txl.alloc_local([NUM_SHIFTED_WORDS + 1], "uint32")
+    is_shift4 = (g_shift & 4) != 0
+    is_shift2 = (g_shift & 2) != 0
+    prmt_selector = txl.Select((g_shift & 1) != 0, txl.uint32(0x5432), txl.uint32(0x3210))
+    g_vals = txl.alloc_local([TOKENS_PER_THREAD + K - 1], "uint16" if use_bf16_fma else "float32")
+    x_vals = txl.alloc_local([TOKENS_PER_THREAD + K - 1], "uint16" if use_bf16_fma else "float32")
+    out = txl.alloc_local([TOKENS_PER_THREAD], "float32")
+    dw_part = txl.alloc_local([K], "float32")
+    acc_dw = txl.alloc_local([2 * K], "float32")
+    dx_bits = txl.alloc_local([TOKENS_PER_THREAD], "uint16")
     for k in range(K):
-        if mixed:
-            load_w_bf16(wk[k], w, (c0 + ch) * K + k, c0 + ch < C)
+        if use_bf16_fma:
+            load_w_bf16(w_taps[k], w, (ch_start + ch) * K + k, ch_start + ch < C)
         else:
-            load_w_f32(wk[k], w, (c0 + ch) * K + k, wdt, c0 + ch < C)
+            load_w_f32(w_taps[k], w, (ch_start + ch) * K + k, w_dtype, ch_start + ch < C)
     for i in range(2 * K):
-        txl.assign(pacc[i], txl.float32(0.0))
-    it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.while_(u < nrt):
-        bs = u % nbs
-        bb = u // nbs
-        txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
+        txl.assign(acc_dw[i], txl.float32(0.0))
+    tile_count = txl.local_scalar("int32", init=txl.int32(0))
+    with txl.while_(row_tile_idx < num_row_tiles):
+        token_tile_idx = row_tile_idx % num_token_tiles
+        batch_idx = row_tile_idx // num_token_tiles
+        txl.cuda.mbarrier_wait(s_full.ptr_to([stage]), phase)
         # channel slots past the slice width read (and discard) the slice's last channel
-        cr = txl.min(ch, nch - 1)
-        gb = stage * GSZ + cr * CF_P + tq * TG
-        xb = stage * XSZ + cr
-        for m in range(NW // 4):
-            txl.ptx["ld.shared.v4.b32"](gw[4 * m], gw[4 * m + 1], gw[4 * m + 2], gw[4 * m + 3],
-                                        gs.ptr_to([gb + 8 * m]))
-        for m in range(NV + 2):
-            txl.assign(ga[m], txl.Select(s4, gw[m + 2], gw[m]))
-        for m in range(NV + 1):
-            txl.assign(gq[m], txl.Select(s2, ga[m + 1], ga[m]))
-        for m in range(NV):
-            txl.ptx["prmt.b32"](gw[m], gq[m], gq[m + 1], sel)
-        for j in range(TG + K - 1):
-            wv = gw[j // 2]
-            if mixed:
-                txl.assign(gv[j], txl.Cast("uint16", wv if j % 2 == 0 else wv >> txl.uint32(16)))
-                txl.ptx["ld.shared.b16"](xv[j], xs.ptr_to([xb + (tq * TG + j) * nch]))
+        read_ch = txl.min(ch, num_ch - 1)
+        g_base = stage * g_stage_size + read_ch * CHANNELS_FIRST_PITCH + token_group * TOKENS_PER_THREAD
+        x_base = stage * x_stage_size + read_ch
+        for word_idx in range(NUM_G_WORDS // 4):
+            txl.ptx["ld.shared.v4.b32"](g_words[4 * word_idx], g_words[4 * word_idx + 1], g_words[4 * word_idx + 2], g_words[4 * word_idx + 3], s_g.ptr_to([g_base + 8 * word_idx]))
+        for word_idx in range(NUM_SHIFTED_WORDS + 2):
+            txl.assign(g_words_shift4[word_idx], txl.Select(is_shift4, g_words[word_idx + 2], g_words[word_idx]))
+        for word_idx in range(NUM_SHIFTED_WORDS + 1):
+            txl.assign(g_words_shift2[word_idx], txl.Select(is_shift2, g_words_shift4[word_idx + 1], g_words_shift4[word_idx]))
+        for word_idx in range(NUM_SHIFTED_WORDS):
+            txl.ptx["prmt.b32"](g_words[word_idx], g_words_shift2[word_idx], g_words_shift2[word_idx + 1], prmt_selector)
+        for j in range(TOKENS_PER_THREAD + K - 1):
+            g_word = g_words[j // 2]
+            if use_bf16_fma:
+                txl.assign(g_vals[j], txl.Cast("uint16", g_word if j % 2 == 0 else g_word >> txl.uint32(16)))
+                txl.ptx["ld.shared.b16"](x_vals[j], s_x.ptr_to([x_base + (token_group * TOKENS_PER_THREAD + j) * num_ch]))
             else:
                 if j % 2 == 0:
-                    txl.assign(gv[j], txl.reinterpret(wv << txl.uint32(16), ty='float32'))
+                    txl.assign(g_vals[j], txl.reinterpret(g_word << txl.uint32(16), ty="float32"))
                 else:
-                    txl.assign(gv[j], txl.reinterpret(wv & txl.uint32(0xFFFF0000), ty='float32'))
-                ld_s_bf16(xv[j], xs.ptr_to([xb + (tq * TG + j) * nch]))
-        release(empty, stage, lane)
-        if mixed:
-            taps_dx_mixed(out, wk, gv, K)
+                    txl.assign(g_vals[j], txl.reinterpret(g_word & txl.uint32(0xFFFF0000), ty="float32"))
+                load_shared_bf16(x_vals[j], s_x.ptr_to([x_base + (token_group * TOKENS_PER_THREAD + j) * num_ch]))
+        release_stage(s_empty, stage, lane)
+        if use_bf16_fma:
+            compute_dx_taps_bf16(out, w_taps, g_vals, K)
         else:
-            taps_dx(out, wk, gv, K)
-        for h in range(2):
-            if mixed:
-                partial_dw_mixed(pw, gv, xv, K, h * TG2, TG2)
+            compute_dx_taps(out, w_taps, g_vals, K)
+        for group_half in range(2):
+            if use_bf16_fma:
+                compute_dw_partials_bf16(dw_part, g_vals, x_vals, K, group_half * PACKED_TOKENS_PER_THREAD, PACKED_TOKENS_PER_THREAD)
             else:
-                partial_dw(pw, gv, xv, K, h * TG2, TG2)
+                compute_dw_partials(dw_part, g_vals, x_vals, K, group_half * PACKED_TOKENS_PER_THREAD, PACKED_TOKENS_PER_THREAD)
             for k in range(K):
-                txl.assign(pacc[h * K + k], pacc[h * K + k] + pw[k])
-        b = it % NDX
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
-        for i in range(TG):
-            txl.ptx["cvt.rn.bf16.f32"](hv[i], out[i])
-        bar_named(1, NC)
-        with txl.if_(act), txl.then_():
-            for i in range(TG):
-                txl.ptx["st.shared.b16"](dxs.ptr_to([b * T * WMAX + (tq * TG + i) * nch + ch]), hv[i])
+                txl.assign(acc_dw[group_half * K + k], acc_dw[group_half * K + k] + dw_part[k])
+        dx_buf = tile_count % NUM_DX_BUFS
+        with txl.if_(tidx == 0), txl.then_():
+            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NUM_DX_BUFS - 1))
+        for i in range(TOKENS_PER_THREAD):
+            txl.ptx["cvt.rn.bf16.f32"](dx_bits[i], out[i])
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        with txl.if_(ch_ok), txl.then_():
+            for i in range(TOKENS_PER_THREAD):
+                txl.ptx["st.shared.b16"](s_dx.ptr_to([dx_buf * T * width_max + (token_group * TOKENS_PER_THREAD + i) * num_ch + ch]), dx_bits[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
-        bar_named(1, NC)
-        store_dx(b, bs, bb)
-        txl.assign(it, it + 1)
-        advance()
-    for h in range(2):
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        ctx.store_dx(dx_buf, token_tile_idx, batch_idx)
+        txl.assign(tile_count, tile_count + 1)
+        ctx.advance_tile()
+    for group_half in range(2):
         for k in range(K):
-            txl.ptx["st.shared.f32"](red.ptr_to([((2 * tq + h) * K + k) * CB + ch]), pacc[h * K + k])
+            txl.ptx["st.shared.f32"](s_dw_groups.ptr_to([((2 * token_group + group_half) * K + k) * TILE_CHANNELS + ch]), acc_dw[group_half * K + k])
 
 
-CF2 = False  # scalar channel ownership uses native BF16-input FP32 FMAs on the timed BF16 path
-
-
-def bwd_cf2_compute(gs, xs, dxs, red, w, wdt, C, K, c0, nch, dlt, tid, warp, lane, full, empty, stage, phase,
-                     u, nrt, nbs, NDX, GSZ, XSZ, WMAX, store_dx, advance):
+def bwd_compute_loop_cf_packed(ctx):
     """
-    Channels-first g with the packed channels-last thread layout: lane = channel pair c2, warp =
-    token group tg of TG2 tokens, f32x2 arithmetic. g is read along tokens from the [nch][CF_P]
-    tile (32 tokens from the aligned tg * TG2 per channel, shifted by the runtime dlt in
-    registers), x per token pair from the channels-last tile. Per-channel arithmetic order
-    identical to every other path.
+    Channels-first g with the packed channels-last thread layout: lane = channel pair pair_ch, warp
+    = token group token_group of PACKED_TOKENS_PER_THREAD tokens, f32x2 arithmetic. g is read along
+    tokens from the [num_ch][CHANNELS_FIRST_PITCH] tile (32 tokens from the aligned token_group *
+    PACKED_TOKENS_PER_THREAD per channel, shifted by the runtime g_shift in registers), x per token
+    pair from the channels-last tile. Per-channel arithmetic order identical to every other path.
     """
-    c2 = 2 * lane
-    tg = warp
-    act = c2 < nch
-    NW = 16  # g words per channel: tokens [tg * TG2, +32)
-    NR = TG2 + K - 1
-    NV = cdiv(NR, 2)
-    wk = txl.alloc_local([K], "uint64")
-    wf = txl.alloc_local([2], "float32")
-    gw = [txl.alloc_local([NW], "uint32") for _ in range(2)]
-    ga = txl.alloc_local([NV + 2], "uint32")
-    gq = txl.alloc_local([NV + 1], "uint32")
-    s4 = (dlt & 4) != 0
-    s2 = (dlt & 2) != 0
-    sel = txl.Select((dlt & 1) != 0, txl.uint32(0x5432), txl.uint32(0x3210))
-    gv = txl.alloc_local([NR], "uint64")
-    xv = txl.alloc_local([NR], "uint64")
-    out = txl.alloc_local([TG2], "uint64")
-    pw = txl.alloc_local([K], "uint64")
-    pacc = txl.alloc_local([K], "uint64")
-    hv = txl.alloc_local([TG2], "uint32")
-    wa = txl.local_scalar("uint32")
-    load_w_pair(wk, wf, w, c0 + c2, C, K, wdt)
+    s_g, s_x, s_dx, s_dw_groups = ctx.s_g, ctx.s_x, ctx.s_dx, ctx.s_dw_groups
+    w, w_dtype, C, K = ctx.w, ctx.w_dtype, ctx.C, ctx.K
+    ch_start, num_ch, g_shift = ctx.ch_start, ctx.num_ch, ctx.g_shift
+    tidx, warp, lane = ctx.tidx, ctx.warp, ctx.lane
+    s_full, s_empty, stage, phase = ctx.s_full, ctx.s_empty, ctx.stage, ctx.phase
+    row_tile_idx, num_row_tiles, num_token_tiles = ctx.row_tile_idx, ctx.num_row_tiles, ctx.num_token_tiles
+    g_stage_size, x_stage_size, width_max = ctx.g_stage_size, ctx.x_stage_size, ctx.width_max
+    pair_ch = 2 * lane
+    token_group = warp
+    ch_ok = pair_ch < num_ch
+    NUM_G_WORDS = 16  # g words per channel: tokens [token_group * PACKED_TOKENS_PER_THREAD, +32)
+    num_vals = PACKED_TOKENS_PER_THREAD + K - 1
+    NUM_SHIFTED_WORDS = cdiv(num_vals, 2)
+    w_taps = txl.alloc_local([K], "uint64")
+    w_pair = txl.alloc_local([2], "float32")
+    g_words = [txl.alloc_local([NUM_G_WORDS], "uint32") for _ in range(2)]
+    g_words_shift4 = txl.alloc_local([NUM_SHIFTED_WORDS + 2], "uint32")
+    g_words_shift2 = txl.alloc_local([NUM_SHIFTED_WORDS + 1], "uint32")
+    is_shift4 = (g_shift & 4) != 0
+    is_shift2 = (g_shift & 2) != 0
+    prmt_selector = txl.Select((g_shift & 1) != 0, txl.uint32(0x5432), txl.uint32(0x3210))
+    g_vals = txl.alloc_local([num_vals], "uint64")
+    x_vals = txl.alloc_local([num_vals], "uint64")
+    out = txl.alloc_local([PACKED_TOKENS_PER_THREAD], "uint64")
+    dw_part = txl.alloc_local([K], "uint64")
+    acc_dw = txl.alloc_local([K], "uint64")
+    dx_words = txl.alloc_local([PACKED_TOKENS_PER_THREAD], "uint32")
+    x_word = txl.local_scalar("uint32")
+    load_w_pair(w_taps, w_pair, w, ch_start + pair_ch, C, K, w_dtype)
     for k in range(K):
-        txl.assign(pacc[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
-    it = txl.local_scalar("int32", init=txl.int32(0))
-    with txl.while_(u < nrt):
-        bs = u % nbs
-        bb = u // nbs
-        txl.cuda.mbarrier_wait(full.ptr_to([stage]), phase)
+        txl.assign(acc_dw[k], txl.cuda.make_float2(txl.float32(0.0), txl.float32(0.0)))
+    tile_count = txl.local_scalar("int32", init=txl.int32(0))
+    with txl.while_(row_tile_idx < num_row_tiles):
+        token_tile_idx = row_tile_idx % num_token_tiles
+        batch_idx = row_tile_idx // num_token_tiles
+        txl.cuda.mbarrier_wait(s_full.ptr_to([stage]), phase)
         # lanes past the slice width read (and discard) the slice's last pair: no reads past the tile
-        cl = txl.min(c2, nch - 2)
-        for e in range(2):
-            gb = stage * GSZ + (cl + e) * CF_P + tg * TG2
-            for m in range(NW // 4):
-                txl.ptx["ld.shared.v4.b32"](gw[e][4 * m], gw[e][4 * m + 1], gw[e][4 * m + 2], gw[e][4 * m + 3],
-                                            gs.ptr_to([gb + 8 * m]))
-            for m in range(NV + 2):
-                txl.assign(ga[m], txl.Select(s4, gw[e][m + 2], gw[e][m]))
-            for m in range(NV + 1):
-                txl.assign(gq[m], txl.Select(s2, ga[m + 1], ga[m]))
-            for m in range(NV):
-                txl.ptx["prmt.b32"](gw[e][m], gq[m], gq[m + 1], sel)
-        xb = stage * XSZ + cl
-        for j in range(NR):
-            g0 = gw[0][j // 2]
-            g1 = gw[1][j // 2]
+        read_ch = txl.min(pair_ch, num_ch - 2)
+        for elem in range(2):
+            g_base = stage * g_stage_size + (read_ch + elem) * CHANNELS_FIRST_PITCH + token_group * PACKED_TOKENS_PER_THREAD
+            for word_idx in range(NUM_G_WORDS // 4):
+                txl.ptx["ld.shared.v4.b32"](g_words[elem][4 * word_idx], g_words[elem][4 * word_idx + 1], g_words[elem][4 * word_idx + 2], g_words[elem][4 * word_idx + 3], s_g.ptr_to([g_base + 8 * word_idx]))
+            for word_idx in range(NUM_SHIFTED_WORDS + 2):
+                txl.assign(g_words_shift4[word_idx], txl.Select(is_shift4, g_words[elem][word_idx + 2], g_words[elem][word_idx]))
+            for word_idx in range(NUM_SHIFTED_WORDS + 1):
+                txl.assign(g_words_shift2[word_idx], txl.Select(is_shift2, g_words_shift4[word_idx + 1], g_words_shift4[word_idx]))
+            for word_idx in range(NUM_SHIFTED_WORDS):
+                txl.ptx["prmt.b32"](g_words[elem][word_idx], g_words_shift2[word_idx], g_words_shift2[word_idx + 1], prmt_selector)
+        x_base = stage * x_stage_size + read_ch
+        for j in range(num_vals):
+            word_ch0 = g_words[0][j // 2]
+            word_ch1 = g_words[1][j // 2]
             if j % 2 == 0:
-                lo = txl.reinterpret(g0 << txl.uint32(16), ty='float32')
-                hi = txl.reinterpret(g1 << txl.uint32(16), ty='float32')
+                lo = txl.reinterpret(word_ch0 << txl.uint32(16), ty="float32")
+                hi = txl.reinterpret(word_ch1 << txl.uint32(16), ty="float32")
             else:
-                lo = txl.reinterpret(g0 & txl.uint32(0xFFFF0000), ty='float32')
-                hi = txl.reinterpret(g1 & txl.uint32(0xFFFF0000), ty='float32')
-            txl.assign(gv[j], txl.cuda.make_float2(lo, hi))
-            txl.ptx["ld.shared.b32"](wa, xs.ptr_to([xb + (tg * TG2 + j) * nch]))
-            txl.assign(xv[j], bf16x2_to_f32x2(wa))
-        release(empty, stage, lane)
-        taps2(out, wk, gv, K, True)
-        partial_dw2(pw, gv, xv, K)
+                lo = txl.reinterpret(word_ch0 & txl.uint32(0xFFFF0000), ty="float32")
+                hi = txl.reinterpret(word_ch1 & txl.uint32(0xFFFF0000), ty="float32")
+            txl.assign(g_vals[j], txl.cuda.make_float2(lo, hi))
+            txl.ptx["ld.shared.b32"](x_word, s_x.ptr_to([x_base + (token_group * PACKED_TOKENS_PER_THREAD + j) * num_ch]))
+            txl.assign(x_vals[j], bf16x2_to_f32x2(x_word))
+        release_stage(s_empty, stage, lane)
+        compute_taps_packed(out, w_taps, g_vals, K, True)
+        compute_dw_partials_packed(dw_part, g_vals, x_vals, K)
         for k in range(K):
-            txl.ptx["add.rn.f32x2"](pacc[k], pacc[k], pw[k])
-        b = it % NDX
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NDX - 1))
-        for i in range(TG2):
-            txl.ptx["cvt.rn.bf16x2.f32"](hv[i], f2(out[i], 1), f2(out[i], 0))
-        bar_named(1, NC)
-        with txl.if_(act), txl.then_():
-            for i in range(TG2):
-                txl.ptx["st.shared.b32"](dxs.ptr_to([b * T * WMAX + (tg * TG2 + i) * nch + c2]), hv[i])
+            txl.ptx["add.rn.f32x2"](acc_dw[k], acc_dw[k], dw_part[k])
+        dx_buf = tile_count % NUM_DX_BUFS
+        with txl.if_(tidx == 0), txl.then_():
+            txl.ptx["cp.async.bulk.wait_group.read"](txl.int32(NUM_DX_BUFS - 1))
+        for i in range(PACKED_TOKENS_PER_THREAD):
+            txl.ptx["cvt.rn.bf16x2.f32"](dx_words[i], float2_elem(out[i], 1), float2_elem(out[i], 0))
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        with txl.if_(ch_ok), txl.then_():
+            for i in range(PACKED_TOKENS_PER_THREAD):
+                txl.ptx["st.shared.b32"](s_dx.ptr_to([dx_buf * T * width_max + (token_group * PACKED_TOKENS_PER_THREAD + i) * num_ch + pair_ch]), dx_words[i])
         txl.ptx["fence.proxy.async.shared::cta"]()
-        bar_named(1, NC)
-        store_dx(b, bs, bb)
-        txl.assign(it, it + 1)
-        advance()
+        named_barrier(1, NUM_COMPUTE_THREADS)
+        ctx.store_dx(dx_buf, token_tile_idx, batch_idx)
+        txl.assign(tile_count, tile_count + 1)
+        ctx.advance_tile()
     for k in range(K):
-        for e in range(2):
-            txl.ptx["st.shared.f32"](red.ptr_to([(tg * K + k) * CB + c2 + e]), f2(pacc[k], e))
+        for elem in range(2):
+            txl.ptx["st.shared.f32"](s_dw_groups.ptr_to([(token_group * K + k) * TILE_CHANNELS + pair_ch + elem]), float2_elem(acc_dw[k], elem))
 
 
-def store_w(dw, idx, r, wdt):
-    if wdt == "float32":
-        txl.ptx["st.global.f32"](dw.ptr_to([idx]), r)
+def store_dw_elem(dw, idx, value, w_dtype):
+    """
+    dw[idx] = value rounded to w_dtype.
+    """
+    if w_dtype == "float32":
+        txl.ptx["st.global.f32"](dw.ptr_to([idx]), value)
     else:
-        h = txl.local_scalar("uint16")
-        txl.ptx["cvt.rn.bf16.f32" if wdt == "bfloat16" else "cvt.rn.f16.f32"](h, r)
-        txl.ptx["st.global.b16"](dw.ptr_to([idx]), h)
+        bits = txl.local_scalar("uint16")
+        txl.ptx["cvt.rn.bf16.f32" if w_dtype == "bfloat16" else "cvt.rn.f16.f32"](bits, value)
+        txl.ptx["st.global.b16"](dw.ptr_to([idx]), bits)
 
 
-# ------------------------------------------------------------------------------------------
-# fallback (any C, S, strides): one tile per CTA, plain loads / stores, same arithmetic
-# ------------------------------------------------------------------------------------------
+# Plain path (any C, S, strides): one tile per CTA, plain loads / stores, same arithmetic.
 
 
-def g2s_chunk(V, words, gptr_, sptr, valid):
+def copy_chunk_to_shared(width, words, g_ptr, s_ptr, valid):
     """
-    Copy V contiguous bf16 from global to shared (zeros when not valid).
+    Copy width contiguous bf16 from global to shared (zeros when not valid).
     """
-    nw = max(V // 2, 1)
-    dt = "uint32" if V >= 2 else "uint16"
-    for i in range(nw):
-        txl.assign(words[i], txl.Cast(dt, 0))
+    num_words = max(width // 2, 1)
+    word_type = "uint32" if width >= 2 else "uint16"
+    for i in range(num_words):
+        txl.assign(words[i], txl.Cast(word_type, 0))
     with txl.if_(valid), txl.then_():
-        if V == 8:
-            txl.ptx["ld.global.nc.v4.b32"](words[0], words[1], words[2], words[3], gptr_)
-        elif V == 4:
-            txl.ptx["ld.global.nc.v2.b32"](words[0], words[1], gptr_)
-        elif V == 2:
-            txl.ptx["ld.global.nc.b32"](words[0], gptr_)
+        if width == 8:
+            txl.ptx["ld.global.nc.v4.b32"](words[0], words[1], words[2], words[3], g_ptr)
+        elif width == 4:
+            txl.ptx["ld.global.nc.v2.b32"](words[0], words[1], g_ptr)
+        elif width == 2:
+            txl.ptx["ld.global.nc.b32"](words[0], g_ptr)
         else:
-            txl.ptx["ld.global.nc.b16"](words[0], gptr_)
-    if V == 8:
-        txl.ptx["st.shared.v4.b32"](sptr, words[0], words[1], words[2], words[3])
-    elif V == 4:
-        txl.ptx["st.shared.v2.b32"](sptr, words[0], words[1])
-    elif V == 2:
-        txl.ptx["st.shared.b32"](sptr, words[0])
+            txl.ptx["ld.global.nc.b16"](words[0], g_ptr)
+    if width == 8:
+        txl.ptx["st.shared.v4.b32"](s_ptr, words[0], words[1], words[2], words[3])
+    elif width == 4:
+        txl.ptx["st.shared.v2.b32"](s_ptr, words[0], words[1])
+    elif width == 2:
+        txl.ptx["st.shared.b32"](s_ptr, words[0])
     else:
-        txl.ptx["st.shared.b16"](sptr, words[0])
+        txl.ptx["st.shared.b16"](s_ptr, words[0])
 
 
-def stage_rows(V, words, src, sbuf, tid, first_row, nrows_valid, R, C, c0, rowbase):
+def stage_rows(width, words, src, s_buf, tidx, first_row, num_rows_valid, num_rows, C, ch_start, src_base):
     """
-    sbuf[j][c] = src[rowbase + (first_row + j) * C + c0 + c] for j < R, zero outside.
+    s_buf[j][ch] = src[src_base + (first_row + j) * C + ch_start + ch] for j < num_rows, zero
+    outside.
     """
-    CPR = CB // V
-    total = R * CPR
-    for i in range(cdiv(total, NC)):
-        idx = i * NC + tid
-        row = idx // CPR
-        chn = idx % CPR
-        gr = first_row + row
-        c = c0 + chn * V
-        valid = (gr >= 0) & (gr < nrows_valid) & (c < C) & (idx < total)
-        with txl.if_(idx < total), txl.then_():
-            g2s_chunk(V, words, src.ptr_to([rowbase + i64(gr * C + c)]), sbuf.ptr_to([row * CB + chn * V]), valid)
+    chunks_per_row = TILE_CHANNELS // width
+    num_chunks = num_rows * chunks_per_row
+    for i in range(cdiv(num_chunks, NUM_COMPUTE_THREADS)):
+        idx = i * NUM_COMPUTE_THREADS + tidx
+        row = idx // chunks_per_row
+        chunk_idx = idx % chunks_per_row
+        src_row = first_row + row
+        ch = ch_start + chunk_idx * width
+        valid = (src_row >= 0) & (src_row < num_rows_valid) & (ch < C) & (idx < num_chunks)
+        with txl.if_(idx < num_chunks), txl.then_():
+            copy_chunk_to_shared(width, words, src.ptr_to([src_base + as_int64(src_row * C + ch)]), s_buf.ptr_to([row * TILE_CHANNELS + chunk_idx * width]), valid)
 
 
 @functools.cache
-def fwd_plain(C, K, wdt):
-    R = T + K - 1
-    NCB = cdiv(C, CB)
-    V = vec_width(C)
-    YP = T + 2
+def build_fwd_plain(C, K, w_dtype):
+    """
+    Plain forward: one (T tokens, TILE_CHANNELS channels) tile per CTA.
+    """
+    STAGE_ROWS = T + K - 1
+    NUM_CH_TILES = cdiv(C, TILE_CHANNELS)
+    WIDTH = vector_width(C)
+    Y_PITCH = T + 2
 
     @txl.kernel()
-    def conv_fwd_plain(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), wdt, data_alignment=1), y: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(S + T - 1) // T, NCB, B], block=NCW * 32))
-        bt, bc, bb = txl.cta_id()
-        tid = txl.thread_id()
+    def conv_fwd_plain(x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), w_dtype, data_alignment=1), y: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(S + T - 1) // T, NUM_CH_TILES, B], block=NUM_COMPUTE_WARPS * 32))
+        token_tile_idx, ch_tile_idx, batch_idx = txl.cta_id()
+        tidx = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
-        t0 = bt * T
-        c0 = bc * CB
+        token_start = token_tile_idx * T
+        ch_start = ch_tile_idx * TILE_CHANNELS
         smem = txl.smem_pool()
-        xs = smem.alloc([R * CB], "bfloat16", align=16)
-        ys = smem.alloc([CB * YP], "bfloat16", align=16)
-        words = txl.alloc_local([4], "uint32" if V >= 2 else "uint16")
-        stage_rows(V, words, x, xs, tid, t0 + offset - (K - 1), L, R, C, c0, i64(bb) * i64(L) * C)
+        s_x = smem.alloc([STAGE_ROWS * TILE_CHANNELS], "bfloat16", align=16)
+        s_y = smem.alloc([TILE_CHANNELS * Y_PITCH], "bfloat16", align=16)
+        words = txl.alloc_local([4], "uint32" if WIDTH >= 2 else "uint16")
+        stage_rows(WIDTH, words, x, s_x, tidx, token_start + offset - (K - 1), L, STAGE_ROWS, C, ch_start, as_int64(batch_idx) * as_int64(L) * C)
         ch = lane + 32 * (warp % 2)
-        tg = warp // 2
-        wk = txl.alloc_local([K], "float32")
+        token_group = warp // 2
+        w_taps = txl.alloc_local([K], "float32")
         for k in range(K):
-            load_w_f32(wk[k], w, (c0 + ch) * K + k, wdt, c0 + ch < C)
-        bar_named(0, NC)
-        xv = txl.alloc_local([TG + K - 1], "float32")
-        for j in range(TG + K - 1):
-            ld_s_bf16(xv[j], xs.ptr_to([(tg * TG + j) * CB + ch]))
-        out = txl.alloc_local([TG], "float32")
-        taps_fwd(out, wk, xv, K)
-        h = txl.local_scalar("uint16")
-        for j in range(TG):
-            txl.ptx["cvt.rn.bf16.f32"](h, out[j])
-            txl.ptx["st.shared.b16"](ys.ptr_to([ch * YP + tg * TG + j]), h)
-        bar_named(0, NC)
-        ybase = i64(bb) * C * i64(S)
-        for i in range(cdiv(CB * T, NC)):
-            idx = i * NC + tid
-            c = idx // T
-            t = idx % T
-            with txl.if_((c0 + c < C) & (t0 + t < S)), txl.then_():
-                txl.ptx["ld.shared.b16"](h, ys.ptr_to([c * YP + t]))
-                txl.ptx["st.global.b16"](y.ptr_to([ybase + i64((c0 + c) * S + t0 + t)]), h)
+            load_w_f32(w_taps[k], w, (ch_start + ch) * K + k, w_dtype, ch_start + ch < C)
+        named_barrier(0, NUM_COMPUTE_THREADS)
+        x_vals = txl.alloc_local([TOKENS_PER_THREAD + K - 1], "float32")
+        for j in range(TOKENS_PER_THREAD + K - 1):
+            load_shared_bf16(x_vals[j], s_x.ptr_to([(token_group * TOKENS_PER_THREAD + j) * TILE_CHANNELS + ch]))
+        out = txl.alloc_local([TOKENS_PER_THREAD], "float32")
+        compute_y_taps(out, w_taps, x_vals, K)
+        y_bits = txl.local_scalar("uint16")
+        for j in range(TOKENS_PER_THREAD):
+            txl.ptx["cvt.rn.bf16.f32"](y_bits, out[j])
+            txl.ptx["st.shared.b16"](s_y.ptr_to([ch * Y_PITCH + token_group * TOKENS_PER_THREAD + j]), y_bits)
+        named_barrier(0, NUM_COMPUTE_THREADS)
+        y_batch_base = as_int64(batch_idx) * C * as_int64(S)
+        for i in range(cdiv(TILE_CHANNELS * T, NUM_COMPUTE_THREADS)):
+            idx = i * NUM_COMPUTE_THREADS + tidx
+            tile_ch = idx // T
+            tile_token = idx % T
+            with txl.if_((ch_start + tile_ch < C) & (token_start + tile_token < S)), txl.then_():
+                txl.ptx["ld.shared.b16"](y_bits, s_y.ptr_to([tile_ch * Y_PITCH + tile_token]))
+                txl.ptx["st.global.b16"](y.ptr_to([y_batch_base + as_int64((ch_start + tile_ch) * S + token_start + tile_token)]), y_bits)
 
     return entry_function(conv_fwd_plain.compile(TARGET))
 
 
 @functools.cache
-def bwd_plain(C, K, wdt, mode):
+def build_bwd_plain(C, K, w_dtype, mode):
     """
     mode: "cl" (g contiguous) or "gen" (runtime strides). Per-thread dw partials go to
-    dwp[u][tg][k][c] (u = bb * nbs + bs) for dw_kernel, which sums them in the TMA order.
+    dwp[row_tile_idx][token group][k][c] (row_tile_idx = batch_idx * num_token_tiles +
+    token_tile_idx) for build_dw_reduce, which sums them in the TMA order.
     """
-    R = T + K - 1
-    NCB = cdiv(C, CB)
-    V = vec_width(C)
-    GP = CB + 2 if mode == "gen" else CB
+    STAGE_ROWS = T + K - 1
+    NUM_CH_TILES = cdiv(C, TILE_CHANNELS)
+    WIDTH = vector_width(C)
+    G_PITCH = TILE_CHANNELS + 2 if mode == "gen" else TILE_CHANNELS
 
     @txl.kernel()
-    def conv_bwd_plain(g: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), wdt, data_alignment=1), dx: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dwp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32, gsb: txl.int64, gst: txl.int64, gsc: txl.int64):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(L + T - 1) // T, NCB, B], block=NCW * 32))
-        bs, bc, bb = txl.cta_id()
-        tid = txl.thread_id()
+    def conv_bwd_plain(g: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), x: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), w: txl.Tensor((txl.int64(),), w_dtype, data_alignment=1), dx: txl.Tensor((txl.int64(),), txl.bf16, data_alignment=1), dwp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), L: txl.int32, S: txl.int32, offset: txl.int32, B: txl.int32, gsb: txl.int64, gst: txl.int64, gsc: txl.int64):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=[(L + T - 1) // T, NUM_CH_TILES, B], block=NUM_COMPUTE_WARPS * 32))
+        token_tile_idx, ch_tile_idx, batch_idx = txl.cta_id()
+        tidx = txl.thread_id()
         warp = txl.warp_id()
         lane = txl.lane_id()
-        s0 = bs * T
-        c0 = bc * CB
-        nbs = (L + T - 1) // T
+        token_start = token_tile_idx * T
+        ch_start = ch_tile_idx * TILE_CHANNELS
+        num_token_tiles = (L + T - 1) // T
         smem = txl.smem_pool()
-        gs = smem.alloc([R * GP], "bfloat16", align=16)
-        xs = smem.alloc([R * CB], "bfloat16", align=16)
-        words = txl.alloc_local([4], "uint32" if V >= 2 else "uint16")
-        xbase = i64(bb) * i64(L) * C
-        stage_rows(V, words, x, xs, tid, s0 - (K - 1), L, R, C, c0, xbase)
+        s_g = smem.alloc([STAGE_ROWS * G_PITCH], "bfloat16", align=16)
+        s_x = smem.alloc([STAGE_ROWS * TILE_CHANNELS], "bfloat16", align=16)
+        words = txl.alloc_local([4], "uint32" if WIDTH >= 2 else "uint16")
+        x_batch_base = as_int64(batch_idx) * as_int64(L) * C
+        stage_rows(WIDTH, words, x, s_x, tidx, token_start - (K - 1), L, STAGE_ROWS, C, ch_start, x_batch_base)
         if mode == "cl":
-            stage_rows(V, words, g, gs, tid, s0 - offset, S, R, C, c0, i64(bb) * gsb)
+            stage_rows(WIDTH, words, g, s_g, tidx, token_start - offset, S, STAGE_ROWS, C, ch_start, as_int64(batch_idx) * gsb)
         else:
-            h = txl.local_scalar("uint16")
-            for i in range(cdiv(R * CB, NC)):
-                idx = i * NC + tid
-                row = idx // CB
-                c = idx % CB
-                t = s0 - offset + row
-                txl.assign(h, txl.uint16(0))
-                with txl.if_((t >= 0) & (t < S) & (c0 + c < C) & (idx < R * CB)), txl.then_():
-                    txl.ptx["ld.global.nc.b16"](h, g.ptr_to([i64(bb) * gsb + i64(t) * gst + i64(c0 + c) * gsc]))
-                with txl.if_(idx < R * CB), txl.then_():
-                    txl.ptx["st.shared.b16"](gs.ptr_to([row * GP + c]), h)
+            g_bits = txl.local_scalar("uint16")
+            for i in range(cdiv(STAGE_ROWS * TILE_CHANNELS, NUM_COMPUTE_THREADS)):
+                idx = i * NUM_COMPUTE_THREADS + tidx
+                row = idx // TILE_CHANNELS
+                tile_ch = idx % TILE_CHANNELS
+                token = token_start - offset + row
+                txl.assign(g_bits, txl.uint16(0))
+                with txl.if_((token >= 0) & (token < S) & (ch_start + tile_ch < C) & (idx < STAGE_ROWS * TILE_CHANNELS)), txl.then_():
+                    txl.ptx["ld.global.nc.b16"](g_bits, g.ptr_to([as_int64(batch_idx) * gsb + as_int64(token) * gst + as_int64(ch_start + tile_ch) * gsc]))
+                with txl.if_(idx < STAGE_ROWS * TILE_CHANNELS), txl.then_():
+                    txl.ptx["st.shared.b16"](s_g.ptr_to([row * G_PITCH + tile_ch]), g_bits)
         ch = lane + 32 * (warp % 2)
-        tg = warp // 2
-        wk = txl.alloc_local([K], "float32")
+        token_group = warp // 2
+        w_taps = txl.alloc_local([K], "float32")
         for k in range(K):
-            load_w_f32(wk[k], w, (c0 + ch) * K + k, wdt, c0 + ch < C)
-        bar_named(0, NC)
-        gv = txl.alloc_local([TG + K - 1], "float32")
-        xv = txl.alloc_local([TG + K - 1], "float32")
-        for j in range(TG + K - 1):
-            ld_s_bf16(gv[j], gs.ptr_to([(tg * TG + j) * GP + ch]))
-            ld_s_bf16(xv[j], xs.ptr_to([(tg * TG + j) * CB + ch]))
-        out = txl.alloc_local([TG], "float32")
-        taps_dx(out, wk, gv, K)
-        pw = txl.alloc_local([2 * K], "float32")
-        # dw partials per TG2-token group (the packed TMA kernels' grouping)
-        for hf in range(2):
-            partial_dw(Sub(pw, hf * K), gv, xv, K, hf * TG2, TG2)
-        h2 = txl.local_scalar("uint16")
-        for i in range(TG):
-            s = s0 + tg * TG + i
-            with txl.if_((s < L) & (c0 + ch < C)), txl.then_():
-                txl.ptx["cvt.rn.bf16.f32"](h2, out[i])
-                txl.ptx["st.global.b16"](dx.ptr_to([xbase + i64(s * C + c0 + ch)]), h2)
-        u = bb * nbs + bs
-        with txl.if_(c0 + ch < C), txl.then_():
-            for hf in range(2):
+            load_w_f32(w_taps[k], w, (ch_start + ch) * K + k, w_dtype, ch_start + ch < C)
+        named_barrier(0, NUM_COMPUTE_THREADS)
+        g_vals = txl.alloc_local([TOKENS_PER_THREAD + K - 1], "float32")
+        x_vals = txl.alloc_local([TOKENS_PER_THREAD + K - 1], "float32")
+        for j in range(TOKENS_PER_THREAD + K - 1):
+            load_shared_bf16(g_vals[j], s_g.ptr_to([(token_group * TOKENS_PER_THREAD + j) * G_PITCH + ch]))
+            load_shared_bf16(x_vals[j], s_x.ptr_to([(token_group * TOKENS_PER_THREAD + j) * TILE_CHANNELS + ch]))
+        out = txl.alloc_local([TOKENS_PER_THREAD], "float32")
+        compute_dx_taps(out, w_taps, g_vals, K)
+        dw_part = txl.alloc_local([2 * K], "float32")
+        # dw partials per PACKED_TOKENS_PER_THREAD-token group (the packed TMA kernels' grouping)
+        for group_half in range(2):
+            compute_dw_partials(LocalWindow(dw_part, group_half * K), g_vals, x_vals, K, group_half * PACKED_TOKENS_PER_THREAD, PACKED_TOKENS_PER_THREAD)
+        dx_bits = txl.local_scalar("uint16")
+        for i in range(TOKENS_PER_THREAD):
+            token = token_start + token_group * TOKENS_PER_THREAD + i
+            with txl.if_((token < L) & (ch_start + ch < C)), txl.then_():
+                txl.ptx["cvt.rn.bf16.f32"](dx_bits, out[i])
+                txl.ptx["st.global.b16"](dx.ptr_to([x_batch_base + as_int64(token * C + ch_start + ch)]), dx_bits)
+        row_tile_idx = batch_idx * num_token_tiles + token_tile_idx
+        with txl.if_(ch_start + ch < C), txl.then_():
+            for group_half in range(2):
                 for k in range(K):
-                    txl.ptx["st.global.f32"](
-                        dwp.ptr_to([((i64(u) * NTG + i64(2 * tg + hf)) * K + k) * C + i64(c0 + ch)]),
-                        pw[hf * K + k],
-                    )
+                    txl.ptx["st.global.f32"](dwp.ptr_to([((as_int64(row_tile_idx) * NUM_TOKEN_GROUPS + as_int64(2 * token_group + group_half)) * K + k) * C + as_int64(ch_start + ch)]), dw_part[group_half * K + k])
 
     return entry_function(conv_bwd_plain.compile(TARGET))
 
 
 @functools.cache
-def dw_kernel(C, K, wdt):
+def build_dw_reduce(C, K, w_dtype):
     """
-    dw[c][k] in the TMA kernel's order: ranks q < KF, token groups, row tiles u = q mod KF.
+    dw[c][k] in the TMA kernel's order: ranks rank_idx < CLUSTER_SIZE, token groups, row tiles
+    row_tile_idx = rank_idx mod CLUSTER_SIZE.
     """
-    N = C * K
-    KF = kfac(cdiv(C, CB))
+    NUM_W = C * K
 
     @txl.kernel()
-    def dw_reduce(dwp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), dw: txl.Tensor((txl.int64(),), wdt, data_alignment=1), nrt: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(N + 255) // 256, block=256))
+    def dw_reduce(dwp: txl.Tensor((txl.int64(),), txl.f32, data_alignment=1), dw: txl.Tensor((txl.int64(),), w_dtype, data_alignment=1), nrt: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=(NUM_W + 255) // 256, block=256))
         idx = txl.cta_id() * 256 + txl.thread_id()
-        k = idx // C
-        c = idx % C
-        out = txl.local_scalar("float32")
-        r = txl.local_scalar("float32")
-        a = txl.local_scalar("float32")
-        rv = txl.local_scalar("float32")
-        uu = txl.local_scalar("int32")
-        with txl.if_(idx < N), txl.then_():
-            txl.assign(out, txl.float32(0.0))
-            for q in range(KF):
-                txl.assign(r, txl.float32(0.0))
-                for tg in range(NTG):
-                    txl.assign(a, txl.float32(0.0))
-                    txl.assign(uu, txl.int32(q))
-                    with txl.while_(uu < nrt):
-                        txl.ptx["ld.global.f32"](
-                            rv, dwp.ptr_to([((i64(uu) * NTG + tg) * K + i64(k)) * C + i64(c)])
-                        )
-                        txl.assign(a, a + rv)
-                        txl.assign(uu, uu + KF)
-                    txl.assign(r, r + a)
-                txl.assign(out, out + r)
-            store_w(dw, c * K + k, out, wdt)
+        tap = idx // C
+        ch = idx % C
+        acc_dw = txl.local_scalar("float32")
+        acc_rank = txl.local_scalar("float32")
+        acc_group = txl.local_scalar("float32")
+        partial = txl.local_scalar("float32")
+        row_tile_idx = txl.local_scalar("int32")
+        with txl.if_(idx < NUM_W), txl.then_():
+            txl.assign(acc_dw, txl.float32(0.0))
+            for rank_idx in range(CLUSTER_SIZE):
+                txl.assign(acc_rank, txl.float32(0.0))
+                for group_idx in range(NUM_TOKEN_GROUPS):
+                    txl.assign(acc_group, txl.float32(0.0))
+                    txl.assign(row_tile_idx, txl.int32(rank_idx))
+                    with txl.while_(row_tile_idx < nrt):
+                        txl.ptx["ld.global.f32"](partial, dwp.ptr_to([((as_int64(row_tile_idx) * NUM_TOKEN_GROUPS + group_idx) * K + as_int64(tap)) * C + as_int64(ch)]))
+                        txl.assign(acc_group, acc_group + partial)
+                        txl.assign(row_tile_idx, row_tile_idx + CLUSTER_SIZE)
+                    txl.assign(acc_rank, acc_rank + acc_group)
+                txl.assign(acc_dw, acc_dw + acc_rank)
+            store_dw_elem(dw, ch * K + tap, acc_dw, w_dtype)
 
     return entry_function(dw_reduce.compile(TARGET))
 
 
-# ------------------------------------------------------------------------------------------
-# entry points
-# ------------------------------------------------------------------------------------------
+def is_aligned16(*tensors):
+    return all(tensor.data_ptr() % 16 == 0 for tensor in tensors)
 
 
-def aligned(*ts):
-    return all(t.data_ptr() % 16 == 0 for t in ts)
-
-
-def realigned(t):
+def realigned(tensor):
     """
-    t itself if its data starts on a 16-byte boundary, else a fresh copy in the same layout (every
-    path reads 16-byte vectors from the base, so a misaligned base would fault).
+    tensor itself if its data starts on a 16-byte boundary, else a fresh copy in the same layout
+    (every path reads 16-byte vectors from the base, so a misaligned base would fault).
     """
-    return t if t.data_ptr() % 16 == 0 else t.clone()
+    return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
-def covered_weight(w):
+def flatten_weight(w):
     """
     w flattened in a dtype the kernels read: other float dtypes are read as fp32.
     """
-    wf = w.reshape(-1)
-    return wf if w.dtype in WDT else wf.float()
+    w_flat = w.reshape(-1)
+    return w_flat if w.dtype in WEIGHT_DTYPE_NAME else w_flat.float()
 
 
 def causal_conv1d_fwd_sm100(x: torch.Tensor, w: torch.Tensor, offset: int) -> torch.Tensor:
@@ -1359,12 +1366,12 @@ def causal_conv1d_fwd_sm100(x: torch.Tensor, w: torch.Tensor, offset: int) -> to
     S = L - offset
     y = torch.empty((B, C, S), dtype=x.dtype, device=x.device)
     if S > 0 and B > 0 and C > 0:
-        wf = covered_weight(w)
-        wdt = WDT[wf.dtype]
-        if C % 8 == 0 and S % 8 == 0 and 2 <= K <= 8 and aligned(x, y):
-            fwd_tma(C, K, wdt, S >= 8192)(x.view(-1), wf, y.view(-1), L, S, offset, B)
+        w_flat = flatten_weight(w)
+        w_dtype = WEIGHT_DTYPE_NAME[w_flat.dtype]
+        if C % 8 == 0 and S % 8 == 0 and 2 <= K <= 8 and is_aligned16(x, y):
+            build_fwd_tma(C, K, w_dtype, S >= 8192)(x.view(-1), w_flat, y.view(-1), L, S, offset, B)
         else:
-            fwd_plain(C, K, wdt)(x.view(-1), wf, y.view(-1), L, S, offset, B)
+            build_fwd_plain(C, K, w_dtype)(x.view(-1), w_flat, y.view(-1), L, S, offset, B)
     return y.transpose(1, 2)
 
 
@@ -1380,26 +1387,26 @@ def causal_conv1d_bwd_sm100(g: torch.Tensor, x: torch.Tensor, w: torch.Tensor, o
     dx = torch.empty_like(x)
     if C == 0:
         return dx.zero_(), torch.zeros(w.shape, dtype=w.dtype, device=w.device)
-    wf = covered_weight(w)
-    wdt = WDT[wf.dtype]
-    dwf = torch.empty((C * K,), dtype=wf.dtype, device=w.device)
+    w_flat = flatten_weight(w)
+    w_dtype = WEIGHT_DTYPE_NAME[w_flat.dtype]
+    dw_flat = torch.empty((C * K,), dtype=w_flat.dtype, device=w.device)
     if g.numel() == 0:
         g = g.contiguous()  # nothing to read: the plain path reads it as channels-last
-    nrt = B * cdiv(L, T)
-    cl = g.is_contiguous()
-    cf = (not cl) and S > 0 and g.stride(1) == 1 and g.stride(2) == S and g.stride(0) == C * S
-    tma_ok = C % 8 == 0 and 2 <= K <= 8 and S > 0 and nrt > 0 and aligned(g, x, dx)
-    if tma_ok and (cl or (cf and S % 8 == 0)):
-        gv = g.view(-1) if cl else g.as_strided((B * C * S,), (1,))
-        bwd_tma(C, K, wdt, not cl)(gv, x.view(-1), wf, dx.view(-1), dwf, L, S, offset, B)
+    num_row_tiles = B * cdiv(L, T)
+    g_channels_last = g.is_contiguous()
+    g_channels_first = (not g_channels_last) and S > 0 and g.stride(1) == 1 and g.stride(2) == S and g.stride(0) == C * S
+    can_use_tma = C % 8 == 0 and 2 <= K <= 8 and S > 0 and num_row_tiles > 0 and is_aligned16(g, x, dx)
+    if can_use_tma and (g_channels_last or (g_channels_first and S % 8 == 0)):
+        g_flat = g.view(-1) if g_channels_last else g.as_strided((B * C * S,), (1,))
+        build_bwd_tma(C, K, w_dtype, not g_channels_last)(g_flat, x.view(-1), w_flat, dx.view(-1), dw_flat, L, S, offset, B)
     else:
-        dwp = torch.empty((max(nrt, 1), NTG, K, C), dtype=torch.float32, device=x.device)
-        if nrt > 0:
-            if cl:
-                bwd_plain(C, K, wdt, "cl")(g.view(-1), x.view(-1), wf, dx.view(-1), dwp.view(-1), L, S, offset, B, S * C, C, 1)
+        dw_partials = torch.empty((max(num_row_tiles, 1), NUM_TOKEN_GROUPS, K, C), dtype=torch.float32, device=x.device)
+        if num_row_tiles > 0:
+            if g_channels_last:
+                build_bwd_plain(C, K, w_dtype, "cl")(g.view(-1), x.view(-1), w_flat, dx.view(-1), dw_partials.view(-1), L, S, offset, B, S * C, C, 1)
             else:
-                sb, st, sc = g.stride()
-                span = 1 + (B - 1) * sb + max(S - 1, 0) * st + (C - 1) * sc
-                bwd_plain(C, K, wdt, "gen")(g.as_strided((span,), (1,)), x.view(-1), wf, dx.view(-1), dwp.view(-1), L, S, offset, B, sb, st, sc)
-        dw_kernel(C, K, wdt)(dwp.view(-1), dwf, nrt)
-    return dx, dwf.to(w.dtype).view(w.shape)
+                g_stride_b, g_stride_s, g_stride_c = g.stride()
+                g_span = 1 + (B - 1) * g_stride_b + max(S - 1, 0) * g_stride_s + (C - 1) * g_stride_c
+                build_bwd_plain(C, K, w_dtype, "gen")(g.as_strided((g_span,), (1,)), x.view(-1), w_flat, dx.view(-1), dw_partials.view(-1), L, S, offset, B, g_stride_b, g_stride_s, g_stride_c)
+        build_dw_reduce(C, K, w_dtype)(dw_partials.view(-1), dw_flat, num_row_tiles)
+    return dx, dw_flat.to(w.dtype).view(w.shape)
