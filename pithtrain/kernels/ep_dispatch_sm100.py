@@ -5,10 +5,10 @@ Sender side: one launch with no unconditional grid barrier. Each CTA counts its 
 shared memory and claims its base in every expert / rank bin with one global atomic per bin. A CTA
 spins on the others only after it has seen every CTA of the grid start, so the spin always ends even
 when comm kernels on other streams hold SMs; otherwise it exits and leaves its placement to a shared
-chunk queue (see send_def). Placement within a bucket uses shared-memory atomics, so the order
-within a bucket is launch-dependent. The workspace (bin counters,
-start / arrive / place / exit words and per-CTA bases) is int32, kept per (device, stream) and
-re-zeroed by the last CTA out, so it is zeroed once on first use and never again from the host.
+chunk queue (see define_send_kernel). Placement within a bucket uses shared-memory atomics, so the
+order within a bucket is launch-dependent. The workspace (bin counters, start / arrive / place /
+exit words and per-CTA bases) is int32, kept per (device, stream) and re-zeroed by the last CTA
+out, so it is zeroed once on first use and never again from the host.
 
 Receiver side: one launch. Every CTA scans the received metadata in shared memory, then
 binary-searches the segment of each of its slots.
@@ -30,199 +30,225 @@ TARGET = tvm_tirx.target.Target({"kind": "cuda", "arch": "sm_100a", "backend_con
 
 __all__ = ["ep_dispatch_recv_idx_sm100", "ep_dispatch_send_idx_sm100"]
 
-FULL = 0xFFFFFFFF
+FULL_MASK = 0xFFFFFFFF
 
 EXECUTABLES = []  # keep the compiled modules alive behind the cached entry functions
 
 
-def entry_function(ex):
+def entry_function(executable):
     """
-    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on every
-    call, a few us of host time); the executable stays alive in EXECUTABLES.
+    The compiled kernel's entry function, looked up once (Executable.__call__ re-resolves it on
+    every call, a few us of host time); the executable stays alive in EXECUTABLES.
     """
-    EXECUTABLES.append(ex)
-    return ex["main"]
+    EXECUTABLES.append(executable)
+    return executable["main"]
 
 
-def bar():
+def bar_sync():
     txl.ptx.bar.sync(txl.uint32(0))
 
 
-def ld_s32(buf, i):
+def ld_s32(buf, idx):
     out = txl.local_scalar("int32")
-    txl.ptx.ld.shared.b32(out, buf.ptr_to([i]))
+    txl.ptx.ld.shared.b32(out, buf.ptr_to([idx]))
     return out
 
 
-def st_s32(buf, i, v):
-    txl.ptx.st.shared.b32(buf.ptr_to([i]), v)
+def st_s32(buf, idx, value):
+    txl.ptx.st.shared.b32(buf.ptr_to([idx]), value)
 
 
-def ld_g64(buf, i):
+def ld_g64(buf, idx):
     out = txl.local_scalar("int64")
-    txl.ptx.ld.global_.b64(out, buf.ptr_to([i]))
+    txl.ptx.ld.global_.b64(out, buf.ptr_to([idx]))
     return out
 
 
-def ld_g32(buf, i):
+def ld_g32(buf, idx):
     out = txl.local_scalar("int32")
-    txl.ptx.ld.global_.b32(out, buf.ptr_to([i]))
+    txl.ptx.ld.global_.b32(out, buf.ptr_to([idx]))
     return out
 
 
-def st_g64(buf, i, v):
-    tmp = txl.local_scalar("int64", init=v)
-    txl.ptx.st.global_.b64(buf.ptr_to([i]), tmp)
+def st_g64(buf, idx, value):
+    tmp = txl.local_scalar("int64", init=value)
+    txl.ptx.st.global_.b64(buf.ptr_to([idx]), tmp)
 
 
-def shfl_up(v, d):
-    out = txl.local_scalar("int32")
-    txl.ptx.shfl_sync.up.b32(out, v, txl.uint32(d), txl.uint32(0), txl.uint32(FULL))
-    return out
+def atom_s_add(buf, idx, value):
+    out = txl.local_scalar("uint32")
+    txl.ptx.atom.shared.add.u32(out, buf.ptr_to([idx]), txl.uint32(value) if isinstance(value, int) else value)
+    return txl.reinterpret(out, ty="int32")
 
 
-def warp_incl_scan(v, lane):
-    acc = txl.local_scalar("int32", init=v)
-    for s in (1, 2, 4, 8, 16):
-        peer = shfl_up(acc, s)
-        txl.assign(acc, txl.Select(lane >= s, acc + peer, acc))
-    return acc
+def warp_inclusive_scan(value, lane):
+    acc_sum = txl.local_scalar("int32", init=value)
+    for offset in (1, 2, 4, 8, 16):
+        peer = txl.local_scalar("int32")
+        txl.ptx.shfl_sync.up.b32(peer, acc_sum, txl.uint32(offset), txl.uint32(0), txl.uint32(FULL_MASK))
+        txl.assign(acc_sum, txl.Select(lane >= offset, acc_sum + peer, acc_sum))
+    return acc_sum
 
 
-def block_excl_scan(src, dst, n, tid, lane, warp, s_warp, nthreads, add=None):
+def block_exclusive_scan(src, dst, num_items, tidx, lane, warp, s_warp, num_threads, add=None):
     """
-    dst[i] = sum(src[:i]) (+ add[i] if given) over shared int32 arrays of trace-time length n.
+    dst[i] = sum(src[:i]) (+ add[i] if given) over shared int32 arrays of num_items (trace-time).
 
-    Each thread owns a contiguous run of ceil(n / nthreads) items; one warp scans the run totals.
-    Ends with a CTA barrier. Returns nothing; dst may alias src only when add is None.
+    Each thread owns a contiguous run of ceil(num_items / num_threads) items; one warp scans the run
+    totals. Ends with a CTA barrier. Returns nothing; dst may alias src only when add is None.
     """
-    per = (n + nthreads - 1) // nthreads
-    nwarps = nthreads // 32
-    run = txl.local_scalar("int32", init=txl.int32(0))
-    for q in range(per):
-        i = tid * per + q
-        with txl.if_(i < n), txl.then_():
-            txl.assign(run, run + ld_s32(src, i))
-    inc = warp_incl_scan(run, lane)
+    items_per_thread = (num_items + num_threads - 1) // num_threads
+    num_warps = num_threads // 32
+    run_total = txl.local_scalar("int32", init=txl.int32(0))
+    for i in range(items_per_thread):
+        idx = tidx * items_per_thread + i
+        with txl.if_(idx < num_items), txl.then_():
+            txl.assign(run_total, run_total + ld_s32(src, idx))
+    run_end = warp_inclusive_scan(run_total, lane)
     with txl.if_(lane == 31), txl.then_():
-        st_s32(s_warp, warp, inc)
-    bar()
+        st_s32(s_warp, warp, run_end)
+    bar_sync()
     with txl.if_(warp == 0), txl.then_():
-        w = txl.local_scalar("int32", init=txl.int32(0))
-        with txl.if_(lane < nwarps), txl.then_():
-            txl.assign(w, ld_s32(s_warp, lane))
-        wi = warp_incl_scan(w, lane)
-        with txl.if_(lane < nwarps), txl.then_():
-            st_s32(s_warp, lane, wi - w)
-    bar()
-    acc = txl.local_scalar("int32", init=ld_s32(s_warp, warp) + inc - run)
-    vals = []
-    for q in range(per):
-        i = tid * per + q
-        v = txl.local_scalar("int32", init=txl.int32(0))
-        with txl.if_(i < n), txl.then_():
-            txl.assign(v, ld_s32(src, i))
-        vals.append(v)
-    bar()
-    for q in range(per):
-        i = tid * per + q
-        with txl.if_(i < n), txl.then_():
+        warp_total = txl.local_scalar("int32", init=txl.int32(0))
+        with txl.if_(lane < num_warps), txl.then_():
+            txl.assign(warp_total, ld_s32(s_warp, lane))
+        warp_end = warp_inclusive_scan(warp_total, lane)
+        with txl.if_(lane < num_warps), txl.then_():
+            st_s32(s_warp, lane, warp_end - warp_total)
+    bar_sync()
+    acc_sum = txl.local_scalar("int32", init=ld_s32(s_warp, warp) + run_end - run_total)
+    run_values = []
+    for i in range(items_per_thread):
+        idx = tidx * items_per_thread + i
+        value = txl.local_scalar("int32", init=txl.int32(0))
+        with txl.if_(idx < num_items), txl.then_():
+            txl.assign(value, ld_s32(src, idx))
+        run_values.append(value)
+    bar_sync()
+    for i in range(items_per_thread):
+        idx = tidx * items_per_thread + i
+        with txl.if_(idx < num_items), txl.then_():
             if add is None:
-                st_s32(dst, i, acc)
+                st_s32(dst, idx, acc_sum)
             else:
-                st_s32(dst, i, acc + ld_s32(add, i))
-        txl.assign(acc, acc + vals[q])
-    bar()
+                st_s32(dst, idx, acc_sum + ld_s32(add, idx))
+        txl.assign(acc_sum, acc_sum + run_values[i])
+    bar_sync()
 
 
-# --------------------------------------------------------------------------------------------
-# recv
-# --------------------------------------------------------------------------------------------
 RECV_WARPS = 8
 RECV_PER_THREAD = 1
 RECV_MAX_SEGMENTS = 2048  # ep_size * experts_per_rank the kernel covers (two int32 smem arrays)
 
 
 @functools.cache
-def recv_kernel(ep, epr):
-    return entry_function(recv_def(ep, epr).compile(TARGET))
+def compile_recv_kernel(ep_size, experts_per_rank):
+    return entry_function(define_recv_kernel(ep_size, experts_per_rank).compile(TARGET))
 
 
-def recv_def(ep, epr):
-    nseg = ep * epr
-    nthreads = RECV_WARPS * 32
-    tile = nthreads * RECV_PER_THREAD
-    steps = max(1, nseg.bit_length())
+def define_recv_kernel(ep_size, experts_per_rank):
+    num_segments = ep_size * experts_per_rank
+    num_threads = RECV_WARPS * 32
+    slots_per_cta = num_threads * RECV_PER_THREAD
+    num_search_steps = max(1, num_segments.bit_length())
 
     @txl.kernel()
     def ep_recv_idx(meta: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), received: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), expert_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), expand_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), recv_stride: txl.int64, total: txl.int32, num_ctas: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(RECV_WARPS) * 32))
-        tid = txl.thread_id()
-        lane, warp = tid & 31, tid >> 5
-        cta = txl.cta_id()
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=RECV_WARPS * 32))
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        cta_idx = txl.cta_id()
         pool = txl.smem_pool()
-        s_cnt, s_end, s_dd, s_warp = pool.alloc([nseg], "int32"), pool.alloc([nseg], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32")
+        s_seg_count, s_seg_end, s_dedup_start, s_warp = pool.alloc([num_segments], "int32"), pool.alloc([num_segments], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32")
 
-        # issue this thread's received loads first: their latency overlaps the metadata scan
-        rv = []
-        for q in range(RECV_PER_THREAD):
-            slot = cta * tile + q * nthreads + tid
-            r = txl.local_scalar("int64", init=txl.int64(0))
-            with txl.if_(slot < total), txl.then_():
-                txl.ptx.ld.global_.b64(r, received.ptr_to([txl.Cast("int64", slot) * recv_stride]))
-            rv.append(r)
+        def load_received_values():
+            """
+            Issue this thread's received loads first: their latency overlaps the metadata scan.
+            """
+            received_values = []
+            for i in range(RECV_PER_THREAD):
+                slot = cta_idx * slots_per_cta + i * num_threads + tidx
+                received_value = txl.local_scalar("int64", init=txl.int64(0))
+                with txl.if_(slot < total), txl.then_():
+                    txl.ptx.ld.global_.b64(received_value, received.ptr_to([txl.Cast("int64", slot) * recv_stride]))
+                received_values.append(received_value)
+            return received_values
 
-        def seg_count(i):
-            s = i // epr
-            return txl.Cast("int32", ld_g64(meta, txl.Cast("int64", s * (epr + 1) + (i - s * epr))))
+        def load_segment_count(seg_idx):
+            sender_idx = seg_idx // experts_per_rank
+            return txl.Cast("int32", ld_g64(meta, txl.Cast("int64", sender_idx * (experts_per_rank + 1) + (seg_idx - sender_idx * experts_per_rank))))
 
-        if nseg <= nthreads:
-            cnt = txl.local_scalar("int32", init=txl.int32(0))
-            with txl.if_(tid < nseg), txl.then_():
-                txl.assign(cnt, seg_count(tid))
-        else:
-            with txl.serial((nseg + nthreads - 1) // nthreads) as it:
-                i = it * nthreads + tid
-                with txl.if_(i < nseg), txl.then_():
-                    st_s32(s_cnt, i, seg_count(i))
-        # sender dedup exclusive prefix (ep <= 32) in warp 0
-        with txl.if_(warp == 0), txl.then_():
-            d = txl.local_scalar("int32", init=txl.int32(0))
-            with txl.if_(lane < ep), txl.then_():
-                txl.assign(d, txl.Cast("int32", ld_g64(meta, txl.Cast("int64", lane * (epr + 1) + epr))))
-            di = warp_incl_scan(d, lane)
-            st_s32(s_dd, lane, di - d)
-        if nseg <= nthreads:
-            inc = warp_incl_scan(cnt, lane)
-            with txl.if_(lane == 31), txl.then_():
-                st_s32(s_warp, warp, inc)
-            bar()
-            pre = txl.local_scalar("int32", init=txl.int32(0))
-            for w in range(RECV_WARPS - 1):
-                txl.assign(pre, pre + txl.Select(warp > w, ld_s32(s_warp, w), txl.int32(0)))
-            with txl.if_(tid < nseg), txl.then_():
-                st_s32(s_end, tid, pre + inc)
-            bar()
-        else:
-            bar()
-            # inclusive end of every segment: exclusive scan plus own count
-            block_excl_scan(s_cnt, s_end, nseg, tid, lane, warp, s_warp, nthreads, add=s_cnt)
+        def load_segment_counts():
+            """
+            One segment per thread in a register when they fit, else all of them into s_seg_count.
+            """
+            if num_segments <= num_threads:
+                count = txl.local_scalar("int32", init=txl.int32(0))
+                with txl.if_(tidx < num_segments), txl.then_():
+                    txl.assign(count, load_segment_count(tidx))
+                return count
+            with txl.serial((num_segments + num_threads - 1) // num_threads) as iteration:
+                seg_idx = iteration * num_threads + tidx
+                with txl.if_(seg_idx < num_segments), txl.then_():
+                    st_s32(s_seg_count, seg_idx, load_segment_count(seg_idx))
+            return None
 
-        for q in range(RECV_PER_THREAD):
-            slot = cta * tile + q * nthreads + tid
-            with txl.if_(slot < total), txl.then_():
-                lo, hi = txl.local_scalar("int32", init=txl.int32(0)), txl.local_scalar("int32", init=txl.int32(nseg))
-                for step in range(steps):
-                    mid = txl.local_scalar("int32", init=(lo + hi) >> 1)
-                    with txl.if_(lo < hi), txl.then_():
-                        above = ld_s32(s_end, txl.Min(mid, txl.int32(nseg - 1))) > slot
-                        txl.assign(hi, txl.Select(above, mid, hi))
-                        txl.assign(lo, txl.Select(above, lo, mid + 1))
-                seg = txl.Min(lo, txl.int32(nseg - 1))
-                sender = seg // epr
-                expert = seg - sender * epr
-                st_g64(expert_out, txl.Cast("int64", slot), txl.Cast("int64", expert))
-                st_g64(expand_out, txl.Cast("int64", slot), rv[q] + txl.Cast("int64", ld_s32(s_dd, sender)))
+        def scan_dedup_starts():
+            """
+            Exclusive prefix of the senders' dedup counts (ep_size <= 32) in warp 0.
+            """
+            with txl.if_(warp == 0), txl.then_():
+                dedup = txl.local_scalar("int32", init=txl.int32(0))
+                with txl.if_(lane < ep_size), txl.then_():
+                    txl.assign(dedup, txl.Cast("int32", ld_g64(meta, txl.Cast("int64", lane * (experts_per_rank + 1) + experts_per_rank))))
+                dedup_end = warp_inclusive_scan(dedup, lane)
+                st_s32(s_dedup_start, lane, dedup_end - dedup)
+
+        def scan_segment_ends(count):
+            """
+            Inclusive end of every segment into s_seg_end; ends with a CTA barrier.
+            """
+            if num_segments <= num_threads:
+                count_end = warp_inclusive_scan(count, lane)
+                with txl.if_(lane == 31), txl.then_():
+                    st_s32(s_warp, warp, count_end)
+                bar_sync()
+                warp_prefix = txl.local_scalar("int32", init=txl.int32(0))
+                for prev_warp in range(RECV_WARPS - 1):
+                    txl.assign(warp_prefix, warp_prefix + txl.Select(warp > prev_warp, ld_s32(s_warp, prev_warp), txl.int32(0)))
+                with txl.if_(tidx < num_segments), txl.then_():
+                    st_s32(s_seg_end, tidx, warp_prefix + count_end)
+                bar_sync()
+            else:
+                bar_sync()
+                # exclusive scan plus own count
+                block_exclusive_scan(s_seg_count, s_seg_end, num_segments, tidx, lane, warp, s_warp, num_threads, add=s_seg_count)
+
+        def store_slot_indices(received_values):
+            """
+            Binary-search each slot's segment; store its local expert and its deduplicated row.
+            """
+            for i in range(RECV_PER_THREAD):
+                slot = cta_idx * slots_per_cta + i * num_threads + tidx
+                with txl.if_(slot < total), txl.then_():
+                    search_start, search_end = txl.local_scalar("int32", init=txl.int32(0)), txl.local_scalar("int32", init=txl.int32(num_segments))
+                    for _ in range(num_search_steps):
+                        mid = txl.local_scalar("int32", init=(search_start + search_end) >> 1)
+                        with txl.if_(search_start < search_end), txl.then_():
+                            above = ld_s32(s_seg_end, txl.Min(mid, txl.int32(num_segments - 1))) > slot
+                            txl.assign(search_end, txl.Select(above, mid, search_end))
+                            txl.assign(search_start, txl.Select(above, search_start, mid + 1))
+                    seg_idx = txl.Min(search_start, txl.int32(num_segments - 1))
+                    sender_idx = seg_idx // experts_per_rank
+                    expert_idx = seg_idx - sender_idx * experts_per_rank
+                    st_g64(expert_out, txl.Cast("int64", slot), txl.Cast("int64", expert_idx))
+                    st_g64(expand_out, txl.Cast("int64", slot), received_values[i] + txl.Cast("int64", ld_s32(s_dedup_start, sender_idx)))
+
+        received_values = load_received_values()
+        count = load_segment_counts()
+        scan_dedup_starts()
+        scan_segment_ends(count)
+        store_slot_indices(received_values)
 
     return ep_recv_idx
 
@@ -241,316 +267,353 @@ def recv_idx_torch(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, e
 
 
 def ep_dispatch_recv_idx_sm100(recv_meta: torch.Tensor, received_expand_idx: torch.Tensor, ep_size: int, experts_per_rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    SM100 implementation of ep_dispatch_recv_idx.
+    """
     # the kernel reads recv_meta with unit stride; received_expand_idx with its own (non-negative)
     recv_meta = recv_meta.contiguous()
     if received_expand_idx.stride(0) < 0:
         received_expand_idx = received_expand_idx.contiguous()
     total = received_expand_idx.shape[0]
-    dev = received_expand_idx.device
+    device = received_expand_idx.device
     if total == 0:
-        return torch.empty(0, dtype=torch.int64, device=dev), torch.empty(0, dtype=torch.int64, device=dev)
+        return torch.empty(0, dtype=torch.int64, device=device), torch.empty(0, dtype=torch.int64, device=device)
     if not (ep_size <= 32 and 0 < ep_size * experts_per_rank <= RECV_MAX_SEGMENTS and total < 2**31 and received_expand_idx.dtype == torch.int64):
         return recv_idx_torch(recv_meta, received_expand_idx, ep_size, experts_per_rank)
-    expert_idxs, expand_idx = torch.empty(total, dtype=torch.int64, device=dev), torch.empty(total, dtype=torch.int64, device=dev)
-    fn = recv_kernel(ep_size, experts_per_rank)
-    tile = RECV_WARPS * 32 * RECV_PER_THREAD
+    expert_idxs, expand_idx = torch.empty(total, dtype=torch.int64, device=device), torch.empty(total, dtype=torch.int64, device=device)
+    fn = compile_recv_kernel(ep_size, experts_per_rank)
+    slots_per_cta = RECV_WARPS * 32 * RECV_PER_THREAD
     stride = received_expand_idx.stride(0)
-    flat = received_expand_idx.as_strided(((total - 1) * stride + 1,), (1,))
-    fn(recv_meta, flat, expert_idxs, expand_idx, stride, total, (total + tile - 1) // tile)
+    received_flat = received_expand_idx.as_strided(((total - 1) * stride + 1,), (1,))
+    fn(recv_meta, received_flat, expert_idxs, expand_idx, stride, total, (total + slots_per_cta - 1) // slots_per_cta)
     return expert_idxs, expand_idx
 
 
-# --------------------------------------------------------------------------------------------
-# send: one launch; a CTA waits for others only once every CTA of the grid has started
-# --------------------------------------------------------------------------------------------
 SEND_WARPS = 8
 SEND_MIN_TOKENS_PER_CTA = 128
 SEND_MAX_CTAS = 128
 SEND_MAX_BINS = 2048  # ep_size * (experts_per_rank + 1) the kernel covers (shared memory < 48 KB)
 
 
-def atom_s_add(buf, i, v):
-    out = txl.local_scalar("uint32")
-    txl.ptx.atom.shared.add.u32(out, buf.ptr_to([i]), txl.uint32(v) if isinstance(v, int) else v)
-    return txl.reinterpret(out, ty="int32")
-
-
 @functools.cache
-def zero_kernel(n):
+def compile_zero_kernel(num_words):
     @txl.kernel()
-    def ep_ws_zero(ws: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)):
+    def ep_ws_zero(workspace: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1)):
         txl.device_entry(launch=txl.cuda.LaunchConfig(grid=1, block=128))
-        tid = txl.thread_id()
-        with txl.serial((n + 127) // 128) as it:
-            i = it * 128 + tid
-            with txl.if_(i < n), txl.then_():
-                txl.ptx.st.global_.b32(ws.ptr_to([i]), txl.int32(0))
+        tidx = txl.thread_id()
+        with txl.serial((num_words + 127) // 128) as iteration:
+            word_idx = iteration * 128 + tidx
+            with txl.if_(word_idx < num_words), txl.then_():
+                txl.ptx.st.global_.b32(workspace.ptr_to([word_idx]), txl.int32(0))
 
     return entry_function(ep_ws_zero.compile(TARGET))
 
 
-def words(ne, ep):
+def workspace_words(num_experts, ep_size):
     """
-    Workspace word indices: counters [0, ne + ep), then start / arrive / place / exit, then bases.
+    Workspace word indices: counters [0, num_experts + ep_size), then start / arrive / place / exit,
+    then the per-CTA bases from bases_start.
     """
-    nb = ne + ep
-    w = {"start": nb, "arrive": nb + 1, "place": nb + 2, "exit": nb + 3}
-    w["cb_off"] = (nb + 4 + 3) // 4 * 4
-    return w
+    num_bins = num_experts + ep_size
+    words = {"start": num_bins, "arrive": num_bins + 1, "place": num_bins + 2, "exit": num_bins + 3}
+    words["bases_start"] = (num_bins + 4 + 3) // 4 * 4
+    return words
 
 
 @functools.cache
-def send_kernel(k, ep, epr, ids_dtype):
-    return entry_function(send_def(k, ep, epr, ids_dtype).compile(TARGET))
+def compile_send_kernel(top_k, ep_size, experts_per_rank, ids_dtype):
+    return entry_function(define_send_kernel(top_k, ep_size, experts_per_rank, ids_dtype).compile(TARGET))
 
 
-def send_def(k, ep, epr, ids_dtype):
+def define_send_kernel(top_k, ep_size, experts_per_rank, ids_dtype):
     """
     Deadlock-free single launch.
 
     Phase 1 (never waits): CTA c counts its token chunk c in shared memory, claims its base in every
-    expert / rank with one global atomic per bin and stores the bases at cbase[c]; it then arrives.
-    Every CTA bumped `start` on entry. A CTA spins on `arrive` only if `start` already equals the
-    grid size: then every CTA is resident and will arrive without waiting on anything, so the spin
-    ends. A CTA that sees an unstarted CTA exits instead. Placement is a shared queue of chunks
-    claimed with `place`; the last CTA to start always sees start == grid size, waits and drains
-    the queue, so every chunk is placed. In the common case all CTAs stay and each places about
-    one chunk. The last CTA to exit re-zeroes the counters and words for the next launch.
+    expert / rank with one global atomic per bin and stores the bases at its row of the per-CTA
+    bases; it then arrives. Every CTA bumped the start word on entry. A CTA spins on the arrive word
+    only if start already equals the grid size: then every CTA is resident and will arrive without
+    waiting on anything, so the spin ends. A CTA that sees an unstarted CTA exits instead. Placement
+    is a shared queue of chunks claimed with the place word; the last CTA to start always sees
+    start == grid size, waits and drains the queue, so every chunk is placed. In the common case
+    all CTAs stay and each places about one chunk. The last CTA to exit re-zeroes the counters and
+    words for the next launch.
     """
-    ne = ep * epr
-    nb = ne + ep
-    nt = SEND_WARPS * 32
-    w = words(ne, ep)
-    cb_off = w["cb_off"]
+    num_experts = ep_size * experts_per_rank
+    num_bins = num_experts + ep_size
+    num_threads = SEND_WARPS * 32
+    words = workspace_words(num_experts, ep_size)
+    bases_start = words["bases_start"]
 
     @txl.kernel()
-    def ep_send_idx(topk: txl.Tensor((txl.int64(),), ids_dtype, data_alignment=1), meta_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), ws: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), m: txl.int32, row_stride: txl.int64, tpc: txl.int32, num_ctas: txl.int32):
-        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=(SEND_WARPS) * 32))
-        tid = txl.thread_id()
-        lane, warp = tid & 31, tid >> 5
-        cta = txl.cta_id()
+    def ep_send_idx(topk_ids: txl.Tensor((txl.int64(),), ids_dtype, data_alignment=1), meta_out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), out: txl.Tensor((txl.int64(),), txl.i64, data_alignment=1), workspace: txl.Tensor((txl.int64(),), txl.i32, data_alignment=1), num_tokens: txl.int32, row_stride: txl.int64, tokens_per_cta: txl.int32, num_ctas: txl.int32):
+        txl.device_entry(launch=txl.cuda.LaunchConfig(grid=num_ctas, block=SEND_WARPS * 32))
+        tidx = txl.thread_id()
+        lane, warp = tidx & 31, tidx >> 5
+        cta_idx = txl.cta_id()
         pool = txl.smem_pool()
-        s_hist, s_ex, s_start, s_cur = pool.alloc([nb], "int32"), pool.alloc([ne], "int32"), pool.alloc([ne], "int32"), pool.alloc([ne], "int32")
-        s_rh, s_rcur, s_rbase, s_rstart, s_warp, s_flag = pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([4], "int32")
+        s_bin_count, s_expert_start, s_slot_start, s_expert_fill = pool.alloc([num_bins], "int32"), pool.alloc([num_experts], "int32"), pool.alloc([num_experts], "int32"), pool.alloc([num_experts], "int32")
+        s_rank_count, s_rank_fill, s_rank_base, s_rank_start, s_warp, s_flag = pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([32], "int32"), pool.alloc([4], "int32")
 
-        m64 = txl.Cast("int64", m)
-        o_idx = m64 * ep
-        o_exp = o_idx + m64 * k
-        o_sm = o_exp + m64 * k
+        # starts of the idxs, expand_idx and send_meta regions of out, after dispatch_token_idxs
+        num_tokens64 = txl.Cast("int64", num_tokens)
+        idxs_start = num_tokens64 * ep_size
+        expand_start = idxs_start + num_tokens64 * top_k
+        send_meta_start = expand_start + num_tokens64 * top_k
 
-        def load_id(tok, j):
-            off = txl.Cast("int64", tok) * row_stride + j
+        def load_expert_id(token, j):
+            id_offset = txl.Cast("int64", token) * row_stride + j
             if ids_dtype == "int64":
-                return txl.Cast("int32", ld_g64(topk, off))
-            return ld_g32(topk, off)
+                return txl.Cast("int32", ld_g64(topk_ids, id_offset))
+            return ld_g32(topk_ids, id_offset)
 
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx.red.relaxed.gpu.global_.add.s32(ws.ptr_to([w["start"]]), txl.int32(1))
-        with txl.serial((nb + nt - 1) // nt) as it:
-            i = it * nt + tid
-            with txl.if_(i < nb), txl.then_():
-                st_s32(s_hist, i, txl.int32(0))
-        bar()
+        def count_chunk():
+            """
+            Histogram of this CTA's chunk: per expert, and per rank the tokens sent there.
+            """
+            with txl.serial((num_bins + num_threads - 1) // num_threads) as iteration:
+                bin_idx = iteration * num_threads + tidx
+                with txl.if_(bin_idx < num_bins), txl.then_():
+                    st_s32(s_bin_count, bin_idx, txl.int32(0))
+            bar_sync()
+            token_start = cta_idx * tokens_per_cta
+            token_end = txl.Min(num_tokens, token_start + tokens_per_cta)
+            with txl.serial((tokens_per_cta + num_threads - 1) // num_threads) as iteration:
+                token = token_start + iteration * num_threads + tidx
+                with txl.if_(token < token_end), txl.then_():
+                    rank_mask = txl.local_scalar("uint32", init=txl.uint32(0))
+                    expert_ids = [txl.local_scalar("int32", init=load_expert_id(token, j)) for j in range(top_k)]
+                    for j in range(top_k):
+                        expert_idx = expert_ids[j]
+                        atom_s_add(s_bin_count, expert_idx, 1)
+                        rank_idx = expert_idx // experts_per_rank
+                        rank_bit = txl.shift_left(txl.uint32(1), txl.Cast("uint32", rank_idx))
+                        with txl.if_(txl.bitwise_and(rank_mask, rank_bit) == txl.uint32(0)), txl.then_():
+                            atom_s_add(s_bin_count, num_experts + rank_idx, 1)
+                        txl.assign(rank_mask, txl.bitwise_or(rank_mask, rank_bit))
+            bar_sync()
 
-        # ---- phase 1: count chunk `cta`, claim its bases --------------------------------
-        t0 = cta * tpc
-        t1 = txl.Min(m, t0 + tpc)
-        with txl.serial((tpc + nt - 1) // nt) as it:
-            tok = t0 + it * nt + tid
-            with txl.if_(tok < t1), txl.then_():
-                mask = txl.local_scalar("uint32", init=txl.uint32(0))
-                ids = [txl.local_scalar("int32", init=load_id(tok, j)) for j in range(k)]
-                for j in range(k):
-                    e = ids[j]
-                    atom_s_add(s_hist, e, 1)
-                    r = e // epr
-                    bit = txl.shift_left(txl.uint32(1), txl.Cast("uint32", r))
-                    with txl.if_(txl.bitwise_and(mask, bit) == txl.uint32(0)), txl.then_():
-                        atom_s_add(s_hist, ne + r, 1)
-                    txl.assign(mask, txl.bitwise_or(mask, bit))
-        bar()
-        with txl.serial((nb + nt - 1) // nt) as it:
-            i = it * nt + tid
-            with txl.if_(i < nb), txl.then_():
-                v = ld_s32(s_hist, i)
-                base = txl.local_scalar("uint32", init=txl.uint32(0))
-                with txl.if_(v > 0), txl.then_():
-                    txl.ptx.atom.global_.add.u32(base, ws.ptr_to([i]), txl.reinterpret(v, ty="uint32"))
-                txl.ptx.st.global_.b32(ws.ptr_to([cb_off + txl.Cast("int64", cta) * nb + i]), txl.reinterpret(base, ty="int32"))
-        bar()
+        def claim_bin_bases():
+            """
+            Claim this CTA's base in every bin with one global atomic and store it in its bases row.
+            """
+            with txl.serial((num_bins + num_threads - 1) // num_threads) as iteration:
+                bin_idx = iteration * num_threads + tidx
+                with txl.if_(bin_idx < num_bins), txl.then_():
+                    count = ld_s32(s_bin_count, bin_idx)
+                    bin_base = txl.local_scalar("uint32", init=txl.uint32(0))
+                    with txl.if_(count > 0), txl.then_():
+                        txl.ptx.atom.global_.add.u32(bin_base, workspace.ptr_to([bin_idx]), txl.reinterpret(count, ty="uint32"))
+                    txl.ptx.st.global_.b32(workspace.ptr_to([bases_start + txl.Cast("int64", cta_idx) * num_bins + bin_idx]), txl.reinterpret(bin_base, ty="int32"))
+            bar_sync()
 
-        # ---- arrive; stay only if the whole grid has started -----------------------------
-        with txl.if_(tid == 0), txl.then_():
-            txl.ptx.fence.acq_rel.gpu()
-            txl.ptx.red.relaxed.gpu.global_.add.s32(ws.ptr_to([w["arrive"]]), txl.int32(1))
-            started = txl.local_scalar("int32")
-            txl.ptx.ld.acquire.gpu.global_.b32(started, ws.ptr_to([w["start"]]))
-            stay = txl.Select(started >= num_ctas, txl.int32(1), txl.int32(0))
-            st_s32(s_flag, 0, stay)
-            with txl.if_(stay == 1), txl.then_():
-                # ty=void: tvm_tirx registers no result type for wait_until and silently drops a non-void call
-                spin = txl.local_scalar("int32", init=txl.int32(0))
-                txl.cuda.wait_until(spin, ws.ptr_to([w["arrive"]]), spin >= num_ctas, scope="gpu", ptx_type="b32", ty=txl.void)
-        bar()
+        def arrive():
+            """
+            Arrive; stay (s_flag[0] = 1) and wait for all arrivals only if the whole grid started.
+            """
+            with txl.if_(tidx == 0), txl.then_():
+                txl.ptx.fence.acq_rel.gpu()
+                txl.ptx.red.relaxed.gpu.global_.add.s32(workspace.ptr_to([words["arrive"]]), txl.int32(1))
+                started = txl.local_scalar("int32")
+                txl.ptx.ld.acquire.gpu.global_.b32(started, workspace.ptr_to([words["start"]]))
+                stay = txl.Select(started >= num_ctas, txl.int32(1), txl.int32(0))
+                st_s32(s_flag, 0, stay)
+                with txl.if_(stay == 1), txl.then_():
+                    # ty=void: tvm_tirx registers no result type for wait_until and silently drops
+                    # a non-void call
+                    spin = txl.local_scalar("int32", init=txl.int32(0))
+                    txl.cuda.wait_until(spin, workspace.ptr_to([words["arrive"]]), spin >= num_ctas, scope="gpu", ptx_type="b32", ty=txl.void)
+            bar_sync()
+
+        def scan_bin_totals():
+            """
+            Load the grid's bin totals; exclusive starts of every expert and every rank.
+            """
+            with txl.serial((num_experts + num_threads - 1) // num_threads) as iteration:
+                expert_idx = iteration * num_threads + tidx
+                with txl.if_(expert_idx < num_experts), txl.then_():
+                    total = txl.local_scalar("int32")
+                    txl.ptx.ld.relaxed.gpu.global_.b32(total, workspace.ptr_to([expert_idx]))
+                    st_s32(s_bin_count, expert_idx, total)
+            with txl.if_(tidx < 32), txl.then_():
+                total = txl.local_scalar("int32", init=txl.int32(0))
+                with txl.if_(tidx < ep_size), txl.then_():
+                    txl.ptx.ld.relaxed.gpu.global_.b32(total, workspace.ptr_to([num_experts + tidx]))
+                st_s32(s_rank_count, tidx, total)
+            bar_sync()
+            block_exclusive_scan(s_bin_count, s_expert_start, num_experts, tidx, lane, warp, s_warp, num_threads)
+            with txl.if_(warp == 0), txl.then_():
+                rank_count = ld_s32(s_rank_count, lane)
+                rank_end = warp_inclusive_scan(rank_count, lane)
+                st_s32(s_rank_start, lane, rank_end - rank_count)
+
+        def claim_chunk(chunk_idx):
+            bar_sync()
+            with txl.if_(tidx == 0), txl.then_():
+                claimed = txl.local_scalar("int32")
+                txl.ptx.atom.relaxed.gpu.global_.add.s32(claimed, workspace.ptr_to([words["place"]]), txl.int32(1))
+                st_s32(s_flag, 1, claimed)
+            bar_sync()
+            txl.assign(chunk_idx, ld_s32(s_flag, 1))
+
+        def load_chunk_bases(chunk_idx):
+            """
+            Slot starts of the chunk in every expert and rank bin; zero the chunk's fill counters.
+            """
+            chunk_bases = bases_start + txl.Cast("int64", chunk_idx) * num_bins
+            with txl.serial((num_experts + num_threads - 1) // num_threads) as iteration:
+                expert_idx = iteration * num_threads + tidx
+                with txl.if_(expert_idx < num_experts), txl.then_():
+                    st_s32(s_slot_start, expert_idx, ld_s32(s_expert_start, expert_idx) + ld_g32(workspace, chunk_bases + expert_idx))
+                    st_s32(s_expert_fill, expert_idx, txl.int32(0))
+            with txl.if_(tidx < 32), txl.then_():
+                rank_base = txl.local_scalar("int32", init=txl.int32(0))
+                with txl.if_(tidx < ep_size), txl.then_():
+                    txl.assign(rank_base, ld_g32(workspace, chunk_bases + num_experts + tidx))
+                st_s32(s_rank_base, tidx, rank_base)
+                st_s32(s_rank_fill, tidx, txl.int32(0))
+            bar_sync()
+
+        def place_chunk(chunk_idx):
+            """
+            Store each token of the chunk once per rank it goes to and once per expert slot.
+            """
+            chunk_start = chunk_idx * tokens_per_cta
+            chunk_end = txl.Min(num_tokens, chunk_start + tokens_per_cta)
+            with txl.serial((tokens_per_cta + num_threads - 1) // num_threads) as iteration:
+                token = chunk_start + iteration * num_threads + tidx
+                with txl.if_(token < chunk_end), txl.then_():
+                    rank_mask = txl.local_scalar("uint32", init=txl.uint32(0))
+                    token64 = txl.Cast("int64", token)
+                    expert_ids = [txl.local_scalar("int32", init=load_expert_id(token, j)) for j in range(top_k)]
+                    rank_idxs, rank_positions = [], []
+                    for j in range(top_k):
+                        expert_idx = expert_ids[j]
+                        rank_idx = txl.local_scalar("int32", init=expert_idx // experts_per_rank)
+                        rank_bit = txl.shift_left(txl.uint32(1), txl.Cast("uint32", rank_idx))
+                        rank_pos = txl.local_scalar("int32", init=txl.int32(0))
+                        with txl.if_(txl.bitwise_and(rank_mask, rank_bit) == txl.uint32(0)):
+                            with txl.then_():
+                                rank_slot = atom_s_add(s_rank_fill, rank_idx, 1)
+                                txl.assign(rank_pos, ld_s32(s_rank_base, rank_idx) + rank_slot)
+                                st_g64(out, txl.Cast("int64", ld_s32(s_rank_start, rank_idx) + rank_pos), token64)
+                            with txl.else_():
+                                for prev in range(j):
+                                    txl.assign(rank_pos, txl.Select(rank_idxs[prev] == rank_idx, rank_positions[prev], rank_pos))
+                        txl.assign(rank_mask, txl.bitwise_or(rank_mask, rank_bit))
+                        rank_idxs.append(rank_idx)
+                        rank_positions.append(rank_pos)
+                        expert_slot = atom_s_add(s_expert_fill, expert_idx, 1)
+                        slot_idx = txl.Cast("int64", ld_s32(s_slot_start, expert_idx) + expert_slot)
+                        st_g64(out, idxs_start + slot_idx, token64 * top_k + j)
+                        st_g64(out, expand_start + slot_idx, txl.Cast("int64", rank_pos))
+
+        def store_send_meta():
+            """
+            Per-rank token and dedup counts into meta_out and the send_meta rows of out.
+            """
+            with txl.serial((num_experts + num_threads - 1) // num_threads) as iteration:
+                expert_idx = iteration * num_threads + tidx
+                with txl.if_(expert_idx < num_experts), txl.then_():
+                    rank_idx = expert_idx // experts_per_rank
+                    st_g64(out, send_meta_start + (expert_idx + rank_idx), txl.Cast("int64", ld_s32(s_bin_count, expert_idx)))
+            with txl.if_(tidx < ep_size), txl.then_():
+                rank_tokens = txl.local_scalar("int32", init=txl.int32(0))
+                with txl.serial(experts_per_rank) as local_expert:
+                    txl.assign(rank_tokens, rank_tokens + ld_s32(s_bin_count, tidx * experts_per_rank + local_expert))
+                rank_dedup = txl.Cast("int64", ld_s32(s_rank_count, tidx))
+                st_g64(meta_out, txl.Cast("int64", tidx), txl.Cast("int64", rank_tokens))
+                st_g64(meta_out, txl.Cast("int64", tidx + ep_size), rank_dedup)
+                st_g64(out, send_meta_start + (tidx * (experts_per_rank + 1) + experts_per_rank), rank_dedup)
+
+        def exit_grid():
+            """
+            Count this CTA out; the last CTA out re-zeroes the counters and words.
+            """
+            bar_sync()
+            with txl.if_(tidx == 0), txl.then_():
+                exited = txl.local_scalar("int32")
+                txl.ptx.atom.acq_rel.gpu.global_.add.s32(exited, workspace.ptr_to([words["exit"]]), txl.int32(1))
+                st_s32(s_flag, 2, txl.Select(exited == num_ctas - 1, txl.int32(1), txl.int32(0)))
+            bar_sync()
+            with txl.if_(ld_s32(s_flag, 2) == 1), txl.then_():
+                txl.ptx.fence.acq_rel.gpu()
+                with txl.serial((num_bins + 4 + num_threads - 1) // num_threads) as iteration:
+                    word_idx = iteration * num_threads + tidx
+                    with txl.if_(word_idx < num_bins + 4), txl.then_():
+                        txl.ptx.st.relaxed.gpu.global_.b32(workspace.ptr_to([word_idx]), txl.int32(0))
+
+        with txl.if_(tidx == 0), txl.then_():
+            txl.ptx.red.relaxed.gpu.global_.add.s32(workspace.ptr_to([words["start"]]), txl.int32(1))
+        count_chunk()
+        claim_bin_bases()
+        arrive()
 
         with txl.if_(ld_s32(s_flag, 0) == 1), txl.then_():
-            # totals, expert exclusive starts, rank starts
-            with txl.serial((ne + nt - 1) // nt) as it:
-                i = it * nt + tid
-                with txl.if_(i < ne), txl.then_():
-                    tot = txl.local_scalar("int32")
-                    txl.ptx.ld.relaxed.gpu.global_.b32(tot, ws.ptr_to([i]))
-                    st_s32(s_hist, i, tot)
-            with txl.if_(tid < 32), txl.then_():
-                tot = txl.local_scalar("int32", init=txl.int32(0))
-                with txl.if_(tid < ep), txl.then_():
-                    txl.ptx.ld.relaxed.gpu.global_.b32(tot, ws.ptr_to([ne + tid]))
-                st_s32(s_rh, tid, tot)
-            bar()
-            block_excl_scan(s_hist, s_ex, ne, tid, lane, warp, s_warp, nt)
-            with txl.if_(warp == 0), txl.then_():
-                d = ld_s32(s_rh, lane)
-                di = warp_incl_scan(d, lane)
-                st_s32(s_rstart, lane, di - d)
+            scan_bin_totals()
+            chunk_idx = txl.local_scalar("int32")
+            claim_chunk(chunk_idx)
+            with txl.while_(chunk_idx < num_ctas):
+                load_chunk_bases(chunk_idx)
+                place_chunk(chunk_idx)
+                with txl.if_(chunk_idx == 0), txl.then_():
+                    store_send_meta()
+                claim_chunk(chunk_idx)
 
-            ch = txl.local_scalar("int32")
-
-            def claim():
-                bar()
-                with txl.if_(tid == 0), txl.then_():
-                    c = txl.local_scalar("int32")
-                    txl.ptx.atom.relaxed.gpu.global_.add.s32(c, ws.ptr_to([w["place"]]), txl.int32(1))
-                    st_s32(s_flag, 1, c)
-                bar()
-                txl.assign(ch, ld_s32(s_flag, 1))
-
-            claim()
-            with txl.while_(ch < num_ctas):
-                cbo = cb_off + txl.Cast("int64", ch) * nb
-                with txl.serial((ne + nt - 1) // nt) as it:
-                    i = it * nt + tid
-                    with txl.if_(i < ne), txl.then_():
-                        st_s32(s_start, i, ld_s32(s_ex, i) + ld_g32(ws, cbo + i))
-                        st_s32(s_cur, i, txl.int32(0))
-                with txl.if_(tid < 32), txl.then_():
-                    cb = txl.local_scalar("int32", init=txl.int32(0))
-                    with txl.if_(tid < ep), txl.then_():
-                        txl.assign(cb, ld_g32(ws, cbo + ne + tid))
-                    st_s32(s_rbase, tid, cb)
-                    st_s32(s_rcur, tid, txl.int32(0))
-                bar()
-
-                c0 = ch * tpc
-                c1 = txl.Min(m, c0 + tpc)
-                with txl.serial((tpc + nt - 1) // nt) as it:
-                    tok = c0 + it * nt + tid
-                    with txl.if_(tok < c1), txl.then_():
-                        mask = txl.local_scalar("uint32", init=txl.uint32(0))
-                        tok64 = txl.Cast("int64", tok)
-                        ids = [txl.local_scalar("int32", init=load_id(tok, j)) for j in range(k)]
-                        ranks, poss = [], []
-                        for j in range(k):
-                            e = ids[j]
-                            r = txl.local_scalar("int32", init=e // epr)
-                            bit = txl.shift_left(txl.uint32(1), txl.Cast("uint32", r))
-                            p = txl.local_scalar("int32", init=txl.int32(0))
-                            with txl.if_(txl.bitwise_and(mask, bit) == txl.uint32(0)):
-                                with txl.then_():
-                                    q = atom_s_add(s_rcur, r, 1)
-                                    txl.assign(p, ld_s32(s_rbase, r) + q)
-                                    st_g64(out, txl.Cast("int64", ld_s32(s_rstart, r) + p), tok64)
-                                with txl.else_():
-                                    for jj in range(j):
-                                        txl.assign(p, txl.Select(ranks[jj] == r, poss[jj], p))
-                            txl.assign(mask, txl.bitwise_or(mask, bit))
-                            ranks.append(r)
-                            poss.append(p)
-                            s = atom_s_add(s_cur, e, 1)
-                            sidx = txl.Cast("int64", ld_s32(s_start, e) + s)
-                            st_g64(out, o_idx + sidx, tok64 * k + j)
-                            st_g64(out, o_exp + sidx, txl.Cast("int64", p))
-
-                with txl.if_(ch == 0), txl.then_():
-                    with txl.serial((ne + nt - 1) // nt) as it:
-                        i = it * nt + tid
-                        with txl.if_(i < ne), txl.then_():
-                            r = i // epr
-                            st_g64(out, o_sm + (i + r), txl.Cast("int64", ld_s32(s_hist, i)))
-                    with txl.if_(tid < ep), txl.then_():
-                        tsum = txl.local_scalar("int32", init=txl.int32(0))
-                        with txl.serial(epr) as le:
-                            txl.assign(tsum, tsum + ld_s32(s_hist, tid * epr + le))
-                        dd = txl.Cast("int64", ld_s32(s_rh, tid))
-                        st_g64(meta_out, txl.Cast("int64", tid), txl.Cast("int64", tsum))
-                        st_g64(meta_out, txl.Cast("int64", tid + ep), dd)
-                        st_g64(out, o_sm + (tid * (epr + 1) + epr), dd)
-                claim()
-
-        # ---- exit; the last CTA out re-zeroes counters and words ----------------------------
-        bar()
-        with txl.if_(tid == 0), txl.then_():
-            old = txl.local_scalar("int32")
-            txl.ptx.atom.acq_rel.gpu.global_.add.s32(old, ws.ptr_to([w["exit"]]), txl.int32(1))
-            st_s32(s_flag, 2, txl.Select(old == num_ctas - 1, txl.int32(1), txl.int32(0)))
-        bar()
-        with txl.if_(ld_s32(s_flag, 2) == 1), txl.then_():
-            txl.ptx.fence.acq_rel.gpu()
-            with txl.serial((nb + 4 + nt - 1) // nt) as it:
-                i = it * nt + tid
-                with txl.if_(i < nb + 4), txl.then_():
-                    txl.ptx.st.relaxed.gpu.global_.b32(ws.ptr_to([i]), txl.int32(0))
+        exit_grid()
 
     return ep_send_idx
 
 
-# Self-resetting int32 workspace of the send kernel, one per (device, stream, ne, ep), so launches
-# on two streams never share it. At most WORKSPACE_ENTRIES are cached (least recently used evicted);
-# an evicted workspace is kept alive in RETIRED until an event recorded on its stream at eviction has
-# completed, so its memory is never released while a launch on that stream may still use it.
+# Self-resetting int32 workspace of the send kernel, one per (device, stream, num_experts, ep_size),
+# so launches on two streams never share it. At most WORKSPACE_ENTRIES are cached (least recently
+# used evicted); an evicted workspace is kept alive in RETIRED until an event recorded on its stream
+# at eviction has completed, so its memory is never released while a launch on that stream may
+# still use it.
 WORKSPACES: dict = {}
 WORKSPACE_ENTRIES = 8
 RETIRED: list = []  # (event, workspace) of evicted workspaces whose stream may still be using them
 
 
-def workspace(device, ne, ep):
+def get_workspace(device, num_experts, ep_size):
     """
     int32: counters and words, zeroed once and kept zero by the kernel's last CTA; then the per-CTA
-    bases (SEND_MAX_CTAS * (ne + ep)), rewritten every launch.
+    bases (SEND_MAX_CTAS * (num_experts + ep_size)), rewritten every launch.
     """
     stream = torch.cuda.current_stream(device)
-    key = (device, stream.cuda_stream, ne, ep)
-    ent = WORKSPACES.pop(key, None)
-    if ent is None:
-        off = words(ne, ep)["cb_off"]
-        ws = torch.empty(off + SEND_MAX_CTAS * (ne + ep), dtype=torch.int32, device=device)
-        zero_kernel(off)(ws)
-        RETIRED[:] = [(ev, old) for ev, old in RETIRED if not ev.query()]
+    key = (device, stream.cuda_stream, num_experts, ep_size)
+    entry = WORKSPACES.pop(key, None)
+    if entry is None:
+        bases_start = workspace_words(num_experts, ep_size)["bases_start"]
+        workspace = torch.empty(bases_start + SEND_MAX_CTAS * (num_experts + ep_size), dtype=torch.int32, device=device)
+        compile_zero_kernel(bases_start)(workspace)
+        RETIRED[:] = [(event, old) for event, old in RETIRED if not event.query()]
         while len(WORKSPACES) >= WORKSPACE_ENTRIES:
             old, old_stream = WORKSPACES.pop(next(iter(WORKSPACES)))
-            ev = torch.cuda.Event()
-            ev.record(old_stream)
-            RETIRED.append((ev, old))
-        ent = (ws, stream)
-    WORKSPACES[key] = ent  # most recently used last
-    return ent[0]
+            event = torch.cuda.Event()
+            event.record(old_stream)
+            RETIRED.append((event, old))
+        entry = (workspace, stream)
+    WORKSPACES[key] = entry  # most recently used last
+    return entry[0]
 
 
 def send_idx_torch(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """
     The sender side in PyTorch (no host sync, token order within each bucket), for inputs the kernel
-    does not cover. m > 0.
+    does not cover. num_tokens > 0.
     """
-    m, k = topk_ids.shape
-    dev = topk_ids.device
+    num_tokens, top_k = topk_ids.shape
+    device = topk_ids.device
     ids = topk_ids.to(torch.int64)
     flat = ids.reshape(-1)
     idxs = torch.argsort(flat, stable=True)
-    visited = torch.zeros(m, ep_size, dtype=torch.bool, device=dev).scatter_(1, ids // experts_per_rank, True).t()
+    visited = torch.zeros(num_tokens, ep_size, dtype=torch.bool, device=device).scatter_(1, ids // experts_per_rank, True).t()
     pos = visited.long().cumsum(1) - 1
-    rank_of = torch.arange(ep_size, device=dev)[:, None].expand(ep_size, m)
-    dispatch_token_idxs = torch.argsort(torch.where(visited, rank_of, ep_size).reshape(-1), stable=True) % m
-    expand_idx = pos[flat[idxs] // experts_per_rank, idxs // k]
-    expert_counts = torch.zeros(num_experts, dtype=torch.int64, device=dev).scatter_add_(0, flat, torch.ones_like(flat)).view(ep_size, experts_per_rank)
+    rank_of = torch.arange(ep_size, device=device)[:, None].expand(ep_size, num_tokens)
+    dispatch_token_idxs = torch.argsort(torch.where(visited, rank_of, ep_size).reshape(-1), stable=True) % num_tokens
+    expand_idx = pos[flat[idxs] // experts_per_rank, idxs // top_k]
+    expert_counts = torch.zeros(num_experts, dtype=torch.int64, device=device).scatter_add_(0, flat, torch.ones_like(flat)).view(ep_size, experts_per_rank)
     dedup = visited.sum(1)
     meta_out[:ep_size].copy_(expert_counts.sum(1))
     meta_out[ep_size : 2 * ep_size].copy_(dedup)
@@ -559,31 +622,34 @@ def send_idx_torch(topk_ids: torch.Tensor, num_experts: int, ep_size: int, exper
 
 
 def ep_dispatch_send_idx_sm100(topk_ids: torch.Tensor, num_experts: int, ep_size: int, experts_per_rank: int, meta_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    m, k = topk_ids.shape
-    dev = topk_ids.device
+    """
+    SM100 implementation of ep_dispatch_send_idx; order within a bucket is atomic order.
+    """
+    num_tokens, top_k = topk_ids.shape
+    device = topk_ids.device
     assert ep_size <= 32, f"ep_size={ep_size} exceeds the 32-rank bitmask"
     if meta_out is None:
-        meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=dev)
-    tpr, dedup = meta_out[:ep_size], meta_out[ep_size : 2 * ep_size]
-    nsm = ep_size * (experts_per_rank + 1)
-    if m == 0:
-        send_meta = torch.zeros(nsm, dtype=torch.int64, device=dev)
+        meta_out = torch.empty(2 * ep_size, dtype=torch.int64, device=device)
+    tokens_per_rank, dedup = meta_out[:ep_size], meta_out[ep_size : 2 * ep_size]
+    num_bins = ep_size * (experts_per_rank + 1)
+    if num_tokens == 0:
+        send_meta = torch.zeros(num_bins, dtype=torch.int64, device=device)
         meta_out[: 2 * ep_size].zero_()
-        empty = torch.empty(0, dtype=torch.int64, device=dev)
-        return tpr, dedup, empty, empty.clone(), empty.clone(), send_meta
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return tokens_per_rank, dedup, empty, empty.clone(), empty.clone(), send_meta
     # the kernel reads int32 or int64 ids with unit inner stride
-    if topk_ids.dtype not in (torch.int32, torch.int64) or (k > 1 and topk_ids.stride(1) != 1) or topk_ids.stride(0) < 0:
+    if topk_ids.dtype not in (torch.int32, torch.int64) or (top_k > 1 and topk_ids.stride(1) != 1) or topk_ids.stride(0) < 0:
         topk_ids = topk_ids.to(torch.int64).contiguous()
-    if nsm > SEND_MAX_BINS or m * max(k, ep_size) >= 2**31:
+    if num_bins > SEND_MAX_BINS or num_tokens * max(top_k, ep_size) >= 2**31:
         return send_idx_torch(topk_ids, num_experts, ep_size, experts_per_rank, meta_out)
-    ws = workspace(dev, num_experts, ep_size)
-    out = torch.empty(m * ep_size + 2 * m * k + nsm, dtype=torch.int64, device=dev)
-    dti, idxs, expand, send_meta = out.split((m * ep_size, m * k, m * k, nsm))
-    num_ctas = min(SEND_MAX_CTAS, (m + SEND_MIN_TOKENS_PER_CTA - 1) // SEND_MIN_TOKENS_PER_CTA)
-    tpc = (m + num_ctas - 1) // num_ctas
-    num_ctas = (m + tpc - 1) // tpc
-    fn = send_kernel(k, ep_size, experts_per_rank, "int64" if topk_ids.dtype == torch.int64 else "int32")
+    workspace = get_workspace(device, num_experts, ep_size)
+    out = torch.empty(num_tokens * ep_size + 2 * num_tokens * top_k + num_bins, dtype=torch.int64, device=device)
+    dispatch_token_idxs, idxs, expand_idx, send_meta = out.split((num_tokens * ep_size, num_tokens * top_k, num_tokens * top_k, num_bins))
+    num_ctas = min(SEND_MAX_CTAS, (num_tokens + SEND_MIN_TOKENS_PER_CTA - 1) // SEND_MIN_TOKENS_PER_CTA)
+    tokens_per_cta = (num_tokens + num_ctas - 1) // num_ctas
+    num_ctas = (num_tokens + tokens_per_cta - 1) // tokens_per_cta
+    fn = compile_send_kernel(top_k, ep_size, experts_per_rank, "int64" if topk_ids.dtype == torch.int64 else "int32")
     stride = topk_ids.stride(0)
-    flat_ids = topk_ids.as_strided(((m - 1) * stride + k,), (1,))
-    fn(flat_ids, meta_out, out, ws, m, stride, tpc, num_ctas)
-    return tpr, dedup, dti, idxs, expand, send_meta
+    flat_ids = topk_ids.as_strided(((num_tokens - 1) * stride + top_k,), (1,))
+    fn(flat_ids, meta_out, out, workspace, num_tokens, stride, tokens_per_cta, num_ctas)
+    return tokens_per_rank, dedup, dispatch_token_idxs, idxs, expand_idx, send_meta
