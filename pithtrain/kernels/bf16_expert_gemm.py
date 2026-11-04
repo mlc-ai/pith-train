@@ -65,16 +65,17 @@ def bf16_expert_down_fwd(h, w_down, cu, slot_of, bias=None):
 def bf16_expert_down_dgrad(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()):
     """
     Down-projection dgrad with the SwiGLU backward fused in the epilogue. Returns
-    (dpre, h, swapped).
+    (dpre, h, dpre_swapped).
 
-    - dy: bf16 (M, H) row-major in received-slot order. w_down: bf16 (G, H, I). preact: the bf16 (M,
-      2I) of bf16_expert_gate_up_fwd. cu, slot_of: as in bf16_expert_down_fwd.
+    - dy: bf16 (M, H) row-major in received-slot order. w_down: bf16 (G, H, I).
+    - preact: the bf16 (M, 2I) of bf16_expert_gate_up_fwd. cu, slot_of: as in bf16_expert_down_fwd.
       w_gate / w_up are read only for their address order.
     - Per grouped row r of expert g: dh = dy[slot_of[r]] @ w_down[g] in fp32, then dswiglu (or the
       clamped dswiglu_oai with act = (alpha, limit), which requires w_gate at the lower address) of
       the saved gate / up gives dg, du and h.
     - dpre: fresh bf16 (M, 2I), pairs in the weights' address order: (dg, du), or (du, dg) when
-      swapped (w_up below w_gate); bf16_expert_gate_up_dgrad and bf16_expert_gate_up_wgrad read that order.
+      dpre_swapped (w_up below w_gate); bf16_expert_gate_up_dgrad and bf16_expert_gate_up_wgrad
+      read that order.
     - h: fresh bf16 (M, I), bit-identical to the forward's h.
 
     M == 0 launches nothing. Deterministic.
@@ -92,8 +93,9 @@ def bf16_expert_down_dgrad(dy, w_down, preact, cu, slot_of, w_gate, w_up, act=()
 
 def bf16_expert_gate_up_dgrad(dpre, w_gate, w_up, cu, dpre_swapped):
     """
-    Gate/up dgrad: a fresh bf16 (M, H) dx in grouped-row order, dx[r] = dg[r] @ w_gate[g] + du[r] @
-    w_up[g] for each row r of expert g, one fp32 accumulation over K = 2I rounded once.
+    Gate/up dgrad: a fresh bf16 (M, H) dx in grouped-row order,
+    dx[r] = dg[r] @ w_gate[g] + du[r] @ w_up[g] for each row r of expert g, one fp32 accumulation
+    over K = 2I rounded once.
 
     - dpre, dpre_swapped: as returned by bf16_expert_down_dgrad; the weights must still be in
       the address order it saw (asserted). w_gate, w_up: bf16 (G, I, H), paired as in

@@ -8,7 +8,6 @@ import importlib.metadata
 import warnings
 from functools import lru_cache
 
-
 from pithtrain.kernels.arch import ARCH_MAJOR
 
 __all__ = ["MAX_GROUPS", "QUACK_VERSION", "bf16_experts_supported", "quack_version"]
@@ -26,6 +25,9 @@ API); any other version is unsupported.
 
 
 def quack_version() -> str | None:
+    """
+    The installed quack-kernels version, or None when it is not installed.
+    """
     try:
         return importlib.metadata.version("quack-kernels")
     except importlib.metadata.PackageNotFoundError:
@@ -33,7 +35,10 @@ def quack_version() -> str | None:
 
 
 @lru_cache(maxsize=None)
-def runtime_supported() -> bool:
+def bf16_experts_runtime_supported() -> bool:
+    """
+    Whether this GPU and QuACK install can run the fused kernels; warns on the first False.
+    """
     if ARCH_MAJOR == 10:
         return True
     if ARCH_MAJOR != 9:
@@ -42,6 +47,7 @@ def runtime_supported() -> bool:
         reason = f"needs quack-kernels=={QUACK_VERSION}, found {version}"
     else:
         return True
+    # stacklevel 3 points the warning at the caller of bf16_experts_supported.
     warnings.warn(f"BF16 CuTe experts disabled ({reason}); using F.grouped_mm", stacklevel=3)
     return False
 
@@ -50,7 +56,7 @@ def bf16_experts_supported(num_groups: int | None = None) -> bool:
     """
     Whether BF16 routed experts with num_groups local experts (any count when None) can use the
     fused bf16_expert_* kernels in this process: needs SM100, or SM90 with quack-kernels exactly
-    QUACK_VERSION, and at most MAX_GROUPS local experts. Warns once when the GPU or the QuACK version
-    rules it out.
+    QUACK_VERSION, and at most MAX_GROUPS local experts. Warns once when the GPU or the QuACK
+    version rules it out.
     """
-    return runtime_supported() and (num_groups is None or num_groups <= MAX_GROUPS)
+    return bf16_experts_runtime_supported() and (num_groups is None or num_groups <= MAX_GROUPS)
