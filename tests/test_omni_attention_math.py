@@ -27,25 +27,27 @@ def backward_op(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    output: torch.Tensor,
+    o: torch.Tensor,
     lse: torch.Tensor,
-    cotangent: torch.Tensor,
-    scale: float,
+    do: torch.Tensor,
+    softmax_scale: float,
     causal: bool,
-    left: Optional[int],
-    right: Optional[int],
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
     deterministic: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Analytic CPU derivative; no nested autograd inside a custom operator.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # pithtrain::flash_attn4_mha_bwd's schema with an analytic CPU derivative; no nested autograd
+    # inside a custom operator. Without a learnable sink the sink gradient is empty, as in FA4's op.
     groups = q.shape[2] // k.shape[2]
     a = q.transpose(1, 2)
     b = k.repeat_interleave(groups, 2).transpose(1, 2)
     c = v.repeat_interleave(groups, 2).transpose(1, 2)
-    dy = cotangent.transpose(1, 2)
+    dy = do.transpose(1, 2)
     mask = torch.ones(q.shape[1], q.shape[1], dtype=torch.bool).triu(1)
-    p = ((a @ b.transpose(-1, -2)) * scale).masked_fill(mask, -torch.inf).softmax(-1)
+    p = ((a @ b.transpose(-1, -2)) * softmax_scale).masked_fill(mask, -torch.inf).softmax(-1)
     dp = dy @ c.transpose(-1, -2)
-    ds = p * (dp - (dp * p).sum(-1, keepdim=True)) * scale
+    ds = p * (dp - (dp * p).sum(-1, keepdim=True)) * softmax_scale
     dq = (ds @ b).transpose(1, 2).contiguous()
     dk = (
         (ds.transpose(-1, -2) @ a)
@@ -59,12 +61,25 @@ def backward_op(
         .reshape(*v.shape[:2], v.shape[2], groups, v.shape[3])
         .sum(3)
     )
-    return dq, dk, dv
+    return dq, dk, dv, q.new_empty(0)
 
 
 @backward_op.register_fake
-def backward_fake(q, k, v, output, lse, cotangent, scale, causal, left, right, deterministic):
-    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+def backward_fake(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    do,
+    softmax_scale,
+    causal,
+    window_size_left,
+    window_size_right,
+    learnable_sink,
+    deterministic,
+):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), q.new_empty(0)
 
 
 def setup_context(ctx, inputs, output):
@@ -76,7 +91,10 @@ def setup_context(ctx, inputs, output):
 
 def backward(ctx, cotangent, unused):
     q, k, v, output, lse = ctx.saved_tensors
-    return (*backward_op(q, k, v, output, lse, cotangent, ctx.scale, True, None, None, False), None)
+    dq, dk, dv, _ = backward_op(
+        q, k, v, output, lse, cotangent, ctx.scale, True, None, None, None, False
+    )
+    return dq, dk, dv, None
 
 
 forward_op.register_autograd(backward, setup_context=setup_context)
@@ -269,3 +287,142 @@ def test_cli_preserves_capture_precondition_not_run_with_nonzero_exception(monke
     assert report["failure_phase"] == "capture_transparency_precondition"
     assert report["actual_captures"] == report["geometry_cases"] == []
     assert not torch.cuda.is_initialized()
+
+
+VARLEN_GRADIENTS = []
+
+
+@torch.library.custom_op("omni_math_contract::varlen_backward", mutates_args=())
+def varlen_backward_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    do: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+    deterministic: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # pithtrain::flash_attn4_varlen_bwd's schema; returns the gradients the test set up.
+    return tuple(value.clone() for value in VARLEN_GRADIENTS[-1])
+
+
+@torch.library.custom_op("omni_math_contract::legacy_backward", mutates_args=())
+def legacy_backward_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    do: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    deterministic: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # FA4's backward schema before learnable_sink, which the capture no longer accepts.
+    return q.clone(), k.clone(), v.clone()
+
+
+def varlen_arguments(record, **changes):
+    """Positional varlen backward arguments for a packed independent record."""
+    cu_seqlens = torch.tensor([0, *record["lengths"]], dtype=torch.int32).cumsum(0).int()
+    call = dict(
+        q=record["q"].detach(),
+        k=record["k"].detach(),
+        v=record["v"].detach(),
+        o=record["output"].detach(),
+        lse=torch.zeros(record["q"].shape[:2], dtype=record["q"].dtype),
+        do=record["cotangent"],
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(record["lengths"]),
+        max_seqlen_k=max(record["lengths"]),
+        softmax_scale=record["scale"],
+        causal=True,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        deterministic=False,
+    )
+    call.update(changes)
+    return [call[name] for name in gate.BWD_ARGUMENTS["varlen"]]
+
+
+def packed_record(monkeypatch, sink_gradient=None):
+    operation = torch.ops.omni_math_contract.varlen_backward.default
+    monkeypatch.setitem(gate.BWD_NAMES, str(operation), "varlen")
+    record = independent_record([3, 4])
+    if sink_gradient is None:
+        sink_gradient = record["q"].new_empty(0)
+    VARLEN_GRADIENTS.append((record["dq"], record["dk"], record["dv"], sink_gradient))
+    return record
+
+
+def test_capture_schema_matches_the_registered_fa4_backward_operations():
+    pytest.importorskip("pithtrain.operators.flash_attn_v4")
+    real = {name: kind for name, kind in gate.BWD_NAMES.items() if name.startswith("pithtrain.")}
+    assert sorted(real.values()) == ["dense", "varlen"]
+    for name, kind in real.items():
+        namespace, operation, _ = name.split(".")
+        schema = getattr(getattr(torch.ops, namespace), operation).default._schema
+        assert tuple(argument.name for argument in schema.arguments) == gate.BWD_ARGUMENTS[kind]
+        assert len(schema.returns) == 4
+
+
+def test_varlen_capture_binds_packed_lengths_and_the_actual_tensors(monkeypatch):
+    record = packed_record(monkeypatch)
+    with gate.ActualBackwardCapture() as observer:
+        result = varlen_backward_op(*varlen_arguments(record))
+    (captured,) = observer.records
+    assert captured["kind"] == "varlen" and captured["lengths"] == [3, 4]
+    assert captured["scale"] == record["scale"] and captured["deterministic"] is False
+    for name in ("q", "k", "v", "output", "cotangent", "dq", "dk", "dv"):
+        assert torch.equal(captured[name], record[name].detach())
+    assert torch.equal(result[0], record["dq"]) and result[3].numel() == 0
+    assert gate.check_record(captured)["status"] == "PASSED"
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (dict(learnable_sink=torch.zeros(4, dtype=torch.float64)), "learnable sink"),
+        (dict(window_size_left=2), "causal/full-window"),
+        (dict(causal=False), "causal/full-window"),
+        (dict(max_seqlen_k=5), "self-attention"),
+    ],
+)
+def test_capture_rejects_calls_outside_the_independent_gate(monkeypatch, change, message):
+    record = packed_record(monkeypatch)
+    with pytest.raises(RuntimeError, match=message), gate.ActualBackwardCapture() as observer:
+        varlen_backward_op(*varlen_arguments(record, **change))
+    assert observer.records == []
+
+
+def test_capture_rejects_a_sink_gradient_without_a_sink(monkeypatch):
+    record = packed_record(monkeypatch, sink_gradient=torch.zeros(4, dtype=torch.float64))
+    with (
+        pytest.raises(RuntimeError, match="sink gradient"),
+        gate.ActualBackwardCapture() as observer,
+    ):
+        varlen_backward_op(*varlen_arguments(record))
+    assert observer.records == []
+
+
+def test_capture_rejects_the_backward_schema_from_before_learnable_sink(monkeypatch):
+    operation = torch.ops.omni_math_contract.legacy_backward.default
+    monkeypatch.setitem(gate.BWD_NAMES, str(operation), "dense")
+    q, k, v = (value.detach() for value in tensors())
+    with pytest.raises(RuntimeError, match="Unexpected FA4 backward schema"):
+        with gate.ActualBackwardCapture() as observer:
+            legacy_backward_op(q, k, v, q, q[..., 0], q, 8**-0.5, True, None, None, False)
+    assert observer.records == []
