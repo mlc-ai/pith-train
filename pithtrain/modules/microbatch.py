@@ -32,11 +32,16 @@ class Microbatch:
     objective_inputs: Any
 
     model_context: Optional[dict[str, torch.Tensor]] = None
-    """Token, mask and position/layout inputs shared by all decoder stages.
+    """Inputs needed to reconstruct multimodal rotary positions on every decoder stage.
 
-    Models opting into media data accept model_context in forward,
-    forward_prolog and forward_posemb. The pipeline adds media_inputs only for
-    stage 0; later stages receive this shared context without media payloads.
+    With the Qwen3-Omni processor these are input_ids, attention_mask,
+    image_grid_thw / video_grid_thw, video_second_per_grid and audio
+    feature_attention_mask when present. They describe where media tokens lie
+    and their temporal/spatial extent; hidden activations alone cannot recover it.
+    Text-only batches leave this None and continue to use S and cu_seqlens.
+
+    Media models accept this dictionary in forward, forward_prolog and
+    forward_posemb. context_for_stage adds encoder tensors only at stage 0.
     """
     media_inputs: Optional[dict[str, torch.Tensor]] = None
     """Encoder inputs, such as image pixels or audio features; stage 0 only."""

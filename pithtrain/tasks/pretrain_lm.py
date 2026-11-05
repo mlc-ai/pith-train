@@ -24,14 +24,13 @@ from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
 from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
+from pithtrain.modules.loss import global_loss_mean, global_target_count
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, model_class_for_config, setup_training
 from pithtrain.modules.training_data import (
-    DensePretrainData,
-    OmniPretrainData,
+    PreparedBundleData,
     PretrainData,
-    global_loss_mean,
-    global_target_count,
+    TokenBinData,
 )
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
@@ -68,15 +67,16 @@ def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
         cp_size=distributed.cp_size,
     )
     if cfg.data.format == "token_bin":
-        return DensePretrainData(cfg.data.dataset, cfg.training, **ranks)
-    data = OmniPretrainData(
-        cfg.data,
-        cfg.training,
-        **ranks,
-        pp_rank=distributed.pp_rank,
-        pp_size=distributed.pp_size,
-        pp_group=distributed.pp_group,
-    )
+        data = TokenBinData(cfg.data.dataset, cfg.training, **ranks)
+    else:
+        data = PreparedBundleData(
+            cfg.data,
+            cfg.training,
+            **ranks,
+            pp_rank=distributed.pp_rank,
+            pp_size=distributed.pp_size,
+            pp_group=distributed.pp_group,
+        )
     config = AutoConfig.from_pretrained(cfg.training.model)
     data.validate_model(model_class_for_config(config), config)
     return data
@@ -94,13 +94,11 @@ def objective(
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Cross-entropy objective for language-model pretraining.
+    Sum cross-entropy over this microbatch's non-ignored next-token targets.
 
-    Labels are already next-token targets from MemmapDataset; do not shift them here.
-    Returns the loss summed over the tokens of this micro-batch, so gradients accumulate across
-    micro-batches; the training step divides by the global non-ignored token count for a correct
-    token-weighted mean. The second return value is the same loss detached, which the step
-    reduces the same way to log the training loss.
+    Token and media readers already shift the labels. Return the differentiable loss sum and
+    its detached copy for logging. The training step normalizes both summed gradients and
+    summed losses once by the global target count across DP x CP.
     """
     (logits,) = model_outputs
     (labels,) = objective_inputs
@@ -149,7 +147,7 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
     microbatches = get_global_batch(cfg, dataset, step, device)
 
     token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
-    num_tokens = global_target_count(microbatches, token_group)
+    global_num_targets = global_target_count(microbatches, token_group)
 
     # Run the forward and backward pass. The objective hands back one detached loss per
     # micro-batch on pipeline rank 0; every other rank gets an empty list.
@@ -158,8 +156,12 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
     # Reduce true loss sums/counts across this pipeline stage's DP x CP ranks.
     # FSDP has already summed gradients over the parameter replica groups.
     if distributed.pp_rank == 0:
-        loss = global_loss_mean(torch.stack(objective_outputs).sum(), num_tokens, token_group)
-    scale = 1.0 / num_tokens
+        loss = global_loss_mean(
+            torch.stack(objective_outputs).sum(), global_num_targets, token_group
+        )
+    # global_num_targets already sums DP x CP; multiplying those sizes again
+    # would divide gradients twice. For dense data it equals local_count * DP * CP.
+    scale = 1.0 / global_num_targets
     scale_grads_(local_grads(model), scale)
 
     gradient_norm = clip_grad_norm(
@@ -172,7 +174,6 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
         scheduler.step()
     if training.fp8:
         precompute_fp8_param_scales()
-    dataset.commit_step(step)
     MoELoadBalanceLossTracker.reset()
 
     step_end_time = time.time()
@@ -245,11 +246,7 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
         should_save |= completed == cfg.training.max_steps
         if should_save:
             assert cfg.training.save_location is not None
-            save_checkpoint(
-                cfg.training.save_location,
-                completed,
-                data_state=dataset.checkpoint_state,
-            )
+            save_checkpoint(cfg.training.save_location, completed)
 
     # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
@@ -265,11 +262,7 @@ def launch(cfg: PretrainLMCfg) -> None:
     logger.info("launch(cfg=%s)" % cfg)
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
-        load_checkpoint(
-            cfg.training.save_location,
-            step,
-            data_state=dataset.checkpoint_state,
-        )
+        load_checkpoint(cfg.training.save_location, step)
         if training.fp8:
             precompute_fp8_param_scales()
     elif cfg.training.hf_import_path is not None:

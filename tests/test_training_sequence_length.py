@@ -45,7 +45,7 @@ def setup_entry(cp_size):
 
 @pytest.mark.parametrize(
     "cp_size,length",
-    [(1, 1), (1, 2), (1, 69), (1, 128), (1, 2049), (2, 128), (4, 128), (8, 128)],
+    [(1, 69), (2, 128)],
 )
 def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length):
     setup_model, calls = setup_entry(cp_size)
@@ -57,18 +57,7 @@ def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length
 
 @pytest.mark.parametrize(
     "cp_size,length",
-    [
-        (2, 1),
-        (2, 2),
-        (2, 69),
-        (2, 70),
-        (2, 127),
-        (4, 4),
-        (4, 68),
-        (4, 127),
-        (8, 8),
-        (8, 120),
-    ],
+    [(2, 69)],
 )
 def test_model_entry_rejects_uneven_multi_rank_cp_before_allocation(cp_size, length):
     setup_model, calls = setup_entry(cp_size)

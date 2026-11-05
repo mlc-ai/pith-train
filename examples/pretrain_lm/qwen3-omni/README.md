@@ -76,17 +76,18 @@ pipeline stage. It normalizes summed gradients once by that count and logs the
 global token-mean loss. PP replicas are not counted twice; a rank can have zero
 targets when the global batch has some. A globally empty target batch fails.
 
-The model/optimizer checkpoint now also stores data identity and the count of
-samples consumed by completed optimizer steps. Prefetch never advances this
-saved count. Relaunch with the same checkpoint directory to resume; increasing
-`--steps` is allowed. Changing the data bundle, modalities, sampling, sequence length,
-seed or batch sizes rejects the resume. An old checkpoint without data state
-cannot silently restart this data stream. Legacy `.bin`-only recipes keep their
-existing checkpoint format and loading path. Selecting the same modalities as an
-existing recipe stage preserves its version-1 fingerprint, so checkpoints from
-the previous `OmniDataCfg.stage` configuration remain compatible. A new subset
-includes its selected modalities in the fingerprint; a different subset cannot
-resume the same checkpoint.
+Both data readers derive the next global sample position from
+`step * global_batch_size`. Media draws depend only on seed, epoch and that
+position; prefetch is an ephemeral cache. Retrying a step or starting a fresh
+reader at a saved step reproduces the same batch, without a commit operation or
+dataset checkpoint state. Epochs contain whole global batches.
+
+Resume with the same bundle, modalities, sampling, seed, sequence length and
+batch configuration to replay the same training stream. The bundle's checksum
+inventory is verified when opening it, but the model checkpoint does not record
+or validate the run's data configuration, just as for token-bin training.
+Checkpoints made by an earlier version of this PR may include a data cursor;
+that extra entry is ignored and the checkpoint's completed step selects the data.
 
 ## Integration check
 
@@ -100,8 +101,8 @@ Use a fresh output directory. The test builds a reduced existing Qwen3 model wit
 the real vocabulary and takes two optimizer steps. Loading the first checkpoint
 must exactly restore model parameters, AdamW state, scheduler state and CUDA RNG.
 Replaying the second step must reproduce token IDs, labels and sequence boundaries,
-advance the data cursor, and produce finite nonzero gradients and a parameter
-update. Its loss is compared using the existing DualPipeV BF16 tolerance
+and produce finite nonzero gradients and a parameter update. Its loss is compared
+using the existing DualPipeV BF16 tolerance
 (`rtol=1e-3`, `atol=1e-3`). Post-update parameters are not compared elementwise:
 repeated GPU reductions can change gradients even without saving or loading.
 This is a data/checkpoint integration check, not a model numerical-regression test.
@@ -109,13 +110,19 @@ This is a data/checkpoint integration check, not a model numerical-regression te
 transport; it does not implement or validate an Omni encoder. CPU coverage is in
 `tests/test_omni_training.py`; GPU checks require Hopper/Blackwell hardware.
 
-The training task consumes all sources through `PretrainData`: `get_batch(step, device)`,
-`commit_step(step)` after optimization, and `checkpoint_state` for save/restore.
-`DensePretrainData` retains the existing token packing, corpus shuffle and DP/CP slicing;
-its position comes from the training step, so legacy checkpoints need no data-state entry.
-`OmniPretrainData` owns the dense or media reader and checkpoints the committed cursor and
-recipe identity. Adding a source with this interface does not require a type check in the
-training loop. This interface does not extend media support beyond CP1/microbatch1.
+The training task consumes all sources through `PretrainData.get_batch(step, device)`
+and calls `validate_model` uniformly during setup. `TokenBinData` names the token-bin
+storage format, retaining the original packing, shuffle and DP/CP slicing.
+`PreparedBundleData` names the prepared-bundle format and can contain text alone
+or media. Its current media processor is Qwen3-Omni-specific; the generic reader
+name does not imply that Omni is a separate kind of modality. Token shards do
+not carry vocabulary metadata; prepared bundles validate their processor's
+vocabulary and the model's declared input modalities. Media remains CP1/microbatch1.
+
+`Microbatch.model_context` carries tokens, attention masks and image/video grids
+or audio masks needed to reconstruct multimodal positions on every decoder stage.
+`media_inputs` carries the larger pixels/audio features only on stage 0, which
+encodes them and replaces placeholder embeddings. Text batches have neither.
 
 ## Target normalization check
 

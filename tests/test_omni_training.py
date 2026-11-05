@@ -16,12 +16,9 @@ import torch.nn.functional as F
 
 from pithtrain.modules.checkpoint import CheckpointState
 from pithtrain.modules.data_config import DataCfg
+from pithtrain.modules.loss import global_loss_mean, global_target_count
 from pithtrain.modules.microbatch import Microbatch
-from pithtrain.modules.training_data import (
-    OmniPretrainData,
-    global_loss_mean,
-    global_target_count,
-)
+from pithtrain.modules.training_data import PreparedBundleData
 from tests import test_qwen3_omni_data as data_fixtures
 
 manifest = data_fixtures.manifest
@@ -86,12 +83,11 @@ def source(root, *, stage="video", rank=0, world=1, seed=1234, cp=1):
     recipe = json.loads((root / "bundle.json").read_text())["recipe"]
     cfg.modalities, cfg.epoch_samples = tuple(recipe["stages"][stage]), 8
     tc = SimpleNamespace(global_batch_size=4, micro_batch_size=1, sequence_length=1024, seed=seed)
-    return OmniPretrainData(cfg, tc, dp_rank=rank, dp_size=world, cp_size=cp)
+    return PreparedBundleData(cfg, tc, dp_rank=rank, dp_size=world, cp_size=cp)
 
 
 def consume(data, step):
     batches = data.get_batch(step, "cpu")
-    data.commit_step(step)
     return batches
 
 
@@ -110,14 +106,14 @@ def test_training_media_batches_dp_resume_and_epoch(training_bundle, processor_c
     data = source(training_bundle)
     rng_before = torch.get_rng_state().clone()
     first = consume(data, 0)
+    compare_batches(consume(data, 0), first)
     assert torch.equal(torch.get_rng_state(), rng_before), "Data iteration changed model RNG"
-    state = data.state_dict()
     expected = consume(data, 1)
     next_epoch = consume(data, 2)
     restored = source(training_bundle)
-    restored.load_state_dict(state)
     compare_batches(consume(restored, 1), expected)
     compare_batches(consume(restored, 2), next_epoch)
+    compare_batches(consume(data, 0), first)
     ranks = [consume(source(training_bundle, rank=rank, world=2), 0) for rank in range(2)]
     compare_batches([mb for pair in zip(*ranks) for mb in pair], first)
     for micro in first + expected + next_epoch:
@@ -125,24 +121,14 @@ def test_training_media_batches_dp_resume_and_epoch(training_bundle, processor_c
         assert micro.model_inputs[0].shape[0] == 1
         assert micro.model_inputs[0].shape == micro.objective_inputs[0].shape
         assert all(value.device.type == "cpu" for value in micro.context_for_stage(0).values())
-    with pytest.raises(ValueError, match="differs"):
-        source(training_bundle, seed=42).load_state_dict(state)
 
 
-def test_training_rejects_unsupported_layout_and_uncommitted_save(
-    training_bundle, processor_config
-):
+def test_media_requires_supported_model_and_layout(training_bundle, processor_config):
     with pytest.raises(ValueError, match="CP=1"):
         source(training_bundle, cp=2)
     data = source(training_bundle)
-    _, config = processor_config
     with pytest.raises(ValueError, match="does not implement"):
-        data.validate_model(type("TextOnly", (), {}), config)
-    data.get_batch(0, "cpu")
-    with pytest.raises(RuntimeError, match="optimizer step"):
-        data.state_dict()
-    with pytest.raises(ValueError, match="disagree"):
-        data.get_batch(0, "cpu")
+        data.validate_model(type("TextOnly", (), {}), processor_config[1])
 
 
 def test_checkpoint_restores_model_optimizer_and_next_data(
@@ -160,8 +146,12 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
     expected_optimizer = copy.deepcopy(optimizer.state_dict())
     expected_scheduler = copy.deepcopy(scheduler.state_dict())
     checkpoint = tmp_path / "checkpoint"
-    state = CheckpointState(model, (optimizer,), (scheduler,), data_state=data.checkpoint_state)
-    dcp.save({"app": state}, checkpoint_id=checkpoint)
+    state = CheckpointState(model, (optimizer,), (scheduler,))
+    # Older PR checkpoints carried an extra data entry. DCP must ignore that
+    # obsolete cursor and restore the ordinary model/optimizer/scheduler state.
+    old_state = state.state_dict()
+    old_state["data"] = dict(version=1, fingerprint="old-data-identity", consumed_samples=4)
+    dcp.save({"app": old_state}, checkpoint_id=checkpoint)
     expected_batch = consume(data, 1)
     restored_data = source(training_bundle)
     restored_model = torch.nn.Linear(2, 2)
@@ -171,10 +161,8 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
         restored_model,
         (restored_optimizer,),
         (restored_scheduler,),
-        data_state=restored_data.checkpoint_state,
     )
     dcp.load({"app": restored}, checkpoint_id=checkpoint)
-    assert restored_data.consumed_samples == 4
     torch.testing.assert_close(restored_optimizer.state_dict(), expected_optimizer, rtol=0, atol=0)
     assert restored_scheduler.state_dict() == expected_scheduler
     for name, value in restored_model.state_dict().items():
@@ -224,17 +212,36 @@ def test_global_target_normalization_excludes_pipeline_duplicates(tmp_path):
     mp.spawn(_reduction_worker, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
 
 
-def test_worker_prefetch_does_not_advance_checkpoint(
+def test_worker_prefetch_replays_requested_step(
     training_bundle, processor_config, single_cpu_thread
 ):
-    expected = source(training_bundle)
-    first, second = consume(expected, 0), consume(expected, 1)
+    reference = source(training_bundle)
+    expected = [consume(reference, step) for step in range(3)]
     data = source(training_bundle)
     data.cfg.num_workers = 1
-    compare_batches(consume(data, 0), first)
-    saved = data.state_dict()
-    assert saved["consumed_samples"] == 4
+    for step in (0, 0, 1, 2, 1):
+        compare_batches(consume(data, step), expected[step])
     restored = source(training_bundle)
     restored.cfg.num_workers = 1
-    restored.load_state_dict(saved)
-    compare_batches(consume(restored, 1), second)
+    compare_batches(consume(restored, 1), expected[1])
+
+
+def test_partial_media_read_can_retry_same_step(training_bundle, processor_config, monkeypatch):
+    reference = source(training_bundle)
+    expected = consume(reference, 0)
+    data = source(training_bundle)
+    read = data._next_media_microbatch
+    calls = 0
+
+    def fail_second(step, device):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("fixture processing failure")
+        return read(step, device)
+
+    monkeypatch.setattr(data, "_next_media_microbatch", fail_second)
+    with pytest.raises(ValueError, match="fixture processing failure"):
+        consume(data, 0)
+    monkeypatch.setattr(data, "_next_media_microbatch", read)
+    compare_batches(consume(data, 0), expected)

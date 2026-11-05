@@ -22,10 +22,9 @@ def validate_modalities(modalities):
 
 
 def resolve_bundle_modalities(recipe, modalities):
-    """Retain a matching recipe preset's ordering and checkpoint identity.
+    """Retain a matching recipe preset's ordering.
 
-    An explicit subset need not have a named preset. Give it stable ordering and
-    fingerprint its modalities instead of borrowing another stage's identity.
+    An explicit subset need not have a named preset; give it stable ordering.
     """
     validate_modalities(modalities)
     matches = [stage for stage, kinds in recipe["stages"].items() if set(kinds) == set(modalities)]

@@ -81,7 +81,7 @@ def read_verified_bundle(root):
                             required.update(item["path"] for item in json.loads(line)["media"])
                 if kind == "text":
                     token_files.add(f"tokens/{split}/{index:05d}.bin")
-    # DensePretrainData recursively consumes every .bin, so an unlisted extra
+    # TokenBinData recursively consumes every .bin, so an unlisted extra
     # shard must fail even when all the listed hashes still match.
     actual_tokens = {path.relative_to(root).as_posix() for path in (root / "tokens").rglob("*.bin")}
     if actual_tokens != token_files or set(checksums) != required | token_files:
