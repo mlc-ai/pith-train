@@ -1,11 +1,31 @@
 """Training data configuration shared by token and prepared-bundle readers."""
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pithtrain.config import SlottedDefault
+
+
+def data_fingerprint(source_identity, training_cfg):
+    """Hash data identity and sampling inputs, excluding progress and prefetch settings.
+
+    Keep the version-1 prepared-bundle encoding compatible with older PR checkpoints.
+    Parallel rank/size and max_steps are deliberately absent: they do not change the
+    global sample stream. Batch and sequence sizes do, so they must agree on resume.
+    """
+    identity = dict(
+        source_identity,
+        version=1,
+        global_batch_size=training_cfg.global_batch_size,
+        micro_batch_size=training_cfg.micro_batch_size,
+        sequence_length=training_cfg.sequence_length,
+        seed=training_cfg.seed,
+    )
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
 def validate_modalities(modalities):

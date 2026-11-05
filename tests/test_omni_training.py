@@ -14,7 +14,7 @@ import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from pithtrain.modules.checkpoint import CheckpointState
+from pithtrain.modules.checkpoint import CheckpointState, validate_data_fingerprint
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.loss import global_loss_mean, global_target_count
 from pithtrain.modules.microbatch import Microbatch
@@ -147,10 +147,9 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
     expected_scheduler = copy.deepcopy(scheduler.state_dict())
     checkpoint = tmp_path / "checkpoint"
     state = CheckpointState(model, (optimizer,), (scheduler,))
-    # Older PR checkpoints carried an extra data entry. DCP must ignore that
-    # obsolete cursor and restore the ordinary model/optimizer/scheduler state.
+    # Validate the former reader's static identity, without restoring its cursor.
     old_state = state.state_dict()
-    old_state["data"] = dict(version=1, fingerprint="old-data-identity", consumed_samples=4)
+    old_state["data"] = dict(version=1, fingerprint=data.data_fingerprint, consumed_samples=4)
     dcp.save({"app": old_state}, checkpoint_id=checkpoint)
     expected_batch = consume(data, 1)
     restored_data = source(training_bundle)
@@ -161,6 +160,11 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
         restored_model,
         (restored_optimizer,),
         (restored_scheduler,),
+    )
+    validate_data_fingerprint(
+        checkpoint,
+        dcp.FileSystemReader(str(checkpoint)).read_metadata(),
+        restored_data.data_fingerprint,
     )
     dcp.load({"app": restored}, checkpoint_id=checkpoint)
     torch.testing.assert_close(restored_optimizer.state_dict(), expected_optimizer, rtol=0, atol=0)

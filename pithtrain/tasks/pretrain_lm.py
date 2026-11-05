@@ -246,7 +246,9 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
         should_save |= completed == cfg.training.max_steps
         if should_save:
             assert cfg.training.save_location is not None
-            save_checkpoint(cfg.training.save_location, completed)
+            save_checkpoint(
+                cfg.training.save_location, completed, data_fingerprint=dataset.data_fingerprint
+            )
 
     # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
@@ -262,7 +264,7 @@ def launch(cfg: PretrainLMCfg) -> None:
     logger.info("launch(cfg=%s)" % cfg)
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
-        load_checkpoint(cfg.training.save_location, step)
+        load_checkpoint(cfg.training.save_location, step, data_fingerprint=dataset.data_fingerprint)
         if training.fp8:
             precompute_fp8_param_scales()
     elif cfg.training.hf_import_path is not None:

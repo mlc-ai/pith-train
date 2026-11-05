@@ -7,7 +7,7 @@ from typing import Protocol
 import torch
 import torch.distributed as dist
 
-from pithtrain.modules.data_config import DataCfg, resolve_bundle_modalities
+from pithtrain.modules.data_config import DataCfg, data_fingerprint, resolve_bundle_modalities
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.operators.cp_sequence import zigzag_spans
@@ -23,6 +23,9 @@ class PretrainData(Protocol):
     With the same data/configuration, retries and checkpoint resumes select the
     same samples. Readers may cache prefetched batches, but have no durable cursor.
     """
+
+    data_fingerprint: str
+    """Static data/configuration identity for checkpoint validation; never a cursor."""
 
     def get_batch(self, step: int, device: torch.device) -> list[Microbatch]: ...
 
@@ -40,9 +43,19 @@ class TokenBinData:
         self.training_cfg = training_cfg
         self.dp_rank, self.dp_size = dp_rank, dp_size
         self.cp_rank, self.cp_size = cp_rank, cp_size
-        files = sorted(Path(root).rglob("*.bin"))
+        root = Path(root).resolve()
+        files = sorted(root.rglob("*.bin"))
         if not files:
             raise ValueError(f"No token shards under {root}")
+        # Raw token shards have no content manifest. Record their location/inventory
+        # without scanning a potentially multi-terabyte corpus on every rank.
+        inventory = []
+        for file in files:
+            stat = file.stat()
+            inventory.append((file.relative_to(root).as_posix(), stat.st_size, stat.st_mtime_ns))
+        self.data_fingerprint = data_fingerprint(
+            dict(format="token_bin", root=str(root), files=inventory), training_cfg
+        )
         memmaps = [MemmapDataset(file, training_cfg.sequence_length) for file in files]
         self.corpus = ConcatDataset(memmaps, training_cfg.seed)
         required = training_cfg.max_steps * training_cfg.global_batch_size
@@ -154,7 +167,7 @@ class PreparedBundleData:
             if dist.get_world_size(pp_group) != pp_size or dist.get_rank(pp_group) != pp_rank:
                 raise ValueError("Pipeline process group does not match the data rank/size")
 
-        self.bundle, _ = self._share_metadata(lambda: read_verified_bundle(self.root))
+        self.bundle, bundle_sha256 = self._share_metadata(lambda: read_verified_bundle(self.root))
         self.recipe = self.bundle["recipe"]
         self.modalities, self.stage = resolve_bundle_modalities(self.recipe, cfg.modalities)
         if set(self.modalities) - set(self.bundle["manifests"]["train"]):
@@ -205,6 +218,15 @@ class PreparedBundleData:
         self._iterator, self._next_step = None, None
         self._processor = self._thinker_config = None
         self.batch_cfg = dict(self.recipe["batch"], max_length=self.sequence_length)
+        identity = dict(
+            bundle_sha256=bundle_sha256,
+            stage=self.stage,
+            weights=self.weights,
+            epoch_samples=self.epoch_samples,
+        )
+        if self.stage is None:
+            identity["modalities"] = self.modalities
+        self.data_fingerprint = data_fingerprint(identity, training_cfg)
         self._dense = (
             TokenBinData(
                 self.root / "tokens/train",

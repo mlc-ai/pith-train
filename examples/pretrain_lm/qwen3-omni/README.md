@@ -82,12 +82,22 @@ position; prefetch is an ephemeral cache. Retrying a step or starting a fresh
 reader at a saved step reproduces the same batch, without a commit operation or
 dataset checkpoint state. Epochs contain whole global batches.
 
-Resume with the same bundle, modalities, sampling, seed, sequence length and
-batch configuration to replay the same training stream. The bundle's checksum
-inventory is verified when opening it, but the model checkpoint does not record
-or validate the run's data configuration, just as for token-bin training.
-Checkpoints made by an earlier version of this PR may include a data cursor;
-that extra entry is ignored and the checkpoint's completed step selects the data.
+Checkpoints store a static `data_fingerprint`, checked before model/optimizer
+tensors are restored. It covers the verified bundle identity, selected modalities,
+effective sampling weights and epoch size, seed, sequence length, and global/micro
+batch sizes. Changing these rejects the resume. Worker count, parallel topology
+and max_steps are excluded, so changing prefetch or extending a run is allowed.
+The fingerprint never advances: the checkpoint's completed step still selects data.
+
+For raw token-bin sources, the fingerprint covers the resolved dataset location,
+shard names, sizes and modification timestamps, plus seed/sequence/batch settings.
+It does not hash the entire token corpus; unlike prepared bundles, raw shards have
+no verified content manifest and must be kept immutable during a run.
+
+Older PR checkpoints with a version-1 data fingerprint are validated using the same
+identity, while their old cursor is ignored. Training checkpoints with no fingerprint
+remain loadable with a warning that data configuration cannot be validated; the user
+must ensure it matches the original run. Model-only weight imports need no data identity.
 
 ## Integration check
 
