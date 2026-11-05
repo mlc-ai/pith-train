@@ -76,9 +76,10 @@ def capture_routes(model, native):
 
         return record
 
-    for index, router in moe_routers(model).items():
-        handles.append(router.register_forward_hook(recorder(index)))
     try:
+        # Registered inside the cleanup scope, so a failure partway releases the earlier hooks.
+        for index, router in moe_routers(model).items():
+            handles.append(router.register_forward_hook(recorder(index)))
         yield routes
     finally:
         for handle in handles:
