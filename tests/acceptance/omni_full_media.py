@@ -7,8 +7,9 @@ Run each modality in a fresh process under an external 600-second hard timeout.
 
 --mode route-conditioned adds a native phase that replays the HF reference's top-k
 routes (omni_route_replay); that phase decides the verdict and the free-running
-native phase becomes a diagnostic. Audio key-bias gradients are analytically zero
-and are judged by size relative to the query bias, in every mode.
+native phase becomes a diagnostic. Audio key-bias gradients are analytically zero, so
+their NSE compares rounding residues; they keep that verdict until a calibrated criterion
+exists, and their size relative to the query bias is reported alongside.
 """
 
 import argparse
@@ -31,7 +32,7 @@ from tests.acceptance.omni_reference_attention import (
     reference_contract,
 )
 from tests.acceptance.omni_route_replay import (
-    apply_key_bias_criterion,
+    annotate_key_bias_ratios,
     capture_routes,
     group_summary,
     replay_routes,
@@ -284,10 +285,10 @@ def compare_gradients(parameters, shapes, expected=None):
                     if row["difference"] is None or row["difference"] >= text_gate.GRAD_THRESHOLD:
                         row["status"] = "FAIL"
         rows.append(row)
-    # Individual mathematically-zero gradients are still compared (including 0 vs 0),
-    # except audio key biases, whose exact gradient is zero by construction and whose
-    # NSE compares two rounding residues; those are judged by relative size instead.
-    apply_key_bias_criterion(rows)
+    # Individual mathematically-zero gradients are still compared (including 0 vs 0).
+    # Audio key biases, whose exact gradient is zero by construction, keep that verdict
+    # too; their size relative to the query bias is reported, being uncalibrated.
+    annotate_key_bias_ratios(rows)
     # Each full trainable component must actually participate in the objective.
     for prefix in ("model.", "lm_head.", "audio_tower.", "visual."):
         members = [row for row in rows if row["name"].startswith(prefix)]

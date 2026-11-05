@@ -219,7 +219,7 @@ def test_route_statistics_count_set_changes_and_use_reference_margins():
     assert stats["unflipped_reference_margin"]["max"] == pytest.approx(0.15)
 
 
-def key_bias_rows(k_actual, k_reference, q=1.0):
+def key_bias_rows(k_actual, k_reference, q=1.0, status="FAIL"):
     rows = []
     for name, actual, reference in (
         ("audio_tower.layers.0.self_attn.k_proj.bias", k_actual, k_reference),
@@ -228,7 +228,7 @@ def key_bias_rows(k_actual, k_reference, q=1.0):
         rows.append(
             {
                 "name": name,
-                "status": "FAIL",
+                "status": status,
                 "finite": True,
                 "actual_l2": actual,
                 "reference_l2": reference,
@@ -238,19 +238,40 @@ def key_bias_rows(k_actual, k_reference, q=1.0):
     return rows
 
 
+@pytest.mark.parametrize("status", ["PASS", "FAIL"])
 @pytest.mark.parametrize(
-    "k_actual,k_reference,status",
-    [(4e-7, 5.6e-6, "PASS"), (1e-3, 2e-2, "PASS"), (0.5, 1e-6, "FAIL"), (None, 1e-6, "FAIL")],
+    "k_actual,k_reference,q,ratios,states",
+    [
+        (4e-7, 5.6e-6, 1.0, (4e-7, 5.6e-6), ("DEFINED", "DEFINED")),
+        (0.05, 0.05, 1.0, (0.05, 0.05), ("DEFINED", "DEFINED")),
+        (0.5, 1e-6, 1.0, (0.5, 1e-6), ("DEFINED", "DEFINED")),
+        (None, 1e-6, 1.0, (None, 1e-6), ("MISSING", "DEFINED")),
+        (0.0, 0.0, 0.0, (None, None), ("UNDEFINED_ZERO_QUERY", "UNDEFINED_ZERO_QUERY")),
+        (float("nan"), 1e-6, 1.0, (None, 1e-6), ("NONFINITE", "DEFINED")),
+    ],
 )
-def test_key_bias_rows_are_judged_by_relative_size_not_nse(k_actual, k_reference, status):
-    rows = routing.apply_key_bias_criterion(key_bias_rows(k_actual, k_reference))
-    assert rows[0]["status"] == status
-    assert rows[0]["difference"] == 1.0 and rows[0]["nse_is_diagnostic_only"]
-    assert rows[1]["status"] == "FAIL"  # every other parameter keeps its NSE verdict
+def test_key_bias_ratios_are_reported_without_changing_the_nse_verdict(
+    k_actual, k_reference, q, ratios, states, status
+):
+    rows = routing.annotate_key_bias_ratios(key_bias_rows(k_actual, k_reference, q, status))
+    key, query = rows
+    assert key["status"] == query["status"] == status and "reason" not in key
+    assert key["difference"] == 1.0
+    got = key["key_to_query_gradient_ratio"]
+    for side, expected in zip(("actual", "reference"), ratios, strict=True):
+        assert got[side] is None if expected is None else got[side] == pytest.approx(expected)
+    assert key["key_to_query_ratio_state"] == dict(actual=states[0], reference=states[1])
+    assert "key_to_query_gradient_ratio" not in query
+
+
+def test_key_bias_ratio_without_its_query_row_is_missing():
+    (row,) = routing.annotate_key_bias_ratios(key_bias_rows(1e-6, 1e-6, status="FAIL")[:1])
+    assert row["status"] == "FAIL"
+    assert row["key_to_query_ratio_state"] == dict(actual="MISSING", reference="MISSING")
 
 
 def test_audio_key_bias_gradient_is_analytically_zero_but_its_nse_is_ill_posed():
-    """Guards the criterion: RoPE or a key norm in audio attention would break invariance."""
+    """Guards the analytic-zero rationale: RoPE or a key norm would break invariance."""
     config = audio_config(encoder_layers=2)
     native, reference = paired(config, dtype=torch.float64)
     lengths = torch.tensor([201, 17])
@@ -296,5 +317,7 @@ def test_audio_key_bias_gradient_is_analytically_zero_but_its_nse_is_ill_posed()
         for target in ("k", "q")
     ]
     assert rows[0]["nse"] > 0.1 and rows[1]["nse"] < 1e-9
-    routing.apply_key_bias_criterion(rows)
-    assert rows[0]["status"] == "PASS" and rows[0]["key_to_query_gradient_ratio"]["actual"] < 1e-4
+    routing.annotate_key_bias_ratios(rows)
+    # The ratio is reported, not judged: the rows keep the status they came with.
+    assert rows[0]["status"] == rows[1]["status"] == "PASS"
+    assert rows[0]["key_to_query_gradient_ratio"]["actual"] < 1e-4

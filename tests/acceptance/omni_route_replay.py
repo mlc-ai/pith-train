@@ -32,9 +32,10 @@ _GROUPS = (
 )
 # Audio self-attention adds k_proj.bias to every key of a query row and has no RoPE or
 # key norm, so softmax shift invariance makes its exact gradient identically zero; the
-# computed value is pure rounding residue, and NSE between two residues is ill-posed.
+# computed value is rounding residue, and NSE between two residues is ill-posed. No
+# calibrated size criterion exists yet, so these rows keep their NSE verdict and
+# annotate_key_bias_ratios only reports their size relative to the query bias.
 AUDIO_KEY_BIAS = re.compile(r"^(audio_tower\.layers\.\d+\.self_attn\.)k_proj\.bias$")
-KEY_BIAS_RATIO_BOUND = 0.1
 
 
 def moe_routers(model):
@@ -173,38 +174,35 @@ def group_summary(rows):
     return dict(sorted(groups.items()))
 
 
-def apply_key_bias_criterion(rows, bound=KEY_BIAS_RATIO_BOUND):
-    """Judge analytically-zero audio key-bias gradients by size, not by NSE.
+def annotate_key_bias_ratios(rows):
+    """Report each audio key-bias gradient's size relative to its layer's query bias.
 
-    Each implementation's key-bias gradient must stay below ``bound`` times its own
-    query-bias gradient norm in the same layer (a real, nonzero gradient is of order
-    one). NSE is retained in the row as a diagnostic only. Rows without a reference
-    comparison or without the same layer's query-bias row, and all other parameters,
-    keep their NSE verdict. (The full-size inventory always contains both biases.)
+    The ratio is an uncalibrated diagnostic: no row's status or reason changes, so the NSE
+    verdict stands. Per implementation the ratio is MISSING when either norm or the query
+    row is absent, NONFINITE for a nonfinite norm, and UNDEFINED_ZERO_QUERY when the query
+    norm is zero (even if the key norm is zero too).
     """
     by_name = {row["name"]: row for row in rows}
     for row in rows:
         match = AUDIO_KEY_BIAS.match(row["name"])
-        if match is None or "reference_l2" not in row:
+        if match is None:
             continue
         query = by_name.get(match.group(1) + "q_proj.bias")
-        if query is None:
-            continue
-        ratios = {}
+        ratios, states = {}, {}
         for side in ("actual", "reference"):
-            norm, scale = row.get(side + "_l2"), query.get(side + "_l2")
-            ratios[side] = None if norm is None or not scale else norm / scale
-        valid = all(value is not None and math.isfinite(value) for value in ratios.values())
+            norm = row.get(side + "_l2")
+            scale = None if query is None else query.get(side + "_l2")
+            if norm is None or scale is None:
+                ratios[side], states[side] = None, "MISSING"
+            elif not (math.isfinite(norm) and math.isfinite(scale)):
+                ratios[side], states[side] = None, "NONFINITE"
+            elif scale == 0:
+                ratios[side], states[side] = None, "UNDEFINED_ZERO_QUERY"
+            else:
+                ratios[side], states[side] = norm / scale, "DEFINED"
         row.update(
-            criterion="analytic-zero: softmax shift invariance; |g_k|/|g_q| per implementation",
             key_to_query_gradient_ratio=ratios,
-            ratio_bound=bound,
-            nse_is_diagnostic_only=True,
+            key_to_query_ratio_state=states,
+            key_bias_ratio_role="uncalibrated diagnostic; status is the NSE verdict",
         )
-        if row.get("reason") or not row.get("finite"):
-            continue
-        if valid and max(ratios.values()) <= bound:
-            row["status"] = "PASS"
-        else:
-            row.update(status="FAIL", reason="Key-bias gradient is not negligible")
     return rows
