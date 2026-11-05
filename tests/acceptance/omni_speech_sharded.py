@@ -4,8 +4,10 @@ Reuse omni_speech_chain.prepare and its immutable media fixture. Produce runs
 four real AdamW updates and saves the native task-v2 checkpoint at scan two;
 restore is a separate torchrun process and reproduces the subsequent scans.
 The independent HFChain evaluates the concatenated DP objective. Every active
-canonical parameter has preclip/postclip gradient and actual update-delta NSE
-checks. Frozen components are listed separately. CPU contracts are not GPU evidence.
+canonical parameter has preclip/postclip gradient NSE checks, and its actual update
+is judged against the HF AdamW settings applied to the native gradients
+(omni_update_gate); the native-vs-HF update delta is a diagnostic. Frozen components
+are listed separately. CPU contracts are not GPU evidence.
 
 Codec EOS is always supervised in the production model. Therefore codec modes
 cannot express a wholly empty objective: text-branch zeros are recorded as such.
@@ -92,7 +94,8 @@ def plan(mode, *, residual_reference="hf-prefix-v1"):
         ),
         thresholds=dict(
             gradient_nse_strict_lt=GRADIENT_NSE,
-            actual_update_delta_nse_strict_lt=GRADIENT_NSE,
+            optimizer_update_nse_strict_lt=GRADIENT_NSE,
+            end_to_end_update_delta="DIAGNOSTIC_ONLY",
             output_and_loss_nse_strict_lt=OUTPUT_NSE,
         ),
         limitations=[
@@ -404,7 +407,7 @@ def reference_step(hf, optimizer, samples, mode, scan, device):
 
 
 @contextmanager
-def observers(model, optimizer, batches, mode, parameters, reference, report):
+def observers(model, optimizer, batches, mode, parameters, reference, report, captured):
     from pithtrain.tasks import omni_speech as task
 
     observed = []
@@ -428,9 +431,9 @@ def observers(model, optimizer, batches, mode, parameters, reference, report):
         return original_clip(owned_model, maximum, group=group)
 
     def pre_step(opt, args, kwargs):
-        report["postclip_gradients"] = compare_tensors(
-            collect_full(parameters, gradients=True), reference["post"]
-        )
+        # The clipped gradients this step consumes also drive the shadow optimizer.
+        captured["gradients"] = collect_full(parameters, gradients=True)
+        report["postclip_gradients"] = compare_tensors(captured["gradients"], reference["post"])
 
     hook = (model.code2wav if mode == "waveform" else model).register_forward_hook(forward_hook)
     step_hook = optimizer.register_step_pre_hook(pre_step)
@@ -528,6 +531,7 @@ def run_gate(args, samples, native, hf, fixture):
     from pithtrain.tasks import omni_speech as task
     from pithtrain.tasks.omni_speech_fsdp import apply_speech_fsdp
     from pithtrain.tasks.sft_lm import SFTState
+    from tests.acceptance.omni_update_gate import END_TO_END_ROLE, ShadowAdamW, optimizer_gate
 
     mode, rank = args.training_mode, dist.get_rank()
     cfg = task.OmniSpeechCfg(
@@ -548,6 +552,8 @@ def run_gate(args, samples, native, hf, fixture):
     hf_optimizer = torch.optim.AdamW(
         [p for p in hf.parameters() if p.requires_grad], lr=1e-4, weight_decay=0, foreach=False
     )
+    # The update verdict applies the HF AdamW settings to the native gradients.
+    shadow = ShadowAdamW.like(hf_optimizer, {name: p.shape for name, p in parameters.items()})
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     data = ScheduledData(samples, fixture["samples_sha256"], mode, rank)
     state = SFTState()
@@ -583,6 +589,7 @@ def run_gate(args, samples, native, hf, fixture):
         ),
         optimizer="torch.optim.AdamW foreach=False",
         reference_trajectory="independent persistent HFChain",
+        update_verdict="HF AdamW settings on native gradients; actual_update_delta is diagnostic",
         checkpoints={},
         evidence={},
         steps=[],
@@ -605,6 +612,7 @@ def run_gate(args, samples, native, hf, fixture):
         )
         hf.model.load_state_dict(expected["hf_model"], strict=True)
         hf_optimizer.load_state_dict(expected["hf_optimizer"])
+        shadow.load_state_dict(expected["shadow_optimizer"])
         result["restored_boundary"] = "EXACT"
         start = 2
     for scan in range(start, scans(mode)):
@@ -621,14 +629,32 @@ def run_gate(args, samples, native, hf, fixture):
         )
         local_batches = scheduled_batches(samples, mode, scan, rank, args.device)
         cfg.max_batches, cfg.max_updates = scan + 1, 4
+        captured = {}
         with observers(
-            native, optimizer, local_batches, mode, parameters, reference, report
+            native, optimizer, local_batches, mode, parameters, reference, report, captured
         ) as observed:
             task.launch(cfg, data, **options, checkpoint_root=args.output / "checkpoints")
         after = collect_full(parameters)
-        report["actual_update_delta"] = compare_tensors(
-            {n: after[n] - before[n] for n in before}, reference["delta"]
-        )
+        native_delta = {n: after[n] - before[n] for n in before}
+        gradients = captured.get("gradients")
+        if gradients is None:
+            # No native optimizer step: a no-update scan is checked exactly below.
+            report["optimizer_update"] = dict(
+                status="FAIL" if reference["updated"] else "PASS",
+                reason="no native optimizer step",
+            )
+        elif any(value is None for value in gradients.values()):
+            report["optimizer_update"] = dict(
+                status="FAIL",
+                reason="missing native gradient",
+                missing=sorted(name for name, value in gradients.items() if value is None),
+            )
+        else:
+            report["optimizer_update"] = optimizer_gate(
+                native_delta, shadow.step(before, gradients), GRADIENT_NSE
+            )
+        report["actual_update_delta"] = compare_tensors(native_delta, reference["delta"])
+        report["actual_update_delta_role"] = END_TO_END_ROLE
         output_rows, label_errors = {}, []
         local_loss = torch.zeros((), dtype=torch.float32, device=args.device)
         if len(observed) != len(local_batches):
@@ -700,7 +726,6 @@ def run_gate(args, samples, native, hf, fixture):
         ):
             raise AssertionError("Actual task cursors differ from explicit schedule")
         checks = [
-            report["actual_update_delta"],
             report["outputs"],
             report["loss"],
             report["optimizer_parameters"],
@@ -712,6 +737,7 @@ def run_gate(args, samples, native, hf, fixture):
             if not label_errors
             and report["count_match"]
             and report["component_update_match"]
+            and report["optimizer_update"]["status"] == "PASS"
             and all(passed(rows) for rows in checks)
             else "FAIL"
         )
@@ -719,6 +745,7 @@ def run_gate(args, samples, native, hf, fixture):
             native=current,
             hf_model=cpu_tree(hf.model.state_dict()),
             hf_optimizer=cpu_tree(hf_optimizer.state_dict()),
+            shadow_optimizer=shadow.state_dict(),
             observed=data.observed[scan],
         )
         if producer is not None:

@@ -84,6 +84,27 @@ The main integration retains media context and upstream inference-record cleanup
 Its 20 affected CPU checks and all eight pre-commit checks passed. The current CUDA
 results above cover the named paths only, not every historical component or scale.
 
+## Update verdict
+
+Native-vs-reference gradients keep their gates. The optimizer update is judged by
+`omni_update_gate.py`: the independent reference AdamW's settings are applied to the
+native pre-step parameters and clipped gradients, with the Adam moments fed by the same
+native gradient stream, and the native update must match at the unchanged 1e-2 NSE.
+The earlier comparison, the reference optimizer on the reference gradients, is still
+computed and reported as a diagnostic. It is ill-conditioned for small tensors: AdamW's
+first steps move every element by about lr, so an element whose two gradients straddle
+zero moves by +lr on one side and -lr on the other, adding about 2/N to the NSE of an
+N-element tensor (0.0156 for N = 128) with both sides correct. At `f828ed01` the G2 gate
+showed this: every one of the 87 gradient NSEs was at most 2.9e-6, while the update NSE
+of `shared_expert_gate.weight` [1, 128] was 0.0135, 99.9999% of it from two elements
+whose gradients are near 1e-7.
+
+This verdict was adopted after those failures were observed. The thresholds are
+unchanged, and the verdict must also reject twice the shadow update and a missing
+update. The Run133/Run136 and `f828ed01` update failures stay recorded as measured;
+only new runs are judged by the split verdict. A weight-decay-only difference, of order
+lr * weight_decay * |p| per element, is below the 1e-2 resolution and is not claimed.
+
 ## Supported boundaries
 
 Native media uses BF16 activations and FP32 master/gradient/Adam state, CP1 and explicit
