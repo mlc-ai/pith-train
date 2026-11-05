@@ -31,6 +31,22 @@ BWD_NAMES = {
     "pithtrain.flash_attn4_mha_bwd.default": "dense",
     "pithtrain.flash_attn4_varlen_bwd.default": "varlen",
 }
+# Their positional arguments, as pithtrain/operators/flash_attn_v4.py registers them. Both return
+# (dq, dk, dv, sink gradient), and the sink gradient is empty when learnable_sink is None.
+BWD_ATTENTION = ("q", "k", "v", "o", "lse", "do")
+BWD_PACKED = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+BWD_POLICY = (
+    "softmax_scale",
+    "causal",
+    "window_size_left",
+    "window_size_right",
+    "learnable_sink",
+    "deterministic",
+)
+BWD_ARGUMENTS = {
+    "dense": BWD_ATTENTION + BWD_POLICY,
+    "varlen": BWD_ATTENTION + BWD_PACKED + BWD_POLICY,
+}
 
 
 def tensor_hash(value):
@@ -83,40 +99,52 @@ class ActualBackwardCapture(TorchDispatchMode):
         self.records = []
 
     def __torch_dispatch__(self, function, types, args=(), kwargs=None):
-        result = function(*args, **(kwargs or {}))
         kind = BWD_NAMES.get(str(function))
-        if kind is not None:
-            if kwargs:
-                raise RuntimeError("Unexpected FA4 backward kwargs; review capture schema")
-            q, k, v, output, _lse, cotangent = args[:6]
-            if kind == "dense":
-                scale, causal, left, right, deterministic = args[6:]
-                lengths = None
-            else:
-                cu_q, cu_k, max_q, max_k, scale, causal, left, right, deterministic = args[6:]
-                if not torch.equal(cu_q, cu_k) or max_q != max_k:
-                    raise RuntimeError("Only the declared self-attention contract is supported")
-                lengths = (cu_q[1:] - cu_q[:-1]).tolist()
-            if not causal or left is not None or right is not None:
-                raise RuntimeError(
-                    "Independent gate requires original causal/full-window attention"
-                )
-            self.records.append(
-                {
-                    "kind": kind,
-                    "lengths": lengths,
-                    "scale": scale,
-                    "deterministic": deterministic,
-                    **{
-                        name: value.detach().clone()
-                        for name, value in zip(
-                            ("q", "k", "v", "output", "cotangent", "dq", "dk", "dv"),
-                            (q, k, v, output, cotangent, *result),
-                            strict=True,
-                        )
-                    },
-                }
-            )
+        if kind is None:
+            return function(*args, **(kwargs or {}))
+        names = tuple(argument.name for argument in function._schema.arguments)
+        if (
+            kwargs
+            or names != BWD_ARGUMENTS[kind]
+            or len(args) != len(names)
+            or len(function._schema.returns) != 4
+        ):
+            raise RuntimeError("Unexpected FA4 backward schema; review capture schema")
+        call = dict(zip(names, args, strict=True))
+        if call["learnable_sink"] is not None:
+            raise RuntimeError("Independent gate covers attention without a learnable sink")
+        if (
+            not call["causal"]
+            or call["window_size_left"] is not None
+            or call["window_size_right"] is not None
+        ):
+            raise RuntimeError("Independent gate requires original causal/full-window attention")
+        lengths = None
+        if kind == "varlen":
+            cu_q, cu_k = call["cu_seqlens_q"], call["cu_seqlens_k"]
+            if not torch.equal(cu_q, cu_k) or call["max_seqlen_q"] != call["max_seqlen_k"]:
+                raise RuntimeError("Only the declared self-attention contract is supported")
+            lengths = (cu_q[1:] - cu_q[:-1]).tolist()
+        result = function(*args)
+        dq, dk, dv, sink_gradient = result
+        if sink_gradient.numel():
+            raise RuntimeError("FA4 returned a sink gradient for attention without a sink")
+        self.records.append(
+            {
+                "kind": kind,
+                "lengths": lengths,
+                "scale": call["softmax_scale"],
+                "deterministic": call["deterministic"],
+                **{
+                    name: value.detach().clone()
+                    for name, value in zip(
+                        ("q", "k", "v", "output", "cotangent", "dq", "dk", "dv"),
+                        (call["q"], call["k"], call["v"], call["o"], call["do"], dq, dk, dv),
+                        strict=True,
+                    )
+                },
+            }
+        )
         return result
 
 
