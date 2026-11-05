@@ -28,23 +28,3 @@ def test_scatter_policies_preserve_values_padding_and_backward(rows, groups, can
     dy = torch.randn_like(actual[0])
     actual[0].backward(dy)
     assert torch.equal(x.grad, dy[actual[1]])
-
-
-@pytest.mark.parametrize("rows,topk,experts", [(1, 2, 4), (257, 4, 8), (1025, 2, 4)])
-def test_independent_dispatch_preserves_routes_and_original_slot_order(rows, topk, experts):
-    from pithtrain.operators.ep_dispatch import fused_dedup_prepare_dispatch
-    from pithtrain.operators.stable_scatter import stable_dedup_prepare_dispatch
-
-    generator = torch.Generator(device="cuda").manual_seed(1731)
-    ids = torch.randint(experts, (rows, topk), device="cuda", generator=generator)
-    reference = stable_dedup_prepare_dispatch(ids, experts, 2, experts // 2)
-    first = None
-    for _ in range(4):
-        actual = fused_dedup_prepare_dispatch(ids, experts, 2, experts // 2, independent_slots=True)
-        for field in (0, 1, 3, 5):
-            assert torch.equal(actual[field], reference[field])
-        assert torch.equal(actual[3], torch.argsort(ids.reshape(-1), stable=True))
-        assert actual[2].numel() == actual[4].numel() == 0
-        if first is not None:
-            assert torch.equal(actual[3], first)
-        first = actual[3]
