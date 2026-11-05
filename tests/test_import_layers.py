@@ -26,7 +26,8 @@ library's interface, over pithtrain/, tests/, benchmarks/, tools/ and examples/:
   import pipeline/ for layer_partition and model_forward, a package-level 2-cycle that is acyclic
   per module because pipeline/ imports only models/interface.py);
 - _sm90 / _sm100 files exist only in kernels/, and every _sm90 file has its _sm100 sibling unless
-  it is SM90-only or a shared SM90 helper;
+  it is SM90-only or a shared SM90 helper (the halves <feature>_fwd_sm90 / <feature>_bwd_sm90 of a
+  rule-8 split pair with <feature>_sm100 and may import each other);
 - no _sm100 file imports an _sm90 file or a picker, an _sm90 file imports another feature's _smXX
   file only along the named cross-feature edges, and no picker imports another picker;
 - get_device_capability appears in pithtrain/ only in kernels/arch.py;
@@ -50,17 +51,21 @@ KERNELS = PKG / "kernels"
 # SM90 kernels with no SM100 kernel to pair with: SM100 runs a non-kernel path.
 SM90_ONLY = {
     "group_indices_sm90",
-    "bf16_expert_gemm_sm90",
-    "bf16_expert_slots_sm90",
-    "gated_delta_rule_pinned_sm90",
+    "fp8_rowwise_kmajor_sm90",
 }
 # Shared CuTe helpers that only SM90 code uses (rule 6).
-SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90"}
+SM90_HELPERS = {"cute_ptx_sm90", "cute_compile_sm90", "fp8_e8m0_scale_sm90", "row_slice_sm90"}
 # Cross-feature edges from an _sm90 file into another feature's _smXX file.
 SM90_CROSS_EDGES = {
     ("fp8_silu_mul_quant_sm90", "fp8_rowwise_kmajor_sm90"),
+    ("fp8_silu_mul_quant_sm90", "silu_mul_sm90"),
     ("fp8_clamped_swiglu_quant_sm90", "fp8_rowwise_kmajor_sm90"),
+    ("fp8_clamped_swiglu_quant_sm90", "clamped_swiglu_sm90"),
     ("fp8_scatter_quant_sm90", "fp8_rowwise_kmajor_sm90"),
+    ("fp8_clamped_swiglu_quant_sm90", "segment_sum_sm90"),
+    ("fp8_scatter_quant_sm90", "token_scatter_sm90"),
+    ("gated_delta_rule_cp_sm90", "gated_delta_rule_pinned_fwd_sm90"),
+    ("gated_delta_rule_cp_sm90", "gated_delta_rule_pinned_bwd_sm90"),
 }
 # What models/ may import from modules/ (from kernels/ only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}
@@ -292,11 +297,28 @@ def is_smxx(mod: str) -> bool:
     return stem_of(mod).endswith(("_sm90", "_sm100"))
 
 
+SPLIT_HALVES = ("_fwd_sm90", "_bwd_sm90")
+"""
+Rule 8: a feature's SM90 code may be split into <feature>_fwd_sm90 / <feature>_bwd_sm90, the two halves
+of its one SM90 implementation.
+"""
+
+
+def sm90_feature(stem: str) -> str:
+    """
+    The feature an _sm90 stem implements: <feature>_sm90, <feature>_fwd_sm90 and <feature>_bwd_sm90
+    all implement <feature>.
+    """
+    for suffix in (*SPLIT_HALVES, "_sm90"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
 def find_pickers() -> set[str]:
     stems = {stem_of(m) for m in MODULES if layer_of(m) == "kernels"}
-    return {
-        f"pithtrain.kernels.{s}" for s in stems if f"{s}_sm90" in stems and f"{s}_sm100" in stems
-    }
+    has_sm90 = lambda s: any(f"{s}{suffix}" in stems for suffix in ("_sm90", *SPLIT_HALVES))
+    return {f"pithtrain.kernels.{s}" for s in stems if has_sm90(s) and f"{s}_sm100" in stems}
 
 
 PICKERS = find_pickers()
@@ -383,7 +405,7 @@ def find_violations() -> set[tuple[str, str, str]]:
         if is_smxx(mod) and layer != "kernels":
             found.add(("smxx-outside-kernels", mod, ""))
         if layer == "kernels" and stem.endswith("_sm90"):
-            sibling = stem[: -len("_sm90")] + "_sm100"
+            sibling = sm90_feature(stem) + "_sm100"
             if (
                 stem not in SM90_ONLY | SM90_HELPERS
                 and f"pithtrain.kernels.{sibling}" not in MODULES
@@ -430,10 +452,12 @@ def find_violations() -> set[tuple[str, str, str]]:
                 if stem.endswith("_sm100") and stem_of(t).endswith("_sm90"):
                     found.add(("sm100-imports-sm90", mod, t))
                 if stem.endswith("_sm90") and stem not in SM90_HELPERS:
-                    own = stem[: -len("_sm90")]
+                    own = sm90_feature(stem)
                     ts = stem_of(t)
                     ok = (
-                        ts == own + "_sm100" or ts in SM90_HELPERS or (stem, ts) in SM90_CROSS_EDGES
+                        ts in SM90_HELPERS
+                        or (stem, ts) in SM90_CROSS_EDGES
+                        or (ts.endswith("_sm90") and sm90_feature(ts) == own)
                     )
                     if not ok:
                         found.add(("sm90-cross-feature", mod, t))
@@ -442,6 +466,22 @@ def find_violations() -> set[tuple[str, str, str]]:
                     found.add(("sm100-imports-picker", mod, t))
                 if mod in PICKERS and t != mod:
                     found.add(("picker-imports-picker", mod, t))
+
+    # No Triton anywhere in pithtrain/: no import of triton and no @triton.jit.
+    for mod, path in sorted(MODULES.items()):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            if any(n == "triton" or n.startswith("triton.") for n in names):
+                found.add(("triton-import", mod, f"line {node.lineno}"))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    if "triton" in ast.unparse(dec):
+                        found.add(("triton-jit", mod, node.name))
 
     for mod in sorted(eager_closure("pithtrain.kernels")):
         heavy = [t for t in top_level_imports(MODULES[mod]) if t.split(".")[0] in HEAVY]

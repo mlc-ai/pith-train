@@ -1,12 +1,12 @@
 """CPU coverage for the real CE wrapper and training objective.
 
-The native Triton kernel remains GPU-only. A Torch kernel substitute exercises
-the production autograd/reduction interface without claiming CUDA equivalence.
+The native CuTe/TIRx kernels remain GPU-only. A Torch kernel substitute exercises
+the production autograd/reduction interface and SM90 launch cache without claiming
+CUDA equivalence.
 """
 
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Tuple
 
 import pytest
@@ -32,42 +32,69 @@ class TorchKernel:
     def __init__(self):
         self.reductions = []
 
-    def __getitem__(self, grid):
-        def launch(**kwargs):
-            reduction = kwargs["REDUCTION"]
-            self.reductions.append(reduction)
-            with torch.enable_grad():
-                logits = kwargs["logits_ptr"].detach().float().requires_grad_()
-                labels = kwargs["target_ptr"]
-                per_row = F.cross_entropy(
-                    logits, labels, ignore_index=kwargs["ignore_index"], reduction="none"
-                )
-                divisor = (labels != kwargs["ignore_index"]).sum().clamp_min(1)
-                loss = per_row.sum() / (divisor if reduction == "mean" else 1)
-                gradient = torch.autograd.grad(loss, logits)[0]
-            kwargs["logits_ptr"].copy_(gradient.to(kwargs["logits_ptr"].dtype))
-            kwargs["loss_ptr"].copy_(per_row.detach())
-
-        return launch
+    def __call__(self, inp, target, ignore_index, reduction):
+        self.reductions.append(reduction)
+        with torch.enable_grad():
+            logits = inp.detach().float().requires_grad_()
+            per_row = F.cross_entropy(logits, target, ignore_index=ignore_index, reduction="none")
+            divisor = (target != ignore_index).sum().clamp_min(1)
+            loss = per_row.sum() / (divisor if reduction == "mean" else 1)
+            gradient = torch.autograd.grad(loss, logits)[0]
+        inp.copy_(gradient.to(inp.dtype))
+        return loss.detach(), inp
 
 
 def wrapper():
     kernel = TorchKernel()
-    namespace = load_nodes(
-        "pithtrain/kernels/cross_entropy.py",
-        {"cross_entropy_fwd_bwd"},
-        dict(
-            torch=torch,
-            triton=SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
-            cross_entropy_fwd=kernel,
-        ),
-    )
+    namespace = dict(torch=torch, cross_entropy_fwd_bwd=kernel)
     load_nodes(
         "pithtrain/operators/cross_entropy.py",
         {"CrossEntropy", "cross_entropy"},
         namespace,
     )
     return namespace["cross_entropy"], kernel
+
+
+@pytest.mark.parametrize("first", ["mean", "sum"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sm90_launch_cache_keeps_reductions_separate(first, dtype):
+    kernel, compiled = TorchKernel(), []
+
+    def compile_kernel(_dtype, _target_dtype, num_cols, *_layout_and_reduction):
+        reduction = _layout_and_reduction[-1]
+        compiled.append(reduction)
+
+        def launch(flat, target, _row_loss, _count, output, ignore_index):
+            loss, _ = kernel(flat.reshape(-1, num_cols), target, ignore_index, reduction)
+            output.copy_(loss)
+
+        return launch
+
+    namespace = load_nodes(
+        "pithtrain/kernels/cross_entropy_sm90.py",
+        {"cross_entropy_fwd_bwd_sm90"},
+        dict(
+            torch=torch,
+            TARGET_TYPES={torch.int64: object()},
+            COMPILED={},
+            pick_layout=lambda *_: (1, 2, True, 256),
+            compile_kernel=compile_kernel,
+        ),
+    )
+    values = torch.linspace(-2, 2, 40, dtype=dtype).reshape(5, 8)
+    target = torch.tensor([0, 1, -100, 3, 4])
+    reductions = [first, "sum" if first == "mean" else "mean", first]
+    for reduction in reductions:
+        expected = values.detach().float().clone().requires_grad_()
+        reference = F.cross_entropy(expected, target, reduction=reduction)
+        reference.backward()
+        inp = values.clone()
+        loss, gradient = namespace["cross_entropy_fwd_bwd_sm90"](inp, target, -100, reduction)
+        torch.testing.assert_close(loss, reference, rtol=0, atol=0)
+        torch.testing.assert_close(gradient, expected.grad.to(dtype), rtol=0, atol=0)
+        assert gradient.data_ptr() == inp.data_ptr()
+    assert compiled == reductions[:2]
+    assert kernel.reductions == reductions
 
 
 @pytest.mark.parametrize("reduction", ["mean", "sum"])

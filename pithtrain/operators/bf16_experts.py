@@ -25,7 +25,7 @@ reduction runs in a fixed order, so the node is deterministic, and accumulation 
 bf16_clamped_swiglu_experts (gpt-oss) adds per-expert biases in fp32 in the two forward
 epilogues, uses the clamped SwiGLU, and returns the bias gradients as per-expert row sums.
 
-SM90 only: import this module after bf16_experts_supported says yes.
+Import this module only after bf16_experts_supported says yes.
 """
 
 from functools import partial

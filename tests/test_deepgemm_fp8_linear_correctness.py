@@ -114,6 +114,44 @@ def test_fp8_linear_backward_weight_grad():
     assert diff < ERR_THRESHOLD, f"weight grad diff = {diff}"
 
 
+def test_fp8_linear_compiled_forward_backward():
+    """
+    An FP8Linear forward inside torch.compile(fullgraph=True, options={"cpp_wrapper": True}), as the
+    models compile their attention projections, backpropagated through the input and a weight that
+    requires grad: the weight quantization (fp8_quant_weight, called inside the region) traces as
+    an opaque op, raises no autograd-registration warning, and the output and both gradients equal
+    eager's.
+    """
+    import warnings
+
+    from pithtrain.operators.linear import FP8Linear
+
+    torch.manual_seed(0)
+    layer = FP8Linear(2048, 1536, bias=False).cuda().to(torch.bfloat16)
+    assert layer.weight.requires_grad
+    x = make_bf16((4, 128, 2048))
+    grad = make_bf16((4, 128, 1536))
+
+    def run(fn):
+        layer.weight.grad = None
+        x_in = x.clone().requires_grad_(True)
+        out = fn(x_in)
+        out.backward(grad)
+        return out.detach(), x_in.grad, layer.weight.grad.clone()
+
+    torch._dynamo.reset()
+    region = torch.compile(lambda t: layer(t), fullgraph=True, options={"cpp_wrapper": True})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compiled = [run(region) for _ in range(2)]  # the first call compiles, the second is cached
+    eager = run(layer)
+    torch._dynamo.reset()
+    assert not [str(c.message) for c in caught if "autograd" in str(c.message).lower()]
+    for got in compiled:
+        for name, a, b in zip(["output", "input grad", "weight grad"], got, eager):
+            assert torch.equal(a, b), name
+
+
 @pytest.mark.parametrize(
     "num_groups,in_features,out_features",
     [(4, 128, 256), (8, 256, 512), (2, 256, 128)],

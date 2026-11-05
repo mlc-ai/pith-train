@@ -15,6 +15,7 @@ from pithtrain.kernels import (
     bf16_experts_supported,
     fp8_fused_experts_supported,
     fp8_quant_weight_grouped,
+    stage_compile_options,
 )
 from pithtrain.models.interface import RoutingInfo
 from pithtrain.modules.fp8_param_gather import fp8_param_operands
@@ -264,7 +265,7 @@ class GptOssTopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
         self.bias = nn.Parameter(torch.zeros(num_experts))
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward(
         self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -376,7 +377,7 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -436,7 +437,7 @@ class GptOssDecoderLayer(nn.Module):
 
     # Not fused with the next layer's forward_stage1 into one compiled region as qwen3_moe does:
     # for this model the fused region changes the forward bits at its layer boundaries.
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage5(
         self,
         moe_outs: torch.Tensor,
