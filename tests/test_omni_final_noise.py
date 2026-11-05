@@ -17,8 +17,9 @@ REVIEWED_HELPER_SOURCE_SHA256 = "21f0ee7aecfe69524f9dfd0f5644d79036fbf18a86fbeed
 REVIEWED_TRAINING_FUNCTIONS_SHA256 = (
     "31e3f440b8f53518528080f2986e2fc6c72c9822c281b0d6f7892b8ee12791c4"
 )
-# D/4e source is intentionally outside that frozen review; this is a test input fingerprint.
-UNREVIEWED_LIVE_HELPER_SOURCE_SHA256 = (
+# The D/4e helper, b3b6ccb, is intentionally outside that frozen review; its exact bytes are
+# frozen in fixtures/omni_final_noise/resume_semantics_b3b6ccb.py.txt as a negative test input.
+UNREVIEWED_D4E_HELPER_SOURCE_SHA256 = (
     "bd7f0054bdb132f8452f58d999865c436d3e98d7629412ece76eab6e78549409"
 )
 
@@ -418,13 +419,26 @@ def reviewed_binding(binding):
     return args
 
 
+def test_d4e_helper_with_unreviewed_token_layout_is_rejected(reviewed_binding):
+    """Historical fixture success must not approve the D/4e helper source."""
+    args = reviewed_binding
+    path = "pithtrain/modules/resume_semantics.py"
+    snapshot = Path(__file__).parent / "fixtures/omni_final_noise/resume_semantics_b3b6ccb.py.txt"
+    source = snapshot.read_bytes()
+    assert hashlib.sha256(source).hexdigest() == UNREVIEWED_D4E_HELPER_SOURCE_SHA256
+    # This exact source adds deterministic_token_layout to model identity.
+    (args.feature_repo / path).write_bytes(source)
+    with pytest.raises(ValueError, match="^Scheduler metadata helper changed$"):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
 def test_live_helper_with_unreviewed_token_layout_is_rejected(reviewed_binding):
-    """Historical fixture success must not approve the live D/4e helper source."""
+    """Historical fixture success must not approve the live helper source either."""
     args = reviewed_binding
     path = "pithtrain/modules/resume_semantics.py"
     source = (new.ROOT / path).read_bytes()
-    assert hashlib.sha256(source).hexdigest() == UNREVIEWED_LIVE_HELPER_SOURCE_SHA256
-    # This exact live source adds deterministic_token_layout to model identity.
+    # Whatever the live helper is now, it is not the reviewed 045a90b helper.
+    assert hashlib.sha256(source).hexdigest() != REVIEWED_HELPER_SOURCE_SHA256
     (args.feature_repo / path).write_bytes(source)
     with pytest.raises(ValueError, match="^Scheduler metadata helper changed$"):
         new.common_audit(args.base_repo, args.feature_repo)
