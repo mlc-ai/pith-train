@@ -40,7 +40,8 @@ def test_plan_keeps_four_updates_and_distinguishes_true_zero(mode):
     assert report["checkpoint"]["policy"] == "conditional_adamw_v1"
     assert report["checkpoint"]["bounded_load"] is True
     assert report["thresholds"]["gradient_nse_strict_lt"] == 1e-2
-    assert report["thresholds"]["actual_update_delta_nse_strict_lt"] == 1e-2
+    assert report["thresholds"]["optimizer_update_nse_strict_lt"] == 1e-2
+    assert report["thresholds"]["end_to_end_update_delta"] == "DIAGNOSTIC_ONLY"
     assert report["caps_seconds"] == dict(prepare=120, produce=600, restore=600, kill_after=10)
     assert report["matrix"]["whole_objective_global_zero"] == (
         "REQUIRED" if mode == "waveform" else "NOT_EXPRESSIBLE_EOS"

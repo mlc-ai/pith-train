@@ -28,6 +28,7 @@ SETTINGS = dict(
 )
 SOURCE_FILES = (
     "tests/acceptance/omni_native_resume.py",
+    "tests/acceptance/omni_update_gate.py",
     "tests/configs/qwen3_omni_text/tiny.json",
     "pithtrain/modules/checkpoint.py",
     "pithtrain/modules/strict_checkpoint.py",
@@ -399,11 +400,28 @@ def rng_probe():
 
 
 def update(args):
+    from tests.acceptance.omni_update_gate import (
+        END_TO_END_ROLE,
+        ShadowAdamW,
+        delta_rows,
+        optimizer_gate,
+    )
+
     data = source(args)
     native, hf = models()
     actual_parts, expected_parts = (native, *optimizer(native)), (hf, *optimizer(hf))
     actual, expected = native_parameters(native), dict(hf.named_parameters())
     initial = {name: parameter.detach().float().clone() for name, parameter in actual.items()}
+    before = {name: parameter.detach().clone() for name, parameter in actual.items()}
+    # The update verdict applies the HF AdamW settings to the native gradients, in the
+    # native storage dtype and device, so BF16 rounding matches the native update.
+    sample = next(iter(actual.values()))
+    shadow = ShadowAdamW.like(
+        expected_parts[1],
+        {name: p.shape for name, p in actual.items()},
+        dtype=sample.dtype,
+        device=sample.device,
+    )
     batches, observed = get_batch(data, 0)
     actual_loss, actual_logits = backward(native, batches)
     expected_loss, expected_logits = backward(hf, batches, hf=True)
@@ -416,13 +434,16 @@ def update(args):
         1e-2,
         "gradient",
     )
+    gradients = {n: p.grad.detach().clone() for n, p in actual.items()}
     apply_update(actual_parts)
     apply_update(expected_parts)
-    delta_error = compare_named(
-        {n: p.detach().float() - initial[n] for n, p in actual.items()},
-        {n: p.detach().float() - initial[n] for n, p in expected.items()},
-        1e-2,
-        "optimizer-update",
+    native_delta = {n: p.detach().float() - initial[n] for n, p in actual.items()}
+    update_gate = optimizer_gate(native_delta, shadow.step(before, gradients), 1e-2)
+    assert update_gate["status"] == "PASS", (
+        f"optimizer-update: failed={update_gate['failed']} controls={update_gate['controls']}"
+    )
+    end_to_end = delta_rows(
+        native_delta, {n: p.detach().float() - initial[n] for n, p in expected.items()}, 1e-2
     )
     assert any(not torch.equal(p.detach().float(), initial[n]) for n, p in actual.items()), (
         "No native parameter changed"
@@ -437,7 +458,9 @@ def update(args):
         hf_loss=expected_loss.item(),
         logits_error=logits_error,
         gradient_errors=grad_error,
-        update_errors=delta_error,
+        update_errors={name: row["nse"] for name, row in update_gate["parameters"].items()},
+        optimizer_update=update_gate,
+        end_to_end_update=dict(role=END_TO_END_ROLE, parameters=end_to_end),
         parameter_count=len(actual),
         data=data.state_dict(),
         batch_sha256=tensor_tree_digest(observed),

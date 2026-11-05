@@ -4,6 +4,8 @@ prepare/plan are CPU-only. produce/restore require explicitly scheduled CUDA;
 this module allocates no cloud resources, downloads no weights and runs no child
 jobs. Synthetic ID records exercise the native supervised update and fresh-process
 resume path, not conversational quality. GRPO acceptance is added by the RL PR.
+Each update is judged against the reference AdamW settings applied to the native
+gradients (omni_update_gate); the native-vs-reference update is a diagnostic.
 """
 
 import argparse
@@ -443,15 +445,15 @@ class Reference:
 
 
 class Observer:
-    def __init__(self, args, config, reference):
-        self.args, self.config, self.reference = args, config, reference
+    def __init__(self, args, config, reference, shadow):
+        self.args, self.config, self.reference, self.shadow = args, config, reference, shadow
         self.calls = 0
-        self.records = None
+        self.records = self.gradients = None
 
     def prepare(self, request, records):
         from pithtrain.contexts import training
 
-        self.request, self.records = request, records
+        self.request, self.records, self.gradients = request, records, None
         canonical = gather_native(training.model, self.config)
         self.before = canonical
         if any(row["mask"].any() for row in records):
@@ -474,6 +476,8 @@ class Observer:
         from pithtrain.modules.hf_converters.qwen3_omni_moe import parameter_shapes
 
         actual = gather_native(training.model, self.config, gradients=True)
+        # The clipped gradients this step consumes also drive the shadow optimizer.
+        self.gradients = actual
 
         def compare():
             report = gradient_evidence(
@@ -529,10 +533,18 @@ class Observer:
             hf_to_canonical,
             parameter_shapes,
         )
+        from tests.acceptance.omni_update_gate import END_TO_END_ROLE, optimizer_gate
 
         actual = gather_native(training.model, self.config)
 
         def compare():
+            require(self.gradients is not None, "No native gradients observed before the update")
+            left = {name: value - self.before[name] for name, value in actual.items()}
+            # Verdict: the reference AdamW settings applied to the native gradients.
+            report = optimizer_gate(
+                left, self.shadow.step(self.before, self.gradients), GRADIENT_NSE
+            )
+            # Diagnostic: the reference optimizer on the reference gradients.
             self.reference.optimizer.step()
             expected, _ = hf_to_canonical(
                 {
@@ -542,15 +554,17 @@ class Observer:
                 self.config,
                 prefix="",
             )
-            left = {name: value - self.before[name] for name, value in actual.items()}
             right = {name: value - self.before[name] for name, value in expected.items()}
-            report = gradient_evidence(left, right, parameter_shapes(self.config))
             report.update(
                 request=self.request,
-                phase="independent_adamw_update_delta",
+                phase="optimizer_update_on_native_gradients",
                 source=self.args.expected_commit,
                 any_native_parameter_changed=any(
                     torch.count_nonzero(value) for value in left.values()
+                ),
+                end_to_end=dict(
+                    gradient_evidence(left, right, parameter_shapes(self.config)),
+                    role=END_TO_END_ROLE,
                 ),
             )
             write_json(
@@ -558,7 +572,8 @@ class Observer:
             )
             require(report["any_native_parameter_changed"], "No native parameter changed")
             require(
-                report["status"] == "PASS", "Native/HF update gate failed; complete report saved"
+                report["status"] == "PASS",
+                "Native optimizer update gate failed; complete report saved",
             )
 
         root_phase(compare)
@@ -656,15 +671,20 @@ def run_gpu(args):
     require(not destination.exists(), "Never overwrite prior acceptance evidence")
     config = model_config()
     initial = gather_native(training.model, config)
-    reference = None
+    reference = shadow = None
 
     def construct_reference():
-        nonlocal reference
+        nonlocal reference, shadow
+        from pithtrain.modules.hf_converters.qwen3_omni_moe import parameter_shapes
+        from tests.acceptance.omni_update_gate import ShadowAdamW
+
         reference = Reference(config, initial)
+        # The update verdict applies the reference AdamW settings to the native gradients.
+        shadow = ShadowAdamW.like(reference.optimizer, parameter_shapes(config))
         return dict(digest=_weights_digest(initial), attention=reference.attention)
 
     identity = root_phase(construct_reference)
-    observer = Observer(args, config, reference)
+    observer = Observer(args, config, reference, shadow)
     from pithtrain.modules import optimizer as native_optimizer
 
     original_clip = native_optimizer.clip_grad_norm
@@ -715,11 +735,16 @@ def run_gpu(args):
             checkpoint, 3, data_state=task_state, strict=True, resume_config=resume_config
         )
         equal(snapshot(task_state), expected["boundary"], "native boundary")
-        root_phase(lambda: reference.optimizer.load_state_dict(expected["reference_optimizer"]))
+
+        def restore_references():
+            reference.optimizer.load_state_dict(expected["reference_optimizer"])
+            shadow.load_state_dict(expected["shadow_optimizer"])
+
+        root_phase(restore_references)
         start = 3
     results, next_records = [], []
     boundary = None
-    reference_boundary = None
+    reference_boundary = shadow_boundary = None
     try:
         for request in range(start, REQUESTS):
             before_calls = observer.calls
@@ -792,6 +817,7 @@ def run_gpu(args):
                     from tests.acceptance.omni_native_resume import cpu_tree
 
                     reference_boundary = cpu_tree(reference.optimizer.state_dict())
+                    shadow_boundary = shadow.state_dict()
         final = snapshot(task_state)
         if args.mode == "produce":
             torch.save(
@@ -803,6 +829,7 @@ def run_gpu(args):
                     next_records=next_records,
                     results=results[3:],
                     reference_optimizer=reference_boundary,
+                    shadow_optimizer=shadow_boundary,
                 ),
                 expected_path,
             )
@@ -845,6 +872,7 @@ def run_gpu(args):
                 strict_resume=args.mode == "restore",
                 results=results,
                 gradient_reports=f"{args.mode}-gradient-request-*.json",
+                update_reports=f"{args.mode}-update-request-*.json",
                 hardware=hardware,
                 reference_attention=identity["attention"],
                 external_service="NOT_INTEGRATED",

@@ -1,8 +1,10 @@
 """Source-bound complete Qwen3-Omni numerical and fresh-process resume gates.
 
 No downloads, job submission, or GPU allocation. ``prepare`` is CPU-only.
-``reference`` compares four actual AdamW updates with independent HF 5.17
-modules. ``produce`` saves step two and records uninterrupted steps three/four;
+``reference`` compares gradients with independent HF 5.17 modules over four
+actual AdamW updates and judges each native update against the HF AdamW settings
+applied to the native gradients (omni_update_gate); the native-vs-HF update delta
+is a diagnostic. ``produce`` saves step two and records uninterrupted steps three/four;
 ``restore`` must be a different process and checks every restored tensor exactly.
 The codec-to-waveform objective uses supplied integer labels: sampling is not a
 differentiable connection from Talker to code2wav. This is tiny numerical
@@ -102,7 +104,10 @@ def compare_named_gradients(actual, expected):
 
 
 def compare_update_deltas(actual, expected, actual_before, expected_before):
-    """Whole-weight agreement cannot substitute for actual optimizer deltas."""
+    """Native vs HF optimizer deltas: the end-to-end diagnostic of omni_update_gate.
+
+    Whole-weight agreement cannot substitute for actual optimizer deltas.
+    """
     if not actual.keys() == expected.keys() == actual_before.keys() == expected_before.keys():
         raise AssertionError("Optimizer update parameter identities differ")
     report, failures = {}, []
@@ -652,10 +657,14 @@ def parameter_steps(model, optimizer, expected):
 
 
 def reference(args, config, samples, native, hf, attention):
+    from tests.acceptance.omni_update_gate import END_TO_END_ROLE, ShadowAdamW, optimizer_gate
+
     optimizers = [
         torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0, foreach=False)
         for model in (native, hf)
     ]
+    # The update verdict applies the HF AdamW settings to the native gradients.
+    shadow = None
     reports = []
     for step in range(STEPS):
         actual_inputs, expected_inputs, output_errors = {}, {}, {}
@@ -733,6 +742,9 @@ def reference(args, config, samples, native, hf, attention):
             )
         before = {name: p.detach().clone() for name, p in actual.items()}
         hf_before = {name: p.detach().clone() for name, p in expected.items()}
+        gradients = {name: p.grad.detach().clone() for name, p in actual.items()}
+        if shadow is None:
+            shadow = ShadowAdamW.like(optimizers[1], {name: p.shape for name, p in actual.items()})
         for model, optimizer in zip((native, hf), optimizers, strict=True):
             optimizer.step()
             parameter_steps(model, optimizer, step + 1)
@@ -746,10 +758,14 @@ def reference(args, config, samples, native, hf, attention):
             not any(name.startswith(component + ".") for name in report["updated_parameters"])
             for component in ("thinker", "talker", "code2wav")
         )
-        report["update_deltas"], bad_deltas = compare_update_deltas(
-            actual, expected, before, hf_before
+        report["optimizer_update"] = optimizer_gate(
+            {name: p.detach() - before[name] for name, p in actual.items()},
+            shadow.step(before, gradients),
+            GRADIENT_NSE,
         )
-        bad_update = bool(bad_deltas) or any(
+        report["update_deltas"], _ = compare_update_deltas(actual, expected, before, hf_before)
+        report["update_deltas_role"] = END_TO_END_ROLE
+        bad_update = report["optimizer_update"]["status"] != "PASS" or any(
             value >= GRADIENT_NSE for value in report["post_update_parameters"].values()
         )
         report["post_update_status"] = "FAIL" if bad_update or missing_update else "PASS"
@@ -766,6 +782,7 @@ def reference(args, config, samples, native, hf, attention):
         precision="FP32 leaves/AdamW state, BF16 compute weights, FP32 rotary buffers",
         full_parameter_count=len(actual),
         reference="independent official HF 5.17",
+        update_verdict="HF AdamW settings on native gradients; update_deltas are diagnostic",
         waveform_bridge="integer labels; no gradient through codec sampling",
     )
 
