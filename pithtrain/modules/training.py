@@ -26,6 +26,10 @@ from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioMode
 from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
 from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
 from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodalModel
+from pithtrain.models.qwen3_omni_stage5_policy import (
+    OmniStage5Aggregation,
+    validate_omni_stage5_aggregation,
+)
 from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
 from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
@@ -36,10 +40,6 @@ from pithtrain.modules.fp8_param_gather import (
 from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.model_config import resolve_text_model_config
-from pithtrain.modules.omni_stage5_policy import (
-    OmniStage5Aggregation,
-    validate_omni_stage5_aggregation,
-)
 from pithtrain.modules.optimizer import Muon, is_muon_param
 from pithtrain.modules.reproducibility import configure_deterministic_training
 from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation

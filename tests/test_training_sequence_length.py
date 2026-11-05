@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.model_config import resolve_text_model_config
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 
 
 class ModelConstructionReached(Exception):

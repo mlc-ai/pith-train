@@ -27,7 +27,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from pithtrain.models.qwen3_omni_speech import thinker_speech_forward
-from pithtrain.modules.omni_speech_fsdp import _thinker_layer_units
+from pithtrain.tasks.omni_speech_fsdp import _thinker_layer_units
 
 ROOT = Path(__file__).resolve().parents[1]
 

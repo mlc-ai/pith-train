@@ -14,10 +14,10 @@ from torch.distributed.tensor import DTensor, Shard
 
 from pithtrain.modules.checkpoint import find_moe
 from pithtrain.modules.distributed_checkpoint import MANIFEST
-from pithtrain.modules.omni_speech_initialization import _require, _sha
 from pithtrain.modules.resume_semantics import model_contract
 from pithtrain.modules.task_checkpoint import TASK_STATE_VERSION
 from pithtrain.tasks.convert_checkpoint import qwen3_omni_full as full
+from pithtrain.tasks.omni_speech_initialization import _require, _sha
 
 
 def read_speech_generation_state(

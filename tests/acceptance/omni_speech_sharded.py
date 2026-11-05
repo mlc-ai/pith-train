@@ -525,8 +525,8 @@ def validate_producer(producer, args, fixture_sha):
 
 
 def run_gate(args, samples, native, hf, fixture):
-    from pithtrain.modules.omni_speech_fsdp import apply_speech_fsdp
     from pithtrain.tasks import omni_speech as task
+    from pithtrain.tasks.omni_speech_fsdp import apply_speech_fsdp
     from pithtrain.tasks.sft_lm import SFTState
 
     mode, rank = args.training_mode, dist.get_rank()

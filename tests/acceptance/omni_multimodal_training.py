@@ -336,9 +336,12 @@ def component_groups(config):
 
 def staged(args):
     from pithtrain.contexts import distributed, training
-    from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
     from pithtrain.modules.distributed import setup_distributed
-    from pithtrain.modules.distributed_checkpoint import resume_contract
+    from pithtrain.modules.distributed_checkpoint import (
+        load_checkpoint,
+        resume_contract,
+        save_checkpoint,
+    )
     from pithtrain.modules.logging import setup_logging
     from pithtrain.modules.training import (
         make_adamw_optimizer,

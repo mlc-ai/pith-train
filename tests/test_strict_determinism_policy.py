@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from pithtrain.contexts import training
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.reproducibility import (
     configure_deterministic_training,
     runtime_determinism_snapshot,

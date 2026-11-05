@@ -427,7 +427,7 @@ def create_omni_dataloader(
     in order; this initial evaluation reader is single-process (no DP padding).
     This returns data batches, not an already-connected DualPipeV training task.
     """
-    from pithtrain.tasks.prepare_omni_data import verify_bundle
+    from pithtrain.modules.omni_bundle import verify_bundle
 
     root = Path(root).resolve()
     bundle = verify_bundle(root)

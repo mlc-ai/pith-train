@@ -191,8 +191,8 @@ def clip_sharded_grad_norm(model, maximum, *, group):
 def _native_checkpoint(
     action, *, root, scan, cfg, model, optimizer, scheduler, data, state, contract, token_group
 ):
-    from pithtrain.modules import checkpoint as native
-    from pithtrain.modules.omni_speech_fsdp import (
+    from pithtrain.modules import distributed_checkpoint as native
+    from pithtrain.tasks.omni_speech_fsdp import (
         native_speech_checkpoint_state,
         speech_checkpoint_context,
     )
@@ -797,7 +797,7 @@ def _step(
         message="Speech step admission rejected on at least one rank",
     )
     if plan is not None:
-        from pithtrain.modules.omni_speech_fsdp import validate_speech_collective_plan
+        from pithtrain.tasks.omni_speech_fsdp import validate_speech_collective_plan
 
         validate_speech_collective_plan(
             batches, cfg.mode, token_group, model=base, speaker=cfg.speaker

@@ -669,8 +669,7 @@ def arm(args):
         boundary = None
         bridge = None
         if args.segment == "restore":
-            from pithtrain.modules.checkpoint import load_checkpoint
-            from pithtrain.modules.distributed_checkpoint import resume_contract
+            from pithtrain.modules.distributed_checkpoint import load_checkpoint, resume_contract
 
             boundary = json.loads(boundary_path.read_text())
             require_same_runtime_policy([policy, boundary])

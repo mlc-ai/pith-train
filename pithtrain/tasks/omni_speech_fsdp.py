@@ -258,7 +258,7 @@ def validate_speech_collective_plan(batches, mode, group=None, *, model=None, sp
                     descriptor.get("weights_initialized") is True,
                     "Speech shards need explicit initialization",
                 )
-            from pithtrain.modules.omni_speech_batch_contract import validate_speech_batch
+            from pithtrain.tasks.omni_speech_batch_contract import validate_speech_batch
 
             for batch in batches:
                 validate_speech_batch(batch, model, mode, speaker)

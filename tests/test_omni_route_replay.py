@@ -19,8 +19,8 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from pithtrain.contexts import training as training_context
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.load_balance import replay_indices
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from tests.acceptance import omni_route_replay as routing
 from tests.acceptance.omni_full_size import gradient_diagnostics, metric
 from tests.cpu_helpers import load_definitions

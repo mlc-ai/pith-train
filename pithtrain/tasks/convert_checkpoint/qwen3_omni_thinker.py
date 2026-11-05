@@ -5,7 +5,6 @@ including DeepStack projection weights, and never silently drops Talker weights.
 Schema construction uses HF modules on the meta device, not released allocations.
 """
 
-import copy
 import json
 from pathlib import Path
 
@@ -13,117 +12,15 @@ import torch
 import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
 from torch.distributed.checkpoint import FileSystemReader
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeThinkerConfig,
-)
 
 from pithtrain.modules.hf_converters import qwen3_omni_moe as text
+
+parameter_shapes = text.thinker_parameter_shapes
+thinker_config = text.thinker_config
 
 SIDECAR = "qwen3_omni_thinker.json"
 SCOPE = "thinker_multimodal"
 _EXCLUDED = ("talker.", "code2wav.")
-
-
-def thinker_config(raw):
-    """Reject text-only and incomplete composite configs before reading weights."""
-    if raw.get("quantization_config"):
-        raise text.ConversionError("Quantized Omni checkpoints are unsupported")
-    if raw.get("model_type") == "qwen3_omni_moe":
-        raw = raw["thinker_config"]
-    if raw.get("quantization_config"):
-        raise text.ConversionError("Quantized Thinker checkpoints are unsupported")
-    if raw.get("model_type") != "qwen3_omni_moe_thinker":
-        raise text.ConversionError("Multimodal conversion requires a full Thinker config")
-    for kind, fields in (
-        (
-            "vision_config",
-            (
-                "depth",
-                "hidden_size",
-                "intermediate_size",
-                "num_heads",
-                "out_hidden_size",
-                "patch_size",
-                "temporal_patch_size",
-                "spatial_merge_size",
-                "in_channels",
-            ),
-        ),
-        (
-            "audio_config",
-            (
-                "num_mel_bins",
-                "encoder_layers",
-                "encoder_attention_heads",
-                "encoder_ffn_dim",
-                "d_model",
-                "output_dim",
-                "downsample_hidden_size",
-                "max_source_positions",
-                "n_window",
-                "n_window_infer",
-                "conv_chunksize",
-            ),
-        ),
-    ):
-        cfg = raw.get(kind)
-        if not isinstance(cfg, dict):
-            raise text.ConversionError(f"Missing {kind}")
-        if cfg.get("quantization_config"):
-            raise text.ConversionError("Quantized encoders are unsupported")
-        for field in fields:
-            if type(cfg.get(field)) is not int or cfg[field] <= 0:
-                raise text.ConversionError(f"Invalid/missing {kind}.{field}")
-    if "deepstack_visual_indexes" not in raw["vision_config"]:
-        raise text.ConversionError("Missing vision_config.deepstack_visual_indexes")
-    config = Qwen3OmniMoeThinkerConfig(**copy.deepcopy(raw))
-    text_cfg = text.text_config(raw)
-    # The released 26291f7 config omits this field. HF's config supplies its
-    # documented architecture default; explicit checkpoint values still win.
-    if (
-        type(config.vision_config.num_position_embeddings) is not int
-        or config.vision_config.num_position_embeddings <= 0
-    ):
-        raise text.ConversionError("Invalid vision_config.num_position_embeddings")
-    if (
-        config.vision_config.out_hidden_size != text_cfg.hidden_size
-        or config.audio_config.output_dim != text_cfg.hidden_size
-    ):
-        raise text.ConversionError("Encoder projection dimensions must match text hidden_size")
-    if config.vision_config.hidden_size % config.vision_config.num_heads:
-        raise text.ConversionError("Vision hidden_size must divide num_heads")
-    if config.audio_config.d_model % config.audio_config.encoder_attention_heads:
-        raise text.ConversionError("Audio d_model must divide encoder_attention_heads")
-    indexes = config.vision_config.deepstack_visual_indexes
-    if (
-        not isinstance(indexes, list)
-        or any(type(i) is not int or not 0 <= i < config.vision_config.depth for i in indexes)
-        or len(set(indexes)) != len(indexes)
-        or len(indexes) > text_cfg.num_hidden_layers
-    ):
-        raise text.ConversionError("Invalid DeepStack layer indexes")
-    return config
-
-
-def parameter_shapes(config, layout="canonical", prefix="thinker."):
-    # These optional HF modeling imports are deliberately local: the default
-    # text-only converter does not require media processor/model dependencies.
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        Qwen3OmniMoeAudioEncoder,
-        Qwen3OmniMoeVisionEncoder,
-    )
-
-    result = text.parameter_shapes(config.text_config, layout, prefix)
-    with torch.device("meta"):
-        encoders = (
-            ("visual", Qwen3OmniMoeVisionEncoder(copy.deepcopy(config.vision_config))),
-            ("audio_tower", Qwen3OmniMoeAudioEncoder(copy.deepcopy(config.audio_config))),
-        )
-    for name, model in encoders:
-        for key, value in model.state_dict().items():
-            root = "" if layout == "canonical" else prefix
-            result[f"{root}{name}.{key}"] = tuple(value.shape)
-    return result
 
 
 def _selected(keys, thinker_only):
@@ -276,7 +173,7 @@ def hf2dcp(cfg, stdout):
 
 
 def dcp2hf(cfg, stdout):
-    from ._core import _write_hf
+    from .hf_shards import write_hf_shards
     from .strict_omni import MANIFEST, assemble, read_payloads, same_config, write_companion
 
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
@@ -302,7 +199,7 @@ def dcp2hf(cfg, stdout):
     state = canonical_to_hf(
         canonical, config, prefix=cfg.omni_prefix, layout=cfg.omni_expert_layout
     )
-    _write_hf(state, save_path, cfg.max_shard_size, stdout)
+    write_hf_shards(state, save_path, cfg.max_shard_size, stdout)
     (save_path / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
     _write_sidecar(save_path, config, cfg.omni_prefix, cfg.omni_expert_layout)
     if strict:

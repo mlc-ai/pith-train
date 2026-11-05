@@ -313,15 +313,14 @@ def main():
                 )
             )
         if args.media:
-            from pithtrain.modules import qwen3_omni_data
+            from pithtrain.modules import omni_bundle, qwen3_omni_data
             from pithtrain.modules.training_data import OmniPretrainData
             from pithtrain.pipeline import dualpipev
-            from pithtrain.tasks import prepare_omni_data
             from tests.omni_media_audit import MediaAudit
 
             media_audit = MediaAudit(distributed.pp_rank, distributed.pp_size, distributed.pp_group)
             media_audit.install(
-                stack, OmniPretrainData, prepare_omni_data, qwen3_omni_data, torch.distributed
+                stack, OmniPretrainData, omni_bundle, qwen3_omni_data, torch.distributed
             )
             media_audit.install_dispatch(stack, dualpipev)
             stack.enter_context(

@@ -16,9 +16,9 @@ import torch.multiprocessing as mp
 
 from pithtrain.contexts import training as training_context
 from pithtrain.models.qwen3_omni_image_inputs import validate_image_inputs
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.model_config import resolve_text_model_config
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.training_data import OmniPretrainData
 from tests import test_omni_training as fixtures
 

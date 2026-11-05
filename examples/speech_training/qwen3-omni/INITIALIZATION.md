@@ -1,6 +1,6 @@
 # Released full-speech initialization
 
-`pithtrain.modules.omni_speech_initialization` connects the full-component
+`pithtrain.tasks.omni_speech_initialization` connects the full-component
 checkpoint converter to the native meta/FSDP speech model. It initializes every
 Thinker, Talker/code-predictor and Code2Wav parameter. It does not restore an
 optimizer, task cursor or RNG state; use the task's strict checkpoint resume for
@@ -36,7 +36,7 @@ does not establish that they came from the release. Tests use the explicit
 
 ```python
 import json
-from pithtrain.modules.omni_speech_initialization import prepare_speech_initialization
+from pithtrain.tasks.omni_speech_initialization import prepare_speech_initialization
 
 prepared = prepare_speech_initialization(
     "/local/released-snapshot", "/local/new-speech-dcp",
@@ -71,8 +71,8 @@ from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodal
 from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalGeneration
 from pithtrain.models.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
 from pithtrain.models.qwen3_omni_speech import Qwen3OmniMoeSpeechModel
-from pithtrain.modules.omni_speech_fsdp import apply_speech_fsdp, materialize_speech_shards
-from pithtrain.modules.omni_speech_initialization import initialize_speech_from_dcp
+from pithtrain.tasks.omni_speech_fsdp import apply_speech_fsdp, materialize_speech_shards
+from pithtrain.tasks.omni_speech_initialization import initialize_speech_from_dcp
 from pithtrain.tasks.omni_speech import configure_trainable_components
 
 # Run after the existing setup_distributed/setup_training; use their CUDA device.

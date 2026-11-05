@@ -1015,7 +1015,7 @@ def fsdp_task_worker(rank, rendezvous):
     # the actual native speech sharded acceptance driver, not this fixture.
     from unittest.mock import patch
 
-    validation = patch("pithtrain.modules.omni_speech_batch_contract.validate_speech_batch")
+    validation = patch("pithtrain.tasks.omni_speech_batch_contract.validate_speech_batch")
     admitted = validation.start()
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
@@ -1151,7 +1151,7 @@ def fsdp_native_task_worker(rank, root_string):
     # the actual native speech sharded acceptance driver, not this fixture.
     from unittest.mock import patch
 
-    validation = patch("pithtrain.modules.omni_speech_batch_contract.validate_speech_batch")
+    validation = patch("pithtrain.tasks.omni_speech_batch_contract.validate_speech_batch")
     admitted = validation.start()
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
@@ -1522,7 +1522,7 @@ def fsdp_waveform_microbatch_worker(rank, rendezvous):
         "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=40)
     )
     # Reuse the real FSDP protocol fixture; only native batch admission is mocked.
-    validation = patch("pithtrain.modules.omni_speech_batch_contract.validate_speech_batch")
+    validation = patch("pithtrain.tasks.omni_speech_batch_contract.validate_speech_batch")
     validation.start()
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))

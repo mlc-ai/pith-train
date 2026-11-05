@@ -37,7 +37,7 @@ BASE_PROVENANCE = {
         "pithtrain/tasks/prepare_omni_data.py": "7ed3ecb5df09ab3c7357a239fe6a95dc140b55ea6bde7c19b4b1898e2e371373",
     },
 }
-ENGINE_SHA256 = "2b1a8f231c4d1c6543697073f4961edf134aada924be90ffa271c49e080259ff"
+ENGINE_SHA256 = "7e64ea2ff4b30c8a76dd73bc7dc15096a2ec6786a40fb702f2157f8bd2635b6c"
 SCHEMA = "omni_final_text_noise_binding_v3"
 BINDING_ENV = "PITHTRAIN_OMNI_FINAL_NOISE_BINDING"
 SHA = re.compile(r"[0-9a-f]{40}")

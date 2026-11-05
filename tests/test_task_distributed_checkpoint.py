@@ -15,7 +15,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from pithtrain.modules import distributed_checkpoint as native
-from pithtrain.modules.checkpoint import find_checkpoint, load_checkpoint, save_checkpoint
+from pithtrain.modules.checkpoint import find_checkpoint
+from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
 from pithtrain.modules.task_checkpoint import TaskCheckpointState
 from tests.acceptance.omni_native_resume import equal
 from tests.test_distributed_strict_checkpoint import build, initialize_mesh

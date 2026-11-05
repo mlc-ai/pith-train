@@ -30,12 +30,12 @@ from pithtrain.contexts import training as training_context
 from pithtrain.models.qwen3_omni_audio import Qwen3OmniMoeAudioEncoder
 from pithtrain.models.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
 from pithtrain.models.qwen3_omni_speech import Qwen3OmniMoeSpeechModel
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalGeneration
 from pithtrain.models.qwen3_omni_vision import Qwen3OmniMoeVideoEncoder, Qwen3OmniMoeVisionEncoder
-from pithtrain.modules import omni_speech_initialization as initialize
-from pithtrain.modules.omni_speech_fsdp import apply_speech_fsdp, materialize_speech_shards
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
+from pithtrain.tasks import omni_speech_initialization as initialize
 from pithtrain.tasks.convert_checkpoint import qwen3_omni_full as full
+from pithtrain.tasks.omni_speech_fsdp import apply_speech_fsdp, materialize_speech_shards
 from tests import test_omni_full_converter as fixtures
 
 ROOT = Path(__file__).resolve().parents[1]
