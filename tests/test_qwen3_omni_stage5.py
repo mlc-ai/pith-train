@@ -59,10 +59,11 @@ def test_text_stage5_fullgraph_output_and_all_gradients(is_moe, ep):
     [(1, torch.bfloat16), (2, torch.bfloat16), (8, torch.bfloat16), (8, torch.float32)],
 )
 @pytest.mark.parametrize("deterministic_token_layout", [False, True])
-def test_expert_order_matches_actual_hf_output_and_all_gradients(
+def test_default_combine_matches_actual_hf_grouped_mm_output_and_all_gradients(
     top_k, dtype, deterministic_token_layout, monkeypatch
 ):
     import transformers
+    import transformers.integrations.moe as hf_moe
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeThinkerTextExperts,
     )
@@ -75,7 +76,7 @@ def test_expert_order_matches_actual_hf_output_and_all_gradients(
         hidden_size=hidden,
         moe_intermediate_size=width,
         hidden_act="silu",
-        _experts_implementation="eager",
+        _experts_implementation="grouped_mm",  # HF 5.17.0 default for this class
     )
     hf = Qwen3OmniMoeThinkerTextExperts(config).to(dtype)
     with torch.no_grad():
@@ -84,33 +85,25 @@ def test_expert_order_matches_actual_hf_output_and_all_gradients(
     inputs = torch.randn(n, hidden, dtype=dtype, requires_grad=True)
     weights, ids = torch.randn(n, experts).softmax(-1).topk(top_k, dim=-1)
     weights = (weights / weights.sum(-1, keepdim=True)).to(dtype).detach().requires_grad_()
-    pointers = {hf.down_proj[e].data_ptr(): e for e in range(experts)}
     observed = []
-    linear = torch.nn.functional.linear
+    grouped_linear = hf_moe._grouped_linear
 
-    def observe(value, weight, bias=None):
-        output = linear(value, weight, bias)
-        expert = pointers.get(weight.data_ptr())
-        if expert is not None:
-            slot, token = torch.where((ids == expert).transpose(0, 1))
-            observed.append((token * top_k + slot, output))
+    def observe(value, weight, offsets, *args, **kwargs):
+        output = grouped_linear(value, weight, offsets, *args, **kwargs)
+        if weight is hf.down_proj:
+            observed.append(output)
         return output  # The actual HF forward and every gradient remain unchanged.
 
     with monkeypatch.context() as patch:
-        patch.setattr(torch.nn.functional, "linear", observe)
+        patch.setattr(hf_moe, "_grouped_linear", observe)
         expected = hf(inputs, ids, weights)
-    indexes = torch.cat([item[0] for item in observed])
-    assert torch.equal(indexes.sort().values, torch.arange(n * top_k))
-    slots = (
-        inputs.new_zeros(n * top_k, hidden)
-        .index_copy(0, indexes, torch.cat([item[1] for item in observed]))
-        .view(n, top_k, hidden)
-    )
-    ordered_ids, order = ids.sort(dim=-1)
+    (rows,) = observed
+    assert rows.shape == (n * top_k, hidden)
+    # HF groups rows with this exact sort; undo it to recover router-slot order.
+    _, by_expert = torch.sort(ids.reshape(-1))
+    slots = rows.new_zeros(rows.shape).index_copy(0, by_expert, rows)
     if top_k > 1:
-        assert not torch.equal(ids, ordered_ids)
-    ordered_weights = weights.gather(1, order)
-    ordered_outputs = slots.gather(1, order[..., None].expand(-1, -1, hidden))
+        assert not torch.equal(ids, ids.sort(dim=-1).values)  # production slots stay unsorted
     targets = (inputs, weights, hf.gate_up_proj, hf.down_proj)
     cotangent = torch.randn_like(expected)
     expected_grad = torch.autograd.grad(expected, targets, cotangent, retain_graph=True)
@@ -123,9 +116,7 @@ def test_expert_order_matches_actual_hf_output_and_all_gradients(
         returned_indices = torch.randperm(n * top_k) if ep == 2 else None
         if returned_indices is not None:
             assert not torch.equal(returned_indices, torch.arange(n * top_k))
-        outputs = ordered_outputs.flatten(0, 1)
-        if returned_indices is not None:
-            outputs = outputs[returned_indices]
+        outputs = slots if returned_indices is None else slots[returned_indices]
 
         # Preserve the original oracle/control matrix: eager for each dtype;
         # compiled for the BF16 top-8 production geometry. Do not double-compile.
@@ -136,15 +127,21 @@ def test_expert_order_matches_actual_hf_output_and_all_gradients(
         if top_k == 8 and dtype == torch.bfloat16:
             calls.append(layer.forward_stage5)
         for call_index, call in enumerate(calls):
-            actual = call(outputs, returned_indices, ordered_weights, torch.zeros_like(expected))
+            actual = call(outputs, returned_indices, weights, torch.zeros_like(expected))
             assert torch.equal(actual, expected)
             # The final compiled backward may donate buffers; release its graph normally.
             retain_graph = not (ep == 2 and call_index == len(calls) - 1)
             actual_grad = torch.autograd.grad(actual, targets, cotangent, retain_graph=retain_graph)
             assert all(torch.equal(a, b) for a, b in zip(actual_grad, expected_grad, strict=True))
     if top_k == 8 and dtype == torch.bfloat16:
-        # Sorting alone and an unordered serial loop are not the HF BF16 contract.
-        assert not torch.equal((ordered_outputs * ordered_weights[..., None]).sum(1), expected)
+        # HF eager's serial BF16 index_add_ in expert-ID order is the opt-in
+        # hf_eager_expert_id_serial contract, not the default; this oracle must reject it.
+        products = slots.view(n, top_k, hidden) * weights[..., None]
+        order = ids.argsort(dim=-1)
+        serial = torch.zeros_like(expected)
+        for slot in range(top_k):
+            serial = serial + products[torch.arange(n), order[:, slot]]
+        assert not torch.equal(serial, expected)
 
 
 @pytest.mark.parametrize("ep", [1, 2])
