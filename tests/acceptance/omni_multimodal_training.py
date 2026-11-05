@@ -347,7 +347,6 @@ def staged(args):
     )
     from pithtrain.tasks import pretrain_lm
     from tests.acceptance.omni_distributed_resume import snapshot
-
     from tests.acceptance.omni_hopper_hardware import require_hardware
 
     require_hardware(getattr(args, "hardware_family", "H100"))

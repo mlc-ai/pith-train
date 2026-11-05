@@ -1,9 +1,13 @@
 """Explicit hardware admission for the existing unchanged Hopper acceptance math."""
+
+
 def add_hardware_argument(parser):
     parser.add_argument("--hardware-family", choices=("H100", "H200"), default="H100")
 
+
 def require_hardware(family):
     import torch
+
     if family not in ("H100", "H200"):
         raise ValueError("Select explicit H100 or H200 acceptance hardware")
     assert torch.cuda.is_available(), "Requires CUDA"
