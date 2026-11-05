@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from pithtrain.contexts import training as training_context
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from tests.acceptance import omni_topology_gradients as strict_gradients
 from tests.acceptance.omni_topology_contract import (
     BY_NAME,

@@ -22,13 +22,13 @@ from torch.distributed.checkpoint.planner import LoadPlan
 from torch.distributed.checkpoint.planner_helpers import create_read_items_for_chunk_list
 from torch.distributed.tensor import DTensor, Shard
 
-from pithtrain.modules.omni_speech_fsdp import (
+from pithtrain.tasks.convert_checkpoint import qwen3_omni_full as full
+from pithtrain.tasks.omni_speech_fsdp import (
     _local_speech_tensors,
     _require,
     _world_mesh,
     load_speech_local_shards,
 )
-from pithtrain.tasks.convert_checkpoint import qwen3_omni_full as full
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"

@@ -14,21 +14,13 @@ import av
 import pyarrow.parquet as pq
 import soundfile as sf
 import zstandard as zstd
-from huggingface_hub import HfApi, HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, HfFileSystem, hf_hub_download
 from PIL import UnidentifiedImageError
-from transformers import AutoConfig, Qwen3OmniMoeProcessor
 
 from pithtrain.config import SlottedDefault
+from pithtrain.modules.omni_bundle import content_id, processor_for, sha256, verify_bundle
 from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator
 from pithtrain.tasks.tokenize_corpus import Worker, Writer
-
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def atomic_write(path, data):
@@ -201,91 +193,11 @@ def records(modality, split, source, cache, max_scan):
                 )
 
 
-def processor_for(recipe, offline=False):
-    snapshot = snapshot_download(
-        recipe["model_id"],
-        revision=recipe["revision"],
-        local_files_only=offline,
-        allow_patterns=[
-            "config.json",
-            "tokenizer_config.json",
-            "vocab.json",
-            "merges.txt",
-            "preprocessor_config.json",
-            "processor_config.json",
-            "video_preprocessor_config.json",
-        ],
-    )
-    processor = Qwen3OmniMoeProcessor.from_pretrained(snapshot, local_files_only=True)
-    config = AutoConfig.from_pretrained(snapshot, local_files_only=True).thinker_config
-    return processor, config
-
-
-def _content_id(checksums):
-    return hashlib.sha256(json.dumps(checksums, sort_keys=True).encode()).hexdigest()
-
-
-def read_verified_bundle(root):
-    """Return metadata and the hash of those same verified bytes for checkpoint identity."""
-    root = Path(root).resolve()
-    bundle_bytes = (root / "bundle.json").read_bytes()
-    bundle = json.loads(bundle_bytes)
-    bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
-    if bundle["status"] != "complete":
-        raise ValueError("Data preparation has not completed")
-    checksums = {}
-    for line in (root / "checksums.sha256").read_text().splitlines():
-        fields = line.split("  ", 1)
-        if len(fields) != 2:
-            raise ValueError("Invalid dataset checksum inventory")
-        expected, name = fields
-        path = (root / name).resolve()
-        if (
-            name in checksums
-            or not name
-            or Path(name).as_posix() != name
-            or not path.is_relative_to(root)
-            or path.relative_to(root).as_posix() != name
-        ):
-            raise ValueError(f"Invalid dataset checksum inventory entry: {name}")
-        actual = bundle_sha256 if name == "bundle.json" else sha256(path)
-        if actual != expected:
-            raise ValueError(f"Dataset hash mismatch: {name}")
-        checksums[name] = actual
-    required = {"bundle.json", "recipe.json", "rejected.jsonl"}
-    token_files = set()
-    for split, modalities in bundle["manifests"].items():
-        for kind, manifests in modalities.items():
-            for index, name in enumerate(manifests):
-                if name not in checksums:
-                    raise ValueError(f"Missing dataset checksum inventory entry: {name}")
-                required.add(name)
-                with (root / name).open() as stream:
-                    for line in stream:
-                        if line.strip():
-                            required.update(item["path"] for item in json.loads(line)["media"])
-                if kind == "text":
-                    token_files.add(f"tokens/{split}/{index:05d}.bin")
-    # DensePretrainData recursively consumes every .bin, so an unlisted extra
-    # shard must fail even when all the listed hashes still match.
-    actual_tokens = {path.relative_to(root).as_posix() for path in (root / "tokens").rglob("*.bin")}
-    if actual_tokens != token_files or set(checksums) != required | token_files:
-        raise ValueError("Dataset checksum inventory differs from the prepared files")
-    checksums.pop("bundle.json")
-    if bundle.get("content_id") != _content_id(checksums):
-        raise ValueError("Dataset content_id does not match verified content")
-    return bundle, bundle_sha256
-
-
-def verify_bundle(root):
-    return read_verified_bundle(root)[0]
-
-
 def write_bundle(root, bundle, files):
     """Seal prepared files with the canonical content identity, then verify the result."""
     root = Path(root)
     checksums = {name: sha256(root / name) for name in sorted(files)}
-    bundle = dict(bundle, content_id=_content_id(checksums))
+    bundle = dict(bundle, content_id=content_id(checksums))
     write_json(root / "bundle.json", bundle)
     checksums["bundle.json"] = sha256(root / "bundle.json")
     atomic_write(

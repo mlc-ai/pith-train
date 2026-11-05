@@ -11,12 +11,12 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo, Stage5RouteMetadata, Stage5RoutingInfo
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.load_balance import (
     MoELoadBalanceLossInjector,
     MoELoadBalanceLossTracker,
     replay_indices,
 )
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func

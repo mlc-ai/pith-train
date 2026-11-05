@@ -17,6 +17,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from pithtrain.contexts import distributed, training
+from pithtrain.modules import checkpoint as plain
 from pithtrain.modules.checkpoint import to_canonical_model, to_localized_model
 from pithtrain.modules.resume_semantics import scheduler_contract
 from pithtrain.modules.strict_checkpoint import (
@@ -793,3 +794,41 @@ def load(root, step, *, data_state, config):
         _phase("rollback all ranks", undo)
         raise
     return step
+
+
+def save_checkpoint(
+    root: Path,
+    step: int,
+    *,
+    data_state=None,
+    strict: bool = False,
+    resume_config: dict | None = None,
+) -> None:
+    """
+    checkpoint.save_checkpoint, or with strict the fixed-topology save above, whose resume contract
+    is resume_config.
+    """
+    assert not training.offloaded, "training state is offloaded; call reload_training_state"
+    if strict:
+        save(root, step, data_state=data_state, config=resume_config)
+    else:
+        plain.save_checkpoint(root, step, data_state=data_state)
+
+
+def load_checkpoint(
+    root: Path,
+    step: int,
+    *,
+    data_state=None,
+    strict: bool = False,
+    resume_config: dict | None = None,
+) -> None:
+    """
+    checkpoint.load_checkpoint, or with strict the fixed-topology load above, which requires the
+    resume contract resume_config.
+    """
+    assert not training.offloaded, "training state is offloaded; call reload_training_state"
+    if strict:
+        load(root, step, data_state=data_state, config=resume_config)
+    else:
+        plain.load_checkpoint(root, step, data_state=data_state)

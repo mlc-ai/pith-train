@@ -22,12 +22,14 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from pithtrain.contexts import distributed, training
-from pithtrain.modules.checkpoint import find_checkpoint, load_checkpoint, save_checkpoint
+from pithtrain.modules.checkpoint import find_checkpoint
 from pithtrain.modules.distributed_checkpoint import (
     MANIFEST,
     DistributedCheckpointError,
     _pack,
     _runtime,
+    load_checkpoint,
+    save_checkpoint,
 )
 from tests.acceptance.omni_native_resume import equal
 

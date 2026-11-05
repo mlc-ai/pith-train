@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
-from pithtrain.modules.omni_speech_fsdp import (
+from pithtrain.tasks.omni_speech_fsdp import (
     _shard_units,
     require_complete_optimizer_state,
     validate_speech_collective_plan,
@@ -199,7 +199,7 @@ def materialization_worker(rank, root):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import DTensor
 
-    from pithtrain.modules.omni_speech_fsdp import (
+    from pithtrain.tasks.omni_speech_fsdp import (
         apply_speech_fsdp,
         load_speech_local_shards,
         materialize_speech_shards,

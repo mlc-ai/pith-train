@@ -12,7 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from pithtrain.modules import distributed_checkpoint as checkpoint
-from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
+from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
 from tests.acceptance.omni_distributed_resume import (
     negative_case,
     verify_corruption_rejection,

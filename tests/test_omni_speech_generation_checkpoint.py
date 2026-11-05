@@ -20,16 +20,16 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
 from pithtrain.modules import distributed_checkpoint as checkpoint
-from pithtrain.modules.omni_speech_fsdp import (
+from pithtrain.modules.resume_semantics import model_contract
+from pithtrain.tasks.omni_speech_fsdp import (
     apply_speech_fsdp,
     load_speech_local_shards,
     materialize_speech_shards,
     native_speech_checkpoint_state,
     speech_checkpoint_context,
 )
-from pithtrain.modules.omni_speech_generation_checkpoint import read_speech_generation_state
-from pithtrain.modules.omni_speech_initialization import _sha
-from pithtrain.modules.resume_semantics import model_contract
+from pithtrain.tasks.omni_speech_generation_checkpoint import read_speech_generation_state
+from pithtrain.tasks.omni_speech_initialization import _sha
 from tests.test_omni_full_converter import tiny_raw
 from tests.test_omni_speech_initialization import native_meta
 

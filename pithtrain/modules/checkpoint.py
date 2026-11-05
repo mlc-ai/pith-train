@@ -532,14 +532,7 @@ class CheckpointState(Stateful):
                 scheduler.load_state_dict(st)
 
 
-def save_checkpoint(
-    root: Path,
-    step: int,
-    *,
-    data_state: Stateful | None = None,
-    strict: bool = False,
-    resume_config: dict | None = None,
-) -> None:
+def save_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None) -> None:
     """
     Save the runtime model, optimizers and schedulers as the step checkpoint under root. The step is
     a count of completed work, the same number find_checkpoint reports and load_checkpoint takes.
@@ -550,11 +543,6 @@ def save_checkpoint(
     expert keys it owns. Non-expert DTensors stay as CPU DTensors and DCP saves each rank's shard.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
-    if strict:
-        from pithtrain.modules.distributed_checkpoint import save
-
-        save(root, step, data_state=data_state, config=resume_config)
-        return
     stdout = logging.stdout
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     location = Path(root, "torch-dcp", "%08d" % step)
@@ -606,14 +594,7 @@ def initialize_checkpoint(root: Path, step: int = 0) -> None:
     logging.stdout.info("Initialize model weights: elapsed %.1fs", time.monotonic() - started)
 
 
-def load_checkpoint(
-    root: Path,
-    step: int,
-    *,
-    data_state: Stateful | None = None,
-    strict: bool = False,
-    resume_config: dict | None = None,
-) -> None:
+def load_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None) -> None:
     """
     Load the step checkpoint under root into the runtime state: the model, plus the optimizers and
     schedulers when the checkpoint carries them. One converted from HuggingFace carries model keys
@@ -625,11 +606,6 @@ def load_checkpoint(
     slot such as an RL reference policy.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
-    if strict:
-        from pithtrain.modules.distributed_checkpoint import load
-
-        load(root, step, data_state=data_state, config=resume_config)
-        return
     if Path(root, "torch-dcp", f"{step:08d}", "strict-manifest.json").exists():
         raise ValueError("This checkpoint requires strict fixed-topology resume")
     stdout = logging.stdout

@@ -24,6 +24,7 @@ from pithtrain.modules.hf_converters.qwen3_omni_moe import (
     read_json,
     require_empty_destination,
     text_config,
+    thinker_parameter_shapes,
     validate_tensors,
 )
 from pithtrain.modules.hf_converters.qwen3_omni_moe import (
@@ -35,9 +36,7 @@ from pithtrain.modules.strict_checkpoint import _numpy_state
 
 def parameter_shapes(config):
     if config.model_type == "qwen3_omni_moe_thinker":
-        from .qwen3_omni_thinker import parameter_shapes as thinker_shapes
-
-        return thinker_shapes(config)
+        return thinker_parameter_shapes(config)
     return text_parameter_shapes(config)
 
 
@@ -621,7 +620,7 @@ def validate_payloads(payloads, step, *, skeleton=False, multimodal=False):
             "HSDP>1 remains unsupported",
         )
         if multimodal:
-            from .qwen3_omni_thinker import thinker_config
+            from pithtrain.modules.hf_converters.qwen3_omni_moe import thinker_config
 
             current = thinker_config(header["config"]["model"])
         else:

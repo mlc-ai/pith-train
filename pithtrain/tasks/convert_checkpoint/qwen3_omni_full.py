@@ -551,7 +551,7 @@ def hf2dcp(cfg, stdout):
 
 
 def dcp2hf(cfg, stdout):
-    from ._core import _write_hf
+    from .hf_shards import write_hf_shards
 
     _reject_resume(cfg)
     src, dst = Path(cfg.load_path), Path(cfg.save_path)
@@ -574,7 +574,7 @@ def dcp2hf(cfg, stdout):
         state, config, namespace=cfg.omni_component_namespace, layout=cfg.omni_expert_layout
     )
     del state
-    _write_hf(output, dst, cfg.max_shard_size, stdout)
+    write_hf_shards(output, dst, cfg.max_shard_size, stdout)
     (dst / "config.json").write_text(json.dumps(config.export_raw(), indent=2) + "\n")
     sidecar = _manifest(
         config,

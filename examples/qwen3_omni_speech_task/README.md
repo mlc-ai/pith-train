@@ -132,7 +132,7 @@ norms and rejects nonfinite gradients on every rank before any update.
 
 ```python
 from torch.distributed.device_mesh import init_device_mesh
-from pithtrain.modules.omni_speech_fsdp import apply_speech_fsdp
+from pithtrain.tasks.omni_speech_fsdp import apply_speech_fsdp
 
 # Initialize the process group first; create the complete native model with
 # FP32 master parameters using the caller's explicit initialization/load plan.
@@ -222,7 +222,7 @@ manifest SHA from its completed checkpoint receipt and explicit host/file caps.
 
 ```python
 import torch
-from pithtrain.modules.omni_speech_generation_checkpoint import read_speech_generation_state
+from pithtrain.tasks.omni_speech_generation_checkpoint import read_speech_generation_state
 
 # model is a fresh complete native meta model; no FSDP wrapping in this process.
 state, receipt = read_speech_generation_state(

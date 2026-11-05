@@ -351,9 +351,9 @@ def run_gpu(args, spec):
     assert input_identity(args.output / "data", spec.modalities) == prepared["input"]
     subprocess.run(["git", "-C", str(REPO), "diff", "--quiet", "HEAD"], check=True)
     from pithtrain.contexts import distributed, training
-    from pithtrain.modules.checkpoint import find_checkpoint, load_checkpoint
+    from pithtrain.modules.checkpoint import find_checkpoint
     from pithtrain.modules.distributed import setup_distributed
-    from pithtrain.modules.distributed_checkpoint import _phase, resume_contract
+    from pithtrain.modules.distributed_checkpoint import _phase, load_checkpoint, resume_contract
     from pithtrain.modules.logging import setup_logging
     from pithtrain.modules.training import make_adamw_optimizer, make_wsd_scheduler, setup_training
     from pithtrain.tasks import pretrain_lm

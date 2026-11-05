@@ -336,7 +336,7 @@ def launch(
     if checkpoint_root is not None:
         if not isinstance(checkpoint_contract, dict) or not checkpoint_contract:
             raise ValueError("Native checkpoint needs an explicit stable model/topology contract")
-        from pithtrain.modules.checkpoint import load_checkpoint
+        from pithtrain.modules.distributed_checkpoint import load_checkpoint
         from pithtrain.modules.task_checkpoint import TaskCheckpointState
 
         checkpoint_contract = dict(
@@ -382,7 +382,7 @@ def launch(
             state.completed_updates += 1
         state.scanned_batches += 1
         if adapter is not None:
-            from pithtrain.modules.checkpoint import save_checkpoint
+            from pithtrain.modules.distributed_checkpoint import save_checkpoint
 
             save_checkpoint(
                 checkpoint_root,

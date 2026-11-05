@@ -617,7 +617,7 @@ def _weights_digest(values):
 
 
 def run_gpu(args):
-    from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
+    from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
     from pithtrain.modules.microbatch import Microbatch
     from pithtrain.modules.task_checkpoint import TaskCheckpointState
     from pithtrain.tasks import sft_lm

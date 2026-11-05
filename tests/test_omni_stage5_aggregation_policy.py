@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from pithtrain.models.interface import RoutingInfo, Stage5RouteMetadata, Stage5RoutingInfo
-from pithtrain.modules.omni_stage5_policy import validate_omni_stage5_aggregation
+from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.resume_semantics import model_contract
 from pithtrain.pipeline import execution
 from tests.cpu_helpers import layer_type, load_definitions

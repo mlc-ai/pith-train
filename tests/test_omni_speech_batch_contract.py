@@ -10,7 +10,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen
 
 from pithtrain.models.qwen3_omni_speech import prepare_talker_condition, speech_teacher_force
 from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalGeneration
-from pithtrain.modules.omni_speech_batch_contract import validate_speech_batch
+from pithtrain.tasks.omni_speech_batch_contract import validate_speech_batch
 from tests.test_omni_speech_integration import config as talker_config
 from tests.test_qwen3_omni_multimodal import KINDS, context
 

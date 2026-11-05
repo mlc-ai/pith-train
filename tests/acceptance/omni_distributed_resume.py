@@ -202,11 +202,11 @@ def verify_corruption_rejection(error, *, fault, world_size, model_key=None):
 
 
 def negative_case(args, cfg, data):
-    from pithtrain.modules.checkpoint import load_checkpoint
     from pithtrain.modules.distributed_checkpoint import (
         MANIFEST,
         DistributedCheckpointError,
         _phase,
+        load_checkpoint,
         resume_contract,
     )
 
@@ -291,9 +291,9 @@ def run_gpu(args):
     assert verify_input(args.output / "data") == verify_input(args.dataset)
     subprocess.run(["git", "-C", str(REPO), "diff", "--quiet", "HEAD"], check=True)
     from pithtrain.contexts import distributed, training
-    from pithtrain.modules.checkpoint import find_checkpoint, load_checkpoint
+    from pithtrain.modules.checkpoint import find_checkpoint
     from pithtrain.modules.distributed import setup_distributed
-    from pithtrain.modules.distributed_checkpoint import resume_contract
+    from pithtrain.modules.distributed_checkpoint import load_checkpoint, resume_contract
     from pithtrain.modules.logging import setup_logging
     from pithtrain.modules.training import make_adamw_optimizer, make_wsd_scheduler, setup_training
     from pithtrain.tasks import pretrain_lm

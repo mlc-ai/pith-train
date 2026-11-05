@@ -403,7 +403,7 @@ def continuation(phase, cfg, data, device, output, producer, train_one):
     """Same transaction body exercised by the real CPU public-init regression."""
     import torch.distributed as dist
 
-    from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
+    from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
 
     rank = dist.get_rank()
     contract = cfg["resume_contract"]
