@@ -1,0 +1,30 @@
+{
+  "total_budget_usd": 300.0,
+  "reserved_upper_bound": 0.0,
+  "unreserved_remaining": 300.0,
+  "prices_snapshot_utc_date": "2026-10-20",
+  "prices_verified_utc_date": null,
+  "price_sources": [
+    "https://modal.com/pricing",
+    "https://modal.com/docs/guide/resources"
+  ],
+  "rates_usd_per_second": {
+    "h100_each": 0.001097,
+    "h200_each": 0.001261,
+    "function_cpu_core": 0.0000131,
+    "function_memory_gib": 0.00000222,
+    "sandbox_cpu_core": 0.00003942,
+    "sandbox_memory_gib": 0.00000667
+  },
+  "egress_usd_per_gib": 0.04,
+  "policy": {
+    "single_coordinator": true,
+    "max_simultaneous_paid_sandboxes": 1,
+    "max_gpu_count": 8,
+    "repair_reserve_usd": 100.0,
+    "retain_reservations_after_stop": true,
+    "persistent_volumes": false,
+    "assume_free_credits": false
+  },
+  "entries": []
+}

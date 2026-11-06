@@ -29,7 +29,13 @@ from torch.autograd import Variable
 
 from pithtrain.contexts import distributed
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
+from pithtrain.models.interface import (
+    AllToAllSplits,
+    LayerProtocol,
+    ModelProtocol,
+    RoutingInfo,
+    Stage5RoutingInfo,
+)
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
 
 __all__ = [
@@ -327,6 +333,17 @@ class Stage5Args(NamedTuple):
     residual: torch.Tensor
 
 
+def _call_stage5(layer, moe_outs, moe_local_idxs, topk_weight, residual, routing):
+    if not isinstance(routing, Stage5RoutingInfo):
+        return layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    call = getattr(layer, "forward_stage5_with_metadata", None)
+    if call is None:
+        raise TypeError("Metadata-bearing routes require the metadata Stage5 capability")
+    return call(
+        moe_outs, moe_local_idxs, topk_weight, residual, stage5_metadata=routing.stage5_metadata
+    )
+
+
 class Stage5Outs(NamedTuple):
     hidden_states: torch.Tensor
 
@@ -352,7 +369,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
     drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
-    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = _call_stage5(layer, moe_outs, moe_local_idxs, topk_weight, residual, routing)
     record.outs = Stage5Outs(hidden_states)
 
     nvtx.range_pop()
@@ -387,10 +404,11 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     fused = getattr(next_layer, "forward_stage5_stage1", None)
-    if fused is not None:
+    # A metadata-bearing route needs the metadata stage 5, which the fused path does not take.
+    if fused is not None and not isinstance(routing, Stage5RoutingInfo):
         dispatch_tokens, next_residual, next_routing = fused(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)  # fmt: skip
     else:
-        hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+        hidden_states = _call_stage5(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, routing)  # fmt: skip
         dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
     ctx.comp_stream.record_event(ctx.fwd_event)
 
@@ -426,9 +444,10 @@ class PrologRecord:
     outs: Optional[PrologOuts] = None
 
 
-def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:  # fmt: skip
+def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord, model_context=None) -> torch.Tensor:  # fmt: skip
     nvtx.range_push("prolog_f")
-    hidden_states = module.forward_prolog(hidden_states)
+    kwargs = {} if model_context is None else {"model_context": model_context}
+    hidden_states = module.forward_prolog(hidden_states, **kwargs)
     record.outs = PrologOuts(hidden_states)
     nvtx.range_pop()
     return hidden_states
@@ -592,7 +611,7 @@ def layer_forward(
     if has_experts and fwd_comm_work is not None:
         layer_record.stage3.outs.moe_outs.untyped_storage().resize_(0)
     moe_local_idxs = routing.moe_local_idxs if has_experts else None
-    hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+    hidden_states = _call_stage5(layer, moe_outs, moe_local_idxs, topk_weight, residual, routing)
 
     record.outs = Stage5Outs(hidden_states)
     layer_record.stage5 = record
@@ -676,6 +695,7 @@ def model_forward(
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor] = None,
+    model_context=None,
 ) -> torch.Tensor:
     """
     Without grad the records are cleared after each layer, bounding activation memory and leaving
@@ -683,11 +703,12 @@ def model_forward(
     """
     forward_only = not torch.is_grad_enabled()
     if module.stage_index == 0:
-        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog)
+        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog, model_context)
         if forward_only:
             chunk_record.prolog.outs = None
 
-    rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens)
+    kwargs = {} if model_context is None else {"model_context": model_context}
+    rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens, **kwargs)
     for layer, layer_record in zip(module.layers.values(), chunk_record.layers):
         hidden_states = layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens)
         if forward_only:

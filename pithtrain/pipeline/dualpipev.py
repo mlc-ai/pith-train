@@ -17,7 +17,6 @@ overlapped_forward_backward, the FSDP integration, FP8 weight caching and the fi
 are not. See pithtrain/pipeline/LICENSE and the NOTICE file at the project root.
 """
 
-from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
@@ -28,6 +27,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 
 from pithtrain.contexts import distributed, training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
+from pithtrain.contexts.microbatch import Microbatch
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import ModelProtocol
 from pithtrain.pipeline.execution import (
@@ -106,29 +106,6 @@ def min_chunks(pp_size: int) -> int:
     return 1 if pp_size == 1 else pp_size * 2
 
 
-@dataclass(slots=True, kw_only=True)
-class Microbatch:
-    """
-    One micro-batch of work for DualPipeV.step. Every pipeline rank gets the same list, so each
-    sizes its receive buffers and reads cu_seqlens without a broadcast; only the first rank uses the
-    values of model_inputs and objective_inputs.
-    """
-
-    model_inputs: Tuple[torch.Tensor, ...]
-    """
-    Model inputs, such as token ids, passed positionally to the first stage. The first one must
-    lead with the batch and sequence dimensions, which size the activations between stages.
-    """
-
-    cu_seqlens: Optional[torch.Tensor]
-    """
-    Document boundaries of a packed sample, or None when each row is one sequence. Under context
-    parallelism they cover the whole sample while the tensors hold this rank's share.
-    """
-
-    objective_inputs: Any
-
-
 class DualPipeV(nn.Module):
     """
     V-shaped bidirectional pipeline scheduler over the two model chunks of this rank, from the
@@ -193,6 +170,8 @@ class DualPipeV(nn.Module):
         self.loss_chunks: List[Optional[torch.Tensor]] = []
         self.objective_output_chunks: List[Any] = []
         self.objective: Optional[Callable] = None
+        self.model_context_chunks = []
+        self.cu_seqlens_chunks = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
         self.current_b_chunk_id: List[int] = [0, 0]
@@ -205,12 +184,18 @@ class DualPipeV(nn.Module):
 
     def setup_step_metadata(self, microbatches: List[Microbatch]) -> int:
         """
-        Micro-batches may differ in shape.
+        Micro-batches may differ in shape. Media payloads reach only the model chunk hosting
+        stage 0; every other chunk, including the other V-shaped chunk on that rank, gets the
+        shared model context.
         """
         device = distributed.device
         hidden = self.module[0].hidden_size
 
         self.p2p_shapes = []
+        self.model_context_chunks = [
+            [microbatch.context_for_stage(module.stage_index) for microbatch in microbatches]
+            for module in self.module
+        ]
         for microbatch in microbatches:
             first_input, *_ = microbatch.model_inputs
             batch, sequence, *_ = first_input.shape
@@ -246,8 +231,12 @@ class DualPipeV(nn.Module):
         cu_seqlens = (
             self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
         )
+        kwargs = dict(cu_seqlens=cu_seqlens)
+        context = self.model_context_chunks[phase][chunk_id]
+        if context is not None:
+            kwargs["model_context"] = context
         training.current_microbatch = chunk_id
-        outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
+        outputs = self.module[phase](*inputs, **kwargs)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage:
@@ -367,6 +356,7 @@ class DualPipeV(nn.Module):
             output_grads1,
             self.chunk_records[phase1][chunk_id1],
             self.comm_stream,
+            model_context=self.model_context_chunks[phase0][chunk_id0],
         )
         nvtx.range_pop()
 
@@ -692,6 +682,7 @@ def overlapped_forward_backward(
     output_grads1: Optional[List[torch.Tensor]],
     chunk_record1: ChunkRecord,
     comm_stream: Optional[torch.cuda.Stream],
+    model_context: Optional[dict[str, torch.Tensor]] = None,
 ):
     """
     Run the forward of one micro-batch through module0 interleaved with the backward of another
@@ -731,9 +722,10 @@ def overlapped_forward_backward(
     moe_outs_grad = stage4_b(ctx, module1_layers[-1], record, (moe_outs_grad,))
 
     if module0.stage_index == 0:
-        hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog)
+        hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog, model_context)
 
-    rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens)
+    kwargs = {} if model_context is None else {"model_context": model_context}
+    rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens, **kwargs)
 
     record, dispatch_tokens, residual, routing = stage1_f(
         ctx, module0_layers[0], hidden_states, rotary_posemb, cu_seqlens

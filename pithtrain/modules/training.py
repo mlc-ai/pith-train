@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -22,6 +22,16 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
+from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioModel
+from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
+from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
+from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodalModel
+from pithtrain.models.qwen3_omni_stage5_policy import (
+    OmniStage5Aggregation,
+    validate_omni_stage5_aggregation,
+)
+from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
+from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
@@ -29,7 +39,9 @@ from pithtrain.modules.fp8_param_gather import (
 )
 from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
-from pithtrain.modules.optimizer import Muon
+from pithtrain.modules.model_config import resolve_text_model_config
+from pithtrain.modules.optimizer import Muon, is_muon_param
+from pithtrain.modules.reproducibility import configure_deterministic_training
 from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
@@ -46,25 +58,20 @@ __all__ = [
     "make_constant_scheduler",
     "init_weights",
     "apply_fsdp",
+    "model_class_for_config",
     "setup_model",
     "offload_training_state",
     "reload_training_state",
     "setup_training",
 ]
 
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
-
-
-def is_muon_param(name: str, param: torch.Tensor) -> bool:
-    if param.ndim < 2:
-        return False
-    if name.endswith(".bias") or name.endswith("_bias"):
-        return False
-    if name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight"):
-        return False
-    if ".gate.weight" in name or ".router.weight" in name:
-        return False
-    return True
+PIPELINE_STAGE_MODELS = (
+    DeepSeekV2Model,
+    GptOssModel,
+    Qwen3MoeModel,
+    Qwen35MoeModel,
+    Qwen3OmniMoeThinkerTextModel,
+)
 
 
 def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
@@ -124,15 +131,47 @@ def make_wsd_scheduler(
             case "linear":
                 return 1.0 + (final_factor - 1.0) * t
 
-    return tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers)
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers),
+        make_wsd_scheduler,
+        dict(
+            lr=cfg.lr,
+            max_steps=cfg.max_steps,
+            start_lr=start_lr,
+            warmup_ratio=warmup_ratio,
+            final_lr=final_lr,
+            decay_ratio=decay_ratio,
+            decay_shape=decay_shape,
+        ),
+    )
 
 
 def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
-    return tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers)
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers),
+        make_constant_scheduler,
+        dict(lr=cfg.lr, max_steps=cfg.max_steps),
+    )
 
 
 @dataclass(init=False, slots=True)
 class TrainingCfg(SlottedDefault):
+    native_multimodal: bool = False
+    """Joint native text/image/audio/video Thinker with fixed encoder collectives."""
+
+    native_video: bool = False
+    """Opt into native video-only Thinker input with temporal RoPE and DeepStack."""
+
+    native_vision: bool = False
+    """Opt into native Omni image training using a composite Thinker config."""
+
+    native_audio: bool = False
+    """Opt into native Omni audio/text training using a composite Thinker config."""
+
     sequence_length: int
     """
     The number of tokens in each training sample. For packed variable-length samples it is an
@@ -175,6 +214,36 @@ class TrainingCfg(SlottedDefault):
     A HuggingFace safetensors directory to stream the initial weights from, skipping hf2dcp.
     Used only when save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS
     (MXFP4) and Qwen3.5-MoE; not compatible with hsdp_replica > 1.
+    """
+
+    deterministic: bool = False
+    """Request PyTorch/cuDNN and FA4 deterministic policies without checkpoint features.
+
+    This independent numerical setting lets baseline and strict-resume runs use
+    identical compute policies. Strict resume also enables it implicitly.
+    Summed CE uses PyTorch FP32 arithmetic with extra temporary vocabulary
+    memory; ordinary training keeps the in-place fused CE kernel.
+    CUDA launches require CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before Python.
+    """
+
+    omni_stage5_aggregation: OmniStage5Aggregation = "grouped_sum"
+    """Thinker aggregation policy, independent of expert projection backends.
+
+    grouped_sum preserves the ordinary path without route-ID copies or sorts.
+    hf_eager_expert_id_serial preserves original dispatch/GEMM layout and orders
+    only Stage5 output/weight accumulation by global expert ID. It is not an HF
+    projection backend selector or a claim of full native/HF equivalence.
+    """
+
+    strict_resume: bool = False
+    """Opt into fixed-topology transactional resume, including every rank's data/RNG.
+
+    Also requests PyTorch deterministic algorithms, fixed cuDNN policy and FA4
+    ordered backward reductions. CUDA launches require CUBLAS_WORKSPACE_CONFIG
+    set to :4096:8 or :16:8 before Python starts. These policies do not guarantee
+    whole-model bitwise reproducibility. Currently requires prepared data, AdamW
+    and StepLR/LambdaLR. Weight-only
+    initialization and changed-world-size resharding keep the legacy path.
     """
 
     save_interval: Optional[int] = None
@@ -252,7 +321,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed
     Initialize this rank's V-chunks (an nn.Sequential of two models) in place, before FSDP shards
     them. Every parameter of 2 or more dims draws from N(0, init_std), except o_proj and down_proj,
     which use N(0, init_std / sqrt(2 * num_layers)) with num_layers of the full model. 1D parameters
-    stay as they are.
+    stay as they are, except the media encoders' norm weights and biases, set to 1 and 0.
 
     Each parameter draws from a stream keyed by its name in the full model, and each routed expert
     of a 3D stacked expert weight from one keyed also by its global expert index, so every parallel
@@ -261,9 +330,12 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed
     """
     output_std = init_std / math.sqrt(2.0 * num_layers)
     for chunk_name, param in model.named_parameters():
+        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
+        if name.startswith(("visual.", "audio_tower.")) and param.dim() == 1:
+            nn.init.zeros_(param) if name.endswith("bias") else nn.init.ones_(param)
+            continue
         if param.dim() < 2:
             continue
-        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
         std = output_std if "o_proj" in name or "down_proj" in name else init_std
         # Routed experts are stacked (local experts, ...), the local ones of this EP rank.
         if ".experts." in name and param.dim() == 3:
@@ -307,36 +379,52 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
     else:
         attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
-    mp = MixedPrecisionPolicy(
+    compute_mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
     )
+    # Pipeline activations already have PARAM_DTYPE. Root context tensors (e.g. media timing) keep
+    # their precision, as on the overlapped path that calls prolog/posemb directly; compute children
+    # still cast their floating inputs through their own policies.
+    root_mp = replace(compute_mp, cast_forward_inputs=False)
     install_lean_hooks()
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
     # the expert parameters stay out of the layer's group.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
         # Embeddings, final norm and LM head run once per step, so they reshard after forward.
-        for name, child in model[i].named_children():
-            if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
+        edges = (
+            model[i].fsdp_edge_modules()
+            if isinstance(model[i], Qwen3OmniMoeTalkerTextModel)
+            else tuple(
+                child
+                for name, child in model[i].named_children()
+                if name != "layers" and next(child.parameters(), None) is not None
+            )
+        )
+        for child in edges:
+            fully_shard(
+                child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
+            )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
                     layer.mlp.experts,
                     mesh=expt_fsdp_mesh,
                     reshard_after_forward=False,
-                    mp_policy=mp,
+                    mp_policy=compute_mp,
                 )
                 if hasattr(layer.mlp.experts, "forward_from_tokens"):
                     register_fsdp_forward_method(layer.mlp.experts, "forward_from_tokens")
-            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            fully_shard(
+                layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=compute_mp
+            )
             register_fsdp_forward_method(layer, "forward_stage1")
             register_fsdp_forward_method(layer, "forward_stage3")
             register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=root_mp)
 
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.
@@ -352,10 +440,49 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
+def model_class_for_config(
+    module_config,
+    native_vision=False,
+    native_audio=False,
+    native_video=False,
+    native_multimodal=False,
+):
+    """Resolve a registered pipeline model before allocating any parameters."""
+    if sum((native_vision, native_audio, native_video, native_multimodal)) > 1:
+        raise ValueError("Select one native mode; combined media uses native_multimodal")
+    if native_vision or native_audio or native_video or native_multimodal:
+        thinker = getattr(module_config, "thinker_config", module_config)
+        if getattr(thinker, "model_type", None) != "qwen3_omni_moe_thinker":
+            raise ValueError(
+                "native_vision/native_audio/native_video/native_multimodal requires a composite Omni Thinker config"
+            )
+        if native_multimodal:
+            return Qwen3OmniMoeThinkerMultimodalModel
+        if native_audio:
+            return Qwen3OmniMoeThinkerAudioModel
+        return Qwen3OmniMoeThinkerVideoModel if native_video else Qwen3OmniMoeThinkerImageModel
+    module_config = resolve_text_model_config(module_config)
+    if module_config.model_type == "deepseek_v2":
+        return DeepSeekV2Model
+    elif module_config.model_type == "qwen3_moe":
+        return Qwen3MoeModel
+    elif module_config.model_type == "qwen3_omni_moe_talker_text":
+        return Qwen3OmniMoeTalkerTextModel
+    elif module_config.model_type == "qwen3_omni_moe_text":
+        return Qwen3OmniMoeThinkerTextModel
+    elif module_config.model_type == "gpt_oss":
+        return GptOssModel
+    elif module_config.model_type == "qwen3_5_moe_text":
+        return Qwen35MoeModel
+    else:
+        raise ValueError(f"Unsupported model_type: {module_config.model_type}")
+
+
 def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
 ) -> None:
+    stage5_aggregation = validate_omni_stage5_aggregation(cfg.omni_stage5_aggregation)
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
@@ -364,31 +491,37 @@ def setup_model(
     cp_group = distributed.cp_group
 
     modules = []
-    module_config = AutoConfig.from_pretrained(cfg.model)
+    source_config = AutoConfig.from_pretrained(cfg.model)
+    module_config = resolve_text_model_config(source_config)
+    if stage5_aggregation != "grouped_sum" and module_config.model_type != "qwen3_omni_moe_text":
+        raise ValueError("hf_eager_expert_id_serial aggregation requires an Omni Thinker model")
+    training.omni_stage5_aggregation = stage5_aggregation
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)
-    if cfg.sequence_length % (2 * cp_size) != 0:
+    # CP=1 has no sequence sharding, so its length may be odd.
+    if cp_size > 1 and cfg.sequence_length % (2 * cp_size) != 0:
         raise ValueError(
             f"sequence_length ({cfg.sequence_length}) must be divisible by "
             f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
-    elif module_config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
-    elif module_config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
-    elif module_config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen35MoeModel
-    else:
-        raise ValueError(f"Unsupported model_type: {module_config.model_type}")
-
-    modules.append(ModelClass(module_config, phase=0))
-    modules.append(ModelClass(module_config, phase=1))
+    ModelClass = model_class_for_config(
+        source_config,
+        native_vision=cfg.native_vision,
+        native_audio=cfg.native_audio,
+        native_video=cfg.native_video,
+        native_multimodal=cfg.native_multimodal,
+    )
+    selected_config = (
+        getattr(source_config, "thinker_config", source_config)
+        if cfg.native_vision or cfg.native_audio or cfg.native_video or cfg.native_multimodal
+        else module_config
+    )
+    modules.append(ModelClass(selected_config, phase=0))
+    modules.append(ModelClass(selected_config, phase=1))
 
     modules = nn.Sequential(*modules)
     init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
@@ -530,6 +663,12 @@ def setup_training(cfg: object) -> None:
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
+    configure_deterministic_training(
+        bool(
+            getattr(cfg.training, "deterministic", False)
+            or getattr(cfg.training, "strict_resume", False)
+        )
+    )
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
