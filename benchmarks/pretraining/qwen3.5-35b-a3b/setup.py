@@ -56,7 +56,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
+cfg.data.dataset = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b")
