@@ -123,8 +123,9 @@ def objective(
     (labels,) = objective_inputs
     logits = logits.view(-1, logits.size(-1))
     labels = labels.view(-1)
-    num_tokens = (labels != -100).sum().clamp_min(1)
-    loss = cross_entropy(logits, labels, ignore_index=-100) * num_tokens
+    # Compute the sum before storing BF16 logit gradients. Multiplying a
+    # previously rounded BF16 mean by the token count loses information.
+    loss = cross_entropy(logits, labels, ignore_index=-100, reduction="sum")
     return loss, loss.detach()
 
 
@@ -173,10 +174,13 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     cp_size = distributed.cp_size
     if distributed.pp_rank == 0:
-        loss = torch.stack(objective_outputs).sum() / num_tokens
-        if cp_size > 1:
-            torch.distributed.all_reduce(loss, group=distributed.cp_group)
-            loss /= cp_size
+        # Log the same global token mean that scales the gradients. Each
+        # objective output is detached; this reduction only affects reporting.
+        loss = torch.stack(objective_outputs).sum()
+        if dp_size * cp_size > 1:
+            token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
+            torch.distributed.all_reduce(loss, group=token_group)
+        loss /= num_tokens * dp_size * cp_size
 
     # The one gradient normalization: FSDP reduces with a plain sum, so this gives the
     # token-weighted mean. The global count is the local count times dp * cp only while every rank

@@ -84,9 +84,10 @@ class CrossEntropy:
     slice, so x[target] is always read before any store.
     """
 
-    def __init__(self, dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int) -> None:
+    def __init__(self, dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int, mean: bool) -> None:
         self.dtype, self.num_cols, self.cluster_size = dtype, num_cols, cluster_size
         self.chunks, self.is_resident, self.threads = chunks, is_resident, threads
+        self.mean = mean
         self.warps = threads // 32
         self.element_bytes = dtype.width // 8
         self.unit_elements = 16 // self.element_bytes
@@ -97,7 +98,7 @@ class CrossEntropy:
     @cute.jit
     def __call__(self, mX: cute.Tensor, mTarget: cute.Tensor, mLoss: cute.Tensor, mCount: cute.Tensor, mMeanLoss: cute.Tensor, ignore_index: Int64, stream) -> None:
         N = mTarget.shape[0]
-        CountNonIgnored().kernel(mTarget, mCount, ignore_index).launch(grid=[1, 1, 1], block=[COUNT_THREADS, 1, 1], stream=stream)
+        CountNonIgnored(self.mean).kernel(mTarget, mCount, ignore_index).launch(grid=[1, 1, 1], block=[COUNT_THREADS, 1, 1], stream=stream)
         self.kernel(mX, mTarget, mLoss, mCount, ignore_index).launch(grid=[N * self.cluster_size, 1, 1], block=[self.threads, 1, 1], cluster=[self.cluster_size, 1, 1] if const_expr(self.cluster_size > 1) else None, stream=stream, use_pdl=True)
         MeanLoss().kernel(mLoss, mCount, mMeanLoss).launch(grid=[1, 1, 1], block=[COUNT_THREADS, 1, 1], stream=stream, use_pdl=True)
 
@@ -299,9 +300,12 @@ class CrossEntropy:
 
 class CountNonIgnored:
     """
-    n = max(#(target != ignore_index), 1) into count[0]. The main kernel, its programmatic
-    dependent, waits for it only before it first reads n.
+    n = max(#(target != ignore_index), 1) for mean, or 1 for sum, into count[0]. The main kernel,
+    its programmatic dependent, waits for it only before it first reads n.
     """
+
+    def __init__(self, mean: bool) -> None:
+        self.mean = mean
 
     @cute.kernel
     def kernel(self, mTarget: cute.Tensor, mCount: cute.Tensor, ignore_index: Int64) -> None:
@@ -309,7 +313,9 @@ class CountNonIgnored:
         lane, warp = tidx % 32, tidx // 32
         cute.arch.griddepcontrol_launch_dependents()
         s_partial = cutlass.memory.SmemAllocator().allocate(COUNT_THREADS // 32 * 4, byte_alignment=16).toint()
-        num_counted = self.count_rows(mTarget, ignore_index, tidx)
+        num_counted = Int32(0)
+        if const_expr(self.mean):
+            num_counted = self.count_rows(mTarget, ignore_index, tidx)
         num_counted = block_sum(num_counted, s_partial, lane, warp, COUNT_THREADS // 32)
         if tidx == 0:
             mCount[0] = Int64(cutlass.max(num_counted, Int32(1)))
@@ -324,7 +330,8 @@ class CountNonIgnored:
 
 class MeanLoss:
     """
-    The fp32 mean of the row losses over n, summed in a fixed order, once the main kernel is done.
+    The fp32 reduction of the row losses over n (1 for sum), summed in a fixed order, once the
+    main kernel is done.
     """
 
     @cute.kernel
@@ -363,14 +370,14 @@ def pick_layout(num_cols: int, element_bytes: int) -> tuple:
     return 8, 2, row_bytes <= 8 * MAX_SLICE_BYTES, 256
 
 
-def compile_kernel(dtype: torch.dtype, target_dtype: torch.dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int) -> Callable:
+def compile_kernel(dtype: torch.dtype, target_dtype: torch.dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int, reduction: str) -> Callable:
     x = fake(TORCH2CUTE[dtype], (cute.sym_int(),), (1,), dtype.itemsize)
     target = fake(TARGET_TYPES[target_dtype], (cute.sym_int(),), (1,), target_dtype.itemsize)
     row_loss, count, mean_loss = fake(Float32, (cute.sym_int(),), (1,), 4), fake(Int64, (1,), (1,), 8), fake(Float32, (1,), (1,), 4)
-    return cute.compile(CrossEntropy(TORCH2CUTE[dtype], num_cols, cluster_size, chunks, is_resident, threads), x, target, row_loss, count, mean_loss, Int64(0), fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(CrossEntropy(TORCH2CUTE[dtype], num_cols, cluster_size, chunks, is_resident, threads, reduction == "mean"), x, target, row_loss, count, mean_loss, Int64(0), fake_stream(), options="--enable-tvm-ffi")
 
 
-def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_index: int, reduction: str = "mean") -> tuple[torch.Tensor, torch.Tensor]:
     """
     The picker's contract on SM90, every dtype, shape and stride through the CuTe kernels.
     """
@@ -389,9 +396,9 @@ def cross_entropy_fwd_bwd_sm90(inp: torch.Tensor, target: torch.Tensor, ignore_i
     row_loss = torch.empty(num_rows, dtype=torch.float32, device=inp.device)
     count = torch.empty(1, dtype=torch.int64, device=inp.device)
     layout = pick_layout(num_cols, inp.element_size())
-    key = ("cross_entropy", inp.dtype, target.dtype, num_cols, *layout)
+    key = ("cross_entropy", inp.dtype, target.dtype, num_cols, *layout, reduction)
     fn = COMPILED.get(key)
     if fn is None:
-        fn = COMPILED[key] = compile_kernel(inp.dtype, target.dtype, num_cols, *layout)
+        fn = COMPILED[key] = compile_kernel(inp.dtype, target.dtype, num_cols, *layout, reduction)
     fn(inp.view(-1), target, row_loss, count, loss.view(1), ignore_index)
     return loss, inp

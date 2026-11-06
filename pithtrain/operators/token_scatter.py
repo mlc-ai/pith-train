@@ -17,10 +17,21 @@ __all__ = [
 class ScatterForGroupedGemm(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, input_tokens, expert_idxs, num_groups, padding_alignment=128, group_counts=None
+        ctx,
+        input_tokens,
+        expert_idxs,
+        num_groups,
+        padding_alignment=128,
+        group_counts=None,
+        deterministic=False,
     ):
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert(
-            input_tokens, expert_idxs, num_groups, padding_alignment, group_counts
+            input_tokens,
+            expert_idxs,
+            num_groups,
+            padding_alignment,
+            group_counts,
+            deterministic=deterministic,
         )
         ctx.save_for_backward(reverse_shuffle_idxs)
         return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks
@@ -36,7 +47,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
     ):
         (reverse_shuffle_idxs,) = ctx.saved_tensors
         grad_input_tokens = grad_output_tokens[reverse_shuffle_idxs]
-        return grad_input_tokens, None, None, None, None
+        return (grad_input_tokens,) + (None,) * (len(ctx.needs_input_grad) - 1)
 
 
 class PaddedIndexGather(torch.autograd.Function):
@@ -82,6 +93,8 @@ def scatter_for_grouped_gemm(
     num_groups: int,
     padding_alignment: int = 128,
     group_counts: Optional[list[int]] = None,
+    *,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     Scatter input_tokens (m, hidden) into expert groups by expert_idxs (m,) int64, each group's
@@ -94,11 +107,16 @@ def scatter_for_grouped_gemm(
     - ks, ks_tensor: the padded group sizes, as a host list and a (num_groups,) int32 tensor.
 
     group_counts, the rows per group on the host if the caller has them, saves the blocking
-    device-to-host copy of the group sizes.
+    device-to-host copy of the group sizes. deterministic preserves input order within each group.
     """
     output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = (
         ScatterForGroupedGemm.apply(
-            input_tokens, expert_idxs, num_groups, padding_alignment, group_counts
+            input_tokens,
+            expert_idxs,
+            num_groups,
+            padding_alignment,
+            group_counts,
+            deterministic,
         )
     )
     return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor

@@ -961,7 +961,7 @@ DBG = None
 
 def scatter_by_expert_torch(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int, group_counts) -> tuple:
     """
-    scatter_by_expert in PyTorch, for more groups than the kernel's MAX_GROUPS: the same outputs,
+    scatter_by_expert in PyTorch, for deterministic placement or more than MAX_GROUPS: same outputs,
     tokens in token order within each group.
     """
     num_tokens, hidden = input_tokens.shape
@@ -986,7 +986,7 @@ def scatter_by_expert_torch(input_tokens: torch.Tensor, expert_idxs: torch.Tenso
     return out[:total], rev, offs, ks_tensor, ks
 
 
-def scatter_by_expert_sm100(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None):
+def scatter_by_expert_sm100(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, *, deterministic: bool = False):
     """
     scatter_by_expert on SM100 (see the picker's contract).
     """
@@ -997,7 +997,7 @@ def scatter_by_expert_sm100(input_tokens: torch.Tensor, expert_idxs: torch.Tenso
         raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {num_tokens=}")
     if num_tokens == 0:
         return (torch.empty((0, hidden), device=device, dtype=input_tokens.dtype), torch.empty((0,), device=device, dtype=torch.int64), torch.empty((0,), device=device, dtype=torch.int32), torch.empty((0,), device=device, dtype=torch.int32), [])
-    if num_groups > MAX_GROUPS:
+    if deterministic or num_groups > MAX_GROUPS:
         return scatter_by_expert_torch(input_tokens, expert_idxs, num_groups, padding_alignment, group_counts)
     if input_tokens.stride(1) != 1 and hidden > 1:
         raise ValueError("input_tokens must have unit inner stride")
