@@ -302,11 +302,15 @@ def test_shift_invariance_faults_fail_the_staged_gate_in_every_shard_layout(faul
 
 
 def test_one_frame_windows_have_undefined_ratios():
+    # A one-token softmax is exactly 1 in any precision, so its query and key gradients are
+    # exactly zero. FP64 states that without PyTorch's CPU BF16 convolution: on HAO's
+    # Sapphire Rapids nodes its weight gradient for a one-frame input was missing or nonfinite
+    # (conv2d2.weight, CPU job 2999673), unrelated to the attention.
     config = staged_like()
-    model = calibration.prepared(config, "native", "bf16", 0)
+    model = calibration.prepared(config, "native", "fp64", 0)
     batch = [(*calibration.random_features(config, [1], 0), "probe", 0)]
     rows = calibration.layer_ratios(
-        calibration.gradient_norms(model, "native", "bf16", "cpu", batch)
+        calibration.gradient_norms(model, "native", "fp64", "cpu", batch)
     )
     assert all(row["query_l2"] == row["key_weight_l2"] == 0 for row in rows)
     assert all(row[name]["1"] == [None] for row in rows for name in calibration.STATISTICS)
