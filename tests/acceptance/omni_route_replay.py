@@ -1,4 +1,4 @@
-"""Route-conditioned MoE parity and analytically-zero gradients for the full-size gates.
+"""Route-conditioned MoE parity for the full-size gates.
 
 Test-only helpers; no production code changes.
 
@@ -10,15 +10,19 @@ gradient, so a free-running per-parameter comparison measures route flips as wel
 arithmetic. Replaying the reference's selected experts through the production
 ``router_replay`` hook removes only that discrete choice: the native router still
 computes its own probabilities and routing weights from its own hidden states.
+
+Audio key-bias gradients, which are structurally zero, are judged separately
+(omni_structural_zero).
 """
 
 import contextlib
-import math
 import re
 import statistics
 
 import torch
 import torch.nn.functional as F
+
+from tests.acceptance.omni_structural_zero import CRITERION
 
 _ROUTER = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.gate$")
 _GROUPS = (
@@ -30,12 +34,6 @@ _GROUPS = (
     ("attention", re.compile(r"\.self_attn\.")),
     ("input_norm", re.compile(r"\.input_layernorm\.")),
 )
-# Audio self-attention adds k_proj.bias to every key of a query row and has no RoPE or
-# key norm, so softmax shift invariance makes its exact gradient identically zero; the
-# computed value is rounding residue, and NSE between two residues is ill-posed. No
-# calibrated size criterion exists yet, so these rows keep their NSE verdict and
-# annotate_key_bias_ratios only reports their size relative to the query bias.
-AUDIO_KEY_BIAS = re.compile(r"^(audio_tower\.layers\.\d+\.self_attn\.)k_proj\.bias$")
 
 
 def moe_routers(model):
@@ -161,48 +159,21 @@ def parameter_group(name):
 
 
 def group_summary(rows):
-    """Compared count, failures and worst NSE per parameter group."""
+    """Compared count, failures and worst NSE per parameter group.
+
+    Rows judged by the structural-zero criterion are counted separately and left out of
+    max_nse, which would otherwise report the NSE between two rounding residues.
+    """
     groups = {}
     for row in rows:
         entry = groups.setdefault(
-            parameter_group(row["name"]), {"parameters": 0, "fail": 0, "max_nse": 0.0}
+            parameter_group(row["name"]),
+            {"parameters": 0, "fail": 0, "max_nse": 0.0, "structural_zero": 0},
         )
         entry["parameters"] += 1
         entry["fail"] += row["status"] != "PASS"
-        if row.get("difference") is not None:
+        if row.get("criterion") == CRITERION:
+            entry["structural_zero"] += 1
+        elif row.get("difference") is not None:
             entry["max_nse"] = max(entry["max_nse"], row["difference"])
     return dict(sorted(groups.items()))
-
-
-def annotate_key_bias_ratios(rows):
-    """Report each audio key-bias gradient's size relative to its layer's query bias.
-
-    The ratio is an uncalibrated diagnostic: no row's status or reason changes, so the NSE
-    verdict stands. Per implementation the ratio is MISSING when either norm or the query
-    row is absent, NONFINITE for a nonfinite norm, and UNDEFINED_ZERO_QUERY when the query
-    norm is zero (even if the key norm is zero too).
-    """
-    by_name = {row["name"]: row for row in rows}
-    for row in rows:
-        match = AUDIO_KEY_BIAS.match(row["name"])
-        if match is None:
-            continue
-        query = by_name.get(match.group(1) + "q_proj.bias")
-        ratios, states = {}, {}
-        for side in ("actual", "reference"):
-            norm = row.get(side + "_l2")
-            scale = None if query is None else query.get(side + "_l2")
-            if norm is None or scale is None:
-                ratios[side], states[side] = None, "MISSING"
-            elif not (math.isfinite(norm) and math.isfinite(scale)):
-                ratios[side], states[side] = None, "NONFINITE"
-            elif scale == 0:
-                ratios[side], states[side] = None, "UNDEFINED_ZERO_QUERY"
-            else:
-                ratios[side], states[side] = norm / scale, "DEFINED"
-        row.update(
-            key_to_query_gradient_ratio=ratios,
-            key_to_query_ratio_state=states,
-            key_bias_ratio_role="uncalibrated diagnostic; status is the NSE verdict",
-        )
-    return rows

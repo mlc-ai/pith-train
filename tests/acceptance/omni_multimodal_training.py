@@ -39,8 +39,13 @@ from tests.acceptance.omni_image_evidence import (
     training_groups,
     validate_target_layout,
 )
-from tests.acceptance.omni_image_staged import expected_shard, local_tensor
-from tests.acceptance.omni_image_training import REPO, commit, error_ratio, tensor_hash
+from tests.acceptance.omni_image_staged import (
+    expected_shard,
+    gradient_rows,
+    local_tensor,
+    record_gradient_rows,
+)
+from tests.acceptance.omni_image_training import REPO, commit, tensor_hash
 from tests.acceptance.omni_image_training import HFReference as ImageReference
 from tests.acceptance.omni_native_resume import equal
 from tests.acceptance.omni_optimizer_probe import isolated_optimizer_probe
@@ -51,6 +56,11 @@ from tests.acceptance.omni_reference_attention import (
     reference_contract,
 )
 from tests.acceptance.omni_reference_precision import FP32GradientReference
+from tests.acceptance.omni_structural_zero import (
+    bound,
+    criterion_contract,
+    require_calibrated_shards,
+)
 from tests.test_qwen3_omni_av import write_av
 
 MEDIA_KEYS = ("pixel_values", "pixel_values_videos", "input_features")
@@ -147,6 +157,11 @@ def source_inputs(dataset):
     )
     collator = Qwen3OmniCollator(processor, config, **bundle["recipe"]["batch"])
     batches = {kind: collator([sample]) for kind, sample in records.items()}
+    return bundle, records, batches, tiny_components(config)
+
+
+def tiny_components(config):
+    """The staged gate's tiny text, vision and audio components, in place."""
     text = json.loads((REPO / "tests/configs/qwen3_omni_text/tiny.json").read_text())
     config.text_config = Qwen3OmniMoeTextConfig(**text)
     vision, audio = config.vision_config, config.audio_config
@@ -159,7 +174,7 @@ def source_inputs(dataset):
         96,
     )
     audio.downsample_hidden_size, audio.output_dim = 8, config.text_config.hidden_size
-    return bundle, records, batches, config
+    return config
 
 
 def prepare(args):
@@ -355,6 +370,8 @@ def staged(args):
     require_hardware(getattr(args, "hardware_family", "H100"))
     assert not args.output.exists(), "Use a fresh evidence directory"
     _, _, batches, config = source_inputs(args.dataset)
+    # Fail before any GPU work if the tiny audio encoder is not the calibrated one.
+    key_bias_bound = bound("multimodal", config.audio_config)
     world, rank = int(os.environ["WORLD_SIZE"]), int(os.environ["RANK"])
     cfg = pretrain_lm.PretrainLMCfg()
     cfg.distributed.pipeline_parallel_size, cfg.distributed.expert_parallel_size = args.pp, args.ep
@@ -404,6 +421,8 @@ def staged(args):
     ownership = [None] * world
     dist.all_gather_object(ownership, sorted(actual))
     assert set().union(*(set(keys) for keys in ownership)) == set(expected)
+    if any(name.startswith("audio_tower.") for name in actual):
+        require_calibrated_shards("multimodal", actual, local_tensor)
     kinds = ("text", "all", "image", "audio", "video", "all", "text", "av")
     global_batches = [copy.deepcopy(batches[kind]) for kind in kinds]
     for index, batch in enumerate(global_batches):
@@ -448,13 +467,18 @@ def staged(args):
     if distributed.pp_rank == 0:
         loss = global_loss_mean(torch.stack(outputs).sum(), count, group)
         torch.testing.assert_close(loss, hf_loss, rtol=1e-3, atol=1e-3)
-    errors = {}
+    pairs = []
     for name, parameter in actual.items():
-        assert parameter.grad is not None and expected[name].grad is not None, name
+        if parameter.grad is None or expected[name].grad is None:
+            pairs.append((name, parameter.grad, expected[name].grad))
+            continue
         parameter.grad.div_(count)
         target = expected_shard(expected[name].grad, parameter, name, distributed)
-        errors[name] = error_ratio(local_tensor(parameter.grad), local_tensor(target))
-        assert errors[name] < 1e-2, (name, errors[name])
+        pairs.append((name, local_tensor(parameter.grad), local_tensor(target)))
+    rows = gradient_rows(pairs, key_bias_bound)
+    errors = record_gradient_rows(
+        args.output / f"gradient-rows-rank-{rank:05d}.json", rank, rows, "multimodal"
+    )
     before = {name: local_tensor(param).detach().clone() for name, param in actual.items()}
     with isolated_optimizer_probe(training.model, lambda: make_adamw_optimizer(t)) as probes:
         for optimizer in probes:
@@ -493,6 +517,8 @@ def staged(args):
         scenario=args.scenario,
         target_layout=layout,
         gradient_errors=errors,
+        gradient_rows=rows,
+        gradient_criterion=criterion_contract("multimodal"),
         reference_precision=reference.precision_contract(),
         reference_attention=attention,
         module_updates=updates,

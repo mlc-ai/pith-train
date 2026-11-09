@@ -32,10 +32,60 @@ from tests.acceptance.omni_reference_attention import (
     reference_contract,
 )
 from tests.acceptance.omni_reference_precision import FP32GradientReference
+from tests.acceptance.omni_structural_zero import (
+    bound,
+    criterion_contract,
+    judge_key_bias_rows,
+    require_calibrated_shards,
+)
+
+GRADIENT_NSE = 1e-2
 
 
 def local_tensor(value):
     return value.to_local() if isinstance(value, DTensor) else value
+
+
+def gradient_rows(pairs, key_bias_bound, threshold=GRADIENT_NSE):
+    """Rows for every (name, native, reference) local gradient pair, built before judging.
+
+    Each compared row records FP64 L2 norms and max-abs values of both sides and of their
+    difference with the NSE (error_ratio) and its verdict; audio key biases are then judged
+    by the structural-zero criterion with key_bias_bound (None when the model has no audio
+    encoder). Missing, misshaped or nonfinite gradients fail.
+    """
+    rows = []
+    for name, actual, reference in pairs:
+        row = dict(name=name, status="FAIL", threshold=threshold)
+        rows.append(row)
+        if actual is None or reference is None:
+            row.update(reason="missing gradient", actual_missing=actual is None)
+            continue
+        a, b = actual.detach().double(), reference.detach().double()
+        row.update(shape=list(a.shape), reference_shape=list(b.shape))
+        row["finite"] = bool(torch.isfinite(a).all()) and bool(torch.isfinite(b).all())
+        if a.shape != b.shape or not row["finite"]:
+            row["reason"] = "shape mismatch or nonfinite gradients"
+            continue
+        row.update(
+            actual_l2=a.norm().item(),
+            reference_l2=b.norm().item(),
+            actual_max_abs=a.abs().max().item() if a.numel() else 0.0,
+            reference_max_abs=b.abs().max().item() if b.numel() else 0.0,
+            difference_max_abs=(a - b).abs().max().item() if a.numel() else 0.0,
+            difference=error_ratio(actual, reference),
+        )
+        row["status"] = "PASS" if row["difference"] < threshold else "FAIL"
+    return judge_key_bias_rows(rows, threshold, key_bias_bound)
+
+
+def record_gradient_rows(path, rank, rows, configuration=None):
+    """Write every row, then fail with all failing rows, so evidence survives a failure."""
+    criterion = criterion_contract(configuration)
+    path.write_text(json.dumps(dict(rank=rank, criterion=criterion, rows=rows), indent=2) + "\n")
+    failed = [row for row in rows if row["status"] != "PASS"]
+    assert not failed, [(row["name"], row.get("difference"), row.get("reason")) for row in failed]
+    return {row["name"]: row["difference"] for row in rows}
 
 
 def expected_shard(value, parameter, name, distributed):
@@ -73,6 +123,9 @@ def run(
     assert world % args.pp == 0 and (world // args.pp) % args.ep == 0
     assert args.scenario != "rank-zero" or world // args.pp > 1
     _, _, batches, config = source_inputs_fn(args.dataset)
+    # Only the audio run has an audio encoder; its bound must match this tiny encoder.
+    key_bias = "staged" if modality == "audio" else None
+    key_bias_bound = None if key_bias is None else bound(key_bias, config.audio_config)
     rank = int(os.environ["RANK"])
     # Before the first barrier every rank checks that evidence is fresh.
     assert not args.output.exists(), "Use a fresh shared output"
@@ -129,6 +182,8 @@ def run(
     owned_keys = [None] * world
     dist.all_gather_object(owned_keys, sorted(actual))
     assert set().union(*(set(keys) for keys in owned_keys)) == set(expected)
+    if key_bias is not None and any(name.startswith("audio_tower.") for name in actual):
+        require_calibrated_shards(key_bias, actual, local_tensor)
 
     # Each scenario has its own process/weights/optimizer and output directory.
     # Preserve nonuniform microbatches; rank-zero also masks every microbatch on
@@ -182,13 +237,18 @@ def run(
     if distributed.pp_rank == 0:
         loss = global_loss_mean(torch.stack(outputs).sum(), count, group)
         torch.testing.assert_close(loss, hf_loss, rtol=1e-3, atol=1e-3)
-    errors = {}
+    pairs = []
     for key, parameter in actual.items():
-        assert parameter.grad is not None and expected[key].grad is not None, key
+        if parameter.grad is None or expected[key].grad is None:
+            pairs.append((key, parameter.grad, expected[key].grad))
+            continue
         parameter.grad.div_(count)
         target = expected_shard(expected[key].grad, parameter, key, distributed)
-        errors[key] = error_ratio(local_tensor(parameter.grad), local_tensor(target))
-        assert errors[key] < 1e-2, (key, errors[key])
+        pairs.append((key, local_tensor(parameter.grad), local_tensor(target)))
+    rows = gradient_rows(pairs, key_bias_bound)
+    errors = record_gradient_rows(
+        args.output / f"gradient-rows-rank-{rank:05d}.json", rank, rows, key_bias
+    )
     before = {n: local_tensor(p).detach().clone() for n, p in actual.items()}
     with isolated_optimizer_probe(training.model, lambda: make_adamw_optimizer(t)) as probes:
         for optimizer in probes:
@@ -246,6 +306,8 @@ def run(
         local_target_count=partition["local_target_count"],
         target_count=int(count),
         gradient_errors=errors,
+        gradient_rows=rows,
+        gradient_criterion=criterion_contract(key_bias),
         reference_precision=reference.precision_contract(),
         reference_attention=attention,
         updated_parameters=updated,

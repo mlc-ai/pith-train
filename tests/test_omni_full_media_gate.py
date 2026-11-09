@@ -157,6 +157,8 @@ def parameters():
         "model.norm.weight": [1.0, 2.0],
         "lm_head.weight": [1.0, 2.0],
         "audio_tower.layers.0.self_attn.k_proj.bias": [0.0, 0.0],
+        "audio_tower.layers.0.self_attn.q_proj.bias": [0.5, -0.25],
+        "audio_tower.layers.0.self_attn.k_proj.weight": [0.6, -0.8],
         "audio_tower.layers.0.self_attn.q_proj.weight": [3.0, 4.0],
     }
     return {
@@ -210,7 +212,39 @@ def test_nse_boundary_is_not_relaxed(monkeypatch):
     expected = {name: parameter.grad.clone() for name, parameter in actual.items()}
     monkeypatch.setattr(text_gate, "metric", lambda *_: 1e-2)
     rows = gate.compare_gradients(actual, {n: p.shape for n, p in actual.items()}, expected)
-    assert all(row["status"] == "FAIL" for row in rows)
+    key = "audio_tower.layers.0.self_attn.k_proj.bias"
+    assert all(row["status"] == "FAIL" for row in rows if row["name"] != key)
+    # Only the structurally zero key bias is judged by its size; its NSE verdict is kept.
+    (row,) = [row for row in rows if row["name"] == key]
+    assert row["criterion"] == "structural_zero_key_bias" and row["nse_status"] == "FAIL"
+
+
+def test_audio_key_bias_rows_are_judged_by_their_calibrated_size(monkeypatch):
+    from tests.acceptance import omni_structural_zero as zero
+
+    actual = parameters()
+    key = "audio_tower.layers.0.self_attn.k_proj.bias"
+    shapes = {name: parameter.shape for name, parameter in actual.items()}
+    expected = {name: parameter.grad.clone() for name, parameter in actual.items()}
+    by_name = {row["name"]: row for row in gate.compare_gradients(actual, shapes, expected)}
+    scale = zero.residue_scale(by_name, key.removesuffix("k_proj.bias"), "actual")
+    bound = zero.bound("official")
+    # Independent residues: NSE 1, each side at half the bound relative to its scale.
+    unit = torch.tensor([1.0, 0.0]) * scale * bound / 2
+    actual[key].grad = unit
+    expected[key] = unit.flip(0)
+    rows = gate.compare_gradients(actual, shapes, expected)
+    (row,) = [row for row in rows if row["name"] == key]
+    assert row["status"] == "PASS" and row["nse_status"] == "FAIL" and row["nse"] == 1
+    assert row["residue_ratio"]["actual"] == pytest.approx(bound / 2)
+    groups = gate.group_summary(rows)
+    assert groups["audio"]["structural_zero"] == 1 and groups["audio"]["max_nse"] == 0
+    actual[key].grad = unit * 3
+    rows = gate.compare_gradients(actual, shapes, expected)
+    (row,) = [row for row in rows if row["name"] == key]
+    assert row["status"] == "FAIL" and "above" in row["reason"]
+    assert gate.group_summary(rows)["audio"]["fail"] == 1
+    json.dumps(rows, allow_nan=False)
 
 
 def test_diagnostics_match_direct_fp64_norm_and_difference_across_chunk_boundary(monkeypatch):
@@ -237,7 +271,9 @@ def test_memory_plan_is_full_bf16_only_and_requires_measured_headroom(modality):
     assert plan["bf16_weights_and_gradients_bytes"] == 4 * plan["parameters"]
     assert plan["minimum_free_gpu_bytes"] == 4 * plan["parameters"] + 12 * 2**30
     assert plan["recommended_host_memory_bytes"] == 256 * 2**30
-    assert plan["outer_timeout_seconds"] == 600
+    # f1 hf-parity runs took 774-780 s; route-conditioned adds one native phase.
+    assert plan["mode"] == "hf-parity" and plan["outer_timeout_seconds"] == 900
+    assert gate.estimate(modality, "route-conditioned")["outer_timeout_seconds"] == 1500
     assert plan["optimizer_update"] == "NOT_RUN"
     assert plan["released_weights"] == "NOT_RUN"
     assert plan["estimate_only"] is True

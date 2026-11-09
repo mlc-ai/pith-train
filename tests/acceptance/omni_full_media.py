@@ -3,13 +3,16 @@
 Uses the existing real prepared-bundle fixtures and HF forward adapters, while
 replacing their returned tiny configs with the pinned official full config.
 No allocation, download, optimizer update, or released-weight loading occurs.
-Run each modality in a fresh process under an external 600-second hard timeout.
+Run each modality in a fresh process under the external hard timeout that estimate()
+suggests for its mode (f1 hf-parity runs took 774-780 s; route-conditioned adds one native
+phase of about 140 s).
 
 --mode route-conditioned adds a native phase that replays the HF reference's top-k
 routes (omni_route_replay); that phase decides the verdict and the free-running
-native phase becomes a diagnostic. Audio key-bias gradients are analytically zero, so
-their NSE compares rounding residues; they keep that verdict until a calibrated criterion
-exists, and their size relative to the query bias is reported alongside.
+native phase becomes a diagnostic. Audio key-bias gradients are structurally zero, so
+their NSE compares rounding residues; they are judged instead by their CPU-calibrated
+size relative to the key-gradient rows (omni_structural_zero), with NSE kept as a
+diagnostic.
 """
 
 import argparse
@@ -32,12 +35,12 @@ from tests.acceptance.omni_reference_attention import (
     reference_contract,
 )
 from tests.acceptance.omni_route_replay import (
-    annotate_key_bias_ratios,
     capture_routes,
     group_summary,
     replay_routes,
     route_statistics,
 )
+from tests.acceptance.omni_structural_zero import bound, criterion_contract, judge_key_bias_rows
 from tests.acceptance.omni_topology_contract import verify_source, write_json
 
 MODALITIES = ("image", "audio", "video")
@@ -62,7 +65,10 @@ def official_config(path, repo):
     return config
 
 
-def estimate(modality):
+OUTER_TIMEOUT_SECONDS = {"hf-parity": 900, "route-conditioned": 1500}
+
+
+def estimate(modality, mode="hf-parity"):
     encoder, tensors = ENCODER_COUNTS[modality]
     parameters = text_gate.PARAMETER_COUNT + encoder
     return {
@@ -73,7 +79,8 @@ def estimate(modality):
         "minimum_free_gpu_bytes": parameters * 4 + 12 * 2**30,
         "recommended_host_memory_bytes": 256 * 2**30,
         "maximum_input_tokens": MAX_INPUT_TOKENS,
-        "outer_timeout_seconds": 600,
+        "mode": mode,
+        "outer_timeout_seconds": OUTER_TIMEOUT_SECONDS[mode],
         "optimizer_update": "NOT_RUN",
         "fp32_main_grad": "NOT_RUN",
         "released_weights": "NOT_RUN",
@@ -286,9 +293,9 @@ def compare_gradients(parameters, shapes, expected=None):
                         row["status"] = "FAIL"
         rows.append(row)
     # Individual mathematically-zero gradients are still compared (including 0 vs 0).
-    # Audio key biases, whose exact gradient is zero by construction, keep that verdict
-    # too; their size relative to the query bias is reported, being uncalibrated.
-    annotate_key_bias_ratios(rows)
+    # Audio key biases, whose exact gradient is zero by construction, are judged by their
+    # calibrated size relative to the key-gradient rows instead; their NSE stays reported.
+    judge_key_bias_rows(rows, text_gate.GRAD_THRESHOLD, bound("official"))
     # Each full trainable component must actually participate in the objective.
     for prefix in ("model.", "lm_head.", "audio_tower.", "visual."):
         members = [row for row in rows if row["name"].startswith(prefix)]
@@ -378,9 +385,10 @@ def execute(args, config, shapes, source, batch, fixture):
         "status": "RUNNING",
         "dtype": "bfloat16",
         "fixture": fixture,
-        "estimate": estimate(args.modality),
+        "estimate": estimate(args.modality, args.mode),
         "configuration": config.to_dict(),
         "reference_attention": {"contract": reference_contract(args)},
+        "structural_zero_criterion": criterion_contract("official"),
         "phases": [],
         "update": "NOT_RUN",
         "fp32_main_grad": "NOT_RUN",
@@ -566,7 +574,7 @@ def main():
                     "mode": args.mode,
                     "status": "NOT_RUN",
                     "weight_source": args.weight_source,
-                    "estimate": estimate(args.modality),
+                    "estimate": estimate(args.modality, args.mode),
                     "fixture": fixture,
                 },
                 indent=2,
