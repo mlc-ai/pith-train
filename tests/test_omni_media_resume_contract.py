@@ -1,5 +1,9 @@
 """CPU observation/coverage guards for strict native media resume acceptance."""
 
+import ast
+import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +15,8 @@ from tests.acceptance.omni_media_resume import (
     ObservedMediaData,
     audio_spec,
     parse_args,
+    phase_marker,
+    process_age,
     require_components,
     run_gpu,
 )
@@ -321,3 +327,52 @@ def test_component_groups_include_both_towers_every_layer_and_deepstack():
         "lm_head.weight",
     ):
         assert len([group for group in groups if name.startswith(group)]) == 1, name
+
+
+def test_phase_marker_prints_one_flushed_json_line_to_stderr(capsys, monkeypatch):
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    phase_marker("train-step-done", step=2, max_allocated_bytes=7)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    (line,) = captured.err.splitlines()
+    prefix, payload = line.split(" ", 1)
+    record = json.loads(payload)
+    assert prefix == "OMNI_MEDIA_RESUME_PHASE" and record["phase"] == "train-step-done"
+    assert record["step"] == 2 and record["max_allocated_bytes"] == 7
+    assert record["rank"] == "1" and record["local_rank"] == "0" and record["pid"] == os.getpid()
+    assert record["utc"].endswith("+00:00")
+    age = process_age()
+    assert age is None or age >= 0
+
+
+def test_gpu_phases_are_marked_in_execution_order():
+    path = Path(__file__).parents[1] / "tests/acceptance/omni_media_resume.py"
+    tree = ast.parse(path.read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_gpu")
+    calls = [
+        call
+        for call in ast.walk(run)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "phase_marker"
+    ]
+    # Source order (ast.walk is breadth-first).
+    phases = [call.args[0].value for call in sorted(calls, key=lambda call: call.lineno)]
+    for earlier, later in (
+        ("run-gpu-start", "cuda-device-set"),
+        ("cuda-device-set", "setup-distributed-start"),
+        ("setup-distributed-start", "setup-distributed-done"),
+        ("setup-distributed-done", "dataset-ready"),
+        ("dataset-ready", "training-ready"),
+        ("checkpoint-found", "expected-state-saved"),
+        ("checkpoint-load-start", "checkpoint-loaded"),
+    ):
+        assert phases.index(earlier) < phases.index(later)
+    for phase in (
+        "train-step-start",
+        "train-step-done",
+        "rank-report-written",
+        "final-barrier-done",
+    ):
+        assert phase in phases

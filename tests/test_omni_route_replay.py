@@ -1,4 +1,4 @@
-"""CPU checks for route-conditioned parity and the analytic-zero audio key-bias criterion.
+"""CPU checks for route-conditioned parity and the analytically zero audio key bias.
 
 The MoE arm uses the real native router/reference method with the CPU kernel
 substitutes below and the production replay_indices hook, so router_replay is
@@ -22,6 +22,7 @@ from pithtrain.contexts import training as training_context
 from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.load_balance import replay_indices
 from tests.acceptance import omni_route_replay as routing
+from tests.acceptance import omni_structural_zero as zero
 from tests.acceptance.omni_full_size import gradient_diagnostics, metric
 from tests.cpu_helpers import load_definitions
 from tests.test_qwen3_omni_audio import audio_config, paired
@@ -219,57 +220,6 @@ def test_route_statistics_count_set_changes_and_use_reference_margins():
     assert stats["unflipped_reference_margin"]["max"] == pytest.approx(0.15)
 
 
-def key_bias_rows(k_actual, k_reference, q=1.0, status="FAIL"):
-    rows = []
-    for name, actual, reference in (
-        ("audio_tower.layers.0.self_attn.k_proj.bias", k_actual, k_reference),
-        ("audio_tower.layers.0.self_attn.q_proj.bias", q, q),
-    ):
-        rows.append(
-            {
-                "name": name,
-                "status": status,
-                "finite": True,
-                "actual_l2": actual,
-                "reference_l2": reference,
-                "difference": 1.0,
-            }
-        )
-    return rows
-
-
-@pytest.mark.parametrize("status", ["PASS", "FAIL"])
-@pytest.mark.parametrize(
-    "k_actual,k_reference,q,ratios,states",
-    [
-        (4e-7, 5.6e-6, 1.0, (4e-7, 5.6e-6), ("DEFINED", "DEFINED")),
-        (0.05, 0.05, 1.0, (0.05, 0.05), ("DEFINED", "DEFINED")),
-        (0.5, 1e-6, 1.0, (0.5, 1e-6), ("DEFINED", "DEFINED")),
-        (None, 1e-6, 1.0, (None, 1e-6), ("MISSING", "DEFINED")),
-        (0.0, 0.0, 0.0, (None, None), ("UNDEFINED_ZERO_QUERY", "UNDEFINED_ZERO_QUERY")),
-        (float("nan"), 1e-6, 1.0, (None, 1e-6), ("NONFINITE", "DEFINED")),
-    ],
-)
-def test_key_bias_ratios_are_reported_without_changing_the_nse_verdict(
-    k_actual, k_reference, q, ratios, states, status
-):
-    rows = routing.annotate_key_bias_ratios(key_bias_rows(k_actual, k_reference, q, status))
-    key, query = rows
-    assert key["status"] == query["status"] == status and "reason" not in key
-    assert key["difference"] == 1.0
-    got = key["key_to_query_gradient_ratio"]
-    for side, expected in zip(("actual", "reference"), ratios, strict=True):
-        assert got[side] is None if expected is None else got[side] == pytest.approx(expected)
-    assert key["key_to_query_ratio_state"] == dict(actual=states[0], reference=states[1])
-    assert "key_to_query_gradient_ratio" not in query
-
-
-def test_key_bias_ratio_without_its_query_row_is_missing():
-    (row,) = routing.annotate_key_bias_ratios(key_bias_rows(1e-6, 1e-6, status="FAIL")[:1])
-    assert row["status"] == "FAIL"
-    assert row["key_to_query_ratio_state"] == dict(actual="MISSING", reference="MISSING")
-
-
 def test_audio_key_bias_gradient_is_analytically_zero_but_its_nse_is_ill_posed():
     """Guards the analytic-zero rationale: RoPE or a key norm would break invariance."""
     config = audio_config(encoder_layers=2)
@@ -301,23 +251,28 @@ def test_audio_key_bias_gradient_is_analytically_zero_but_its_nse_is_ill_posed()
         out = call(model).last_hidden_state
         probe = torch.randn(out.shape, generator=torch.Generator().manual_seed(5), dtype=out.dtype)
         (out * probe).sum().backward()
+        attention = model.get_submodule("layers.0.self_attn")
         gradients[name] = {
-            target: model.get_submodule(f"layers.0.self_attn.{target}_proj").bias.grad
-            for target in ("k", "q")
+            "k_proj.bias": attention.k_proj.bias.grad,
+            "q_proj.bias": attention.q_proj.bias.grad,
+            "k_proj.weight": attention.k_proj.weight.grad,
         }
     for name in gradients:
-        assert gradients[name]["k"].norm() < 1e-4 * gradients[name]["q"].norm()
+        assert gradients[name]["k_proj.bias"].norm() < 1e-4 * gradients[name]["q_proj.bias"].norm()
     rows = [
         {
-            "name": f"audio_tower.layers.0.self_attn.{target}_proj.bias",
+            "name": f"audio_tower.layers.0.self_attn.{target}",
             "status": "PASS",
             "finite": True,
+            "shape": list(gradients["native"][target].shape),
             **gradient_diagnostics(gradients["native"][target], gradients["hf"][target]),
         }
-        for target in ("k", "q")
+        for target in ("k_proj.bias", "q_proj.bias", "k_proj.weight")
     ]
-    assert rows[0]["nse"] > 0.1 and rows[1]["nse"] < 1e-9
-    routing.annotate_key_bias_ratios(rows)
-    # The ratio is reported, not judged: the rows keep the status they came with.
-    assert rows[0]["status"] == rows[1]["status"] == "PASS"
-    assert rows[0]["key_to_query_gradient_ratio"]["actual"] < 1e-4
+    assert rows[0]["nse"] > 0.1 and rows[1]["nse"] < 1e-9 and rows[2]["nse"] < 1e-9
+    # FP64 residues sit far below any calibrated BF16 bound; 1e-3 is illustrative.
+    zero.judge_key_bias_rows(rows, 1e-2, 1e-3)
+    # The NSE between the two residues fails; the structural-zero criterion decides.
+    assert rows[0]["nse_status"] == "FAIL" and rows[0]["status"] == "PASS"
+    assert max(rows[0]["residue_ratio"].values()) < 1e-4
+    assert all("criterion" not in row and row["status"] == "PASS" for row in rows[1:])

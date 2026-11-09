@@ -3,6 +3,10 @@
 Select audio, video or the complete multimodal Thinker with --component.
 All modes use the production prepared-bundle reader. All native model parameters,
 optimizers, schedulers, RNG and data cursor remain in strict snapshots.
+
+Each phase boundary prints one flushed OMNI_MEDIA_RESUME_PHASE JSON line to stderr (UTC
+time, rank, pid, seconds since process start), so a run killed by an outer timeout still
+shows the last phase it reached. The markers only print.
 """
 
 import argparse
@@ -11,10 +15,11 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +37,34 @@ from tests.test_omni_training_acceptance import digest
 
 REPO = Path(__file__).resolve().parents[2]
 PROCESS_NONCE = uuid.uuid4().hex
+
+
+def process_age():
+    """Seconds since this process started (Linux /proc), or None elsewhere."""
+    try:
+        with open("/proc/self/stat") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        with open("/proc/uptime") as handle:
+            uptime = float(handle.read().split()[0])
+        return round(uptime - int(fields[19]) / os.sysconf("SC_CLK_TCK"), 3)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def phase_marker(phase, **fields):
+    """Print one flushed stderr line marking a phase boundary; it changes no state."""
+    record = dict(
+        utc=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        rank=os.environ.get("RANK"),
+        local_rank=os.environ.get("LOCAL_RANK"),
+        pid=os.getpid(),
+        process_age_seconds=process_age(),
+        phase=phase,
+        **fields,
+    )
+    print(
+        "OMNI_MEDIA_RESUME_PHASE", json.dumps(record, sort_keys=True), file=sys.stderr, flush=True
+    )
 
 
 @dataclass(frozen=True)
@@ -334,13 +367,16 @@ def require_components(keys, prefixes):
 
 
 def run_gpu(args, spec):
+    phase_marker("run-gpu-start", mode=getattr(args, "mode", None), component=spec.name)
     assert os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", "GPU execution is opt-in"
     assert int(os.environ.get("WORLD_SIZE", "1")) == args.world_size
     assert torch.cuda.is_available(), "Requires CUDA"
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    phase_marker("cuda-device-set")
     from tests.acceptance.omni_hopper_hardware import require_hardware
 
     require_hardware(getattr(args, "hardware_family", "H100"))
+    phase_marker("hardware-verified")
     prepared = json.loads((args.output / "prepare.json").read_text())
     assert {
         key: value
@@ -350,6 +386,7 @@ def run_gpu(args, spec):
     assert prepared["production_reader"]["status"] == "PASSED"
     assert input_identity(args.output / "data", spec.modalities) == prepared["input"]
     subprocess.run(["git", "-C", str(REPO), "diff", "--quiet", "HEAD"], check=True)
+    phase_marker("prepared-input-verified")
     from pithtrain.contexts import distributed, training
     from pithtrain.modules.checkpoint import find_checkpoint
     from pithtrain.modules.distributed import setup_distributed
@@ -357,6 +394,8 @@ def run_gpu(args, spec):
     from pithtrain.modules.logging import setup_logging
     from pithtrain.modules.training import make_adamw_optimizer, make_wsd_scheduler, setup_training
     from pithtrain.tasks import pretrain_lm
+
+    phase_marker("training-imports-done")
 
     cfg = pretrain_lm.PretrainLMCfg()
     cfg.distributed.pipeline_parallel_size, cfg.distributed.expert_parallel_size = args.pp, args.ep
@@ -386,9 +425,13 @@ def run_gpu(args, spec):
         "checkpoints" if args.mode == "produce" else "restored-checkpoints"
     )
     setup_logging(cfg)
+    phase_marker("setup-distributed-start")
     setup_distributed(cfg)
+    phase_marker("setup-distributed-done")
     data = ObservedMediaData(pretrain_lm.setup_dataset(cfg))
+    phase_marker("dataset-ready")
     setup_training(cfg)
+    phase_marker("training-ready", max_allocated_bytes=torch.cuda.max_memory_allocated())
     rank = distributed.rank
     label = args.mode if args.mode != "negative" else "negative-" + args.negative_case
     report_path = args.output / f"{label}-rank-{rank:05d}.json"
@@ -422,12 +465,18 @@ def run_gpu(args, spec):
     )
 
     def observed_step(step):
+        # Step 1 also writes the step-2 checkpoint (save_interval 2) inside train_step.
+        phase_marker("train-step-start", step=step)
         observation = ObjectiveObservation(pretrain_lm.objective)
         with patch.object(pretrain_lm, "objective", observation):
             pretrain_lm.train_step(cfg, data, step)
+        phase_marker(
+            "train-step-done", step=step, max_allocated_bytes=torch.cuda.max_memory_allocated()
+        )
         return observation.outputs
 
     def complete_snapshot():
+        phase_marker("snapshot-start")
         state = snapshot(data)
         local_keys = sorted(state["model"])
         keys = [None] * args.world_size
@@ -435,10 +484,12 @@ def run_gpu(args, spec):
         require_components(set().union(*(set(part) for part in keys)), spec.required_components)
         assert set(state) == {"model", "optimizer", "scheduler", "data", "rng"}
         assert set(state["rng"]) == {"torch_cpu", "python", "numpy", "cuda"}
+        phase_marker("snapshot-done")
         return state
 
     try:
         if args.mode == "negative":
+            phase_marker("negative-case-start", case=args.negative_case)
             report["rejection"] = negative_case(args, cfg, data)
             report["negative_case"] = args.negative_case
             report["all_ranks_rejected"] = True
@@ -446,6 +497,7 @@ def run_gpu(args, spec):
             for step in range(2):
                 observed_step(step)
             assert find_checkpoint(t.save_location) == 2
+            phase_marker("checkpoint-found", step=2)
             expected = dict(
                 boundary=complete_snapshot(), producer_nonce=PROCESS_NONCE, producer_pid=os.getpid()
             )
@@ -456,9 +508,12 @@ def run_gpu(args, spec):
                 third_objectives=objectives,
                 third_module_updates=observer.steps[-1],
             )
+            phase_marker("expected-state-save-start")
             torch.save(expected, expected_path)
+            phase_marker("expected-state-saved")
             assert len(observer.steps) == 3
         else:
+            phase_marker("expected-state-load-start")
             expected = torch.load(expected_path, weights_only=True)
             assert expected["producer_nonce"] != PROCESS_NONCE, (
                 "Use a fresh Python/torchrun process"
@@ -468,6 +523,7 @@ def run_gpu(args, spec):
                 for parameter in training.model.parameters():
                     parameter.zero_()
             torch.manual_seed(9917 + rank)
+            phase_marker("checkpoint-load-start", step=2)
             load_checkpoint(
                 args.restore_root or args.output / "checkpoints",
                 2,
@@ -475,6 +531,7 @@ def run_gpu(args, spec):
                 strict=True,
                 resume_config=resume_contract(cfg),
             )
+            phase_marker("checkpoint-loaded", step=2)
             boundary = complete_snapshot()
             _phase(
                 "exact complete boundary",
@@ -521,7 +578,9 @@ def run_gpu(args, spec):
         pre_hook.remove()
         post_hook.remove()
         report_path.write_text(json.dumps(report, indent=2) + "\n")
+        phase_marker("rank-report-written", status=report["status"])
     dist.barrier()
+    phase_marker("final-barrier-done")
 
 
 def config_from_file(path):
@@ -571,5 +630,6 @@ def execute(args, spec):
 
 
 if __name__ == "__main__":
+    phase_marker("entrypoint-imported")
     arguments = parse_args()
     execute(arguments, component_spec(arguments.component))

@@ -105,6 +105,66 @@ update. The Run133/Run136 and `f828ed01` update failures stay recorded as measur
 only new runs are judged by the split verdict. A weight-decay-only difference, of order
 lr * weight_decay * |p| per element, is below the 1e-2 resolution and is not claimed.
 
+## Full-size parity verdicts
+
+Two criteria were revised on 2026-11-08 by maintainer decision after the f1 results on
+`f1cc8f3`. Both apply only to new runs. Every result judged under the earlier criteria
+stays as measured, including the f1 failures of the official-dimension text, image, audio
+and video rows and of the staged audio gate.
+
+**Route-conditioned MoE parity.** At official dimensions with random weights, the
+free-running comparison fails only on routers, experts and post-attention norms. A
+rounding-level difference upstream of a router flips the top-k choice of tokens whose k-th
+and (k+1)-th router probabilities nearly tie, and every parameter such a token reaches gets
+a legitimately different gradient. The f1 text controls show this is not native-specific:
+HF with FA4 against HF eager fails the same 19 of 531 parameters with the same 156 of 1,536
+token-layer route flips as native, and native replaying the reference's routes passes
+531/531. The verdict for these rows is therefore `--mode route-conditioned` of
+`omni_full_size.py` and `omni_full_media.py`, present since `e9e98c3`, before the f1 runs:
+the replay phase decides and the free-running phase is a diagnostic. Replay removes only the
+discrete expert choice; native routers still compute their own probabilities and weights.
+For image, audio and video, attributing their free-running failures to route flips remains
+an inference until their route-conditioned runs exist.
+
+**Audio key-bias structural zero.** Audio self-attention adds `k_proj.bias` to every key a
+query sees, with no RoPE, key norm or bias-dependent mask, so the exact gradient of
+`audio_tower.layers.*.self_attn.k_proj.bias` is zero by softmax shift invariance. A computed
+value is rounding residue, and the NSE of two independent residues is about 1 at any size.
+`omni_structural_zero.py` judges these rows instead by the residue's size relative to the
+key-gradient rows whose rounded sum it is (the same layer's `k_proj.weight` gradient norm
+over the square root of its width), on each side, against a bound for the gate's
+configuration; NSE stays a diagnostic. `omni_key_bias_calibration.py` fixed the bounds on CPU
+alone, before any GPU run under the rule: 10x the largest BF16 ratio as each gate evaluates
+it, rounded up to two significant figures.
+
+| Configuration (gate) | Evaluated layouts | Largest BF16 ratio | Bound | Injected faults caught in every layer on the gate's real input |
+|---|---|---|---|---|
+| official (`omni_full_media`) | whole vector | 2.5e-3 | 0.025 | RoPE on keys, key norm, bias on half the keys |
+| staged (`omni_image_staged`, audio) | whole, 1/2, 1/4 shards | 0.016 | 0.17 | RoPE on keys, key norm; bias on half the keys is missed |
+| multimodal (`omni_multimodal_training`) | whole, 1/2, 1/4 shards | 7.7e-3 | 0.078 | RoPE on keys, key norm; bias on half the keys is missed |
+
+The faults are injected into the native attention on CPU, on the gates' real fixture and
+recordings. The weakest, a bias applied to only half of each window's keys, leaves the
+forward pass unchanged at zero bias. At full size it gives at least 0.071, 2.8 times the
+bound; on the staged encoders it gives at most 0.084 against bounds of 0.17 and 0.078, so
+this criterion does not detect it there (on short random windows it does).
+
+In FP64, with the softmax kept in FP64, exactly the audio key biases are structurally zero
+for both implementations: at most 7e-19 of the largest gradient norm, against at least 2e-6
+for every other parameter. The full-size grid used emulated BF16 kernels (FP32 GEMMs and
+convolutions on BF16 inputs, rounded to BF16); on the fixture case PyTorch's own CPU BF16
+kernels give a largest ratio of 2.0e-3 against 1.8e-3 emulated. The scale was chosen on
+the same CPU data: the query-bias gradient, the other candidate, varies more on the tiny
+encoders and would have given staged bounds of 0.39. The f1 GPU audio ratios, about 1e-3
+on the query-bias scale, were seen before calibration and set no bound. `bound()` refuses
+encoder dimensions, and `require_calibrated_shards` shard layouts, that the calibration did
+not cover.
+
+**Diagnostics.** The staged gates write every parameter's FP64 norms, max-abs values and NSE
+to `gradient-rows-rank-*.json` before judging, and report all failures together.
+`omni_media_resume.py` prints one `OMNI_MEDIA_RESUME_PHASE` JSON line per phase boundary to
+stderr, so a run killed by an outer timeout shows the last phase it reached.
+
 ## Supported boundaries
 
 Native media uses BF16 activations and FP32 master/gradient/Adam state, CP1 and explicit
@@ -116,6 +176,8 @@ not implemented. Released 30B end-to-end training has not passed. Caller-provide
 codes/data are required; this PR does not add an RVQ tokenizer or a reward model.
 
 Do not turn failed normalized-error checks into passes by changing denominators,
-freezing parameters, forcing routing, or citing a small aggregate loss difference.
+freezing parameters, forcing routing, or citing a small aggregate loss difference. The
+criteria revised above are recorded maintainer decisions for new runs; they do not re-score
+earlier failures.
 The original fast-path strict noise ratios are retained as reproducibility diagnostics;
 ordinary numerical correctness and strict repeatability remain distinct contracts.
