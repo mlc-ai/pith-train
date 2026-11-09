@@ -1,5 +1,7 @@
 """CPU mathematical and real custom-op/compiled observer controls."""
 
+import ast
+from pathlib import Path
 from typing import Optional, Tuple
 
 import pytest
@@ -368,7 +370,54 @@ def packed_record(monkeypatch, sink_gradient=None):
     return record
 
 
+FA4_SOURCE = Path(__file__).resolve().parents[1] / "pithtrain" / "operators" / "flash_attn_v4.py"
+
+
+def fa4_custom_op_signatures():
+    """{registered name: (argument names, return count)} of the FA4 custom ops, from source.
+
+    torch.library.custom_op infers each schema from its function's signature, so this reads
+    them without importing the operators, whose import probes the CUDA device
+    (pithtrain.kernels.arch).
+    """
+    signatures = {}
+    for node in ast.parse(FA4_SOURCE.read_text(encoding="utf-8")).body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            if not (
+                isinstance(decorator, ast.Call)
+                and ast.unparse(decorator.func) == "torch.library.custom_op"
+            ):
+                continue
+            namespace, operation = decorator.args[0].value.split("::")
+            arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            returns = node.returns
+            count = (
+                len(returns.slice.elts)
+                if isinstance(returns, ast.Subscript) and isinstance(returns.slice, ast.Tuple)
+                else 1
+            )
+            signatures[f"{namespace}.{operation}.default"] = (
+                tuple(argument.arg for argument in arguments),
+                count,
+            )
+    return signatures
+
+
+def test_capture_schema_matches_the_fa4_backward_operation_sources():
+    signatures = fa4_custom_op_signatures()
+    real = {name: kind for name, kind in gate.BWD_NAMES.items() if name.startswith("pithtrain.")}
+    assert sorted(real.values()) == ["dense", "varlen"]
+    for name, kind in real.items():
+        assert signatures[name] == (gate.BWD_ARGUMENTS[kind], 4)
+
+
 def test_capture_schema_matches_the_registered_fa4_backward_operations():
+    # Importing the operators runs pithtrain.kernels.arch, which probes the CUDA device; without
+    # one, the source check above covers the schema.
+    if not torch.cuda.is_available():
+        pytest.skip("importing the FA4 operators probes a CUDA device")
     pytest.importorskip("pithtrain.operators.flash_attn_v4")
     real = {name: kind for name, kind in gate.BWD_NAMES.items() if name.startswith("pithtrain.")}
     assert sorted(real.values()) == ["dense", "varlen"]
