@@ -393,7 +393,7 @@ def test_audio_has_no_transformers_execution_imports_or_cached_feature_state():
                 assert all(
                     not (
                         isinstance(target, ast.Attribute)
-                        and target.attr in {"input_features", "model_context", "audio_features"}
+                        and target.attr in {"input_features", "media_context", "audio_features"}
                     )
                     for target in node.targets
                 )

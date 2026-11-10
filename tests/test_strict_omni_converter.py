@@ -1,4 +1,4 @@
-"""Actual strict container CPU I/O; HF modules and cursor are protocol fixtures.
+"""Actual strict container CPU I/O; HF modules and data fingerprint are protocol fixtures.
 
 No native GPU forward/backward, real loader, or NCCL acceptance is claimed.
 """
@@ -22,6 +22,7 @@ from torch.distributed.tensor import Shard, distribute_tensor
 
 from pithtrain.contexts import distributed, training
 from pithtrain.modules.distributed_checkpoint import (
+    _DataFingerprint,
     _pack,
     _runtime,
     load_checkpoint,
@@ -42,7 +43,7 @@ from pithtrain.tasks.convert_checkpoint.strict_omni import (
     read_payloads,
 )
 from tests import test_qwen3_omni_checkpoint as fixtures
-from tests.test_distributed_strict_checkpoint import Cursor
+from tests.test_distributed_strict_checkpoint import FINGERPRINT
 from tests.test_strict_checkpoint import assert_tree_equal, native_shaped_cpu_model
 
 
@@ -126,7 +127,7 @@ def make_runtime(profile, rank):
         hsdp_replica=1,
         protocol="CPU-fixture",
     )
-    return model, opt, sch, Cursor(), contract
+    return model, opt, sch, _DataFingerprint(FINGERPRINT), contract
 
 
 def advance(model, opt, sch, data):
@@ -135,7 +136,6 @@ def advance(model, opt, sch, data):
     opt.step()
     sch.step()
     opt.zero_grad(set_to_none=True)
-    data.consumed += 2
 
 
 def worker(rank, folder, profile, mode):
@@ -153,12 +153,20 @@ def worker(rank, folder, profile, mode):
         if mode == "save":
             advance(model, opt, sch, data)
             save_checkpoint(
-                root / "original", 1, data_state=data, strict=True, resume_config=contract
+                root / "original",
+                1,
+                data_fingerprint=FINGERPRINT,
+                strict=True,
+                resume_config=contract,
             )
         else:
             assert not opt.state
             load_checkpoint(
-                root / "restored", 1, data_state=data, strict=True, resume_config=contract
+                root / "restored",
+                1,
+                data_fingerprint=FINGERPRINT,
+                strict=True,
+                resume_config=contract,
             )
             values, _ = _runtime(model, (opt,), (sch,), data, torch.device("cpu"))
             expected = torch.load(
@@ -251,7 +259,7 @@ FAULTS = (
     "scheduler-factory",
     "scheduler-step",
     "scheduler-nonfinite",
-    "cursor",
+    "legacy-cursor",
     "missing-rng",
     "cpu-rng",
     "topology",
@@ -320,8 +328,9 @@ def corrupt(folder, fault, companion=False):
         state["scheduler"][0]["last_epoch"] = 2
     elif fault == "scheduler-nonfinite":
         state["scheduler"][0]["gamma"] = float("nan")
-    elif fault == "cursor":
-        state["data"]["consumed_samples"] = 1
+    elif fault == "legacy-cursor":
+        # A version-1 consumed-sample cursor is rejected rather than ignored.
+        state["data"].update(version=1, consumed_samples=1)
     elif fault == "missing-rng":
         del payload["rng"]["torch_cpu"]
     elif fault == "cpu-rng":
@@ -359,7 +368,7 @@ def test_export_rejects_corruption_before_writing(saved, tmp_path, fault):
         "scheduler-policy-config",
         "scheduler-factory",
         "missing-moment",
-        "cursor",
+        "legacy-cursor",
         "missing-rng",
         "checksum",
         "config-diff",

@@ -50,14 +50,15 @@ def binding(tmp_path, monkeypatch):
         p = base / name
         p.parent.mkdir(parents=True, exist_ok=True)
         if name.endswith("training_data.py"):
+            # Step-indexed reader shape: the text early return comes first, no cursor.
             p.write_text(
-                "class DensePretrainData:\n    def __init__(self): pass\n"
-                "class OmniPretrainData:\n"
+                "class TokenBinData:\n    def __init__(self): pass\n"
+                "class PreparedBundleData:\n"
                 "    def get_batch(self, step, device):\n"
-                "        self.begin_step(step)\n"
                 "        if self._dense is not None:\n"
                 "            return self._dense.get_batch(step, device)\n"
-                "        return self._media_microbatches(device)\n"
+                "        result, failure = None, None\n"
+                "        return self._media_microbatches(step, device)\n"
                 + "".join(
                     f"    def {method.split('.')[1]}(self): pass\n"
                     for method in methods
@@ -174,7 +175,9 @@ def test_changed_numeric_function_rejected(binding):
 def test_text_early_return_cannot_be_changed(binding):
     args, _ = binding
     p = args.feature_repo / "pithtrain/modules/training_data.py"
-    p.write_text(p.read_text().replace("self.begin_step(step)", "self.begin_step(step + 1)"))
+    before = "self._dense.get_batch(step, device)"
+    assert before in p.read_text()
+    p.write_text(p.read_text().replace(before, "self._dense.get_batch(step + 1, device)"))
     commit(args.feature_repo, "data order changed")
     with pytest.raises(ValueError, match="Text batch early-return"):
         new.common_audit(args.base_repo, args.feature_repo)
@@ -452,7 +455,8 @@ def test_actual_reviewed_function_binding_and_roundtrip(reviewed_binding, monkey
     new.create_binding(args)
     bound = new.load_binding(args.output)
     audit = bound["source_audit"]
-    assert len(audit["identical_functions"]) == 9
+    # 4 training + 2 task + TokenBinData, less the 2 scoped; the cursor methods are gone.
+    assert len(audit["identical_functions"]) == 5
     assert len(audit["scoped_equivalent_functions"]) == 2
     for report in audit["scoped_equivalent_functions"].values():
         assert report["raw_ast_equal"] is False

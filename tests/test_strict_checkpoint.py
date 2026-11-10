@@ -1,8 +1,8 @@
 """CPU recovery contract, not native CUDA backward or real PP/EP execution.
 
 Fresh processes run a real HF Thinker text model with a stochastic test loss and
-the converter's native-shaped checkpoint proxy. The small Stateful fixture is
-test-only; PR100's actual loader remains a separately pinned integration gate.
+the converter's native-shaped checkpoint proxy. The small step-indexed data fixture
+is test-only; PR100's actual readers are covered by their own tests.
 """
 
 import argparse
@@ -42,46 +42,27 @@ from pithtrain.tasks.convert_checkpoint import hf2dcp
 from tests import test_qwen3_omni_checkpoint as converter
 
 
-class CommittedDataFixture:
-    """PR100 state protocol test double using the existing MemmapDataset.
+class StepIndexedDataFixture:
+    """PR100 step-indexed data test double using the existing MemmapDataset.
 
-    Deliberately no new production loader/sampler. Real PR100 fingerprint,
-    prefetch, staged-token handling and observation protocol need integration.
+    Deliberately no new production loader/sampler: the training step selects the
+    samples and a static fingerprint records data identity. There is no cursor.
     """
 
     global_batch_size = 2
 
     def __init__(self, path):
         self.dataset = MemmapDataset(path, sequence_length=7)
-        self.fingerprint = hashlib.sha256(path.read_bytes() + b"B2/S7/test-fixture").hexdigest()
-        self.consumed_samples, self.pending_step = 0, None
-
-    def state_dict(self):
-        if self.pending_step is not None:
-            raise RuntimeError("Only checkpoint data after the optimizer step has completed")
-        return dict(version=1, fingerprint=self.fingerprint, consumed_samples=self.consumed_samples)
-
-    def load_state_dict(self, state):
-        if state["version"] != 1 or state["fingerprint"] != self.fingerprint:
-            raise ValueError("Data fixture fingerprint/version differs")
-        consumed = state["consumed_samples"]
-        if type(consumed) is not int or consumed < 0 or consumed % self.global_batch_size:
-            raise ValueError("Invalid checkpoint data consumption position")
-        self.consumed_samples, self.pending_step = consumed, None
+        self.data_fingerprint = hashlib.sha256(
+            path.read_bytes() + b"B2/S7/test-fixture"
+        ).hexdigest()
 
     def get_batch(self, step):
-        assert self.pending_step is None and self.consumed_samples == step * 2
-        self.pending_step = step
-        ids = list(range(self.consumed_samples, self.consumed_samples + 2))
+        ids = list(range(step * self.global_batch_size, (step + 1) * self.global_batch_size))
         pairs = [self.dataset[index] for index in ids]
         tokens, labels = (torch.stack(values) for values in zip(*pairs, strict=True))
         labels[:, 0] = -100
         return dict(sample_ids=ids, tokens=tokens, labels=labels, mask=labels != -100)
-
-    def commit_step(self, step):
-        assert self.pending_step == step
-        self.consumed_samples += self.global_batch_size
-        self.pending_step = None
 
 
 def seed(value):
@@ -133,7 +114,12 @@ def make_optimizer(model, kind):
 
 def resume_state(model, optimizer, scheduler, data, step):
     return StrictResumeState(
-        model, (optimizer,), (scheduler,), data_state=data, step=step, global_batch_size=2
+        model,
+        (optimizer,),
+        (scheduler,),
+        data_fingerprint=data.data_fingerprint,
+        step=step,
+        global_batch_size=2,
     )
 
 
@@ -153,7 +139,6 @@ def update(model, optimizer, scheduler, data, step):
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad(set_to_none=True)
-    data.commit_step(step)
     assert any(not torch.equal(left, right) for left, right in zip(before, model.parameters()))
     assert all(torch.isfinite(p).all() for p in model.parameters())
     return {
@@ -170,7 +155,7 @@ def worker(root, mode, layout, optimizer_kind):
     seed(2026 if mode == "save" else 901)
     config = converter.config.__wrapped__()
     model = native_shaped_cpu_model(config).train()
-    data = CommittedDataFixture(root / "tokens.npy")
+    data = StepIndexedDataFixture(root / "tokens.npy")
     optimizer, scheduler = make_optimizer(model, optimizer_kind)
     checkpoint = root / "training"
     if mode == "save":
@@ -207,7 +192,7 @@ def worker(root, mode, layout, optimizer_kind):
                     "max_state_error": 0,
                     "cuda_initialized": torch.cuda.is_initialized(),
                     "model": "HF Thinker eager CPU, native-shaped checkpoint proxy",
-                    "data": "MemmapDataset + test-only PR100 Stateful contract fixture",
+                    "data": "MemmapDataset + test-only PR100 step-indexed data fixture",
                 },
                 indent=2,
             )
@@ -271,18 +256,14 @@ def test_fresh_process_next_batch_and_continuous_update(data_path, layout, optim
     print("RESUME_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
 
 
-def linear_state(data_path, *, committed):
+def linear_state(data_path):
     model = nn.Linear(2, 3)
     optimizer, scheduler = make_optimizer(model, "adamw")
     model(torch.ones(1, 2)).square().sum().backward()
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad(set_to_none=True)
-    data = CommittedDataFixture(data_path)
-    if committed:
-        data.get_batch(0)
-        data.commit_step(0)
-    return resume_state(model, optimizer, scheduler, data, 1)
+    return resume_state(model, optimizer, scheduler, StepIndexedDataFixture(data_path), 1)
 
 
 FAULTS = [
@@ -305,8 +286,8 @@ FAULTS = [
     "optimizer_membership",
     "optimizer_order",
     "fingerprint",
-    "cursor",
-    "cursor_bool",
+    "fingerprint_type",
+    "legacy_cursor",
     "step",
     "batch_size",
     "optimizer_type",
@@ -343,10 +324,11 @@ def corrupt(saved, fault):
         saved["optimizer"]["param_groups"][0]["params"].reverse()
     elif fault == "fingerprint":
         saved["data"]["fingerprint"] = "different-data"
-    elif fault == "cursor":
-        saved["data"]["consumed_samples"] = 4
-    elif fault == "cursor_bool":
-        saved["data"]["consumed_samples"] = True
+    elif fault == "fingerprint_type":
+        saved["data"]["fingerprint"] = 7
+    elif fault == "legacy_cursor":
+        # A version-1 checkpoint's consumed-sample cursor is rejected, not ignored.
+        saved["data"].update(version=1, consumed_samples=2)
     elif fault == "step":
         saved["resume"]["step"] = 7
     elif fault == "batch_size":
@@ -366,27 +348,35 @@ def corrupt(saved, fault):
 
 @pytest.mark.parametrize("fault", FAULTS)
 def test_corrupt_checkpoint_rejected_before_live_state_changes(data_path, fault):
-    saved = copy.deepcopy(linear_state(data_path, committed=True).state_dict())
+    saved = copy.deepcopy(linear_state(data_path).state_dict())
     corrupt(saved, fault)
     root = data_path.parent / "corrupt"
     dcp.save({"app": saved}, checkpoint_id=root / "torch-dcp/00000001", no_dist=True)
-    live = linear_state(data_path, committed=False)
+    live = linear_state(data_path)
     before = copy.deepcopy(live._snapshot())
     with pytest.raises(StrictResumeError):
         load_strict_checkpoint(root, live)
     assert_tree_equal(live._snapshot(), before)
-    assert live.data_state.pending_step is None
 
 
-def test_save_rejects_uncommitted_or_wrong_boundary_and_existing_target(data_path):
-    state = linear_state(data_path, committed=False)
+@pytest.mark.parametrize("fingerprint", [None, "", 7])
+def test_strict_state_requires_data_fingerprint(fingerprint):
+    model = nn.Linear(2, 3)
+    optimizer, scheduler = make_optimizer(model, "adamw")
+    with pytest.raises(StrictResumeError, match="data fingerprint"):
+        StrictResumeState(
+            model,
+            (optimizer,),
+            (scheduler,),
+            data_fingerprint=fingerprint,
+            step=1,
+            global_batch_size=2,
+        )
+
+
+def test_save_never_overwrites_existing_target(data_path):
+    state = linear_state(data_path)
     root = data_path.parent / "checkpoint"
-    with pytest.raises(StrictResumeError, match="position disagree"):
-        save_strict_checkpoint(root, state)
-    state.data_state.get_batch(0)
-    with pytest.raises(RuntimeError, match="optimizer step"):
-        save_strict_checkpoint(root, state)
-    state.data_state.commit_step(0)
     location = save_strict_checkpoint(root, state)
     content = {p.name: p.read_bytes() for p in location.iterdir()}
     with pytest.raises(FileExistsError):
@@ -395,13 +385,13 @@ def test_save_rejects_uncommitted_or_wrong_boundary_and_existing_target(data_pat
 
 
 def test_rejected_checkpoint_preserves_pristine_optimizer(data_path):
-    saved = linear_state(data_path, committed=True).state_dict()
+    saved = linear_state(data_path).state_dict()
     del saved["optimizer"]
     root = data_path.parent / "pristine"
     dcp.save({"app": saved}, checkpoint_id=root / "torch-dcp/00000001", no_dist=True)
     model = nn.Linear(2, 3)
     optimizer, scheduler = make_optimizer(model, "adamw")
-    state = resume_state(model, optimizer, scheduler, CommittedDataFixture(data_path), 1)
+    state = resume_state(model, optimizer, scheduler, StepIndexedDataFixture(data_path), 1)
     before = copy.deepcopy(model.state_dict())
     optimizer_before = copy.deepcopy(optimizer.state_dict())
     assert not optimizer.state
@@ -413,7 +403,7 @@ def test_rejected_checkpoint_preserves_pristine_optimizer(data_path):
 
 
 def test_weight_initialization_is_not_strict_resume(data_path, monkeypatch):
-    state = linear_state(data_path, committed=False)
+    state = linear_state(data_path)
     root = data_path.parent / "weights-only"
     dcp.save(
         {"app": {"model": state.base.state_dict()["model"]}},
@@ -436,7 +426,7 @@ def test_initialization_rejects_strict_rank_local_format_before_model_access(tmp
 
 
 def test_python_cached_gaussian_is_valid_resume_state(data_path):
-    source = linear_state(data_path, committed=True)
+    source = linear_state(data_path)
     random.seed(125)
     random.gauss(0, 1)
     assert isinstance(random.getstate()[2], float)
@@ -444,7 +434,7 @@ def test_python_cached_gaussian_is_valid_resume_state(data_path):
     save_strict_checkpoint(root, source)
     expected = random.gauss(0, 1)
     random.seed(991)
-    restored = linear_state(data_path, committed=False)
+    restored = linear_state(data_path)
     load_strict_checkpoint(root, restored)
     assert random.gauss(0, 1) == expected
 
@@ -453,7 +443,7 @@ def test_python_cached_gaussian_is_valid_resume_state(data_path):
 def test_distributed_resume_is_explicitly_not_certified(data_path, monkeypatch, axis):
     monkeypatch.setattr(distributed, axis, 2)
     with pytest.raises(NotImplementedError, match="PP=EP=CP=1"):
-        linear_state(data_path, committed=False)
+        linear_state(data_path)
 
 
 @pytest.mark.parametrize("pp,ep", [(1, 1), (1, 2), (2, 1), (2, 2)])

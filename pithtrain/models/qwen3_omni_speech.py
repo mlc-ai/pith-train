@@ -216,7 +216,7 @@ def generate_speech_from_condition(
             module.training = was_training
 
 
-def thinker_speech_forward(thinker, input_ids, model_context, accept_hidden_layer):
+def thinker_speech_forward(thinker, input_ids, media_context, accept_hidden_layer):
     """Expose native Thinker embeddings and the selected layer without hooks.
 
     This composition requires a complete native module (phase=-1, CP=EP=1).
@@ -235,13 +235,13 @@ def thinker_speech_forward(thinker, input_ids, model_context, accept_hidden_laye
         if hasattr(mlp, "experts_per_rank") and mlp.experts_per_rank != mlp.num_experts:
             raise ValueError("Speech feature extraction cannot bypass expert-parallel dispatch")
     width = getattr(thinker, "text_hidden_size", thinker.hidden_size)
-    payload = thinker.forward_prolog(input_ids, model_context)
+    payload = thinker.forward_prolog(input_ids, media_context)
     embeddings = payload[..., :width]
     current_hidden = embeddings
-    context = model_context or {}
+    context = media_context or {}
     has_vision = any(context.get(key) is not None for key in ("image_grid_thw", "video_grid_thw"))
     hidden = embeddings if accept_hidden_layer == 0 else None
-    rotary = thinker.forward_posemb(input_ids.shape[1], model_context=model_context)
+    rotary = thinker.forward_posemb(input_ids.shape[1], media_context=media_context)
     for index, layer in enumerate(layers, 1):
         if hasattr(layer, "reference_forward_with_hidden"):
             payload, layer_hidden = layer.reference_forward_with_hidden(
@@ -518,7 +518,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
     def forward(
         self,
         input_ids,
-        model_context,
+        media_context,
         codes,
         code_lengths,
         *,
@@ -528,7 +528,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
         position_kwargs=None,
     ):
         features = thinker_speech_forward(
-            self.thinker, input_ids, model_context, self.config.talker_config.accept_hidden_layer
+            self.thinker, input_ids, media_context, self.config.talker_config.accept_hidden_layer
         )
         condition = prepare_talker_condition(
             self.talker,
@@ -539,7 +539,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
             text_embedding=self.thinker.embed_tokens,
             prompt_lengths=prompt_lengths,
             speaker=speaker,
-            attention_mask=model_context.get("attention_mask"),
+            attention_mask=media_context.get("attention_mask"),
             position_kwargs=position_kwargs,
         )
         outputs = speech_teacher_force(
@@ -556,7 +556,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
     def generate(
         self,
         input_ids,
-        model_context,
+        media_context,
         *,
         max_text_tokens=128,
         max_codec_frames=1024,
@@ -578,7 +578,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
             raise ValueError("max_text_tokens must be a positive finite integer")
         if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
             raise ValueError("Native complete Thinker generation requires one nonempty row")
-        mask = model_context.get("attention_mask")
+        mask = media_context.get("attention_mask")
         if mask is not None and (mask.shape != input_ids.shape or not (mask == 1).all()):
             raise ValueError("Native complete Thinker generation requires an unpadded prompt")
         # The released Thinker text config leaves eos_token_id unset.
@@ -603,7 +603,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
         self.eval()
         try:
             sequence, prompt_length, reached_eos = input_ids.clone(), input_ids.shape[1], False
-            context = dict(model_context)
+            context = dict(media_context)
             context.pop("position_ids", None)  # Recompute positions for the growing token sequence.
             for _ in range(max_text_tokens):
                 context.update(input_ids=sequence, attention_mask=torch.ones_like(sequence))

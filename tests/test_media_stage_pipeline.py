@@ -80,7 +80,7 @@ def test_pipeline_passes_media_only_to_stage_zero(pp_rank, phase, overlap, with_
                 model_inputs=(tokens,),
                 objective_inputs=(tokens,),
                 cu_seqlens=None,
-                model_context={"input_ids": tokens, "image_grid_thw": torch.tensor([[1, 2, 2]])}
+                media_context={"input_ids": tokens, "image_grid_thw": torch.tensor([[1, 2, 2]])}
                 if with_media
                 else None,
                 media_inputs={"pixel_values": torch.full((4, 3), float(index))}
@@ -125,11 +125,11 @@ def test_pipeline_passes_media_only_to_stage_zero(pp_rank, phase, overlap, with_
     assert stage == modules[phase].stage_index
     # The overlapped backward uses batch 0; routing replay must see forward batch 1.
     assert replay_microbatch == 1
-    context = kwargs.get("model_context")
+    context = kwargs.get("media_context")
     if not with_media:
         assert context is None
         if not overlap:
-            assert "model_context" not in kwargs
+            assert "media_context" not in kwargs
     else:
         expected = batches[1].context_for_stage(stage)
         assert context.keys() == expected.keys()

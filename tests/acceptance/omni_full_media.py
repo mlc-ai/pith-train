@@ -322,7 +322,7 @@ def run_phase(
     with capture_routes(model, native) as routes:
         with contextlib.nullcontext() if replay is None else replay_routes(model, replay):
             logits = (
-                model.reference_forward(inputs["input_ids"], model_context=inputs)
+                model.reference_forward(inputs["input_ids"], media_context=inputs)
                 if native
                 else model(inputs)
             )

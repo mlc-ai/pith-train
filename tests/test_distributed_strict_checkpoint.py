@@ -1,7 +1,7 @@
 """Real two-process Gloo/DTensor protocol tests, not native GPU acceptance.
 
-The small CPU model and cursor isolate rank-local storage, uneven expert shards,
-collective rejection and rollback. The separate GPU entrance uses production
+The small CPU model and a static data fingerprint isolate rank-local storage, uneven
+expert shards, collective rejection and rollback. The separate GPU entrance uses production
 Omni, DualPipeV/FSDP and the real PR100 loader without these protocol fixtures.
 """
 
@@ -26,6 +26,7 @@ from pithtrain.modules.checkpoint import find_checkpoint
 from pithtrain.modules.distributed_checkpoint import (
     MANIFEST,
     DistributedCheckpointError,
+    _DataFingerprint,
     _pack,
     _runtime,
     load_checkpoint,
@@ -33,27 +34,8 @@ from pithtrain.modules.distributed_checkpoint import (
 )
 from tests.acceptance.omni_native_resume import equal
 
-
-class Cursor:
-    """Protocol-only CPU state; never described as a real data-loader test."""
-
-    def __init__(self):
-        self.consumed = 0
-        self.pending = self.fail_apply = self.malformed = False
-
-    def state_dict(self):
-        if self.pending:
-            raise ValueError("uncommitted batch")
-        value = dict(version=1, fingerprint="cpu-protocol", consumed_samples=self.consumed)
-        if self.malformed:
-            del value["fingerprint"]
-        return value
-
-    def load_state_dict(self, value):
-        self.consumed = value["consumed_samples"]
-        if self.fail_apply:
-            self.fail_apply = False
-            raise RuntimeError("injected one-rank apply failure")
+# Step-indexed data contributes only this static identity to strict checkpoints.
+FINGERPRINT = "cpu-protocol"
 
 
 def initialize_mesh(profile, rank):
@@ -100,17 +82,16 @@ def build(attn_mesh, expt_mesh):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False)
     sch = torch.optim.lr_scheduler.StepLR(opt, 1, gamma=0.8)
     training.model, training.optimizers, training.schedulers = model, (opt,), (sch,)
-    return model, opt, sch, Cursor()
+    return model, opt, sch, _DataFingerprint(FINGERPRINT)
 
 
 def advance(parts):
-    model, opt, sch, data = parts
+    model, opt, sch, _ = parts
     loss = sum((p.square().sum()).full_tensor() for p in model.parameters())
     loss.backward()
     opt.step()
     sch.step()
     opt.zero_grad(set_to_none=True)
-    data.consumed += 2
     random.random()
     np.random.random()
     torch.rand(3)
@@ -170,8 +151,11 @@ def mutate(root, case):
         state["optimizer"][0]["param_groups"][0]["params"].reverse()
     elif case == "missing-rng":
         del payload["rng"]["torch_cpu"]
-    elif case == "cursor":
-        state["data"]["consumed_samples"] = 3
+    elif case == "fingerprint":
+        state["data"]["fingerprint"] = "other-data"
+    elif case == "legacy-cursor":
+        # A version-1 consumed-sample cursor is rejected rather than ignored.
+        state["data"].update(version=1, consumed_samples=2)
     else:
         raise AssertionError(case)
     torch.save(payload, path)
@@ -194,7 +178,6 @@ def worker(rank, root, profile, mode):
         torch.set_num_threads(1)
         attn, expt = initialize_mesh(profile, rank)
         parts = build(attn, expt)
-        data = parts[-1]
         contract = dict(training=dict(global_batch_size=2), protocol="CPU-only", profile=profile)
         seed = (100 if mode == "save" else 900) + rank
         random.seed(seed)
@@ -202,14 +185,18 @@ def worker(rank, root, profile, mode):
         torch.manual_seed(seed)
         if mode == "save":
             advance(parts)
-            save_checkpoint(root / "good", 1, data_state=data, strict=True, resume_config=contract)
+            save_checkpoint(
+                root / "good", 1, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
+            )
             assert find_checkpoint(root / "good") == 1
             boundary = snapshot(parts)
             advance(parts)
             torch.save(dict(boundary=boundary, after=snapshot(parts)), root / f"expected-{rank}.pt")
         else:
             assert not parts[1].state
-            load_checkpoint(root / "good", 1, data_state=data, strict=True, resume_config=contract)
+            load_checkpoint(
+                root / "good", 1, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
+            )
             expected = torch.load(root / f"expected-{rank}.pt", weights_only=True)
             equal(snapshot(parts), expected["boundary"])
             advance(parts)
@@ -231,7 +218,8 @@ def worker(rank, root, profile, mode):
                 "moment-mesh",
                 "moment-nonfinite",
                 "missing-rng",
-                "cursor",
+                "fingerprint",
+                "legacy-cursor",
             )
             for case in cases:
                 target = root / case
@@ -241,41 +229,71 @@ def worker(rank, root, profile, mode):
                 dist.barrier()
                 before = snapshot(parts)
                 try:
-                    load_checkpoint(target, 1, data_state=data, strict=True, resume_config=contract)
+                    load_checkpoint(
+                        target, 1, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
+                    )
                 except DistributedCheckpointError:
                     pass
                 else:
                     raise AssertionError(f"Accepted {case}")
                 equal(snapshot(parts), before)
+            # Ranks that disagree on the data identity are rejected collectively.
             before = snapshot(parts)
-            data.malformed = rank == 1
             with pytest.raises(DistributedCheckpointError, match="load contract"):
                 load_checkpoint(
-                    root / "good", 1, data_state=data, strict=True, resume_config=contract
+                    root / "good",
+                    1,
+                    data_fingerprint=FINGERPRINT if rank == 0 else "other-data",
+                    strict=True,
+                    resume_config=contract,
                 )
-            data.malformed = False
             equal(snapshot(parts), before)
-            before = snapshot(parts)
-            data.fail_apply = rank == 1
+            with pytest.raises(DistributedCheckpointError, match="load arguments"):
+                load_checkpoint(
+                    root / "good",
+                    1,
+                    data_fingerprint=FINGERPRINT if rank == 0 else "",
+                    strict=True,
+                    resume_config=contract,
+                )
+            equal(snapshot(parts), before)
+            # A one-rank failure while applying restores every rank. Patch the class, not the
+            # instance: the scheduler contract serializes instance attributes.
+            scheduler_type = type(parts[2])
+            original = scheduler_type.load_state_dict
+
+            def fail_once(self, value):
+                scheduler_type.load_state_dict = original
+                raise RuntimeError("injected one-rank apply failure")
+
+            if rank == 1:
+                scheduler_type.load_state_dict = fail_once
             with pytest.raises(DistributedCheckpointError, match="apply strict checkpoint"):
                 load_checkpoint(
-                    root / "good", 1, data_state=data, strict=True, resume_config=contract
+                    root / "good",
+                    1,
+                    data_fingerprint=FINGERPRINT,
+                    strict=True,
+                    resume_config=contract,
                 )
+            scheduler_type.load_state_dict = original
             equal(snapshot(parts), before)
-            data.pending = rank == 1
-            with pytest.raises(DistributedCheckpointError, match="uncommitted"):
+            with pytest.raises(DistributedCheckpointError, match="save contract"):
                 save_checkpoint(
-                    root / "uncommitted", 2, data_state=data, strict=True, resume_config=contract
+                    root / "disagreeing",
+                    2,
+                    data_fingerprint=FINGERPRINT if rank == 0 else "other-data",
+                    strict=True,
+                    resume_config=contract,
                 )
-            data.pending = False
-            assert not (root / "uncommitted/torch-dcp/00000002" / MANIFEST).exists()
+            assert not (root / "disagreeing/torch-dcp/00000002" / MANIFEST).exists()
             if rank == 1:
                 parts[1].state.clear()
             with pytest.raises(DistributedCheckpointError, match="optimizer parameter state"):
                 save_checkpoint(
                     root / "missing-optimizer",
                     2,
-                    data_state=data,
+                    data_fingerprint=FINGERPRINT,
                     strict=True,
                     resume_config=contract,
                 )
@@ -283,7 +301,11 @@ def worker(rank, root, profile, mode):
             distributed.cp_size = 2 if rank == 1 else 1
             with pytest.raises(DistributedCheckpointError, match="CP=1"):
                 load_checkpoint(
-                    root / "good", 1, data_state=data, strict=True, resume_config=contract
+                    root / "good",
+                    1,
+                    data_fingerprint=FINGERPRINT,
+                    strict=True,
+                    resume_config=contract,
                 )
             distributed.cp_size = 1
             assert not torch.cuda.is_initialized()
@@ -294,7 +316,7 @@ def worker(rank, root, profile, mode):
                         profile=profile,
                         corruption_cases=len(cases),
                         apply_failure_rollback=True,
-                        uncommitted_rejected=True,
+                        fingerprint_disagreement_rejected=True,
                         cuda_initialized=False,
                     )
                 )
@@ -401,7 +423,7 @@ def scheduler_contract_worker(rank, directory):
         contract = dict(test="strict-lambda-v1", training=dict(global_batch_size=2))
         advance(parts)
         save_checkpoint(
-            root / "lambda", 1, data_state=parts[3], strict=True, resume_config=contract
+            root / "lambda", 1, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
         )
         advance(parts)
         expected = snapshot(parts)
@@ -411,12 +433,16 @@ def scheduler_contract_worker(rank, directory):
         before = snapshot(restored)
         with pytest.raises(DistributedCheckpointError, match="configuration"):
             load_checkpoint(
-                root / "lambda", 1, data_state=restored[3], strict=True, resume_config=contract
+                root / "lambda",
+                1,
+                data_fingerprint=FINGERPRINT,
+                strict=True,
+                resume_config=contract,
             )
         equal(snapshot(restored), before)
         restored[2].lr_lambdas = [_native_lr_factory(0.5)]
         load_checkpoint(
-            root / "lambda", 1, data_state=restored[3], strict=True, resume_config=contract
+            root / "lambda", 1, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
         )
         advance(restored)
         equal(snapshot(restored), expected)

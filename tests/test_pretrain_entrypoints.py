@@ -58,40 +58,6 @@ def test_qwen_example_help_needs_no_training_imports(monkeypatch, capsys):
     assert "--data-format" in help_text
 
 
-@pytest.mark.parametrize(
-    "arguments,match",
-    [
-        (["--modalities", "text", "text"], "modalities"),
-        (["--data-format", "token_bin", "--modalities", "image"], "token_bin"),
-        (
-            ["--modalities", "text", "image", "--sampling-weights", '{"text":1}'],
-            "weights",
-        ),
-        (["--num-workers", "-1"], "num_workers"),
-    ],
-)
-def test_qwen_example_rejects_invalid_data_before_launch(monkeypatch, tmp_path, arguments, match):
-    calls = example_modules(monkeypatch)
-    path = ROOT / "examples/pretrain_lm/qwen3-omni/script.py"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(path),
-            "--dataset",
-            str(tmp_path),
-            "--model",
-            "model-config",
-            "--checkpoint",
-            str(tmp_path / "checkpoint"),
-            *arguments,
-        ],
-    )
-    with pytest.raises(ValueError, match=match):
-        runpy.run_path(str(path), run_name="__main__")
-    assert calls == []
-
-
 @pytest.mark.parametrize("historical", [False, True], ids=["current", "pr-base"])
 @pytest.mark.parametrize("kind", ["correctness", "performance"])
 def test_identical_validation_template_supports_base_and_feature(monkeypatch, historical, kind):

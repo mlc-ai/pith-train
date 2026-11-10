@@ -25,7 +25,9 @@ StepLR/LambdaLR and PR100 prepared data**. It operates on actual rank-local
 DTensor shards; no `full_tensor()` or model all-gather is used for saving.
 Model weights use the existing canonical expert mapping and public
 localization on restore. Optimizer parameter membership, its local shards,
-scheduler, committed data cursor and Python/NumPy/CPU/CUDA RNG remain per rank.
+scheduler, data fingerprint and Python/NumPy/CPU/CUDA RNG remain per rank. Data is
+step-indexed (strict format version 2): no reader cursor is saved, and version-1
+checkpoints that stored one are rejected.
 No dummy optimizer step initializes a fresh live optimizer during preflight.
 
 Strict steps are stored under `root/torch-dcp/XXXXXXXX/` as `rank-NNNNN.pt`
@@ -38,7 +40,7 @@ All ranks agree on step, data and numerical contract. Before applying any
 state they verify the complete file set/checksums, world size, both parallel
 meshes, rank coordinates, DTensor placements/global and local shapes/dtypes,
 all model keys, exact optimizer membership and moments, update counters,
-scheduler state, committed cursor/fingerprint and every RNG component.
+scheduler state, the data fingerprint and every RNG component.
 Local validation errors are exchanged so all participating ranks reject.
 Recoverable application errors trigger rollback on **all** ranks, including
 those that already applied the checkpoint. No rank proceeds into training
@@ -56,15 +58,16 @@ the wrong global expert count; the CPU test uses three experts split 2/1.
 `tests/test_distributed_strict_checkpoint.py` launches real two-process Gloo
 groups and real DTensors, with separate producer and restore processes. It
 checks DP sharding, PP stage names and EP expert ownership layouts. A small
-CPU model and explicitly labeled cursor fixture isolate the checkpoint
+CPU model and a static data fingerprint isolate the checkpoint
 protocol; they are **not** a native model or real-loader acceptance substitute.
 
 Cases include exact state and next-update equality, missing rank/completion,
 checksum truncation, missing/unexpected model keys, shape/dtype/topology errors,
-optimizer order, missing RNG, wrong cursor and bool-valued headers/manifests;
+optimizer order, missing RNG, wrong data fingerprint, a legacy version-1 cursor and
+bool-valued headers/manifests;
 every rank must reject without changing its live state. Additional cases
-cover one-rank apply failure with rollback, an uncommitted cursor and missing
-optimizer state before save. Existing lifecycle tests now exercise strict
+cover one-rank apply failure with rollback, ranks that disagree on the data
+fingerprint (load and save) and missing optimizer state before save. Existing lifecycle tests now exercise strict
 option propagation through both production save and launch/load paths.
 Existing converter and single-process strict negative tests remain intact.
 

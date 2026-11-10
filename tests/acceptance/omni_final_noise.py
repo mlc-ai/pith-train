@@ -37,7 +37,8 @@ BASE_PROVENANCE = {
         "pithtrain/tasks/prepare_omni_data.py": "7ed3ecb5df09ab3c7357a239fe6a95dc140b55ea6bde7c19b4b1898e2e371373",
     },
 }
-ENGINE_SHA256 = "7e64ea2ff4b30c8a76dd73bc7dc15096a2ec6786a40fb702f2157f8bd2635b6c"
+# The engine now records PR100's step-indexed data fingerprint instead of a reader cursor.
+ENGINE_SHA256 = "79280631334c2fa8280b909cad69fc0d0228ab419dc971ed0355eea831bf27d6"
 SCHEMA = "omni_final_text_noise_binding_v3"
 BINDING_ENV = "PITHTRAIN_OMNI_FINAL_NOISE_BINDING"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -67,13 +68,10 @@ UNCHANGED_FUNCTIONS = {
         "setup_training",
     ),
     "pithtrain/tasks/pretrain_lm.py": ("objective", "get_global_batch"),
-    "pithtrain/modules/training_data.py": (
-        "DensePretrainData",
-        "OmniPretrainData.begin_step",
-        "OmniPretrainData.commit_step",
-        "OmniPretrainData.state_dict",
-        "OmniPretrainData.load_state_dict",
-    ),
+    # PR100's step-indexed reader removed the cursor methods (begin_step, commit_step,
+    # state_dict, load_state_dict). The text position, step * global_batch_size, is in
+    # TokenBinData.get_batch; PreparedBundleData's text early return is pinned below.
+    "pithtrain/modules/training_data.py": ("TokenBinData",),
 }
 # Exact reviewed 1611d085 -> 045a90b numerical-equivalence projections. Any other
 # function, constructor, metadata helper dependency, or FSDP policy needs review.
@@ -279,7 +277,7 @@ def common_audit(base, feature):
     for repo in (base, feature):
         tree = ast.parse((repo / "pithtrain/modules/training_data.py").read_text())
         cls = next(
-            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "OmniPretrainData"
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PreparedBundleData"
         )
         method = next(
             n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "get_batch"

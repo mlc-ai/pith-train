@@ -385,10 +385,12 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         output_dtype=None,
         cast_forward_inputs=True,
     )
-    # Pipeline activations already have PARAM_DTYPE. Root context tensors (e.g. media timing) keep
-    # their precision, as on the overlapped path that calls prolog/posemb directly; compute children
-    # still cast their floating inputs through their own policies.
+    # Pipeline activations already have PARAM_DTYPE. Keep root context tensors
+    # (e.g. media timing) in their original precision, consistently with the
+    # overlapped path which calls prolog/posemb directly. Compute children
+    # still cast their floating inputs through their own FSDP policies.
     root_mp = replace(compute_mp, cast_forward_inputs=False)
+
     install_lean_hooks()
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
     # the expert parameters stay out of the layer's group.
@@ -424,7 +426,12 @@ def apply_fsdp(model, hsdp_replica: int = 1):
             register_fsdp_forward_method(layer, "forward_stage1")
             register_fsdp_forward_method(layer, "forward_stage3")
             register_fsdp_forward_method(layer, "forward_stage5")
-        fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=root_mp)
+        fully_shard(
+            model[i],
+            mesh=attn_fsdp_mesh,
+            reshard_after_forward=False,
+            mp_policy=root_mp,
+        )
 
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.

@@ -197,9 +197,9 @@ def validate_speech_batch(batch, model, mode, speaker="ethan"):
         return
     ids = _tensor(batch.get("input_ids"), "input_ids", device=codes.device)
     _require(ids.dtype in (torch.int32, torch.int64), "input_ids must be integer")
-    context = batch.get("model_context")
-    _require(isinstance(context, dict), "Explicit model_context is required")
-    _tensor(context.get("input_ids"), "model_context.input_ids", device=ids.device, shape=ids.shape)
+    context = batch.get("media_context")
+    _require(isinstance(context, dict), "Explicit media_context is required")
+    _tensor(context.get("input_ids"), "media_context.input_ids", device=ids.device, shape=ids.shape)
     for name, value in context.items():
         if isinstance(value, torch.Tensor):
             _tensor(value, name, device=ids.device)

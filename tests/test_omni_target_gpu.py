@@ -19,8 +19,7 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(minutes=2))
     from pithtrain.modules.microbatch import Microbatch
-    from pithtrain.modules.training_data import global_loss_mean, global_target_count
-    from pithtrain.tasks.pretrain_lm import objective
+    from pithtrain.tasks.pretrain_lm import global_loss_mean, global_target_count, objective
 
     rank = dist.get_rank()
     assert dist.get_world_size() == 4

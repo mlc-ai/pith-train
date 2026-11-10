@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from pithtrain.modules.microbatch import Microbatch
-from pithtrain.modules.training_data import global_loss_mean, global_target_count
 from tests.acceptance.omni_image_evidence import (
     OptimizerStepEvidence,
     fixed_image_batches,
@@ -38,6 +37,7 @@ from tests.acceptance.omni_structural_zero import (
     judge_key_bias_rows,
     require_calibrated_shards,
 )
+from tests.pretrain_lm_cpu import global_loss_mean, global_target_count
 
 GRADIENT_NSE = 1e-2
 
@@ -86,6 +86,21 @@ def record_gradient_rows(path, rank, rows, configuration=None):
     failed = [row for row in rows if row["status"] != "PASS"]
     assert not failed, [(row["name"], row.get("difference"), row.get("reason")) for row in failed]
     return {row["name"]: row["difference"] for row in rows}
+
+
+class ObservedSteps:
+    """Record which steps the unchanged production reader serves; batches pass through."""
+
+    def __init__(self, source):
+        self.source, self.steps = source, []
+
+    def __getattr__(self, name):
+        return getattr(self.source, name)
+
+    def get_batch(self, step, device):
+        batches = self.source.get_batch(step, device)
+        self.steps.append(dict(step=step, sample_ids=[batch.sample_ids for batch in batches]))
+        return batches
 
 
 def expected_shard(value, parameter, name, distributed):
@@ -162,7 +177,7 @@ def run(
         args.output.mkdir(parents=True)
         config.save_pretrained(t.model)
     dist.barrier()
-    data = pretrain_lm.setup_dataset(cfg)
+    data = ObservedSteps(pretrain_lm.setup_dataset(cfg))
     setup_training(cfg)
     hf_reference = reference_class(config, torch.bfloat16).to(distributed.device)
     attention = configure_reference_attention(hf_reference, config, reference_contract(args))
@@ -200,7 +215,7 @@ def run(
                 model_inputs=(inputs["input_ids"],),
                 cu_seqlens=None,
                 objective_inputs=(batch.labels.to(distributed.device),),
-                model_context=inputs,
+                media_context=inputs,
                 media_inputs={pixel_key: pixels} if distributed.pp_rank == 0 else None,
                 sample_ids=batch.sample_ids,
             )
@@ -290,7 +305,8 @@ def run(
         pre_hook.remove()
         post_hook.remove()
     assert len(observer.steps) == 4
-    assert data.consumed_samples == 32
+    # Step-indexed data: each update read exactly its own global step from the real reader.
+    assert [row["step"] for row in data.steps] == list(range(4)), data.steps
     report = dict(
         status="PASSED",
         modality=modality,
@@ -314,7 +330,8 @@ def run(
         training_modules=modules,
         real_reader_module_updates=observer.steps,
         real_reader_steps=4,
-        consumed_samples=32,
+        data_fingerprint=data.data_fingerprint,
+        real_reader_batches=data.steps,
         zero_target_rejection=zero_error,
         max_allocated_bytes=torch.cuda.max_memory_allocated(),
     )

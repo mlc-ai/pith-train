@@ -19,7 +19,7 @@ from pithtrain.models.qwen3_omni_image_inputs import validate_image_inputs
 from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.model_config import resolve_text_model_config
-from pithtrain.modules.training_data import OmniPretrainData
+from pithtrain.modules.training_data import PreparedBundleData
 from tests import test_omni_training as fixtures
 
 manifest = fixtures.manifest
@@ -67,7 +67,7 @@ def test_native_visual_modules_have_no_hf_execution_imports_or_feature_cache():
                         assert target.attr not in {
                             "image_features",
                             "deepstack_features",
-                            "model_context",
+                            "media_context",
                         }, name
 
 
@@ -87,38 +87,40 @@ def _bad_image_worker(rank, root, rendezvous, output):
     training = SimpleNamespace(
         global_batch_size=4, micro_batch_size=1, sequence_length=1024, seed=1234
     )
-    data = OmniPretrainData(
-        cfg,
-        training,
-        dp_rank=rank % 2,
-        dp_size=2,
-        pp_rank=rank // 2,
-        pp_size=2,
-        pp_group=pp_groups[rank % 2],
+    ranks = dict(
+        dp_rank=rank % 2, dp_size=2, pp_rank=rank // 2, pp_size=2, pp_group=pp_groups[rank % 2]
     )
+    data = PreparedBundleData(cfg, training, **ranks)
+    corrupt = [rank == 1]
 
     def validator(ids, inputs, config):
-        if rank == 1:
+        if corrupt[0]:
             inputs["pixel_values"][0, 0] = float("nan")
         return validate_image_inputs(ids, inputs, config)
 
     from pithtrain.tasks.prepare_omni_data import processor_for
 
     _, config = processor_for(data.recipe, True)
-    data.validate_model(
-        SimpleNamespace(input_modalities=("image",), validate_media_batch=validator), config
-    )
+    consumer = SimpleNamespace(input_modalities=("image",), validate_media_batch=validator)
+    data.validate_model(consumer, config)
     try:
-        data.get_batch(0, "cpu")
-    except RuntimeError as error:
-        message = str(error)
-        assert "Global media batch rejected" in message and "pixel_values" in message
-        assert data.consumed_samples == 0
+        try:
+            data.get_batch(0, "cpu")
+        except RuntimeError as error:
+            message = str(error)
+            assert "Global media batch rejected" in message and "pixel_values" in message
+        else:
+            raise AssertionError("Bad image accepted on a rank")
+        # Nothing durable advanced: once the input is valid, retrying the rejected step
+        # on every rank returns exactly what a fresh reader returns for that step.
+        corrupt[0] = False
+        retry = data.get_batch(0, "cpu")
+        fresh = PreparedBundleData(cfg, training, **ranks)
+        fresh.validate_model(consumer, config)
+        fixtures.compare_batches(retry, fresh.get_batch(0, "cpu"))
         Path(output, f"rank-{rank}.json").write_text(
             json.dumps(dict(status="PASSED", error=message))
         )
-    else:
-        raise AssertionError("Bad image accepted on a rank")
     finally:
         dist.destroy_process_group()
 
@@ -132,6 +134,17 @@ def test_one_bad_image_rejects_all_pp_and_dp_ranks(training_bundle, processor_co
     reports = [json.loads((output / f"rank-{rank}.json").read_text()) for rank in range(4)]
     assert len({row["error"] for row in reports}) == 1
     assert all(row["status"] == "PASSED" for row in reports)
+
+
+def test_staged_reader_observation_passes_batches_and_records_steps():
+    from tests.acceptance.omni_image_staged import ObservedSteps
+
+    batches = [SimpleNamespace(sample_ids=("image-a",)), SimpleNamespace(sample_ids=("image-b",))]
+    source = SimpleNamespace(get_batch=lambda step, device: batches, data_fingerprint="image-id")
+    data = ObservedSteps(source)
+    assert data.get_batch(3, "cpu") is batches
+    assert data.data_fingerprint == "image-id"
+    assert data.steps == [dict(step=3, sample_ids=[("image-a",), ("image-b",)])]
 
 
 def test_optimizer_keeps_vision_conv_and_projection_in_adamw():

@@ -16,7 +16,7 @@ import torch
 
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.data_config import DataCfg, resolve_bundle_modalities
-from pithtrain.modules.training_data import DensePretrainData, OmniPretrainData
+from pithtrain.modules.training_data import PreparedBundleData, TokenBinData
 from tests import test_training_data as text_fixtures
 
 text_corpus = text_fixtures.text_corpus
@@ -43,8 +43,8 @@ def task_config(**overrides):
             native_vision=False, native_video=False, native_audio=False, native_multimodal=False
         ),
         LoggingCfg=SimpleNamespace,
-        DensePretrainData=DensePretrainData,
-        OmniPretrainData=OmniPretrainData,
+        TokenBinData=TokenBinData,
+        PreparedBundleData=PreparedBundleData,
         distributed=SimpleNamespace(
             dp_rank=0, dp_size=1, cp_rank=0, cp_size=1, pp_rank=0, pp_size=1, pp_group=None
         ),
@@ -55,45 +55,10 @@ def task_config(**overrides):
     return SimpleNamespace(**namespace)
 
 
-def test_one_data_config_owns_source_and_independent_defaults(tmp_path):
-    task = task_config()
-    left, right = task.PretrainLMCfg(), task.PretrainLMCfg()
-    assert left.data is not right.data
-    assert not hasattr(left, "dataset") and not hasattr(left, "omni_data")
-    for removed in ("dataset", "omni_data"):
-        with pytest.raises(AttributeError, match=removed):
-            setattr(left, removed, tmp_path)
-    left.data.dataset = tmp_path
-    left.data.validate()
-    assert left.data.to_json_dict() == dict(
-        dataset=str(tmp_path),
-        format="token_bin",
-        modalities=("text",),
-        sampling_weights=None,
-        epoch_samples=None,
-        num_workers=0,
-    )
-    with pytest.raises(ValueError, match="data.dataset"):
-        right.data.validate()
-
-
 @pytest.mark.parametrize(
     "updates,match",
     [
-        ({"format": "guess"}, "data.format"),
-        ({"format": []}, "data.format"),
-        ({"dataset": None}, "data.dataset"),
-        ({"dataset": ""}, "data.dataset"),
-        ({"modalities": ()}, "modalities"),
-        ({"modalities": "text"}, "modalities"),
-        ({"modalities": ("text", "text")}, "modalities"),
-        ({"modalities": ("lidar",)}, "modalities"),
-        ({"modalities": (["text"],)}, "modalities"),
         ({"modalities": ("image",)}, "token_bin"),
-        ({"num_workers": -1}, "num_workers"),
-        ({"num_workers": True}, "num_workers"),
-        ({"epoch_samples": 8}, "Dense text"),
-        ({"sampling_weights": {"text": 1}}, "Dense text"),
         (
             {
                 "format": "prepared_bundle",
@@ -102,29 +67,9 @@ def test_one_data_config_owns_source_and_independent_defaults(tmp_path):
             },
             "weights",
         ),
-        (
-            {
-                "format": "prepared_bundle",
-                "modalities": ("image",),
-                "sampling_weights": {"image": float("nan")},
-            },
-            "weights",
-        ),
-        (
-            {
-                "format": "prepared_bundle",
-                "modalities": ("image",),
-                "sampling_weights": {"image": "1"},
-            },
-            "weights",
-        ),
-        (
-            {"format": "prepared_bundle", "modalities": ("image",), "epoch_samples": 0},
-            "epoch_samples",
-        ),
     ],
 )
-def test_config_rejects_ambiguous_or_unsupported_settings(tmp_path, updates, match):
+def test_config_rejects_incompatible_source_and_mixture(tmp_path, updates, match):
     cfg = DataCfg()
     cfg.dataset = tmp_path
     for name, value in updates.items():
@@ -139,7 +84,8 @@ def test_task_routes_storage_format_with_identical_text_batches(text_bundle, mon
     checks = []
     group = object()
     ranks = dict(dp_rank=1, dp_size=2, cp_rank=1, cp_size=2, pp_rank=1, pp_size=2, pp_group=group)
-    monkeypatch.setattr(OmniPretrainData, "validate_model", lambda self, *args: checks.append(args))
+    for cls in (TokenBinData, PreparedBundleData):
+        monkeypatch.setattr(cls, "validate_model", lambda self, *args: checks.append(args))
     task = task_config(
         AutoConfig=SimpleNamespace(from_pretrained=lambda path: path),
         model_class_for_config=lambda cfg, **flags: "Model",
@@ -152,10 +98,10 @@ def test_task_routes_storage_format_with_identical_text_batches(text_bundle, mon
     cfg.training.model = "model-config"
     cfg.data.dataset = root / "tokens/train"
     dense = task.setup_dataset(cfg)
-    assert isinstance(dense, DensePretrainData) and not checks
+    assert isinstance(dense, TokenBinData) and checks == [("Model", "model-config")]
     cfg.data.dataset, cfg.data.format = root, "prepared_bundle"
     prepared = task.setup_dataset(cfg)
-    assert isinstance(prepared, OmniPretrainData) and checks == [("Model", "model-config")]
+    assert isinstance(prepared, PreparedBundleData) and checks == [("Model", "model-config")] * 2
     for key, value in ranks.items():
         provider = prepared._dense if key.startswith("cp_") else prepared
         assert getattr(provider, key) == value

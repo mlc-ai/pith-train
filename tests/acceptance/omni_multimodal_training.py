@@ -31,7 +31,7 @@ from pithtrain.models.qwen3_omni_multimodal_inputs import multimodal_position_id
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator, Qwen3OmniDataset
-from pithtrain.modules.training_data import OmniPretrainData, global_loss_mean, global_target_count
+from pithtrain.modules.training_data import PreparedBundleData
 from pithtrain.tasks.prepare_omni_data import processor_for, verify_bundle, write_bundle, write_json
 from pithtrain.tasks.tokenize_corpus import Writer
 from tests.acceptance.omni_image_evidence import (
@@ -61,6 +61,7 @@ from tests.acceptance.omni_structural_zero import (
     criterion_contract,
     require_calibrated_shards,
 )
+from tests.pretrain_lm_cpu import global_loss_mean, global_target_count
 from tests.test_qwen3_omni_av import write_av
 
 MEDIA_KEYS = ("pixel_values", "pixel_values_videos", "input_features")
@@ -257,21 +258,23 @@ def prepare(args):
                 for key, value in batch.model_inputs.items()
             },
         )
-    # Verify the actual deterministic production mixture, then prove exact data resume.
+    # Verify the actual deterministic production mixture, then prove exact data resume:
+    # the reader is step-indexed, so a fresh reader with the same static fingerprint must
+    # return step 2 from the step alone, with no saved or restored reader cursor.
     data_cfg = DataCfg()
     data_cfg.dataset, data_cfg.format = destination, "prepared_bundle"
     data_cfg.modalities, data_cfg.epoch_samples = ("text", "image", "audio", "video"), 32
     train_cfg = SimpleNamespace(
         global_batch_size=8, micro_batch_size=1, sequence_length=2048, seed=1234
     )
-    data = OmniPretrainData(data_cfg, train_cfg)
+    data = PreparedBundleData(data_cfg, train_cfg)
     data.validate_model(
         SimpleNamespace(
             input_modalities=data_cfg.modalities, validate_media_batch=multimodal_position_ids
         ),
         config,
     )
-    steps, saved = [], None
+    steps = []
     for step in range(4):
         micro = data.get_batch(step, "cpu")
         kinds = [batch.sample_ids for batch in micro]
@@ -285,27 +288,27 @@ def prepare(args):
             )
             for batch in micro
         ), f"No vision at step {step}"
-        data.commit_step(step)
-        if step == 1:
-            saved = data.state_dict()
         if step == 2:
             expected = batch_hashes(micro)
-    restored = OmniPretrainData(data_cfg, train_cfg)
+    restored = PreparedBundleData(data_cfg, train_cfg)
     restored.validate_model(
         SimpleNamespace(
             input_modalities=data_cfg.modalities, validate_media_batch=multimodal_position_ids
         ),
         config,
     )
-    restored.load_state_dict(saved)
+    assert restored.data_fingerprint == data.data_fingerprint, "restored-data-fingerprint"
     equal(batch_hashes(restored.get_batch(2, "cpu")), expected, "restored-mixed-data")
     report = dict(
         status="PASSED",
-        scope="CPU real/controlled processor positions and exact next-data restore",
+        scope="CPU real/controlled processor positions and exact step-indexed next-data restore",
         gpu_acceptance="NOT_RUN",
         commit=commit(),
         inputs=audits,
         mixture_steps=steps,
+        data_fingerprint=data.data_fingerprint,
+        restored_step=2,
+        next_step=2,
         dataset_checksum=digest(destination / "checksums.sha256"),
         torch=torch.__version__,
     )
@@ -326,13 +329,14 @@ def batch_hashes(batches):
 
 class ObservedData:
     def __init__(self, source):
-        self.source, self.batches = source, {}
+        self.source, self.batches, self.steps_read = source, {}, []
 
     def __getattr__(self, name):
         return getattr(self.source, name)
 
     def get_batch(self, step, device):
         batches = self.source.get_batch(step, device)
+        self.steps_read.append(step)
         self.batches[step] = batch_hashes(batches)
         return batches
 
@@ -366,6 +370,10 @@ def staged(args):
     from pithtrain.tasks import pretrain_lm
     from tests.acceptance.omni_distributed_resume import snapshot
     from tests.acceptance.omni_hopper_hardware import require_hardware
+    from tests.acceptance.omni_media_resume import (
+        fingerprint_rejection,
+        require_stored_fingerprint,
+    )
 
     require_hardware(getattr(args, "hardware_family", "H100"))
     assert not args.output.exists(), "Use a fresh evidence directory"
@@ -440,7 +448,7 @@ def staged(args):
                 model_inputs=(inputs["input_ids"],),
                 cu_seqlens=None,
                 objective_inputs=(batch.labels.to(distributed.device),),
-                model_context=inputs,
+                media_context=inputs,
                 media_inputs=media if distributed.pp_rank == 0 else None,
                 sample_ids=batch.sample_ids,
             )
@@ -494,17 +502,28 @@ def staged(args):
         pretrain_lm.train_step(cfg, data, step)
         if step == 1:
             save_checkpoint(
-                checkpoint, 2, data_state=data.checkpoint_state, strict=True, resume_config=contract
+                checkpoint,
+                2,
+                data_fingerprint=data.data_fingerprint,
+                strict=True,
+                resume_config=contract,
             )
             boundary = snapshot(data)
         if step == 2:
             next_inputs, next_state = data.batches[2], snapshot(data)
-    assert data.consumed_samples == 32
+    # Step-indexed data: the real reader served steps 0-3 and the checkpoint holds only its
+    # static identity. A mismatched identity must be rejected before any state changes.
+    assert data.steps_read == [0, 1, 2, 3], data.steps_read
+    stored_fingerprint = require_stored_fingerprint(checkpoint, rank, data.data_fingerprint)
+    rejection = fingerprint_rejection(
+        checkpoint, 2, data.data_fingerprint, contract, lambda: snapshot(data)
+    )
     load_checkpoint(
-        checkpoint, 2, data_state=data.checkpoint_state, strict=True, resume_config=contract
+        checkpoint, 2, data_fingerprint=data.data_fingerprint, strict=True, resume_config=contract
     )
     equal(snapshot(data), boundary, "restored-model-optimizer-scheduler-rng-data")
     pretrain_lm.train_step(cfg, data, 2)
+    assert data.steps_read == [0, 1, 2, 3, 2], data.steps_read
     equal(data.batches[2], next_inputs, "next-mixed-inputs-and-media")
     equal(snapshot(data), next_state, "next-native-update")
     report = dict(
@@ -523,6 +542,10 @@ def staged(args):
         reference_attention=attention,
         module_updates=updates,
         strict_resume="EXACT",
+        data_fingerprint=data.data_fingerprint,
+        checkpoint_data_fingerprint=stored_fingerprint,
+        fingerprint_rejection=rejection,
+        data_steps_read=data.steps_read,
         next_inputs=next_inputs,
         processor=verify_bundle(args.dataset)["recipe"]["revision"],
         dataset_checksum=digest(args.dataset / "checksums.sha256"),

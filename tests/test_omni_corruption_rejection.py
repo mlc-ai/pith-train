@@ -15,10 +15,17 @@ from pithtrain.modules import distributed_checkpoint as checkpoint
 from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
 from tests.acceptance.omni_distributed_resume import (
     negative_case,
+    stored_data_fingerprint,
     verify_corruption_rejection,
 )
 from tests.acceptance.omni_native_resume import equal
-from tests.test_distributed_strict_checkpoint import advance, build, initialize_mesh, snapshot
+from tests.test_distributed_strict_checkpoint import (
+    FINGERPRINT,
+    advance,
+    build,
+    initialize_mesh,
+    snapshot,
+)
 
 FAULTS = {
     "missing-rank": (
@@ -45,6 +52,13 @@ FAULTS = {
         "validate every rank before mutation",
         "DistributedCheckpointError",
         "Optimizer group configuration/membership differs",
+    ),
+    # Step-indexed data: the stored data fingerprint is the only data state.
+    "fingerprint": (
+        "validate every rank before mutation",
+        "DistributedCheckpointError",
+        "Checkpoint data fingerprint differs: check the dataset, modalities, sampling, "
+        "seed, sequence length and batch sizes before resuming",
     ),
 }
 
@@ -144,7 +158,6 @@ def protocol_worker(rank, directory):
         torch.set_num_threads(1)
         assert not torch.cuda.is_initialized()
         parts = build(*initialize_mesh("fsdp-layout", rank))
-        cursor = parts[-1]
         cfg = SimpleNamespace(
             training=SimpleNamespace(
                 model=root / "model",
@@ -156,15 +169,26 @@ def protocol_worker(rank, directory):
         advance(parts)
         advance(parts)
         save_checkpoint(
-            root / "checkpoints", 2, data_state=cursor, strict=True, resume_config=contract
+            root / "checkpoints",
+            2,
+            data_fingerprint=FINGERPRINT,
+            strict=True,
+            resume_config=contract,
         )
         before = snapshot(parts)
         # Positive control uses the identical production load path and configuration.
         load_checkpoint(
-            root / "checkpoints", 2, data_state=cursor, strict=True, resume_config=contract
+            root / "checkpoints",
+            2,
+            data_fingerprint=FINGERPRINT,
+            strict=True,
+            resume_config=contract,
         )
         equal(snapshot(parts), before)
-        data = SimpleNamespace(checkpoint_state=cursor)
+        # The driver's evidence reads back exactly the data identity this rank stored.
+        assert stored_data_fingerprint(root / "checkpoints", rank) == FINGERPRINT
+        # The driver's view of the step-indexed source: only its static fingerprint.
+        data = SimpleNamespace(data_fingerprint=FINGERPRINT)
         args = SimpleNamespace(output=root, restore_root=None, world_size=2)
         results = {}
         for fault in FAULTS:
@@ -216,7 +240,7 @@ def protocol_worker(rank, directory):
         dist.destroy_process_group()
 
 
-def test_real_two_rank_loader_all_five_faults_and_incidental_failures(tmp_path):
+def test_real_two_rank_loader_all_faults_and_incidental_failures(tmp_path):
     (tmp_path / "model").mkdir()
     (tmp_path / "model/config.json").write_text('{"fixture":"CPU protocol only"}\n')
     mp.spawn(protocol_worker, args=(str(tmp_path),), nprocs=2, join=True)

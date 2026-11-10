@@ -1,8 +1,9 @@
 """Opt-in single-process strict training resume, separate from weight initialization.
 
-Reuses checkpoint.py's canonical model/optimizer mapping and PR100's Stateful
-data boundary. Production task wiring and distributed resume remain integration
-work: this entrypoint explicitly rejects PP/EP/CP/FSDP and multiple processes.
+Reuses checkpoint.py's canonical model/optimizer mapping and PR100's step-indexed
+data contract: a static data fingerprint, never a reader cursor. Production task
+wiring and distributed resume remain integration work: this entrypoint explicitly
+rejects PP/EP/CP/FSDP and multiple processes.
 """
 
 import copy
@@ -98,23 +99,25 @@ def _restore_rng(state, device):
 
 
 class StrictResumeState:
-    """Model + optimizer + scheduler + committed data + RNG, all required.
+    """Model + optimizer + scheduler + data identity + RNG, all required.
 
-    ``step`` counts completed updates. ``data_state`` is the existing loader's
-    checkpoint_state, whose version-1 schema includes fingerprint and
-    consumed_samples. No loader, sampler or cursor convention is introduced.
+    ``step`` counts completed updates. Training data is step-indexed: the checkpoint
+    records the reader's static ``data_fingerprint`` and the completed step selects
+    the next batch, so no loader, sampler or cursor state is saved or restored.
     The caller must construct the same optimizer/scheduler classes and layout.
     """
 
-    def __init__(self, model, optimizers, schedulers, *, data_state, step, global_batch_size):
+    def __init__(self, model, optimizers, schedulers, *, data_fingerprint, step, global_batch_size):
         if type(step) is not int or step < 1:
             raise StrictResumeError("Strict resume requires at least one completed update")
         if type(global_batch_size) is not int or global_batch_size < 1:
             raise StrictResumeError("global_batch_size must be a positive integer")
-        if data_state is None or not optimizers or not schedulers:
-            raise StrictResumeError("Strict resume requires data, optimizer and scheduler state")
+        if not isinstance(data_fingerprint, str) or not data_fingerprint:
+            raise StrictResumeError("Strict resume requires the data fingerprint")
+        if not optimizers or not schedulers:
+            raise StrictResumeError("Strict resume requires optimizer and scheduler state")
         self.base = CheckpointState(model, tuple(optimizers), tuple(schedulers))
-        self.data_state, self.step = data_state, step
+        self.data_fingerprint, self.step = data_fingerprint, step
         self.global_batch_size = global_batch_size
         self._check_scope()
 
@@ -140,9 +143,10 @@ class StrictResumeState:
         if any(not optimizer.state for optimizer in base.optimizers):
             base = copy.deepcopy(base)
         result = base.state_dict()
-        result["data"] = self.data_state.state_dict()
+        result["data"] = {"fingerprint": self.data_fingerprint}
         result["resume"] = {
-            "version": 1,
+            # Version 1 saved a consumed-sample cursor; step-indexed data needs none.
+            "version": 2,
             "step": self.step,
             "global_batch_size": self.global_batch_size,
             "optimizer_types": [_type_name(opt) for opt in self.base.optimizers],
@@ -152,21 +156,8 @@ class StrictResumeState:
         }
         return result
 
-    def _check_data_position(self, data):
-        if (
-            type(data.get("version")) is not int
-            or data["version"] != 1
-            or not isinstance(data.get("fingerprint"), str)
-        ):
-            raise StrictResumeError("Expected PR100 version-1 data checkpoint_state")
-        consumed = data.get("consumed_samples")
-        if type(consumed) is not int or consumed != self.step * self.global_batch_size:
-            raise StrictResumeError("Checkpoint step and committed data position disagree")
-
     def state_dict(self):
-        result = self._snapshot()
-        self._check_data_position(result["data"])
-        return result
+        return self._snapshot()
 
     def _validate(self, loaded, expected):
         _check_schema(loaded, expected)
@@ -180,9 +171,11 @@ class StrictResumeState:
         ):
             if loaded["resume"][field] != expected["resume"][field]:
                 raise StrictResumeError(f"resume.{field}: incompatible training continuation")
-        self._check_data_position(loaded["data"])
         if loaded["data"]["fingerprint"] != expected["data"]["fingerprint"]:
-            raise StrictResumeError("Checkpoint data fingerprint differs from this run")
+            raise StrictResumeError(
+                "Checkpoint data fingerprint differs: check the dataset, modalities, sampling, "
+                "seed, sequence length and batch sizes before resuming"
+            )
         # Existing localization reconstructs membership; validate first so it
         # cannot hide dropped/reordered parameters in a corrupt checkpoint.
         for saved, live in zip(
@@ -194,15 +187,8 @@ class StrictResumeState:
 
     def load_state_dict(self, state_dict):
         expected = self._snapshot()
+        # Data identity is validated with everything else before any live state changes.
         self._validate(state_dict, expected)
-        # PR100 validates its own data contract before touching the model. If it
-        # rejects extra schema constraints, retain the caller's original cursor.
-        previous_data = copy.deepcopy(expected["data"])
-        try:
-            self.data_state.load_state_dict(state_dict["data"])
-        except Exception:
-            self.data_state.load_state_dict(previous_data)
-            raise
         self.base.load_state_dict(state_dict)
         _restore_rng(state_dict["resume"]["rng"], self.device)
 

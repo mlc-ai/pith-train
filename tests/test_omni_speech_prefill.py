@@ -139,10 +139,10 @@ class ScriptedThinker(nn.Module):
         self.norm = nn.Identity()
         self.output_tokens, self.calls = output_tokens, 0
 
-    def forward_prolog(self, ids, model_context=None):
+    def forward_prolog(self, ids, media_context=None):
         return self.embed_tokens(ids)
 
-    def forward_posemb(self, length, model_context=None):
+    def forward_posemb(self, length, media_context=None):
         return None
 
     def forward_epilog(self, payload):

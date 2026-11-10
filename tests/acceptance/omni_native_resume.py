@@ -204,9 +204,11 @@ def source(args):
     cfg.training.model = args.output / "model"
     model_config().save_pretrained(cfg.training.model)
     # Reuse the production data entrypoint, including model/processor vocabulary
-    # and modality validation. The loader's own state owns consumption.
+    # and modality validation. The step selects the data; a strict checkpoint
+    # records only the reader's static fingerprint, so it must hold no other state.
     data = setup_dataset(cfg)
-    assert data.is_text and data.checkpoint_state is data
+    assert data.is_text and not hasattr(data, "state_dict")
+    assert isinstance(data.data_fingerprint, str) and data.data_fingerprint
     return data
 
 
@@ -317,10 +319,19 @@ def state(parts, data, step):
         model,
         (opt,),
         (sch,),
-        data_state=data.checkpoint_state,
+        data_fingerprint=data.data_fingerprint,
         step=step,
         global_batch_size=SETTINGS["global_batch_size"],
     )
+
+
+def stored_data_fingerprint(location):
+    """Read back only the data identity a strict checkpoint recorded, not its tensors."""
+    import torch.distributed.checkpoint as dcp
+
+    stored = {"app": {"data": {"fingerprint": ""}}}
+    dcp.load(stored, checkpoint_id=location, no_dist=True)
+    return stored["app"]["data"]["fingerprint"]
 
 
 def get_batch(data, step):
@@ -352,7 +363,7 @@ def get_batch(data, step):
 def backward(model, batches, *, hf=False):
     # Same PR100 label contract and single global-token normalization. Labels
     # are already shifted by the real loader; never shift them a second time.
-    from pithtrain.modules.training_data import global_target_count
+    from tests.pretrain_lm_cpu import global_target_count
 
     count = global_target_count(batches)
     loss = torch.zeros((), device="cuda", dtype=torch.float32)
@@ -452,7 +463,6 @@ def update(args):
         assert len(parts[1].state) == len(list(parts[0].parameters()))
         assert all(item["step"].item() == 1 for item in parts[1].state.values())
         assert parts[2].last_epoch == 1
-    data.commit_step(0)
     return dict(
         loss=actual_loss.item(),
         hf_loss=expected_loss.item(),
@@ -462,7 +472,7 @@ def update(args):
         optimizer_update=update_gate,
         end_to_end_update=dict(role=END_TO_END_ROLE, parameters=end_to_end),
         parameter_count=len(actual),
-        data=data.state_dict(),
+        data_fingerprint=data.data_fingerprint,
         batch_sha256=tensor_tree_digest(observed),
     )
 
@@ -486,10 +496,10 @@ def tensor_tree_digest(value):
 
 
 def step_once(parts, data, step):
+    # Step-indexed data: get_batch(step) alone selects the batch; nothing to commit.
     batches, observed = get_batch(data, step)
     loss, _ = backward(parts[0], batches)
     apply_update(parts)
-    data.commit_step(step)
     return dict(batch=observed, loss=cpu_tree(loss), rng=cpu_tree(rng_probe()))
 
 
@@ -515,6 +525,9 @@ def produce(args):
     )
     expected["next"] = step_once(parts, data, 2)
     expected["after"] = cpu_tree(state(parts, data, 3).state_dict())
+    # Read back after every compared observation, so the read cannot perturb one.
+    stored = stored_data_fingerprint(location)
+    assert stored == data.data_fingerprint, "Checkpoint did not record the live data fingerprint"
     torch.save(expected, args.output / "continuous.pt")
     return dict(
         checkpoint=str(location),
@@ -522,7 +535,8 @@ def produce(args):
         final_step=3,
         losses=[record["loss"].item() for record in records] + [expected["next"]["loss"].item()],
         next_batch=tensor_tree_digest(expected["next"]["batch"]),
-        consumed_samples=data.consumed_samples,
+        data_fingerprint=data.data_fingerprint,
+        checkpoint_data_fingerprint=stored,
     )
 
 
@@ -533,22 +547,29 @@ def restore(args):
     assert expected["schema"] == SCHEMA and expected["protocol"] == PROTOCOL
     assert expected["pid"] != os.getpid(), "Restore must execute in a new process"
     parts, data = build_run(args)
-    # Prove the checkpoint replaces model and all RNG state, not just a cursor.
+    # Prove the checkpoint replaces model and all RNG state. Data has no cursor:
+    # the fresh reader must reproduce the next batch from the restored step alone.
     with torch.no_grad():
         for parameter in parts[0].parameters():
             parameter.zero_()
     seed(9917)
     boundary = state(parts, data, 2)
-    assert not parts[1].state and data.consumed_samples == 0
+    assert not parts[1].state
+    stored = stored_data_fingerprint(args.output / "checkpoints/torch-dcp/00000002")
+    assert stored == data.data_fingerprint, (
+        "Fresh reader's data fingerprint differs from checkpoint"
+    )
     assert load_strict_checkpoint(args.output / "checkpoints", boundary) == 2
     equal(cpu_tree(boundary.state_dict()), expected["boundary"], "restored-boundary")
+    # get_batch(2) of the fresh reader: same indices/tokens/labels/sample IDs as continuous.
     observed = step_once(parts, data, 2)
     equal(observed, expected["next"], "next-update")
     equal(cpu_tree(state(parts, data, 3).state_dict()), expected["after"], "after-update")
     return dict(
         restored_step=2,
         final_step=3,
-        consumed_samples=data.consumed_samples,
+        data_fingerprint=data.data_fingerprint,
+        checkpoint_data_fingerprint=stored,
         max_error=0,
         producer_pid=expected["pid"],
         next_batch=tensor_tree_digest(observed["batch"]),
@@ -572,7 +593,7 @@ def negative(args):
         "missing-data",
         "missing-cuda-rng",
         "fingerprint",
-        "cursor",
+        "legacy-cursor",
         "optimizer-order",
     ]
     for name in names:
@@ -592,8 +613,9 @@ def negative(args):
             del corrupt["resume"]["rng"]["cuda"]
         elif name == "fingerprint":
             corrupt["data"]["fingerprint"] = "wrong"
-        elif name == "cursor":
-            corrupt["data"]["consumed_samples"] += 1
+        elif name == "legacy-cursor":
+            # A version-1 consumed-sample cursor is rejected, never reinterpreted.
+            corrupt["data"].update(version=1, consumed_samples=2 * SETTINGS["global_batch_size"])
         elif name == "optimizer-order":
             corrupt["optimizer"]["param_groups"][0]["params"].reverse()
         try:

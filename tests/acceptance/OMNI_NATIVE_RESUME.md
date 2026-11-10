@@ -47,8 +47,8 @@ CUDA_VISIBLE_DEVICES= PYTHONPATH=. HF_HUB_OFFLINE=1 \
 
 Preflight never constructs `ConcatDataset` or initializes CUDA. Subsequent
 GPU modes call production `pretrain_lm.setup_dataset`, which constructs the
-**unchanged real** `OmniPretrainData` →
-`DensePretrainData` → `ConcatDataset`, including CUDA shuffle and barrier.
+**unchanged real** `PreparedBundleData` →
+`TokenBinData` → `ConcatDataset`, including CUDA shuffle and barrier.
 Every mode rechecks data and source fingerprints. Cache writes occur only in
 the copied corpus. Input labels are already shifted by PR100 and are not
 shifted again.
@@ -91,14 +91,14 @@ load the historical 5080 SDPA adapter or local FA4 fixes.
   observes live state **after saving**, and continues the third update.
 - `restore`: a distinct process constructs a fresh native model/optimizer and
   real loader, zeroes model weights and changes RNG seeds, then loads with
-  `load_strict_checkpoint`. Boundary weights, optimizer, scheduler, data cursor
-  and Python/NumPy/CPU/CUDA RNG must match exactly. Third-step batch/indices,
+  `load_strict_checkpoint`. Boundary weights, optimizer, scheduler, the data
+  fingerprint and Python/NumPy/CPU/CUDA RNG must match exactly; the step selects data. Third-step batch/indices,
   loss, full post-update state and RNG probes must match the continuous arm
   with zero tolerance. The RNG probes audit the generators after real updates;
   they do not replace model inputs or gradients.
 - `negative`: on the real restored native model, reject 11 corrupt snapshots
   (missing/unexpected/shape/dtype model, missing optimizer/scheduler/data/CUDA
-  RNG, wrong fingerprint/cursor, reordered optimizer membership) without
+  RNG, wrong fingerprint, legacy version-1 cursor, reordered optimizer membership) without
   changing live state. Existing 40 CPU strict tests continue to cover actual
   DCP metadata corruption; the new mode is additional CUDA-state validation.
 

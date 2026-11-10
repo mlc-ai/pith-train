@@ -18,7 +18,9 @@ from unittest.mock import patch
 
 import torch
 
-REPORT_VERSION = 3
+# Version 4: checkpoint_state.data is the step-indexed {"fingerprint"} for both formats,
+# replacing version 3's prepared-bundle cursor (and None for token_bin).
+REPORT_VERSION = 4
 OBSERVATION_PROTOCOL = "save_then_runtime_state_v1"
 
 
@@ -108,14 +110,17 @@ def configure_data(cfg, args):
 
 
 def checkpoint_data(data, args):
+    """The data identity a checkpoint records; the historical base has none.
+
+    Both formats are step-indexed: get_batch(step) selects the data, so a checkpoint
+    stores only the static data fingerprint and the reader may hold no durable state.
+    """
     if args.legacy:
         return None
-    state = data.checkpoint_state
-    if args.data_format == "token_bin":
-        assert state is None, "Dense position must follow the training step"
-    else:
-        assert state is not None, "Prepared data must preserve its committed state"
-    return state
+    assert not hasattr(data, "state_dict"), "Data position must follow the training step"
+    fingerprint = getattr(data, "data_fingerprint", None)
+    assert isinstance(fingerprint, str) and fingerprint, "Data must expose its fingerprint"
+    return fingerprint
 
 
 def validate_restore_report(expected, args, *, mesh, config, source_sha256):
@@ -153,15 +158,19 @@ def validate_restore_report(expected, args, *, mesh, config, source_sha256):
         "cuda_rng",
         "data",
     }
-    assert (state["data"] is None) == (args.data_format == "token_bin"), (
-        "Checkpoint data state differs"
-    )
+    data = state["data"]
+    assert (
+        isinstance(data, dict)
+        and set(data) == {"fingerprint"}
+        and isinstance(data["fingerprint"], str)
+        and data["fingerprint"]
+    ), "Checkpoint data state must be the step-indexed data fingerprint"
     for batch in expected["batches"]:
         assert batch and all(len(micro) == 6 for micro in batch), "Invalid microbatch schema"
 
 
 def media_kind(microbatch, pp_rank):
-    context = microbatch.model_context or {}
+    context = microbatch.media_context or {}
     media = microbatch.media_inputs or {}
     fields = (
         ("image_grid_thw", "pixel_values", "image"),
@@ -268,29 +277,29 @@ def main():
     original_prolog = Qwen3MoeModel.forward_prolog
     original_posemb = Qwen3MoeModel.forward_posemb
 
-    def forward(self, inputs, cu_seqlens=None, model_context=None):
+    def forward(self, inputs, cu_seqlens=None, media_context=None):
         normal_calls[self.stage_index] += 1
-        media_audit.observe_dispatch(self.stage_index, model_context, "normal")
-        return model_forward(self, inputs, self.chunk_record, cu_seqlens, model_context)
+        media_audit.observe_dispatch(self.stage_index, media_context, "normal")
+        return model_forward(self, inputs, self.chunk_record, cu_seqlens, media_context)
 
-    def prolog(self, inputs, model_context=None):
-        torch.testing.assert_close(inputs, model_context["input_ids"], rtol=0, atol=0)
+    def prolog(self, inputs, media_context=None):
+        torch.testing.assert_close(inputs, media_context["input_ids"], rtol=0, atol=0)
         hidden = original_prolog(self, inputs)
         for name in ("pixel_values", "input_features", "pixel_values_videos"):
-            if name in model_context:
-                feature = model_context[name]
+            if name in media_context:
+                feature = media_context[name]
                 assert feature.device == hidden.device and torch.isfinite(feature).all(), name
                 assert feature.numel() > 0, name
                 hidden = hidden + feature.float().mean().to(hidden.dtype) * 0.01
         return hidden
 
-    def posemb(self, length, cu_seqlens=None, model_context=None):
-        assert model_context["input_ids"].shape[1] == length
+    def posemb(self, length, cu_seqlens=None, media_context=None):
+        assert media_context["input_ids"].shape[1] == length
         if self.stage_index != 0:
             assert (
-                not {"pixel_values", "input_features", "pixel_values_videos"} & model_context.keys()
+                not {"pixel_values", "input_features", "pixel_values_videos"} & media_context.keys()
             )
-        for name, value in model_context.items():
+        for name, value in media_context.items():
             assert value.device == distributed.device, name
             if value.is_floating_point():
                 assert value.dtype == torch.float32, (name, value.dtype)
@@ -314,13 +323,13 @@ def main():
             )
         if args.media:
             from pithtrain.modules import omni_bundle, qwen3_omni_data
-            from pithtrain.modules.training_data import OmniPretrainData
+            from pithtrain.modules.training_data import PreparedBundleData
             from pithtrain.pipeline import dualpipev
             from tests.omni_media_audit import MediaAudit
 
             media_audit = MediaAudit(distributed.pp_rank, distributed.pp_size, distributed.pp_group)
             media_audit.install(
-                stack, OmniPretrainData, omni_bundle, qwen3_omni_data, torch.distributed
+                stack, PreparedBundleData, omni_bundle, qwen3_omni_data, torch.distributed
             )
             media_audit.install_dispatch(stack, dualpipev)
             stack.enter_context(
@@ -338,7 +347,7 @@ def main():
             ):
                 stack.enter_context(patch.object(Qwen3MoeModel, name, method))
         data = pretrain_lm.setup_dataset(cfg)
-        data_state = checkpoint_data(data, args)
+        fingerprint = checkpoint_data(data, args)
         setup_training(cfg)
 
         def runtime_state():
@@ -348,7 +357,7 @@ def main():
                     optimizers=[opt.state_dict() for opt in training.optimizers],
                     schedulers=[s.state_dict() for s in training.schedulers],
                     cuda_rng=torch.cuda.get_rng_state(),
-                    data=None if data_state is None else data_state.state_dict(),
+                    data=None if fingerprint is None else dict(fingerprint=fingerprint),
                 )
             )
 
@@ -375,7 +384,8 @@ def main():
             assert digest(dict(training.model.named_parameters())) == expected["initial_state"], (
                 "Fresh-process initialization differs"
             )
-            load_checkpoint(args.restore, args.checkpoint_step, data_state=data_state)
+            # Validates the stored data fingerprint before tensors; the step selects the data.
+            load_checkpoint(args.restore, args.checkpoint_step, data_fingerprint=fingerprint)
             assert runtime_state() == expected["checkpoint_state"], (
                 "Fresh-process restored state differs"
             )
@@ -407,7 +417,7 @@ def main():
                         mb.model_inputs,
                         mb.objective_inputs,
                         mb.cu_seqlens,
-                        getattr(mb, "model_context", None),
+                        getattr(mb, "media_context", None),
                         getattr(mb, "media_inputs", None),
                         getattr(mb, "sample_ids", ()),
                     )
@@ -464,13 +474,13 @@ def main():
                 assert not objective_outputs
             if args.restore is None and step + 1 == args.checkpoint_step:
                 # Every producer saves and hashes at this same boundary. The
-                # historical base predates the data_state keyword; its dense
-                # cursor is still derived from the step, just as in current dense.
+                # historical base predates the data_fingerprint keyword; its dense
+                # position is derived from the step, just as in current data.
                 if args.legacy:
-                    assert data_state is None
+                    assert fingerprint is None
                     save_checkpoint(t.save_location, step + 1)
                 else:
-                    save_checkpoint(t.save_location, step + 1, data_state=data_state)
+                    save_checkpoint(t.save_location, step + 1, data_fingerprint=fingerprint)
                 checkpoint_events.append(dict(operation="save_checkpoint", step=step + 1))
                 checkpoint_state = runtime_state()
                 checkpoint_events.append(dict(operation="runtime_state", step=step + 1))
@@ -478,8 +488,9 @@ def main():
         assert initial != final, "Training did not update weights"
         for parameter in training.model.parameters():
             assert torch.isfinite(parameter.to_local()).all()
-        if data_state is not None:
-            assert data.consumed_samples == args.steps * t.global_batch_size
+        if fingerprint is not None:
+            # No cursor to check: each step from start read exactly one global batch.
+            assert len(batches) == args.steps - start, "Each step must read one global batch"
         if args.media:
             all_seen = [None] * distributed.world_size
             torch.distributed.all_gather_object(all_seen, dict(seen))

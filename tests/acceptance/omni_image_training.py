@@ -333,7 +333,7 @@ def gpu_reference(
         for batch in batches:
             inputs = {k: v.to(device) for k, v in batch.model_inputs.items()}
             labels = batch.labels.to(device)
-            logits = native.reference_forward(inputs["input_ids"], model_context=inputs)
+            logits = native.reference_forward(inputs["input_ids"], media_context=inputs)
             target = reference(inputs)
             logits_errors.append(error_ratio(logits, target))
             assert logits_errors[-1] < 1e-3

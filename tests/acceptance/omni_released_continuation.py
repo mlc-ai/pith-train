@@ -391,11 +391,16 @@ def prepare(args):
 
 
 def capture_state(data, device):
+    """Complete rank state; step-indexed data contributes only its static fingerprint."""
     from pithtrain.contexts import training
-    from pithtrain.modules.distributed_checkpoint import _runtime
+    from pithtrain.modules.distributed_checkpoint import _DataFingerprint, _runtime
 
     return _runtime(
-        training.model, training.optimizers, training.schedulers, data.checkpoint_state, device
+        training.model,
+        training.optimizers,
+        training.schedulers,
+        _DataFingerprint(data.data_fingerprint),
+        device,
     )[0]
 
 
@@ -408,17 +413,19 @@ def continuation(phase, cfg, data, device, output, producer, train_one):
     rank = dist.get_rank()
     contract = cfg["resume_contract"]
     checkpoint = cfg["checkpoint"]
+    # The checkpoint records and validates the data fingerprint; step 1 selects the next batch.
+    fingerprint = data.data_fingerprint
     if phase == "produce":
         train_one(0)
         write_rows(output / f"boundary-{rank}", state_rows(capture_state(data, device)))
         with deadline(cfg["save_seconds"]):
             save_checkpoint(
-                checkpoint, 1, strict=True, data_state=data.checkpoint_state, resume_config=contract
+                checkpoint, 1, strict=True, data_fingerprint=fingerprint, resume_config=contract
             )
     else:
         with deadline(cfg["load_seconds"]):
             load_checkpoint(
-                checkpoint, 1, strict=True, data_state=data.checkpoint_state, resume_config=contract
+                checkpoint, 1, strict=True, data_fingerprint=fingerprint, resume_config=contract
             )
         compare_rows(
             state_rows(capture_state(data, device)), read_rows(producer / f"boundary-{rank}")
@@ -440,9 +447,11 @@ def observed_step(cfg, data, step, parameters, groups, output):
     report = dict(status="RUNNING", step=step + 1, rank=rank, parameters={}, errors=[])
     optimizer = training.optimizers[0]
     old_step, old_batch = training.model.step, data.get_batch
+    requested = []
 
-    def batch(*args, **kwargs):
-        result = old_batch(*args, **kwargs)
+    def batch(data_step, device):
+        result = old_batch(data_step, device)
+        requested.append(data_step)
         # Includes actual sample IDs, labels, positions and full media tensor bytes.
         write_rows(
             output / f"batch-{step}-{rank}",
@@ -451,7 +460,7 @@ def observed_step(cfg, data, step, parameters, groups, output):
                     dict(
                         model_inputs=m.model_inputs,
                         objective_inputs=m.objective_inputs,
-                        model_context=m.model_context,
+                        media_context=m.media_context,
                         media_inputs=m.media_inputs,
                         cu_seqlens=m.cu_seqlens,
                         sample_ids=m.sample_ids,
@@ -508,7 +517,8 @@ def observed_step(cfg, data, step, parameters, groups, output):
     try:
         with deadline(600):
             pretrain_lm.train_step(cfg, data, step)
-        assert data.consumed_samples == 16 * (step + 1)
+        # No cursor: this update read exactly one global batch, selected by its own step.
+        assert requested == [step], requested
         assert all(p.grad is None for p in parameters.values())
         gathered = [None] * world
         dist.all_gather_object(gathered, dict(rank=rank, parameters=report["parameters"]))
@@ -677,7 +687,7 @@ def run_gpu(args):
         data_configuration=cfg.data.to_json_dict(),
         recipe=data.recipe,
         bundle_sha256=file_sha(args.dataset / "bundle.json"),
-        fingerprint=data.fingerprint,
+        fingerprint=data.data_fingerprint,
         epoch_samples=data.epoch_samples,
         sampler_seed=data.seed,
         weights=data.weights,
@@ -738,7 +748,9 @@ def run_gpu(args):
         assert set().union(*(set(v) for v in all_keys)) == set(selected)
         if args.phase == "produce":
             initialize_checkpoint(work / "initialization", 0)
-            assert not training.optimizers[0].state and data.consumed_samples == 0
+            # Model-only: no optimizer state. Data has no position to restore; the first
+            # update must read step 0, which observed_step checks.
+            assert not training.optimizers[0].state
             verify_loaded_parameters(selected, args.output / f"initialized-{rank}")
     producer = args.producer
     if args.phase == "restore":

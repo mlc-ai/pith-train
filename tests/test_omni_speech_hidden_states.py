@@ -135,7 +135,7 @@ class NativePayloadThinker(nn.Module):
         for index, layer in enumerate(hf.layers):
             self.layers[str(index)].layer.load_state_dict(layer.state_dict(), strict=True)
 
-    def forward_prolog(self, input_ids, model_context=None):
+    def forward_prolog(self, input_ids, media_context=None):
         embed = self.embed_tokens(input_ids)
         lanes = []
         for feature in self.deepstack:
@@ -144,7 +144,7 @@ class NativePayloadThinker(nn.Module):
             lanes.append(lane)
         return torch.cat((embed, *lanes), -1)
 
-    def forward_posemb(self, length, model_context=None):
+    def forward_posemb(self, length, media_context=None):
         positions = torch.arange(length)[None, None].expand(3, 1, -1)
         dummy = self.embed_tokens.weight.new_zeros(1, length, self.text_hidden_size)
         mask = torch.full((1, 1, length, length), torch.finfo(dummy.dtype).min).triu(1)

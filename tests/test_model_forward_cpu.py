@@ -68,13 +68,13 @@ def test_model_forward_clears_inference_records_and_reuses_for_training(
             self.head = nn.Linear(3, 2)
 
         def forward_prolog(self, hidden, **kwargs):
-            assert kwargs == {} if context is None else kwargs["model_context"] is context
-            offset = 0 if context is None else kwargs["model_context"]["offset"]
+            assert kwargs == {} if context is None else kwargs["media_context"] is context
+            offset = 0 if context is None else kwargs["media_context"]["offset"]
             return self.embed(hidden + offset)
 
         def forward_posemb(self, length, boundaries, **kwargs):
             assert length == inputs.shape[1] and boundaries is cu_seqlens
-            assert kwargs == {} if context is None else kwargs["model_context"] is context
+            assert kwargs == {} if context is None else kwargs["media_context"] is context
             if not torch.is_grad_enabled():
                 assert_empty(records.prolog)
             return None

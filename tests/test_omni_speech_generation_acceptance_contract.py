@@ -219,7 +219,7 @@ def test_native_logit_observer_restores_method_without_instance_override(fail):
     model = ProtocolModel()
     batch = {
         "input_ids": torch.ones(1, 2, dtype=torch.long),
-        "model_context": {},
+        "media_context": {},
         "position_kwargs": {},
     }
     if fail:
@@ -298,7 +298,7 @@ def official_full_cpu():
     )
     batch = dict(
         input_ids=ids,
-        model_context=dict(input_ids=ids, attention_mask=torch.ones_like(ids)),
+        media_context=dict(input_ids=ids, attention_mask=torch.ones_like(ids)),
         prompt_lengths=[ids.shape[1]],
         position_kwargs={},
     )
@@ -667,7 +667,7 @@ def test_official_composite_mixed_prefill_propagates_audio_video_flag(
     )
     batch = dict(
         input_ids=ids,
-        model_context=context,
+        media_context=context,
         prompt_lengths=[ids.shape[1]],
         position_kwargs=dict(
             image_grid_thw=context["image_grid_thw"],

@@ -17,7 +17,12 @@ import torch.multiprocessing as mp
 from pithtrain.modules import distributed_checkpoint as native
 from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
 from tests.acceptance.omni_native_resume import equal
-from tests.test_distributed_strict_checkpoint import advance, build, initialize_mesh
+from tests.test_distributed_strict_checkpoint import (
+    FINGERPRINT,
+    advance,
+    build,
+    initialize_mesh,
+)
 from tests.test_task_distributed_checkpoint import StatefulTask, commit, envelope
 
 
@@ -48,6 +53,8 @@ def _worker(rank, directory, protocol, fault, phase):
             if task
             else parts[3]
         )
+        # Scan-cursor tasks commit a TaskCheckpointState; step-indexed data only its fingerprint.
+        checkpoint_data = dict(data_state=data) if task else dict(data_fingerprint=FINGERPRINT)
         config = dict(training=dict(global_batch_size=2), protocol=protocol)
         seed = rank + (100 if phase == "produce" else 900)
         torch.manual_seed(seed)
@@ -135,7 +142,7 @@ def _worker(rank, directory, protocol, fault, phase):
             step()
             boundary = _snapshot(parts, data)
             tracked = "save"
-            save_checkpoint(root / "good", 1, data_state=data, strict=True, resume_config=config)
+            save_checkpoint(root / "good", 1, **checkpoint_data, strict=True, resume_config=config)
             tracked = None
             gc.collect()
             dist.barrier()
@@ -174,7 +181,7 @@ def _worker(rank, directory, protocol, fault, phase):
             if fault:
                 with pytest.raises(native.DistributedCheckpointError):
                     load_checkpoint(
-                        root / "good", 1, data_state=data, strict=True, resume_config=config
+                        root / "good", 1, **checkpoint_data, strict=True, resume_config=config
                     )
                 tracked = None
                 equal(_snapshot(parts, data), before)
@@ -183,7 +190,7 @@ def _worker(rank, directory, protocol, fault, phase):
             else:
                 assert not parts[1].state
                 load_checkpoint(
-                    root / "good", 1, data_state=data, strict=True, resume_config=config
+                    root / "good", 1, **checkpoint_data, strict=True, resume_config=config
                 )
                 tracked = None
                 assert reads == 2

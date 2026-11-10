@@ -59,7 +59,7 @@ def validate_audio_inputs(input_ids, context, config, *, require_features=True):
         raise ValueError("Native audio requires one nonempty integer sample per microbatch")
     shared_ids = context.get("input_ids")
     if shared_ids is not None and not torch.equal(shared_ids, input_ids):
-        raise ValueError("model_context input_ids must match model_inputs")
+        raise ValueError("media_context input_ids must match model_inputs")
     if input_ids.min() < 0 or input_ids.max() >= config.text_config.vocab_size:
         raise ValueError("input_ids are outside the text vocabulary")
     mask = context.get("attention_mask")
