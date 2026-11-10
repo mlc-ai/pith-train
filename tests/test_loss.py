@@ -8,8 +8,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pithtrain.modules import loss
 from pithtrain.modules.microbatch import Microbatch
+from tests import pretrain_lm_cpu as loss
 
 
 @pytest.mark.parametrize("masked", [False, True])

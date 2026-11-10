@@ -3,6 +3,7 @@
 No CUDA/NCCL or native encoder execution is covered by these tests.
 """
 
+import builtins
 import json
 from contextlib import ExitStack
 from datetime import timedelta
@@ -44,11 +45,11 @@ def assert_batches(batches, expected, owns_media):
         all_inputs = reference["inputs"]
         common = {name: value for name, value in all_inputs.items() if name not in PAYLOADS}
         media = {name: value for name, value in all_inputs.items() if name in PAYLOADS}
-        torch.testing.assert_close(actual.model_context, common, rtol=0, atol=0)
+        torch.testing.assert_close(actual.media_context, common, rtol=0, atol=0)
         torch.testing.assert_close(
             actual.media_inputs or {}, media if owns_media else {}, rtol=0, atol=0
         )
-        assert actual.model_inputs[0] is actual.model_context["input_ids"]
+        assert actual.model_inputs[0] is actual.media_context["input_ids"]
         assert not PAYLOADS & actual.context_for_stage(3).keys()
         if owns_media:
             torch.testing.assert_close(actual.context_for_stage(0), all_inputs, rtol=0, atol=0)
@@ -118,7 +119,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
     with ExitStack() as stack:
         for module, name, counter in (
             (omni_bundle, "read_verified_bundle", "verify"),
-            (omni_bundle, "processor_for", "processor"),
+            (qwen3_omni_data, "processor_for", "processor"),
             (qwen3_omni_data, "create_omni_dataloader", "loader"),
         ):
             stack.enter_context(
@@ -231,7 +232,7 @@ def test_stage_context_keeps_shared_inputs_and_rejects_overwrite():
         model_inputs=(tokens,),
         objective_inputs=(tokens,),
         cu_seqlens=None,
-        model_context=shared,
+        media_context=shared,
         media_inputs={"pixel_values": pixels},
     )
     assert micro.context_for_stage(0)["pixel_values"] is pixels
@@ -243,3 +244,28 @@ def test_stage_context_keeps_shared_inputs_and_rejects_overwrite():
         micro.context_for_stage(0)
     plain = Microbatch(model_inputs=(tokens,), objective_inputs=(tokens,), cu_seqlens=None)
     assert plain.context_for_stage(0) is None and plain.context_for_stage(1) is None
+
+
+def test_non_reader_model_validation_does_not_import_media_dependencies(
+    training_bundle, monkeypatch
+):
+    cfg, tc = configs(training_bundle, ("image",))
+    data = PreparedBundleData(cfg, tc)
+    data.pp_rank, data.pp_size, data.pp_group = 1, 2, object()
+    monkeypatch.setattr(dist, "get_global_rank", lambda group, rank: 0)
+
+    def broadcast(message, *, src, group):
+        assert src == 0 and group is data.pp_group
+        message[0] = (200000, None)
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    original_import = builtins.__import__
+
+    def no_media_import(name, *args, **kwargs):
+        assert name != "pithtrain.modules.qwen3_omni_data", "Only the reader imports media code"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_media_import)
+    model = type("MediaModel", (), {"input_modalities": {"text", "image"}})
+    data.validate_model(model, SimpleNamespace(vocab_size=200000))
+    assert data._processor is None and data._thinker_config is None

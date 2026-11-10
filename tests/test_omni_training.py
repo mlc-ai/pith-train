@@ -16,10 +16,10 @@ import torch.nn.functional as F
 
 from pithtrain.modules.checkpoint import CheckpointState, validate_data_fingerprint
 from pithtrain.modules.data_config import DataCfg
-from pithtrain.modules.loss import global_loss_mean, global_target_count
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.training_data import PreparedBundleData
 from tests import test_qwen3_omni_data as data_fixtures
+from tests.pretrain_lm_cpu import global_loss_mean, global_target_count
 
 manifest = data_fixtures.manifest
 processor_config = data_fixtures.processor_config
@@ -95,7 +95,7 @@ def compare_batches(actual, expected):
     assert [mb.sample_ids for mb in actual] == [mb.sample_ids for mb in expected]
     for left, right in zip(actual, expected, strict=True):
         torch.testing.assert_close(left.objective_inputs[0], right.objective_inputs[0])
-        for field in ("model_context", "media_inputs"):
+        for field in ("media_context", "media_inputs"):
             left_inputs, right_inputs = getattr(left, field) or {}, getattr(right, field) or {}
             assert left_inputs.keys() == right_inputs.keys()
             for name in left_inputs:
@@ -117,7 +117,7 @@ def test_training_media_batches_dp_resume_and_epoch(training_bundle, processor_c
     ranks = [consume(source(training_bundle, rank=rank, world=2), 0) for rank in range(2)]
     compare_batches([mb for pair in zip(*ranks) for mb in pair], first)
     for micro in first + expected + next_epoch:
-        assert micro.model_inputs[0] is micro.model_context["input_ids"]
+        assert micro.model_inputs[0] is micro.media_context["input_ids"]
         assert micro.model_inputs[0].shape[0] == 1
         assert micro.model_inputs[0].shape == micro.objective_inputs[0].shape
         assert all(value.device.type == "cpu" for value in micro.context_for_stage(0).values())

@@ -249,10 +249,11 @@ class PreparedBundleData:
         text_config = getattr(
             getattr(model_config, "thinker_config", model_config), "text_config", model_config
         )
-        # The pinned processor config defines the embedding vocabulary, not tokenizer.vocab_size.
-        from pithtrain.modules.omni_bundle import processor_for
 
+        # The pinned processor config defines the embedding vocabulary, not tokenizer.vocab_size.
         def prepare():
+            from pithtrain.modules.qwen3_omni_data import processor_for
+
             self._processor, self._thinker_config = processor_for(self.recipe, True)
             return self._thinker_config.text_config.vocab_size
 
@@ -285,8 +286,7 @@ class PreparedBundleData:
         return result
 
     def _make_iterator(self, step):
-        from pithtrain.modules.omni_bundle import processor_for
-        from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
+        from pithtrain.modules.qwen3_omni_data import create_omni_dataloader, processor_for
 
         if self._processor is None:
             self._processor, self._thinker_config = processor_for(self.recipe, True)
@@ -354,7 +354,7 @@ class PreparedBundleData:
             model_inputs=(shared["input_ids"],),
             cu_seqlens=None,
             objective_inputs=(labels,),
-            model_context=shared,
+            media_context=shared,
             media_inputs=media_inputs or None,
             sample_ids=sample_ids,
         )

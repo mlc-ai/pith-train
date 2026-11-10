@@ -52,10 +52,10 @@ subsets of prepared modalities are allowed. No extra modality is silently enable
 - Within each PP group, only rank 0 verifies/reads media and runs the processor.
   It keeps image/video pixels and audio features in `Microbatch.media_inputs`.
   Tokens, shifted labels and position/layout tensors are broadcast to its PP peers;
-  `model_context` holds the shared inputs, without encoder payloads. DP selects
+  `media_context` holds the shared inputs, without encoder payloads. DP selects
   records; PP and EP do not select additional independent samples. CPU workers use
   a separate RNG so reading a batch does not perturb the model's random state.
-- A media-capable model must declare `input_modalities` and accept `model_context`
+- A media-capable model must declare `input_modalities` and accept `media_context`
   in `forward`, `forward_prolog` and `forward_posemb`. Its normal forward passes
   this argument to `model_forward`; the overlapped scheduler passes it directly.
   Encoders/feature insertion belong in the model prolog, and multimodal position
@@ -129,7 +129,7 @@ name does not imply that Omni is a separate kind of modality. Token shards do
 not carry vocabulary metadata; prepared bundles validate their processor's
 vocabulary and the model's declared input modalities. Media remains CP1/microbatch1.
 
-`Microbatch.model_context` carries tokens, attention masks and image/video grids
+`Microbatch.media_context` carries tokens, attention masks and image/video grids
 or audio masks needed to reconstruct multimodal positions on every decoder stage.
 `media_inputs` carries the larger pixels/audio features only on stage 0, which
 encodes them and replaces placeholder embeddings. Text batches have neither.

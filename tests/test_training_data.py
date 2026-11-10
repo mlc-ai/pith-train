@@ -96,7 +96,7 @@ def prepared_config(root):
 
 
 def tensors(batches):
-    assert all(mb.cu_seqlens is None and mb.model_context is None for mb in batches)
+    assert all(mb.cu_seqlens is None and mb.media_context is None for mb in batches)
     assert all(
         mb.model_inputs[0].dtype == mb.objective_inputs[0].dtype == torch.long for mb in batches
     )

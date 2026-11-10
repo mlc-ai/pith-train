@@ -20,14 +20,13 @@ from PIL import UnidentifiedImageError
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.omni_bundle import (
     _content_id,
-    processor_for,
     sha256,
     verify_bundle,
 )
 from pithtrain.modules.omni_bundle import (
     read_verified_bundle as read_verified_bundle,
 )
-from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator
+from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator, processor_for
 from pithtrain.tasks.tokenize_corpus import Worker, Writer
 
 

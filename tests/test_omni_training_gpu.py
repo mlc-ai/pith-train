@@ -4,7 +4,7 @@ Uses a reduced existing Qwen3 model with the real Omni vocabulary. This tests th
 training connection, not native Omni encoders or their numerical correctness.
 Checkpoint state and next inputs must restore exactly. The following BF16 step
 checks loss and a finite, nonzero update; GPU reductions are not bit-reproducible.
-Run with torchrun; --context also exercises a test-only model_context consumer.
+Run with torchrun; --context also exercises a test-only media_context consumer.
 """
 
 import argparse
@@ -140,7 +140,7 @@ def main():
             torch.testing.assert_close(batches_seen[2], batches_seen[1], rtol=0, atol=0)
         if args.context:
             for i, mb in enumerate(batches):
-                mb.model_context = {
+                mb.media_context = {
                     "input_ids": mb.model_inputs[0],
                     "video_second_per_grid": torch.tensor(
                         [2.0 / 3.0], device=distributed.device, dtype=torch.float32
@@ -149,23 +149,23 @@ def main():
                 }
         return batches
 
-    def forward(self, inputs, cu_seqlens=None, model_context=None):
-        assert model_context is not None
+    def forward(self, inputs, cu_seqlens=None, media_context=None):
+        assert media_context is not None
         normal_calls[self.stage_index] += 1
-        return model_forward(self, inputs, self.chunk_record, cu_seqlens, model_context)
+        return model_forward(self, inputs, self.chunk_record, cu_seqlens, media_context)
 
-    def prolog(self, inputs, model_context=None):
-        torch.testing.assert_close(inputs, model_context["input_ids"], rtol=0, atol=0)
+    def prolog(self, inputs, media_context=None):
+        torch.testing.assert_close(inputs, media_context["input_ids"], rtol=0, atol=0)
         return original_prolog(self, inputs)
 
-    def posemb(self, length, cu_seqlens=None, model_context=None):
-        assert model_context is not None and model_context["input_ids"].shape[1] == length
-        timing = model_context["video_second_per_grid"]
+    def posemb(self, length, cu_seqlens=None, media_context=None):
+        assert media_context is not None and media_context["input_ids"].shape[1] == length
+        timing = media_context["video_second_per_grid"]
         assert timing.dtype == torch.float32, "FSDP must not round timing metadata to BF16"
         torch.testing.assert_close(
             timing, torch.tensor([2.0 / 3.0], device=timing.device), rtol=0, atol=0
         )
-        seen[self.stage_index, int(model_context["batch_index"])] += 1
+        seen[self.stage_index, int(media_context["batch_index"])] += 1
         return original_posemb(self, length, cu_seqlens)
 
     from contextlib import ExitStack
