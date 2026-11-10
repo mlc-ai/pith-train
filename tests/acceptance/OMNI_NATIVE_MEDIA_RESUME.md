@@ -55,10 +55,11 @@ video, synchronized AV and combined audio/image/AV (`all`).
 
 Preparation validates every fixture through its native input validator, copies
 and verifies the bundle, records named fixture hashes, and saves the reduced
-composite model config. It also uses the unchanged production `OmniPretrainData`
+composite model config. It also uses the unchanged production `PreparedBundleData`
 reader with the requested DP partitions, seed 1234 and 32-sample epochs. It
 checks all three global steps contain input for each required tower and proves
-exact next-data restoration after step two. This CPU check does not execute PP,
+that a fresh reader with the same data fingerprint returns step three's exact batch
+from the step alone (the reader is step-indexed and has no cursor). This CPU check does not execute PP,
 model updates, or GPU checkpoint loading.
 
 Use the same component in all three commands (replace `audio` with `video` or
@@ -92,7 +93,9 @@ The producer saves strict rank-local shards after two production updates,
 captures complete runtime state, and performs the third continuous update.
 The restore process starts with empty optimizer state, deliberately clears
 model weights, changes RNG, then uses production strict loading. It requires
-exact model/optimizer/scheduler/Python/NumPy/CPU/CUDA RNG/data restoration,
+exact model/optimizer/scheduler/Python/NumPy/CPU/CUDA RNG restoration, a stored
+data fingerprint equal to the live reader's (a mismatched fingerprint must be rejected
+before any state changes), and only the next step read by the restored process,
 identical next input IDs, labels, media tensors, layout/context and sample IDs,
 identical third objective sums, exact third-update state, and identical
 per-component third-step gradient/update evidence. The observer requires finite,

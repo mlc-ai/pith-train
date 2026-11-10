@@ -101,8 +101,8 @@ def test_actual_reference_control_flow_checks_gradients_before_master_updates(
             super().__init__()
             self.norm = Norm()
 
-        def reference_forward(self, ids, model_context):
-            value = self.norm.weight + model_context.get("input_features", torch.zeros(1)).sum()
+        def reference_forward(self, ids, media_context):
+            value = self.norm.weight + media_context.get("input_features", torch.zeros(1)).sum()
             if bad_gradient:
                 value = value + value - value.detach()
             return torch.stack((value, -value), dim=-1).expand(*ids.shape, 2)

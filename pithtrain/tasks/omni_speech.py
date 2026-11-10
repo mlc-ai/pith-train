@@ -838,7 +838,7 @@ def _step(
             else:
                 output = model(
                     batch["input_ids"],
-                    batch["model_context"],
+                    batch["media_context"],
                     batch["codes"],
                     batch["code_lengths"],
                     prompt_lengths=batch["prompt_lengths"],

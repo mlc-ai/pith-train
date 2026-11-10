@@ -37,8 +37,8 @@ class Qwen3OmniMoeThinkerAudioModel(Qwen3OmniMoeThinkerTextModel):
     def validate_media_batch(input_ids, context, config):
         return validate_audio_inputs(input_ids, context, config)
 
-    def forward_prolog(self, input_ids, model_context=None):
-        context = model_context or {}
+    def forward_prolog(self, input_ids, media_context=None):
+        context = media_context or {}
         validate_audio_inputs(input_ids, context, self.audio_config)
         lengths = audio_feature_lengths(context, self.audio_config)
         features = self.audio_tower(flatten_audio_features(context), lengths).last_hidden_state
@@ -46,25 +46,25 @@ class Qwen3OmniMoeThinkerAudioModel(Qwen3OmniMoeThinkerTextModel):
             self.embed_tokens(input_ids), input_ids, self.audio_config.audio_token_id, features
         )
 
-    def forward_posemb(self, length, cu_seqlens=None, model_context=None):
+    def forward_posemb(self, length, cu_seqlens=None, media_context=None):
         if cu_seqlens is not None:
             raise NotImplementedError("Packed native audio training is not implemented")
-        if model_context is None:
-            raise ValueError("Native audio positions require the shared model_context")
+        if media_context is None:
+            raise ValueError("Native audio positions require the shared media_context")
         positions = validate_audio_inputs(
-            model_context["input_ids"], model_context, self.audio_config, require_features=False
+            media_context["input_ids"], media_context, self.audio_config, require_features=False
         )
         if positions.shape[-1] != length:
             raise ValueError("Audio context sequence length differs from model activation")
         return self.rotary_emb(positions, training.PARAM_DTYPE)
 
-    def forward(self, hidden_states, cu_seqlens=None, model_context=None):
-        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens, model_context)
+    def forward(self, hidden_states, cu_seqlens=None, media_context=None):
+        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens, media_context)
 
-    def reference_forward(self, hidden_states, cu_seqlens=None, model_context=None):
+    def reference_forward(self, hidden_states, cu_seqlens=None, media_context=None):
         if self.stage_index == 0:
-            hidden_states = self.forward_prolog(hidden_states, model_context)
-        rotary = self.forward_posemb(hidden_states.shape[1], cu_seqlens, model_context)
+            hidden_states = self.forward_prolog(hidden_states, media_context)
+        rotary = self.forward_posemb(hidden_states.shape[1], cu_seqlens, media_context)
         for layer in self.layers.values():
             hidden_states = layer.reference_forward(hidden_states, rotary, cu_seqlens)
         if self.stage_index == self.stage_count - 1:

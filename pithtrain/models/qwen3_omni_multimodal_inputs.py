@@ -71,7 +71,7 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
         raise ValueError("input_ids are outside the text vocabulary")
     shared = context.get("input_ids")
     if shared is not None and not torch.equal(input_ids, shared):
-        raise ValueError("model_context input_ids must match model_inputs")
+        raise ValueError("media_context input_ids must match model_inputs")
     mask = context.get("attention_mask")
     if mask is not None and (mask.shape != input_ids.shape or not (mask == 1).all()):
         raise ValueError("Native multimodal microbatches must be unpadded")

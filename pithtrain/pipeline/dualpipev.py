@@ -170,7 +170,7 @@ class DualPipeV(nn.Module):
         self.loss_chunks: List[Optional[torch.Tensor]] = []
         self.objective_output_chunks: List[Any] = []
         self.objective: Optional[Callable] = None
-        self.model_context_chunks = []
+        self.media_context_chunks = []
         self.cu_seqlens_chunks = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
@@ -184,20 +184,25 @@ class DualPipeV(nn.Module):
 
     def setup_step_metadata(self, microbatches: List[Microbatch]) -> int:
         """
-        Micro-batches may differ in shape. Media payloads reach only the model chunk hosting
-        stage 0; every other chunk, including the other V-shaped chunk on that rank, gets the
-        shared model context.
+        Record the per-step shapes.
+
+        Every pipeline rank has the same sample order and token shapes, so each derives
+        activation shapes locally. Media payloads stay on the rank hosting stage 0, and
+        even that rank's other V-shaped model chunk sees only the shared context.
+        Micro-batches may differ in shape. The hidden size comes from the local model.
+
+        Returns the number of micro-batches in this step.
         """
         device = distributed.device
         hidden = self.module[0].hidden_size
 
         self.p2p_shapes = []
-        self.model_context_chunks = [
-            [microbatch.context_for_stage(module.stage_index) for microbatch in microbatches]
+        self.media_context_chunks = [
+            [mb.context_for_stage(module.stage_index) for mb in microbatches]
             for module in self.module
         ]
-        for microbatch in microbatches:
-            first_input, *_ = microbatch.model_inputs
+        for mb in microbatches:
+            first_input, *_ = mb.model_inputs
             batch, sequence, *_ = first_input.shape
             self.p2p_shapes.append([(batch, sequence, hidden)])
 
@@ -232,9 +237,9 @@ class DualPipeV(nn.Module):
             self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
         )
         kwargs = dict(cu_seqlens=cu_seqlens)
-        context = self.model_context_chunks[phase][chunk_id]
+        context = self.media_context_chunks[phase][chunk_id]
         if context is not None:
-            kwargs["model_context"] = context
+            kwargs["media_context"] = context
         training.current_microbatch = chunk_id
         outputs = self.module[phase](*inputs, **kwargs)
         self.module[phase].chunk_record = None
@@ -356,7 +361,7 @@ class DualPipeV(nn.Module):
             output_grads1,
             self.chunk_records[phase1][chunk_id1],
             self.comm_stream,
-            model_context=self.model_context_chunks[phase0][chunk_id0],
+            media_context=self.media_context_chunks[phase0][chunk_id0],
         )
         nvtx.range_pop()
 
@@ -682,7 +687,7 @@ def overlapped_forward_backward(
     output_grads1: Optional[List[torch.Tensor]],
     chunk_record1: ChunkRecord,
     comm_stream: Optional[torch.cuda.Stream],
-    model_context: Optional[dict[str, torch.Tensor]] = None,
+    media_context: Optional[dict[str, torch.Tensor]] = None,
 ):
     """
     Run the forward of one micro-batch through module0 interleaved with the backward of another
@@ -722,9 +727,9 @@ def overlapped_forward_backward(
     moe_outs_grad = stage4_b(ctx, module1_layers[-1], record, (moe_outs_grad,))
 
     if module0.stage_index == 0:
-        hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog, model_context)
+        hidden_states = prolog_f(module0, hidden_states, chunk_record0.prolog, media_context)
 
-    kwargs = {} if model_context is None else {"model_context": model_context}
+    kwargs = {} if media_context is None else {"media_context": media_context}
     rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens, **kwargs)
 
     record, dispatch_tokens, residual, routing = stage1_f(

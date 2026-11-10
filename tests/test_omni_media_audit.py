@@ -15,8 +15,8 @@ def install_audit(stack, audit, original):
         validate_model = lambda *_: None
         _next_media_microbatch = lambda *_: None
 
-    prepare = SimpleNamespace(read_verified_bundle=lambda: None, processor_for=lambda: None)
-    reader = SimpleNamespace(create_omni_dataloader=lambda: None)
+    prepare = SimpleNamespace(read_verified_bundle=lambda: None)
+    reader = SimpleNamespace(create_omni_dataloader=lambda: None, processor_for=lambda: None)
     dist = SimpleNamespace(
         broadcast_object_list=original,
         broadcast=lambda *_: None,

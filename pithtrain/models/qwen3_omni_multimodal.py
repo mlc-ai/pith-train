@@ -32,8 +32,8 @@ class Qwen3OmniMoeThinkerMultimodalModel(Qwen3OmniMoeThinkerImageModel):
     def validate_media_batch(input_ids, context, config):
         return multimodal_position_ids(input_ids, context, config)
 
-    def forward_prolog(self, input_ids, model_context=None):
-        context = model_context or {}
+    def forward_prolog(self, input_ids, media_context=None):
+        context = media_context or {}
         multimodal_position_ids(input_ids, context, self.image_config)
         return encode_multimodal(
             self.visual,
@@ -44,12 +44,12 @@ class Qwen3OmniMoeThinkerMultimodalModel(Qwen3OmniMoeThinkerImageModel):
             self.image_config,
         )
 
-    def forward_posemb(self, length, cu_seqlens=None, model_context=None):
+    def forward_posemb(self, length, cu_seqlens=None, media_context=None):
         if cu_seqlens is not None:
             raise NotImplementedError("Packed native multimodal training is not implemented")
-        if model_context is None:
+        if media_context is None:
             return super().forward_posemb(length)
         positions = multimodal_position_ids(
-            model_context["input_ids"], model_context, self.image_config, require_media=False
+            media_context["input_ids"], media_context, self.image_config, require_media=False
         )
         return self.rotary_emb(positions, training.PARAM_DTYPE)

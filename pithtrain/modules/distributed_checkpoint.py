@@ -3,6 +3,11 @@
 Weights use checkpoint.py's canonical expert mapping. Per-rank optimizer
 membership and RNG are never deduplicated across PP/EP ranks. This version
 supports AdamW and StepLR/LambdaLR only; it is not a resharding weight export.
+
+Step-indexed training data (PretrainData) contributes only its static data
+fingerprint: the completed step selects the next batch, so no reader cursor is
+saved or restored. Scan-cursor tasks (SFT/speech) commit their own cursors
+through TaskCheckpointState.
 """
 
 import copy
@@ -33,11 +38,45 @@ from pithtrain.modules.task_checkpoint import (
 )
 
 MANIFEST = "strict-manifest.json"
-VERSION = 1
+# Version 2 stores a step-indexed source's data fingerprint instead of version 1's
+# consumed-sample cursor; version-1 checkpoints are rejected rather than reinterpreted.
+VERSION = 2
 
 
 class DistributedCheckpointError(ValueError):
     """All participating ranks reject the checkpoint or restore transaction."""
+
+
+class _DataFingerprint:
+    """Checkpoint view of step-indexed data: its static identity, never a cursor."""
+
+    def __init__(self, fingerprint):
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise DistributedCheckpointError("Strict resume requires a data fingerprint")
+        self.fingerprint = fingerprint
+
+    def state_dict(self):
+        return {"fingerprint": self.fingerprint}
+
+    def load_state_dict(self, state):
+        # Nothing to restore: the completed step selects the data.
+        if state != self.state_dict():
+            raise DistributedCheckpointError("Checkpoint data fingerprint differs from this run")
+
+
+def _data_source(data_fingerprint, data_state):
+    """A scan-cursor task's TaskCheckpointState, or step-indexed data's fingerprint."""
+    if (data_fingerprint is None) == (data_state is None):
+        raise DistributedCheckpointError(
+            "Strict resume requires exactly one of data_fingerprint and data_state"
+        )
+    if data_state is None:
+        return _DataFingerprint(data_fingerprint)
+    if not isinstance(data_state, TaskCheckpointState):
+        raise DistributedCheckpointError(
+            "data_state must be a TaskCheckpointState; step-indexed data passes data_fingerprint"
+        )
+    return data_state
 
 
 def _phase(label, function):
@@ -348,30 +387,25 @@ def _conditional_optimizer_templates(optimizers, schema, updates):
     return templates, counters
 
 
-def _validate_data(value, *, step, global_batch_size, fingerprint, data_state=None):
+def _validate_data(value, *, step, fingerprint, data_state=None):
     if isinstance(data_state, TaskCheckpointState):
         data_state.validate_state_dict(value)
         if value["cursors"]["transaction"] != step:
             raise DistributedCheckpointError("Checkpoint transaction and task cursor disagree")
         return value["cursors"]["updates"]
-    if (
-        set(value) != {"version", "fingerprint", "consumed_samples"}
-        or type(value["version"]) is not int
-        or value["version"] != 1
-    ):
-        raise DistributedCheckpointError("Expected complete PR100 version-1 data state")
-    if value["fingerprint"] != fingerprint or not isinstance(fingerprint, str):
-        raise DistributedCheckpointError("Data fingerprint mismatch")
-    if (
-        type(value["consumed_samples"]) is not int
-        or value["consumed_samples"] != step * global_batch_size
-    ):
-        raise DistributedCheckpointError("Step and committed data cursor disagree")
+    if not isinstance(value, dict) or set(value) != {"fingerprint"}:
+        raise DistributedCheckpointError("Expected a step-indexed data fingerprint")
+    if not isinstance(fingerprint, str) or value["fingerprint"] != fingerprint:
+        raise DistributedCheckpointError(
+            "Checkpoint data fingerprint differs: check the dataset, modalities, sampling, "
+            "seed, sequence length and batch sizes before resuming"
+        )
     return step
 
 
-def _objects(data_state, step, config):
-    if type(step) is not int or step < 1 or data_state is None or not isinstance(config, dict):
+def _objects(data_fingerprint, data_state, step, config):
+    data_state = _data_source(data_fingerprint, data_state)
+    if type(step) is not int or step < 1 or not isinstance(config, dict):
         raise DistributedCheckpointError(
             "Strict resume requires completed step, data and configuration"
         )
@@ -398,15 +432,9 @@ def _objects(data_state, step, config):
             "Optimizer parameter coverage is missing, duplicated or unexpected"
         )
     device = next(model.parameters()).device
-    global_batch_size = None
-    if not isinstance(data_state, TaskCheckpointState):
-        global_batch_size = config["training"]["global_batch_size"]
-        if type(global_batch_size) is not int or global_batch_size < 1:
-            raise DistributedCheckpointError("Invalid global batch size")
-    data = (
-        data_state.state_dict()
-    )  # Reject pending, uncommitted reads before collectives with state.
-    return model, optimizers, schedulers, device, global_batch_size, data
+    # A task state rejects pending, uncommitted scans here, before collectives with state.
+    data = data_state.state_dict()
+    return model, optimizers, schedulers, device, data_state, data
 
 
 def _runtime(model, optimizers, schedulers, data_state, device):
@@ -478,20 +506,21 @@ def _write_tensor_file(path, payload):
     temporary.replace(path)
 
 
-def save(root, step, *, data_state, config):
+def save(root, step, *, config, data_fingerprint=None, data_state=None):
+    """Save a completed step. Step-indexed data passes data_fingerprint; a scan-cursor
+    task passes its TaskCheckpointState as data_state. Exactly one is required."""
     if not dist.is_initialized():
         raise DistributedCheckpointError("Initialize the real process group before strict saving")
-    objects = _phase("save arguments", lambda: _objects(data_state, step, config))
-    model, opts, scheds, device, batch, data = objects
+    objects = _phase("save arguments", lambda: _objects(data_fingerprint, data_state, step, config))
+    model, opts, scheds, device, data_state, data = objects
     task_mode = isinstance(data_state, TaskCheckpointState)
     conditional = task_mode and data_state.optimizer_policy == CONDITIONAL_OPTIMIZER_POLICY
     version = TASK_STATE_VERSION if task_mode else VERSION
     updates = _phase(
-        "committed cursor",
+        "committed data",
         lambda: _validate_data(
             data,
             step=step,
-            global_batch_size=batch,
             fingerprint=data["fingerprint"],
             data_state=data_state,
         ),
@@ -592,11 +621,12 @@ def save(root, step, *, data_state, config):
     return location
 
 
-def load(root, step, *, data_state, config):
+def load(root, step, *, config, data_fingerprint=None, data_state=None):
+    """Restore a completed step transactionally; data arguments are as for save."""
     if not dist.is_initialized():
         raise DistributedCheckpointError("Initialize the real process group before strict loading")
-    model, opts, scheds, device, batch, data = _phase(
-        "load arguments", lambda: _objects(data_state, step, config)
+    model, opts, scheds, device, data_state, data = _phase(
+        "load arguments", lambda: _objects(data_fingerprint, data_state, step, config)
     )
     task_mode = isinstance(data_state, TaskCheckpointState)
     conditional = task_mode and data_state.optimizer_policy == CONDITIONAL_OPTIMIZER_POLICY
@@ -693,7 +723,6 @@ def load(root, step, *, data_state, config):
             updates = _validate_data(
                 payload["task"],
                 step=step,
-                global_batch_size=None,
                 fingerprint=data["fingerprint"],
                 data_state=data_state,
             )
@@ -711,12 +740,7 @@ def load(root, step, *, data_state, config):
         restore_template = template
         restored_data = payload["task"] if task_mode else payload["state"]["data"]
         if not task_mode:
-            _validate_data(
-                restored_data,
-                step=step,
-                global_batch_size=batch,
-                fingerprint=data["fingerprint"],
-            )
+            _validate_data(restored_data, step=step, fingerprint=data["fingerprint"])
         _check_training_state(
             payload["state"],
             expected_optimizers,
@@ -800,35 +824,53 @@ def save_checkpoint(
     root: Path,
     step: int,
     *,
+    data_fingerprint: str | None = None,
     data_state=None,
     strict: bool = False,
     resume_config: dict | None = None,
 ) -> None:
     """
     checkpoint.save_checkpoint, or with strict the fixed-topology save above, whose resume contract
-    is resume_config.
+    is resume_config. data_state (a scan-cursor TaskCheckpointState) requires strict.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
     if strict:
-        save(root, step, data_state=data_state, config=resume_config)
+        save(
+            root,
+            step,
+            config=resume_config,
+            data_fingerprint=data_fingerprint,
+            data_state=data_state,
+        )
+    elif data_state is not None:
+        raise ValueError("Task checkpoint state requires strict fixed-topology checkpoints")
     else:
-        plain.save_checkpoint(root, step, data_state=data_state)
+        plain.save_checkpoint(root, step, data_fingerprint=data_fingerprint)
 
 
 def load_checkpoint(
     root: Path,
     step: int,
     *,
+    data_fingerprint: str | None = None,
     data_state=None,
     strict: bool = False,
     resume_config: dict | None = None,
 ) -> None:
     """
     checkpoint.load_checkpoint, or with strict the fixed-topology load above, which requires the
-    resume contract resume_config.
+    resume contract resume_config. data_state (a scan-cursor TaskCheckpointState) requires strict.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
     if strict:
-        load(root, step, data_state=data_state, config=resume_config)
+        load(
+            root,
+            step,
+            config=resume_config,
+            data_fingerprint=data_fingerprint,
+            data_state=data_state,
+        )
+    elif data_state is not None:
+        raise ValueError("Task checkpoint state requires strict fixed-topology checkpoints")
     else:
-        plain.load_checkpoint(root, step, data_state=data_state)
+        plain.load_checkpoint(root, step, data_fingerprint=data_fingerprint)

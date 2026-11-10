@@ -17,7 +17,7 @@ import torch
 
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.microbatch import Microbatch
-from pithtrain.modules.training_data import DensePretrainData, OmniPretrainData
+from pithtrain.modules.training_data import PreparedBundleData, TokenBinData
 from tests import test_omni_training_acceptance as runner
 from tests import test_training_data as data_fixtures
 from tests.test_data_config import ROOT, task_config
@@ -71,17 +71,28 @@ def test_legacy_mode_cannot_mislabel_current_logging(tmp_path):
 
 
 @pytest.mark.parametrize("data_format", ["token_bin", "prepared_bundle"])
-def test_required_checkpoint_state_kind(tmp_path, data_format):
+@pytest.mark.parametrize(
+    "data",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(data_fingerprint=None),
+        SimpleNamespace(data_fingerprint=""),
+        # A durable reader cursor would be silently dropped: only the fingerprint is saved.
+        SimpleNamespace(data_fingerprint="same-data", state_dict=lambda: {"consumed_samples": 8}),
+    ],
+    ids=["missing", "none", "empty", "cursor"],
+)
+def test_required_checkpoint_data_identity(tmp_path, data_format, data):
     args = runner.parse_args(arguments(tmp_path, "--data-format", data_format))
     with pytest.raises(AssertionError):
-        runner.checkpoint_data(
-            SimpleNamespace(checkpoint_state=object() if data_format == "token_bin" else None), args
-        )
+        runner.checkpoint_data(data, args)
+    valid = SimpleNamespace(data_fingerprint="same-data")
+    assert runner.checkpoint_data(valid, args) == "same-data"
 
 
 def example_report(data_format="prepared_bundle"):
     return dict(
-        report_version=3,
+        report_version=4,
         checkpoint_observation=dict(
             protocol="save_then_runtime_state_v1",
             events=[dict(operation=name, step=1) for name in ("save_checkpoint", "runtime_state")],
@@ -100,14 +111,13 @@ def example_report(data_format="prepared_bundle"):
         rows=[{"train/step": n} for n in range(3)],
         loss_statistics=[{"loss_sum": 1.0, "target_count": 2}] * 3,
         batches=[[[[], [], None, None, None, []]] for _ in range(3)],
-        checkpoint_state=dict(
-            weights={},
-            optimizers=[],
-            schedulers=[],
-            cuda_rng={},
-            data=None if data_format == "token_bin" else {"consumed_samples": 8},
-        ),
+        # Both formats checkpoint only the step-indexed data fingerprint.
+        checkpoint_state=checkpoint_state({"fingerprint": "same-data"}),
     )
+
+
+def checkpoint_state(data):
+    return dict(weights={}, optimizers=[], schedulers=[], cuda_rng={}, data=data)
 
 
 @pytest.mark.parametrize(
@@ -115,6 +125,7 @@ def example_report(data_format="prepared_bundle"):
     [
         {"report_version": 1},
         {"report_version": 2},
+        {"report_version": 3},
         {"checkpoint_observation": None},
         {"checkpoint_observation": {"protocol": "save_then_runtime_state_v1", "events": []}},
         {"legacy": True},
@@ -130,6 +141,14 @@ def example_report(data_format="prepared_bundle"):
         {"rows": [{"train/step": 1}]},
         {"loss_statistics": []},
         {"checkpoint_state": None},
+        {"checkpoint_state": checkpoint_state(None)},
+        {"checkpoint_state": checkpoint_state({"fingerprint": ""})},
+        {"checkpoint_state": checkpoint_state({"consumed_samples": 8})},
+        {
+            "checkpoint_state": checkpoint_state(
+                {"version": 1, "fingerprint": "same-data", "consumed_samples": 8}
+            )
+        },
         {"batches": [[[[], [], None, None, []]]] * 3},
     ],
 )
@@ -190,7 +209,7 @@ def test_media_contract_rejects_lost_leaked_or_extra_payload(kind, marker, paylo
         model_inputs=(tokens,),
         cu_seqlens=None,
         objective_inputs=(tokens,),
-        model_context=context,
+        media_context=context,
         media_inputs=media,
     )
     assert runner.media_kind(mb, 0) == kind
@@ -203,7 +222,7 @@ def test_media_contract_rejects_lost_leaked_or_extra_payload(kind, marker, paylo
         with pytest.raises(AssertionError, match="ownership"):
             runner.media_kind(mb, 1)
         leaked = copy.copy(mb)
-        leaked.model_context = dict(context, **media)
+        leaked.media_context = dict(context, **media)
         with pytest.raises(AssertionError, match="Shared context"):
             runner.media_kind(leaked, 0)
     mb.media_inputs = dict(media or {}, unexpected=torch.ones(1))
@@ -289,12 +308,12 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
 
     def setup_dataset(cfg):
         if legacy:
-            data = DensePretrainData(cfg.dataset, cfg.training)
+            data = TokenBinData(cfg.dataset, cfg.training)
         elif cfg.data.format == "token_bin":
-            data = DensePretrainData(cfg.data.dataset, cfg.training)
+            data = TokenBinData(cfg.data.dataset, cfg.training)
         else:
-            data = OmniPretrainData(cfg.data, cfg.training)
-        events.append(("data", id(data)))
+            data = PreparedBundleData(cfg.data, cfg.training)
+        events.append(("data", id(data), data.data_fingerprint))
         return data
 
     def get_batch(cfg, data, step, device):
@@ -310,8 +329,8 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
         context.optimizers[0].step()
         context.optimizers[0].zero_grad(set_to_none=True)
         context.schedulers[0].step()
-        data.commit_step(step)
-        events.append(("commit", step))
+        # As in production, step-indexed data has nothing to commit after the update.
+        events.append(("update", step))
         task.wandb.log(
             {
                 "train/step": step,
@@ -320,8 +339,8 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
             }
         )
 
-    def save_current_checkpoint(path, step, *, data_state):
-        assert events[-1] == ("commit", step - 1)
+    def save_current_checkpoint(path, step, *, data_fingerprint=None):
+        assert events[-1] == ("update", step - 1)
         if fault == "save":
             raise RuntimeError("save failed before observation")
         path.mkdir(parents=True, exist_ok=True)
@@ -331,28 +350,28 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
                 optimizer=context.optimizers[0].state_dict(),
                 scheduler=context.schedulers[0].state_dict(),
                 rng=torch.get_rng_state(),
-                data=None if data_state is None else data_state.state_dict(),
+                data_fingerprint=data_fingerprint,
             ),
             path / f"{step}.pt",
         )
-        events.append(("save", data_state is None))
+        events.append(("save", data_fingerprint))
 
     def save_legacy_checkpoint(path, step):
-        # Exact historical API: supplying data_state would raise TypeError.
-        return save_current_checkpoint(path, step, data_state=None)
+        # Exact historical API: supplying data_fingerprint would raise TypeError.
+        return save_current_checkpoint(path, step)
 
-    def load_checkpoint(path, step, *, data_state):
+    def load_checkpoint(path, step, *, data_fingerprint=None):
         state = torch.load(path / f"{step}.pt", weights_only=True)
-        assert (state["data"] is None) == (data_state is None)
+        # Like production, validate the stored data identity before restoring any state.
+        if state["data_fingerprint"] != data_fingerprint:
+            raise ValueError("Checkpoint data fingerprint differs")
         context.model.load_state_dict(state["model"])
         context.optimizers[0].load_state_dict(state["optimizer"])
         context.schedulers[0].load_state_dict(state["scheduler"])
-        if data_state is not None:
-            data_state.load_state_dict(state["data"])
         torch.set_rng_state(state["rng"])
         if fault == "rng":
             torch.rand(())
-        events.append(("load", data_state is None))
+        events.append(("load", data_fingerprint))
 
     task.setup_dataset, task.get_global_batch, task.train_step = (
         setup_dataset,
@@ -389,6 +408,13 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *args, **kwargs: 0)
     monkeypatch.setattr(torch.cuda, "get_rng_state", torch.get_rng_state)
     return context
+
+
+def provider_fingerprint(events):
+    """Every provider built in these runs reads the same data, so one identity."""
+    (fingerprint,) = {event[2] for event in events if event[0] == "data"}
+    assert isinstance(fingerprint, str) and fingerprint
+    return fingerprint
 
 
 @pytest.mark.parametrize("data_format", ["token_bin", "prepared_bundle"])
@@ -466,11 +492,15 @@ def test_actual_runner_constructs_and_restores_each_provider(
             assert replay["batches"] == full["batches"][1:]
             assert replay["exact_restore"] and not replay["legacy"]
             assert replay["data_format"] == data_format
-        assert ("save", data_format == "token_bin") in events
+        # Both formats save, and restore validates, the provider's own fingerprint.
+        fingerprint = provider_fingerprint(events)
+        produced = json.loads((producer / "report/rank0.json").read_text())
+        assert produced["checkpoint_state"]["data"] == {"fingerprint": fingerprint}
+        assert ("save", fingerprint) in events
         if fault == "initialization":
             assert not any(event[0] == "load" for event in events)
         else:
-            assert ("load", data_format == "token_bin") in events
+            assert ("load", fingerprint) in events
         assert not torch.cuda.is_initialized()
 
 
@@ -491,7 +521,7 @@ def test_historical_producer_must_save_and_hash_at_the_common_boundary(
         )
         runner.main()
     report = json.loads((data_root / "report/rank0.json").read_text())
-    assert [event for event in events if event[0] == "save"] == [("save", True)]
+    assert [event for event in events if event[0] == "save"] == [("save", None)]
     assert report["checkpoint_state"] is not None
     assert report["checkpoint_state"]["data"] is None
     assert (data_root / "run/checkpoints/1.pt").is_file()
@@ -516,7 +546,8 @@ def test_every_producer_has_one_ordered_observation_and_stops_on_failure(
                 "cuda_rng",
                 "data",
             }:
-                assert events[-1] == ("save", mode != "prepared_bundle")
+                saved = None if mode == "legacy" else provider_fingerprint(events)
+                assert events[-1] == ("save", saved)
                 events.append(("state_hash", 1))
                 if fault == "state_hash":
                     raise RuntimeError("state hash failed")
@@ -536,11 +567,11 @@ def test_every_producer_has_one_ordered_observation_and_stops_on_failure(
             with pytest.raises(RuntimeError, match="failed"):
                 runner.main()
             assert not (data_root / "report/rank0.json").exists()
-            assert [event for event in events if event[0] == "commit"] == [("commit", 0)]
+            assert [event for event in events if event[0] == "update"] == [("update", 0)]
         else:
             runner.main()
             report = json.loads((data_root / "report/rank0.json").read_text())
-            assert report["report_version"] == 3
+            assert report["report_version"] == 4
             assert report["checkpoint_observation"] == {
                 "protocol": "save_then_runtime_state_v1",
                 "events": [
@@ -549,12 +580,13 @@ def test_every_producer_has_one_ordered_observation_and_stops_on_failure(
                 ],
             }
             assert report["config"]["save_interval"] is None
-            assert [event for event in events if event[0] in {"commit", "save", "state_hash"}] == [
-                ("commit", 0),
-                ("save", mode != "prepared_bundle"),
+            saved = None if mode == "legacy" else provider_fingerprint(events)
+            assert [event for event in events if event[0] in {"update", "save", "state_hash"}] == [
+                ("update", 0),
+                ("save", saved),
                 ("state_hash", 1),
-                ("commit", 1),
-                ("commit", 2),
+                ("update", 1),
+                ("update", 2),
             ]
         assert not torch.cuda.is_initialized()
 

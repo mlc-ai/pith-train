@@ -11,7 +11,7 @@ import torch.multiprocessing as mp
 
 from pithtrain.models.qwen3_omni_video_inputs import validate_video_inputs
 from pithtrain.modules.data_config import DataCfg
-from pithtrain.modules.training_data import OmniPretrainData
+from pithtrain.modules.training_data import PreparedBundleData
 from tests import test_omni_training as fixtures
 
 manifest = fixtures.manifest
@@ -26,7 +26,7 @@ def video_data(root, **ranks):
     training = SimpleNamespace(
         global_batch_size=4, micro_batch_size=1, sequence_length=1024, seed=1234
     )
-    return OmniPretrainData(cfg, training, **ranks)
+    return PreparedBundleData(cfg, training, **ranks)
 
 
 def _bad_video_worker(rank, root, rendezvous, output):
@@ -39,37 +39,40 @@ def _bad_video_worker(rank, root, rendezvous, output):
         timeout=timedelta(seconds=45),
     )
     pp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
-    data = video_data(
-        root,
-        dp_rank=rank % 2,
-        dp_size=2,
-        pp_rank=rank // 2,
-        pp_size=2,
-        pp_group=pp_groups[rank % 2],
+    ranks = dict(
+        dp_rank=rank % 2, dp_size=2, pp_rank=rank // 2, pp_size=2, pp_group=pp_groups[rank % 2]
     )
+    data = video_data(root, **ranks)
+    corrupt = [rank == 1]
 
     def validator(ids, inputs, config):
-        if rank == 1:
+        if corrupt[0]:
             inputs["video_second_per_grid"][0] = float("nan")
         return validate_video_inputs(ids, inputs, config)
 
     from pithtrain.tasks.prepare_omni_data import processor_for
 
     _, config = processor_for(data.recipe, True)
-    data.validate_model(
-        SimpleNamespace(input_modalities=("video",), validate_media_batch=validator), config
-    )
+    consumer = SimpleNamespace(input_modalities=("video",), validate_media_batch=validator)
+    data.validate_model(consumer, config)
     try:
-        data.get_batch(0, "cpu")
-    except RuntimeError as error:
-        message = str(error)
-        assert "Global media batch rejected" in message and "video_second_per_grid" in message
-        assert data.consumed_samples == 0
+        try:
+            data.get_batch(0, "cpu")
+        except RuntimeError as error:
+            message = str(error)
+            assert "Global media batch rejected" in message and "video_second_per_grid" in message
+        else:
+            raise AssertionError("Invalid temporal metadata accepted")
+        # Nothing durable advanced: once the input is valid, retrying the rejected step
+        # on every rank returns exactly what a fresh reader returns for that step.
+        corrupt[0] = False
+        retry = data.get_batch(0, "cpu")
+        fresh = video_data(root, **ranks)
+        fresh.validate_model(consumer, config)
+        fixtures.compare_batches(retry, fresh.get_batch(0, "cpu"))
         Path(output, f"rank-{rank}.json").write_text(
             json.dumps(dict(status="PASSED", error=message))
         )
-    else:
-        raise AssertionError("Invalid temporal metadata accepted")
     finally:
         dist.destroy_process_group()
 
@@ -93,15 +96,15 @@ def test_video_reader_resume_keeps_pixels_and_temporal_metadata(training_bundle,
     data = video_data(training_bundle, dp_rank=0, dp_size=1)
     data.validate_model(consumer, config)
     data.get_batch(0, "cpu")
-    data.commit_step(0)
-    state = data.state_dict()
     expected = data.get_batch(1, "cpu")
+    # Step-indexed resume after one completed step: a fresh reader with the same static
+    # identity reads step 1 from the step alone; no reader cursor is saved or restored.
     restored = video_data(training_bundle, dp_rank=0, dp_size=1)
     restored.validate_model(consumer, config)
-    restored.load_state_dict(state)
+    assert restored.data_fingerprint == data.data_fingerprint
     actual = restored.get_batch(1, "cpu")
     fixtures.compare_batches(actual, expected)
     for batch in actual:
         assert "pixel_values_videos" in batch.media_inputs
-        assert "video_second_per_grid" in batch.model_context
+        assert "video_second_per_grid" in batch.media_context
         validate_video_inputs(batch.model_inputs[0], batch.context_for_stage(0), config)

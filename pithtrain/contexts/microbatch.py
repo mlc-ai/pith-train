@@ -18,7 +18,7 @@ class Microbatch:
 
     The caller supplies the same sample order and sequence shapes to every pipeline rank
     within each data/context coordinate. The first PP rank consumes model/objective inputs;
-    all PP ranks may read model_context. Only the rank hosting stage 0 holds media_inputs.
+    all PP ranks may read media_context. Only the rank hosting stage 0 holds media_inputs.
 
     Attributes:
         model_inputs: Inputs to the model, for instance the token ids, handed to its first
@@ -36,10 +36,10 @@ class Microbatch:
     cu_seqlens: Optional[torch.Tensor]
     objective_inputs: Any
 
-    model_context: Optional[dict[str, torch.Tensor]] = None
+    media_context: Optional[dict[str, torch.Tensor]] = None
     """Token, mask and position/layout inputs shared by all decoder stages.
 
-    Models opting into media data accept model_context in forward,
+    Models opting into media data accept media_context in forward,
     forward_prolog and forward_posemb. The pipeline adds media_inputs only for
     stage 0; later stages receive this shared context without media payloads.
     """
@@ -49,8 +49,8 @@ class Microbatch:
 
     def context_for_stage(self, stage_index: int) -> Optional[dict[str, torch.Tensor]]:
         if stage_index == 0 and self.media_inputs:
-            context = self.model_context or {}
+            context = self.media_context or {}
             if context.keys() & self.media_inputs.keys():
                 raise ValueError("Media inputs must not overwrite shared model context")
             return dict(context, **self.media_inputs)
-        return self.model_context
+        return self.media_context

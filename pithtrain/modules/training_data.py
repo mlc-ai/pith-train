@@ -1,16 +1,13 @@
 """A shared pretraining data boundary; optional media imports remain lazy."""
 
-import hashlib
-import json
 import math
 from pathlib import Path
 from typing import Protocol
 
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint.stateful import Stateful
 
-from pithtrain.modules.data_config import DataCfg, resolve_bundle_modalities
+from pithtrain.modules.data_config import DataCfg, data_fingerprint, resolve_bundle_modalities
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.operators.cp_sequence import zigzag_spans
@@ -20,40 +17,22 @@ from pithtrain.operators.cp_sequence import zigzag_spans
 _MEDIA_INPUTS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
 
 
-def global_target_count(microbatches, group=None):
-    """Count labels over one pipeline stage's DP x CP group, without PP duplication."""
-    count = sum((mb.objective_inputs[0] != -100).sum() for mb in microbatches)
-    if dist.is_initialized():
-        dist.all_reduce(count, group=group)
-    if count.item() == 0:
-        raise ValueError("The global batch has no valid next-token targets")
-    return count.to(dtype=torch.float32)
-
-
-def global_loss_mean(local_loss_sum, target_count, group=None):
-    """Reduce loss sums, then divide once; ranks may have unequal or zero targets."""
-    total = local_loss_sum.detach().float().clone()
-    if dist.is_initialized():
-        dist.all_reduce(total, group=group)
-    return total / target_count
-
-
 class PretrainData(Protocol):
-    """The task reads a batch, commits after optimization, and checkpoints its data state.
+    """Read a deterministic global batch by training step.
 
-    Sources whose position follows solely from the training step can return None
-    for checkpoint_state. Stateful sources must reject saving an uncommitted batch.
+    With the same data/configuration, retries and checkpoint resumes select the
+    same samples. Readers may cache prefetched batches, but have no durable cursor.
     """
+
+    data_fingerprint: str
+    """Static data/configuration identity for checkpoint validation; never a cursor."""
 
     def get_batch(self, step: int, device: torch.device) -> list[Microbatch]: ...
 
-    def commit_step(self, step: int) -> None: ...
-
-    @property
-    def checkpoint_state(self) -> Stateful | None: ...
+    def validate_model(self, model_class, model_config) -> None: ...
 
 
-class DensePretrainData:
+class TokenBinData:
     """The existing shuffled token stream, with its DP ordering and zigzag CP reads.
 
     The training step determines the position, so legacy checkpoints need no
@@ -64,9 +43,19 @@ class DensePretrainData:
         self.training_cfg = training_cfg
         self.dp_rank, self.dp_size = dp_rank, dp_size
         self.cp_rank, self.cp_size = cp_rank, cp_size
-        files = sorted(Path(root).rglob("*.bin"))
+        root = Path(root).resolve()
+        files = sorted(root.rglob("*.bin"))
         if not files:
             raise ValueError(f"No token shards under {root}")
+        # Raw token shards have no content manifest. Record their location/inventory
+        # without scanning a potentially multi-terabyte corpus on every rank.
+        inventory = []
+        for file in files:
+            stat = file.stat()
+            inventory.append((file.relative_to(root).as_posix(), stat.st_size, stat.st_mtime_ns))
+        self.data_fingerprint = data_fingerprint(
+            dict(format="token_bin", root=str(root), files=inventory), training_cfg
+        )
         memmaps = [MemmapDataset(file, training_cfg.sequence_length) for file in files]
         self.corpus = ConcatDataset(memmaps, training_cfg.seed)
         required = training_cfg.max_steps * training_cfg.global_batch_size
@@ -74,13 +63,12 @@ class DensePretrainData:
             f"corpus has {len(self.corpus)} samples, run needs {required}"
         )
 
-    @property
-    def checkpoint_state(self) -> None:
-        return None
+    def validate_model(self, model_class, model_config) -> None:
+        """Token shards carry no tokenizer/vocabulary metadata to compare with the model.
 
-    def commit_step(self, step: int) -> None:
-        # No separate cursor: get_batch indexes the corpus from the training step.
-        pass
+        All supported language models accept text. As with tokenize_corpus, the
+        caller must use shards produced with the model's tokenizer.
+        """
 
     def get_batch(self, step: int, device: torch.device) -> list[Microbatch]:
         # short-hands
@@ -132,14 +120,16 @@ class DensePretrainData:
         ]
 
 
-class OmniPretrainData:
-    """Checkpointable data position shared by all ranks.
+class PreparedBundleData:
+    """Step-indexed reader for a verified prepared bundle, including text-only bundles.
 
     Text uses the existing dense .bin loader and its CP layout. Media uses one
     sample per microbatch so feature tensors never need ambiguous batch slicing.
     Only PP rank 0 reads/processes media; its peers receive tokens, labels and
     position/layout tensors. Large encoder payloads never cross the PP group.
-    Only commit_step advances the durable cursor; prefetch does not count.
+    The media sampler maps seed/epoch/global sample position to records. A cached
+    iterator only avoids repeating setup during consecutive steps; seeking or
+    retrying a step rebuilds it from step * global_batch_size.
     """
 
     def __init__(
@@ -157,7 +147,7 @@ class OmniPretrainData:
     ):
         cfg.validate()
         if cfg.format != "prepared_bundle":
-            raise ValueError("OmniPretrainData requires prepared_bundle format")
+            raise ValueError("PreparedBundleData requires prepared_bundle format")
         # Keep legacy text training independent of the optional omni-data extra.
         from pithtrain.modules.omni_bundle import read_verified_bundle
 
@@ -227,28 +217,20 @@ class OmniPretrainData:
             or self.epoch_samples % self.global_batch_size
         ):
             raise ValueError("epoch_samples must be a positive multiple of global_batch_size")
-        self.consumed_samples, self.pending_step = 0, None
-        self._iterator = None
+        self._iterator, self._next_step = None, None
         self._processor = self._thinker_config = None
         self.batch_cfg = dict(self.recipe["batch"], max_length=self.sequence_length)
         identity = dict(
-            version=1,
             bundle_sha256=bundle_sha256,
             stage=self.stage,
-            global_batch_size=self.global_batch_size,
-            micro_batch_size=self.micro_batch_size,
-            sequence_length=self.sequence_length,
-            seed=self.seed,
             weights=self.weights,
             epoch_samples=self.epoch_samples,
         )
-        # Existing recipe presets keep their exact version-1 checkpoint fingerprint.
-        # A new explicit mixture must include its own modalities in the identity.
         if self.stage is None:
             identity["modalities"] = self.modalities
-        self.fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        self.data_fingerprint = data_fingerprint(identity, training_cfg)
         self._dense = (
-            DensePretrainData(
+            TokenBinData(
                 self.root / "tokens/train",
                 training_cfg,
                 dp_rank=dp_rank,
@@ -260,27 +242,23 @@ class OmniPretrainData:
             else None
         )
 
-    @property
-    def checkpoint_state(self) -> Stateful:
-        return self
-
     def get_batch(self, step: int, device: torch.device) -> list[Microbatch]:
-        self.begin_step(step)
         if self._dense is not None:
             return self._dense.get_batch(step, device)
+        if not dist.is_initialized():
+            # No peers to agree with: surface the reader's own error; a retry rebuilds it.
+            return self._media_microbatches(step, device)
         # Each PP group first finishes its local read/broadcast protocol. Then
         # agree globally before any rank enters model/EP collectives.
-        result, failure = None, None
+        result, local, failure = None, None, None
         try:
-            result = self._media_microbatches(device)
+            result = self._media_microbatches(step, device)
         except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        failures = [failure]
-        if dist.is_initialized():
-            failures = [None] * dist.get_world_size()
-            dist.all_gather_object(failures, failure)
+            local, failure = error, f"{type(error).__name__}: {error}"
+        failures = [None] * dist.get_world_size()
+        dist.all_gather_object(failures, failure)
         if any(error is not None for error in failures):
-            raise RuntimeError(f"Global media batch rejected: {failures}")
+            raise RuntimeError(f"Global media batch rejected: {failures}") from local
         return result
 
     def validate_model(self, model_class, model_config):
@@ -289,10 +267,11 @@ class OmniPretrainData:
         text_config = getattr(
             getattr(model_config, "thinker_config", model_config), "text_config", model_config
         )
-        # The pinned processor config defines the embedding vocabulary, not tokenizer.vocab_size.
-        from pithtrain.modules.omni_bundle import processor_for
 
+        # The pinned processor config defines the embedding vocabulary, not tokenizer.vocab_size.
         def prepare():
+            from pithtrain.modules.qwen3_omni_data import processor_for
+
             self._processor, self._thinker_config = processor_for(self.recipe, True)
             return self._thinker_config.text_config.vocab_size
 
@@ -304,32 +283,6 @@ class OmniPretrainData:
             raise ValueError(
                 f"{model_class.__name__} does not implement the requested Omni modalities: {self.modalities}"
             )
-
-    def state_dict(self):
-        if self.pending_step is not None:
-            raise RuntimeError("Only checkpoint data after the optimizer step has completed")
-        return dict(version=1, fingerprint=self.fingerprint, consumed_samples=self.consumed_samples)
-
-    def load_state_dict(self, state):
-        if state.get("version") != 1 or state.get("fingerprint") != self.fingerprint:
-            raise ValueError(
-                "Checkpoint data recipe/stage/sampling/training layout differs from this run"
-            )
-        consumed = state.get("consumed_samples")
-        if type(consumed) is not int or consumed < 0 or consumed % self.global_batch_size:
-            raise ValueError("Invalid checkpoint data consumption position")
-        self.consumed_samples, self.pending_step, self._iterator = consumed, None, None
-
-    def begin_step(self, step):
-        if self.pending_step is not None or self.consumed_samples != step * self.global_batch_size:
-            raise ValueError("Training step and committed data position disagree")
-        self.pending_step = step
-
-    def commit_step(self, step):
-        if self.pending_step != step:
-            raise ValueError("Cannot commit a data step that was not read")
-        self.consumed_samples += self.global_batch_size
-        self.pending_step = None
 
     def _share_metadata(self, read):
         """Read on PP rank 0; share only small metadata or an explicit read failure."""
@@ -350,12 +303,12 @@ class OmniPretrainData:
             raise RuntimeError(f"Pipeline media reader failed: {error}") from failure
         return result
 
-    def _make_iterator(self):
-        from pithtrain.modules.omni_bundle import processor_for
-        from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
+    def _make_iterator(self, step):
+        from pithtrain.modules.qwen3_omni_data import create_omni_dataloader, processor_for
 
         if self._processor is None:
             self._processor, self._thinker_config = processor_for(self.recipe, True)
+        position = step * self.global_batch_size
         loader = create_omni_dataloader(
             self.root,
             self._processor,
@@ -365,8 +318,8 @@ class OmniPretrainData:
             batch_size=1,
             num_samples=self.epoch_samples,
             weights=self.weights,
-            epoch=self.consumed_samples // self.epoch_samples,
-            start_sample=self.consumed_samples % self.epoch_samples,
+            epoch=position // self.epoch_samples,
+            start_sample=position % self.epoch_samples,
             rank=self.dp_rank,
             world_size=self.dp_size,
             num_workers=self.cfg.num_workers,
@@ -376,24 +329,27 @@ class OmniPretrainData:
         with torch.device("cpu"):
             self._iterator = iter(loader)
 
-    def _media_microbatches(self, device):
-        if self.is_text or self.pending_step is None:
-            raise RuntimeError("Media batches must be requested inside a media training step")
+    def _media_microbatches(self, step, device):
+        if step != self._next_step:
+            self._iterator = None
+        # A partial read or processing failure must also rebuild on retry.
+        self._next_step = None
         batches = [
-            self._next_media_microbatch(device)
+            self._next_media_microbatch(step, device)
             for _ in range(self.global_batch_size // self.dp_size)
         ]
+        self._next_step = step + 1
         # Epochs contain whole global steps. Reset only after yielding the final step.
-        if (self.consumed_samples + self.global_batch_size) % self.epoch_samples == 0:
+        if (step + 1) * self.global_batch_size % self.epoch_samples == 0:
             self._iterator = None
         return batches
 
-    def _next_media_microbatch(self, device):
+    def _next_media_microbatch(self, step, device):
         shared, media_inputs = {}, {}
 
         def read():
             if self._iterator is None:
-                self._make_iterator()
+                self._make_iterator(step)
             with torch.device("cpu"):
                 batch = next(self._iterator)
             if self._media_validator is not None:
@@ -420,7 +376,7 @@ class OmniPretrainData:
             model_inputs=(shared["input_ids"],),
             cu_seqlens=None,
             objective_inputs=(labels,),
-            model_context=shared,
+            media_context=shared,
             media_inputs=media_inputs or None,
             sample_ids=sample_ids,
         )

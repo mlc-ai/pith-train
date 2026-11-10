@@ -10,13 +10,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from pithtrain.modules.microbatch import Microbatch
-from pithtrain.modules.training_data import global_target_count
 from tests.acceptance.omni_image_evidence import (
     OptimizerStepEvidence,
     fixture_image_index,
     module_update_evidence,
     snapshot,
 )
+from tests.pretrain_lm_cpu import global_target_count
 
 
 def parameters():

@@ -605,13 +605,14 @@ class StepCapture(logging.Handler):
 
 def runtime_digest(data):
     from pithtrain.contexts import distributed, training
-    from pithtrain.modules.distributed_checkpoint import _pack, _runtime
+    from pithtrain.modules.distributed_checkpoint import _DataFingerprint, _pack, _runtime
 
+    # Step-indexed data contributes only its static fingerprint, never a cursor.
     values, _ = _runtime(
         training.model,
         training.optimizers,
         training.schedulers,
-        data.checkpoint_state,
+        _DataFingerprint(data.data_fingerprint),
         distributed.device,
     )
     return tensor_digest(_pack(values))
@@ -687,19 +688,24 @@ def arm(args):
             require(
                 all(not opt.state for opt in training.optimizers), "Fresh optimizer must be empty"
             )
+            # No cursor is restored: the producer's data identity must match, and the
+            # strict load validates the stored fingerprint against it before mutation.
+            require(
+                boundary["data_fingerprint"] == data.data_fingerprint,
+                "Restored run reads a different data identity",
+            )
             load_checkpoint(
                 args.output / "converted",
                 16,
-                data_state=data.checkpoint_state,
+                data_fingerprint=data.data_fingerprint,
                 strict=True,
                 resume_config=resume_contract(cfg),
             )
             restored = runtime_digest(data)
             require(
                 restored == boundary["runtime_sha256"],
-                "Exact step16 state/RNG/cursor restoration failed",
+                "Exact step16 state/RNG/data-identity restoration failed",
             )
-            require(data.consumed_samples == 128, "Wrong restored cursor")
             require(initial == boundary["initial_weights_sha256"], "Fresh initialization changed")
             bridge = dict(
                 protocol=BRIDGE,
@@ -716,10 +722,9 @@ def arm(args):
             pretrain_lm.train_step(cfg, data, step)
         gc.enable()
         require_same_runtime_policy([policy, runtime_policy_metadata()])
-        require(
-            data.consumed_samples == last * 8 and list(data.batches) == list(range(first, last)),
-            "Incomplete real-data consumption",
-        )
+        # Step-indexed data: every update read its own step's batch exactly once, in order
+        # (a restore starts at step 16; ObservedData rejects a repeated step).
+        require(list(data.batches) == list(range(first, last)), "Incomplete real-data consumption")
         require(all(s.last_epoch == last for s in training.schedulers), "Scheduler skipped updates")
         require(
             all(
@@ -753,6 +758,7 @@ def arm(args):
                     rank=distributed.rank,
                     pid=os.getpid(),
                     runtime_sha256=runtime_digest(data),
+                    data_fingerprint=data.data_fingerprint,
                     initial_weights_sha256=initial,
                     records=records,
                     batches=data.batches,
@@ -782,7 +788,7 @@ def arm(args):
                 input=plan["input"],
                 initial_weights_sha256=initial,
                 batches=batches,
-                consumed_samples=data.consumed_samples,
+                data_fingerprint=data.data_fingerprint,
                 records=records,
                 bridge=bridge,
                 gpu=torch.cuda.get_device_name(),
@@ -820,9 +826,11 @@ def validate_arm(plan, folder, profile, arm_name):
             and report["profile"] == list(profile),
             "Arm configuration mismatch",
         )
+        # No cursor: consumption is one batch per step 0..31 plus the static data identity.
+        fingerprint = report.get("data_fingerprint")
         require(
-            report["input"] == plan["input"] and report["consumed_samples"] == 256,
-            "Input/consumption mismatch",
+            report["input"] == plan["input"] and isinstance(fingerprint, str) and fingerprint,
+            "Input/data identity mismatch",
         )
         require(set(report["batches"]) == {str(n) for n in range(32)}, "Missing batch evidence")
         require("H100" in report["gpu"] and report["native_fa4"] is True, "Wrong execution backend")
@@ -852,6 +860,10 @@ def compare_profile(plan, folder, profile):
         require(
             all(r["batches"] == reports[0]["batches"] for r in reports),
             "Arms consumed different batches",
+        )
+        require(
+            all(r["data_fingerprint"] == reports[0]["data_fingerprint"] for r in reports),
+            "Arms read different data identities",
         )
         require(
             all(

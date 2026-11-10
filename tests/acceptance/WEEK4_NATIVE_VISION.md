@@ -31,7 +31,7 @@ no detached/precomputed/frozen visual training path. This correctness-first
 implementation costs (K+1) times the decoder hidden activation/P2P width; the
 tiny gate uses K=2. Sparse transport is a later performance optimization.
 
-The existing Microbatch `model_context` and `media_inputs` already match these
+The existing Microbatch `media_context` and `media_inputs` already match these
 consumers, so no duplicate data system or unused payload field is added.
 `TrainingCfg.native_vision=True` opts into the composite Thinker image model.
 The default remains the original text model. Use AdamW in the acceptance

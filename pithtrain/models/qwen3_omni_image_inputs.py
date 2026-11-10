@@ -81,7 +81,7 @@ def validate_image_inputs(input_ids, context, config, *, require_pixels=True):
         raise ValueError("input_ids must be nonempty [batch, sequence]")
     shared_ids = context.get("input_ids")
     if shared_ids is not None and not torch.equal(input_ids, shared_ids):
-        raise ValueError("model_context input_ids must match model_inputs")
+        raise ValueError("media_context input_ids must match model_inputs")
     if input_ids.min() < 0 or input_ids.max() >= config.text_config.vocab_size:
         raise ValueError("input_ids are outside the text vocabulary")
     if input_ids.shape[0] != 1:

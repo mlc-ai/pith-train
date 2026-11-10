@@ -112,7 +112,7 @@ def validate_video_inputs(input_ids, context, config, *, require_pixels=True):
         raise ValueError("input_ids are outside the text vocabulary")
     shared = context.get("input_ids")
     if shared is not None and not torch.equal(shared, input_ids):
-        raise ValueError("model_context input_ids must match model_inputs")
+        raise ValueError("media_context input_ids must match model_inputs")
     mask = context.get("attention_mask")
     if mask is not None and (mask.shape != input_ids.shape or not (mask == 1).all()):
         raise ValueError("Native video microbatches must be unpadded")

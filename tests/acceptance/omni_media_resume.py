@@ -2,7 +2,9 @@
 
 Select audio, video or the complete multimodal Thinker with --component.
 All modes use the production prepared-bundle reader. All native model parameters,
-optimizers, schedulers, RNG and data cursor remain in strict snapshots.
+optimizers, schedulers and RNG remain in strict snapshots. The reader is step-indexed:
+snapshots and checkpoints hold only its static data fingerprint, and the completed
+step selects the next batch, so no data cursor is saved or restored.
 
 Each phase boundary prints one flushed OMNI_MEDIA_RESUME_PHASE JSON line to stderr (UTC
 time, rank, pid, seconds since process start), so a run killed by an outer timeout still
@@ -10,9 +12,11 @@ shows the last phase it reached. The markers only print.
 """
 
 import argparse
+import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +34,11 @@ import torch.distributed as dist
 
 from pithtrain.modules.reproducibility import runtime_determinism_snapshot
 from pithtrain.tasks.prepare_omni_data import verify_bundle
-from tests.acceptance.omni_distributed_resume import negative_case, snapshot
+from tests.acceptance.omni_distributed_resume import (
+    negative_case,
+    snapshot,
+    stored_data_fingerprint,
+)
 from tests.acceptance.omni_image_evidence import OptimizerStepEvidence
 from tests.acceptance.omni_native_resume import equal, sha
 from tests.test_omni_training_acceptance import digest
@@ -199,13 +207,18 @@ def require_input_components(batches, prefixes):
 
 
 def cpu_reader_audit(dataset, spec, config, dp_size):
-    """Read all DP partitions on CPU; this does not claim PP/GPU execution."""
-    from pithtrain.modules.training_data import OmniPretrainData
+    """Read all DP partitions on CPU; this does not claim PP/GPU execution.
+
+    The reader is step-indexed: after two completed steps, a fresh reader with the same
+    static data fingerprint must return the continuous run's step-2 batch from the step
+    alone. No reader cursor exists to save or restore.
+    """
+    from pithtrain.modules.training_data import PreparedBundleData
 
     data_cfg, training_cfg = reader_config(dataset, spec)
 
     def make_reader(rank):
-        reader = OmniPretrainData(data_cfg, training_cfg, dp_rank=rank, dp_size=dp_size)
+        reader = PreparedBundleData(data_cfg, training_cfg, dp_rank=rank, dp_size=dp_size)
         reader.validate_model(
             SimpleNamespace(
                 input_modalities=spec.modalities, validate_media_batch=spec.validate_inputs
@@ -215,7 +228,10 @@ def cpu_reader_audit(dataset, spec, config, dp_size):
         return ObservedMediaData(reader)
 
     readers = [make_reader(rank) for rank in range(dp_size)]
-    boundaries, steps = None, []
+    # Strict resume requires every rank to agree on this identity; it excludes the DP partition.
+    fingerprint = readers[0].data_fingerprint
+    assert all(reader.data_fingerprint == fingerprint for reader in readers)
+    steps = []
     for step in range(3):
         global_batches = [reader.get_batch(step, "cpu") for reader in readers]
         require_input_components(
@@ -235,27 +251,21 @@ def cpu_reader_audit(dataset, spec, config, dp_size):
                 for rank, part in enumerate(global_batches)
             ]
         )
-        for reader in readers:
-            reader.commit_step(step)
-        if step == 1:
-            boundaries = [reader.state_dict() for reader in readers]
-    assert boundaries is not None
     for rank, reader in enumerate(readers):
+        # Resume at the step-2 boundary: a fresh reader seeks the next step from the step.
         restored = make_reader(rank)
-        restored.load_state_dict(boundaries[rank])
-        equal(restored.state_dict(), boundaries[rank], f"reader-{rank}-boundary")
+        assert restored.data_fingerprint == fingerprint, f"reader-{rank}-fingerprint"
         restored.get_batch(2, "cpu")
         equal(restored.batches[2], reader.batches[2], f"reader-{rank}-next-input")
-        restored.commit_step(2)
-        equal(restored.state_dict(), reader.state_dict(), f"reader-{rank}-third-state")
-        assert restored.consumed_samples == 24
     return dict(
         status="PASSED",
-        scope="CPU production DP partitions and exact next-data restore",
+        scope="CPU production DP partitions and exact step-indexed next-data restore",
         gpu_acceptance="NOT_RUN",
         pp_execution="NOT_RUN",
         dp_size=dp_size,
-        consumed_samples=24,
+        data_fingerprint=fingerprint,
+        restored_step=2,
+        next_step=2,
         steps=steps,
     )
 
@@ -269,7 +279,8 @@ def input_identity(root, modalities):
 def identity(args, spec):
     return dict(
         expected_hardware_family=getattr(args, "hardware_family", "H100"),
-        protocol="strict_multimodal_save_then_runtime_state_v1",
+        # v2: strict state holds the static data fingerprint; v1 evidence restored a cursor.
+        protocol="strict_multimodal_save_then_runtime_state_v2",
         commit=subprocess.check_output(
             ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True
         ).strip(),
@@ -320,16 +331,17 @@ def prepare(args, spec):
 
 
 class ObservedMediaData:
-    """Hash every tensor returned by the unchanged production source."""
+    """Hash every tensor returned by the unchanged production source, in step order."""
 
     def __init__(self, source):
-        self.source, self.batches = source, {}
+        self.source, self.batches, self.steps_read = source, {}, []
 
     def __getattr__(self, name):
         return getattr(self.source, name)
 
     def get_batch(self, step, device):
         batches = self.source.get_batch(step, device)
+        self.steps_read.append(step)
         self.batches[step] = digest(
             [
                 dict(
@@ -337,7 +349,7 @@ class ObservedMediaData:
                     objective_inputs=mb.objective_inputs,
                     cu_seqlens=mb.cu_seqlens,
                     sample_ids=mb.sample_ids,
-                    model_context=mb.model_context,
+                    media_context=mb.media_context,
                     media_inputs=mb.media_inputs,
                 )
                 for mb in batches
@@ -364,6 +376,82 @@ def require_components(keys, prefixes):
         assert any(key.startswith(prefix) for key in keys), (
             f"Missing checkpoint component: {prefix}"
         )
+
+
+# Strict loading validates rank shards one owner at a time, so rank 0 stops the restore.
+FINGERPRINT_REJECTION = dict(
+    phase="validate every rank before mutation",
+    error_type="DistributedCheckpointError",
+    message=(
+        "Checkpoint data fingerprint differs: check the dataset, modalities, sampling, "
+        "seed, sequence length and batch sizes before resuming"
+    ),
+    ranks=[0],
+)
+
+
+def require_stored_fingerprint(root, rank, data_fingerprint):
+    """This rank's committed step-2 strict shard must hold exactly the live data identity."""
+    stored = stored_data_fingerprint(root, rank)
+    assert stored == data_fingerprint, "Checkpoint data fingerprint differs from this run"
+    return stored
+
+
+def verify_fingerprint_rejection(error):
+    """Accept only the strict loader's collective, pre-mutation data identity rejection."""
+    from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
+
+    expected = FINGERPRINT_REJECTION
+    assert type(error) is DistributedCheckpointError, (
+        f"Expected a collective data fingerprint rejection, got {error!r}"
+    )
+    message = str(error)
+    prefix = expected["phase"] + ": "
+    assert message.startswith(prefix), f"Wrong data fingerprint rejection phase: {message}"
+    ranks = []
+    for item in message.removeprefix(prefix).split("; "):
+        match = re.fullmatch(r"rank (\d+): (\w+): (.+)", item)
+        assert match is not None, f"Malformed collective rejection: {message}"
+        rank, error_type, reason = match.groups()
+        assert error_type == expected["error_type"] and reason == expected["message"], (
+            f"Wrong data fingerprint rejection reason: {item}"
+        )
+        ranks.append(int(rank))
+    assert ranks == expected["ranks"], f"Wrong data fingerprint rejecting ranks: {ranks}"
+    return dict(reason_verified=True, message=message, expected=expected)
+
+
+def fingerprint_rejection(root, step, data_fingerprint, resume_config, capture):
+    """A mismatched live data fingerprint must fail on every rank before any state changes.
+
+    capture() returns this rank's complete runtime snapshot and may run collectives.
+    """
+    from pithtrain.modules.distributed_checkpoint import (
+        DistributedCheckpointError,
+        _phase,
+        load_checkpoint,
+    )
+
+    mismatched = hashlib.sha256(f"mismatched-{data_fingerprint}".encode()).hexdigest()
+    assert mismatched != data_fingerprint
+    before = capture()
+    rejection = None
+    try:
+        load_checkpoint(
+            root, step, data_fingerprint=mismatched, strict=True, resume_config=resume_config
+        )
+    except DistributedCheckpointError as error:
+        rejection = error
+    evidence = _phase(
+        "verify data fingerprint rejection", lambda: verify_fingerprint_rejection(rejection)
+    )
+    after = capture()
+    _phase(
+        "verify data fingerprint rejection atomicity",
+        lambda: equal(after, before, "data-fingerprint-rejection-atomicity"),
+    )
+    evidence.update(atomicity_verified=True, mismatched_fingerprint=mismatched)
+    return evidence
 
 
 def run_gpu(args, spec):
@@ -484,6 +572,8 @@ def run_gpu(args, spec):
         require_components(set().union(*(set(part) for part in keys)), spec.required_components)
         assert set(state) == {"model", "optimizer", "scheduler", "data", "rng"}
         assert set(state["rng"]) == {"torch_cpu", "python", "numpy", "cuda"}
+        # Step-indexed data contributes only its static identity, never a reader cursor.
+        assert state["data"] == {"fingerprint": data.data_fingerprint}
         phase_marker("snapshot-done")
         return state
 
@@ -498,6 +588,9 @@ def run_gpu(args, spec):
                 observed_step(step)
             assert find_checkpoint(t.save_location) == 2
             phase_marker("checkpoint-found", step=2)
+            report["checkpoint_data_fingerprint"] = require_stored_fingerprint(
+                t.save_location, rank, data.data_fingerprint
+            )
             expected = dict(
                 boundary=complete_snapshot(), producer_nonce=PROCESS_NONCE, producer_pid=os.getpid()
             )
@@ -523,11 +616,22 @@ def run_gpu(args, spec):
                 for parameter in training.model.parameters():
                     parameter.zero_()
             torch.manual_seed(9917 + rank)
+            root = args.restore_root or args.output / "checkpoints"
+            # The checkpoint carries no cursor: prove that it holds this reader's identity
+            # and that strict loading rejects any other identity before mutating state.
+            phase_marker("data-identity-start", step=2)
+            report["checkpoint_data_fingerprint"] = require_stored_fingerprint(
+                root, rank, data.data_fingerprint
+            )
+            report["fingerprint_rejection"] = fingerprint_rejection(
+                root, 2, data.data_fingerprint, resume_contract(cfg), complete_snapshot
+            )
+            phase_marker("data-identity-verified", step=2)
             phase_marker("checkpoint-load-start", step=2)
             load_checkpoint(
-                args.restore_root or args.output / "checkpoints",
+                root,
                 2,
-                data_state=data.checkpoint_state,
+                data_fingerprint=data.data_fingerprint,
                 strict=True,
                 resume_config=resume_contract(cfg),
             )
@@ -562,10 +666,16 @@ def run_gpu(args, spec):
             report["exact_component_updates"] = True
             report["exact_restore"] = True
             report["exact_third_step"] = True
-        assert data.consumed_samples == (0 if args.mode == "negative" else 24)
+        # The step alone selects data: the producer read steps 0-2, the restored process
+        # only the next step (2), and a rejected restore reads nothing.
+        expected_steps = dict(negative=[], produce=[0, 1, 2], restore=[2])[args.mode]
+        assert data.steps_read == expected_steps, f"Data steps read: {data.steps_read}"
+        if args.mode == "restore":
+            report.update(restored_step=2, next_step=data.steps_read[0])
         report.update(
             status="PASSED",
-            consumed_samples=data.consumed_samples,
+            data_fingerprint=data.data_fingerprint,
+            data_steps_read=data.steps_read,
             optimizer_step_evidence=observer.steps,
             required_components=spec.required_components,
             converted_checkpoint_root=str(args.restore_root) if args.restore_root else None,
@@ -607,7 +717,14 @@ def parse_args(argv=None):
     parser.add_argument("--ep", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--negative-case",
-        choices=("missing-rank", "missing-cuda-rng", "shape", "topology", "optimizer-order"),
+        choices=(
+            "missing-rank",
+            "missing-cuda-rng",
+            "shape",
+            "topology",
+            "optimizer-order",
+            "fingerprint",
+        ),
     )
     args = parser.parse_args(argv)
     if (args.mode == "negative") != (args.negative_case is not None):

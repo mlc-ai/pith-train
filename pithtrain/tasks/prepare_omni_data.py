@@ -18,8 +18,8 @@ from huggingface_hub import HfApi, HfFileSystem, hf_hub_download
 from PIL import UnidentifiedImageError
 
 from pithtrain.config import SlottedDefault
-from pithtrain.modules.omni_bundle import content_id, processor_for, sha256, verify_bundle
-from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator
+from pithtrain.modules.omni_bundle import content_id, sha256, verify_bundle
+from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator, processor_for
 from pithtrain.tasks.tokenize_corpus import Worker, Writer
 
 

@@ -42,7 +42,7 @@ def test_production_dataset_routes_explicit_native_audio_flag():
         PretrainLMCfg=object,
         PretrainData=object,
         distributed=distributed,
-        OmniPretrainData=Data,
+        PreparedBundleData=Data,
         model_class_for_config=choose,
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: "composite"),
     )

@@ -75,7 +75,7 @@ class MediaAudit:
         original = pipeline_module.overlapped_forward_backward
 
         def overlap(module, *args, **kwargs):
-            self.observe_dispatch(module.stage_index, kwargs["model_context"], "overlap")
+            self.observe_dispatch(module.stage_index, kwargs["media_context"], "overlap")
             return original(module, *args, **kwargs)
 
         stack.enter_context(patch.object(pipeline_module, "overlapped_forward_backward", overlap))
@@ -89,9 +89,10 @@ class MediaAudit:
 
             return wrapped
 
+        # PR100 moved processor_for next to the Qwen3-Omni reader it configures.
         for module, name, counter in (
             (prepare, "read_verified_bundle", "verify_calls"),
-            (prepare, "processor_for", "processor_calls"),
+            (reader, "processor_for", "processor_calls"),
             (reader, "create_omni_dataloader", "loader_calls"),
         ):
             stack.enter_context(
@@ -122,11 +123,11 @@ class MediaAudit:
         stack.enter_context(patch.object(data_class, "validate_model", validate))
         original_batch = data_class._next_media_microbatch
 
-        def batch(data, device):
+        def batch(data, step, device):
             assert not self.in_batch
             self.in_batch, self.specs = True, None
             try:
-                result = original_batch(data, device)
+                result = original_batch(data, step, device)
                 assert self.pp_size == 1 or self.specs == [], "A shared tensor was not broadcast"
                 self.counts["microbatches"] += 1
                 return result
@@ -192,7 +193,7 @@ class MediaAudit:
         self.order = []
         self.seen = Counter()
         for batch in batches:
-            key = identity(batch.model_context["input_ids"])
+            key = identity(batch.media_context["input_ids"])
             assert key not in self.bound, "Ambiguous microbatch storage"
             self.bound[key] = batch
             self.order.append(key)

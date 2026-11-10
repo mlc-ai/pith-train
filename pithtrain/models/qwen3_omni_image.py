@@ -120,8 +120,8 @@ class Qwen3OmniMoeThinkerImageModel(Qwen3OmniMoeThinkerTextModel):
     def validate_media_batch(input_ids, context, config):
         return validate_image_inputs(input_ids, context, config)
 
-    def forward_prolog(self, input_ids, model_context=None):
-        context = model_context or {}
+    def forward_prolog(self, input_ids, media_context=None):
+        context = media_context or {}
         validate_image_inputs(input_ids, context, self.image_config)
         embeddings = self.embed_tokens(input_ids)
         pixels = context.get("pixel_values")
@@ -130,26 +130,26 @@ class Qwen3OmniMoeThinkerImageModel(Qwen3OmniMoeThinkerTextModel):
             embeddings, input_ids, self.image_config.image_token_id, visual, self.deepstack_count
         )
 
-    def forward_posemb(self, length, cu_seqlens=None, model_context=None):
+    def forward_posemb(self, length, cu_seqlens=None, media_context=None):
         if cu_seqlens is not None:
             raise NotImplementedError("Packed native image training is not implemented")
-        if model_context is None:
+        if media_context is None:
             return super().forward_posemb(length)
         positions = validate_image_inputs(
-            model_context["input_ids"], model_context, self.image_config, require_pixels=False
+            media_context["input_ids"], media_context, self.image_config, require_pixels=False
         )
         return self.rotary_emb(positions, training.PARAM_DTYPE)
 
     def forward_epilog(self, payload):
         return super().forward_epilog(payload[..., : self.text_hidden_size])
 
-    def forward(self, hidden_states, cu_seqlens=None, model_context=None):
-        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens, model_context)
+    def forward(self, hidden_states, cu_seqlens=None, media_context=None):
+        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens, media_context)
 
-    def reference_forward(self, hidden_states, cu_seqlens=None, model_context=None):
+    def reference_forward(self, hidden_states, cu_seqlens=None, media_context=None):
         if self.stage_index == 0:
-            hidden_states = self.forward_prolog(hidden_states, model_context)
-        rotary = self.forward_posemb(hidden_states.shape[1], cu_seqlens, model_context)
+            hidden_states = self.forward_prolog(hidden_states, media_context)
+        rotary = self.forward_posemb(hidden_states.shape[1], cu_seqlens, media_context)
         for layer in self.layers.values():
             hidden_states = layer.reference_forward(hidden_states, rotary, cu_seqlens)
         if self.stage_index == self.stage_count - 1:

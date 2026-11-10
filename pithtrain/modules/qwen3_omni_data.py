@@ -25,6 +25,29 @@ from pithtrain.modules.data_config import resolve_bundle_modalities
 from pithtrain.modules.qwen3_omni_av import decode_video_audio
 
 
+def processor_for(recipe, offline=False):
+    from huggingface_hub import snapshot_download
+    from transformers import AutoConfig, Qwen3OmniMoeProcessor
+
+    snapshot = snapshot_download(
+        recipe["model_id"],
+        revision=recipe["revision"],
+        local_files_only=offline,
+        allow_patterns=[
+            "config.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "video_preprocessor_config.json",
+        ],
+    )
+    processor = Qwen3OmniMoeProcessor.from_pretrained(snapshot, local_files_only=True)
+    config = AutoConfig.from_pretrained(snapshot, local_files_only=True).thinker_config
+    return processor, config
+
+
 class Qwen3OmniDataset(Dataset):
     """Index JSONL shards by byte offset; decode records only when requested.
 

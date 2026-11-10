@@ -444,9 +444,14 @@ class PrologRecord:
     outs: Optional[PrologOuts] = None
 
 
-def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord, model_context=None) -> torch.Tensor:  # fmt: skip
+def prolog_f(
+    module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord, media_context=None
+) -> torch.Tensor:
+    """
+    Prolog forward: embed the input tokens, recording into record for the backward.
+    """
     nvtx.range_push("prolog_f")
-    kwargs = {} if model_context is None else {"model_context": model_context}
+    kwargs = {} if media_context is None else {"media_context": media_context}
     hidden_states = module.forward_prolog(hidden_states, **kwargs)
     record.outs = PrologOuts(hidden_states)
     nvtx.range_pop()
@@ -695,7 +700,7 @@ def model_forward(
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor] = None,
-    model_context=None,
+    media_context=None,
 ) -> torch.Tensor:
     """
     Without grad the records are cleared after each layer, bounding activation memory and leaving
@@ -703,11 +708,11 @@ def model_forward(
     """
     forward_only = not torch.is_grad_enabled()
     if module.stage_index == 0:
-        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog, model_context)
+        hidden_states = prolog_f(module, hidden_states, chunk_record.prolog, media_context)
         if forward_only:
             chunk_record.prolog.outs = None
 
-    kwargs = {} if model_context is None else {"model_context": model_context}
+    kwargs = {} if media_context is None else {"media_context": media_context}
     rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens, **kwargs)
     for layer, layer_record in zip(module.layers.values(), chunk_record.layers):
         hidden_states = layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens)

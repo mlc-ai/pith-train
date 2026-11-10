@@ -75,7 +75,7 @@ def sample(kind="text", frames=2, length=None):
         positions["second_per_grids"] = inputs["video_second_per_grid"]
     batch = dict(
         input_ids=ids,
-        model_context=inputs,
+        media_context=inputs,
         prompt_lengths=[ids.shape[1] - 2],
         labels=torch.full_like(ids, -100),
         codes=torch.zeros(1, frames, 16, dtype=torch.long),
@@ -104,7 +104,7 @@ def test_original_media_geometry_and_real_talker_prompt(kind, mode):
         config=cfg,
         text_embedding=torch.nn.Embedding(256, width),
         prompt_lengths=batch["prompt_lengths"],
-        attention_mask=batch["model_context"]["attention_mask"],
+        attention_mask=batch["media_context"]["attention_mask"],
         position_kwargs=batch["position_kwargs"],
     )
     result = speech_teacher_force(talker, condition, batch["codes"], batch["code_lengths"])
@@ -128,9 +128,9 @@ def mutate(batch, field):
     elif field == "mask_dtype":
         batch["codebook_mask"] = torch.ones_like(batch["codes"])
     elif field == "missing_context_ids":
-        del batch["model_context"]["input_ids"]
+        del batch["media_context"]["input_ids"]
     elif field == "context_ids_drift":
-        batch["model_context"]["input_ids"] = batch["input_ids"] + 1
+        batch["media_context"]["input_ids"] = batch["input_ids"] + 1
     elif field == "prompt_float":
         batch["prompt_lengths"] = [float(batch["prompt_lengths"][0])]
     elif field == "prompt_boundary":
@@ -140,7 +140,7 @@ def mutate(batch, field):
     elif field == "no_user":
         batch["input_ids"][0, 1] = 103
     elif field == "padded_thinker":
-        batch["model_context"]["attention_mask"][0, 0] = 0
+        batch["media_context"]["attention_mask"][0, 0] = 0
     elif field == "text_label_range":
         batch["labels"][0, 0] = 256
     elif field == "text_label_negative":
@@ -212,7 +212,7 @@ def test_media_must_remain_in_user_conditioning_prefix():
         [[100, 103, 198, 13, 10, 10, 14, 100, 101, 198, 3, 4, 100, 102, 198, 40, 41]]
     )
     batch.update(input_ids=ids, labels=torch.full_like(ids, -100), prompt_lengths=[15])
-    batch["model_context"].update(input_ids=ids, attention_mask=torch.ones_like(ids))
+    batch["media_context"].update(input_ids=ids, attention_mask=torch.ones_like(ids))
     with pytest.raises(ValueError, match="Unused|missing"):
         validate_speech_batch(batch, owner, "codec_only", "ethan")
 

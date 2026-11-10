@@ -3,7 +3,7 @@
 No CUDA/NCCL or native encoder execution is covered by these tests.
 """
 
-import hashlib
+import builtins
 import json
 from contextlib import ExitStack
 from datetime import timedelta
@@ -19,7 +19,7 @@ import torch.multiprocessing as mp
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
-from pithtrain.modules.training_data import OmniPretrainData
+from pithtrain.modules.training_data import PreparedBundleData
 from tests import test_omni_training as fixtures
 
 manifest = fixtures.manifest
@@ -45,11 +45,11 @@ def assert_batches(batches, expected, owns_media):
         all_inputs = reference["inputs"]
         common = {name: value for name, value in all_inputs.items() if name not in PAYLOADS}
         media = {name: value for name, value in all_inputs.items() if name in PAYLOADS}
-        torch.testing.assert_close(actual.model_context, common, rtol=0, atol=0)
+        torch.testing.assert_close(actual.media_context, common, rtol=0, atol=0)
         torch.testing.assert_close(
             actual.media_inputs or {}, media if owns_media else {}, rtol=0, atol=0
         )
-        assert actual.model_inputs[0] is actual.model_context["input_ids"]
+        assert actual.model_inputs[0] is actual.media_context["input_ids"]
         assert not PAYLOADS & actual.context_for_stage(3).keys()
         if owns_media:
             torch.testing.assert_close(actual.context_for_stage(0), all_inputs, rtol=0, atol=0)
@@ -61,7 +61,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
-        init_method=f"file://{rendezvous}",
+        init_method=Path(rendezvous).resolve().as_uri(),
         rank=rank,
         world_size=4,
         timeout=timedelta(seconds=90),
@@ -119,7 +119,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
     with ExitStack() as stack:
         for module, name, counter in (
             (omni_bundle, "read_verified_bundle", "verify"),
-            (omni_bundle, "processor_for", "processor"),
+            (qwen3_omni_data, "processor_for", "processor"),
             (qwen3_omni_data, "create_omni_dataloader", "loader"),
         ):
             stack.enter_context(
@@ -129,49 +129,37 @@ def _media_worker(rank, rendezvous, root, reference_file):
         stack.enter_context(patch.object(dist, "broadcast", tensor_broadcast))
         for mode, kinds in enumerate(MODES):
             cfg, tc = configs(root, kinds)
-            data = OmniPretrainData(cfg, tc, **kwargs)
+            data = PreparedBundleData(cfg, tc, **kwargs)
             supported = type("TestMediaModel", (), {"input_modalities": set(kinds)})
             data.validate_model(supported, SimpleNamespace(vocab_size=200000))
             rng = torch.get_rng_state().clone()
             first = data.get_batch(0, "cpu")
             assert_batches(first, reference[mode][dp_rank][0], pp_rank == 0)
-            with pytest.raises(RuntimeError, match="optimizer step"):
-                data.state_dict()
-            data.commit_step(0)
-            saved = data.state_dict()
-            assert saved["version"] == 1 and saved["consumed_samples"] == 4
             if pp_rank != 0:
                 assert data._iterator is None and data._processor is None
             for step in (1, 2):
                 assert_batches(
                     data.get_batch(step, "cpu"), reference[mode][dp_rank][step], pp_rank == 0
                 )
-                data.commit_step(step)
             assert torch.equal(torch.get_rng_state(), rng), "Data distribution changed model RNG"
 
-            restored = OmniPretrainData(cfg, tc, **kwargs)
-            restored.load_state_dict(saved)
+            restored = PreparedBundleData(cfg, tc, **kwargs)
             for step in (1, 2):
                 assert_batches(
                     restored.get_batch(step, "cpu"), reference[mode][dp_rank][step], pp_rank == 0
                 )
-                restored.commit_step(step)
-            assert restored.state_dict() == data.state_dict()
 
         cfg, tc = configs(root, ("image",))
-        failed = OmniPretrainData(cfg, tc, **kwargs)
+        failed = PreparedBundleData(cfg, tc, **kwargs)
 
-        def fail_read():
+        def fail_read(step):
             raise ValueError("expected-reader-failure")
 
         failed._make_iterator = fail_read
         with pytest.raises(RuntimeError, match="expected-reader-failure"):
             failed.get_batch(0, "cpu")
-        assert failed.pending_step == 0 and failed.consumed_samples == 0
-        with pytest.raises(RuntimeError, match="optimizer step"):
-            failed.state_dict()
         with pytest.raises(ValueError, match="process group does not match"):
-            OmniPretrainData(cfg, tc, **dict(kwargs, pp_group=dist.group.WORLD))
+            PreparedBundleData(cfg, tc, **dict(kwargs, pp_group=dist.group.WORLD))
 
         # The owner still checks EVERY payload hash. A corrupted media file
         # fails the whole PP group, including peers that never open the file.
@@ -180,7 +168,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
             (Path(root) / "image.png").write_bytes(b"corrupt test image")
         dist.barrier()
         with pytest.raises(RuntimeError, match="Dataset hash mismatch"):
-            OmniPretrainData(cfg, tc, **kwargs)
+            PreparedBundleData(cfg, tc, **kwargs)
 
     assert not pending_specs
     assert all(counters[name] > 0 for name in ("headers", "tensors"))
@@ -237,17 +225,6 @@ def test_media_payloads_stay_on_owner_with_real_processor_and_gloo(
     )
 
 
-@pytest.mark.parametrize("rank,size", [(-1, 2), (2, 2), (0, 0), (True, 2)])
-def test_media_rejects_invalid_pp_coordinates(training_bundle, rank, size):
-    with pytest.raises(ValueError, match="pipeline-parallel"):
-        OmniPretrainData(*configs(training_bundle, ("image",)), pp_rank=rank, pp_size=size)
-
-
-def test_media_rejects_missing_pp_group(training_bundle):
-    with pytest.raises(ValueError, match="initialized pipeline"):
-        OmniPretrainData(*configs(training_bundle, ("image",)), pp_size=2)
-
-
 def test_stage_context_keeps_shared_inputs_and_rejects_overwrite():
     tokens, pixels = torch.ones(1, 3, dtype=torch.long), torch.ones(4, 3)
     shared = {"input_ids": tokens, "image_grid_thw": torch.tensor([[1, 2, 2]])}
@@ -255,7 +232,7 @@ def test_stage_context_keeps_shared_inputs_and_rejects_overwrite():
         model_inputs=(tokens,),
         objective_inputs=(tokens,),
         cu_seqlens=None,
-        model_context=shared,
+        media_context=shared,
         media_inputs={"pixel_values": pixels},
     )
     assert micro.context_for_stage(0)["pixel_values"] is pixels
@@ -269,25 +246,26 @@ def test_stage_context_keeps_shared_inputs_and_rejects_overwrite():
     assert plain.context_for_stage(0) is None and plain.context_for_stage(1) is None
 
 
-def test_media_checkpoint_fingerprint_unchanged(training_bundle, processor_config):
-    cfg, tc = configs(training_bundle, ("text", "image", "audio", "video"))
-    data = OmniPretrainData(cfg, tc)
-    recipe = json.loads((training_bundle / "bundle.json").read_text())["recipe"]
-    identity = dict(
-        version=1,
-        bundle_sha256=hashlib.sha256((training_bundle / "bundle.json").read_bytes()).hexdigest(),
-        stage="video",
-        global_batch_size=4,
-        micro_batch_size=1,
-        sequence_length=1024,
-        seed=17,
-        weights={k: recipe["sampling_weights"][k] for k in cfg.modalities},
-        epoch_samples=8,
-    )
-    saved = dict(
-        version=1,
-        fingerprint=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
-        consumed_samples=4,
-    )
-    data.load_state_dict(saved)
-    assert data.state_dict() == saved
+def test_non_reader_model_validation_does_not_import_media_dependencies(
+    training_bundle, monkeypatch
+):
+    cfg, tc = configs(training_bundle, ("image",))
+    data = PreparedBundleData(cfg, tc)
+    data.pp_rank, data.pp_size, data.pp_group = 1, 2, object()
+    monkeypatch.setattr(dist, "get_global_rank", lambda group, rank: 0)
+
+    def broadcast(message, *, src, group):
+        assert src == 0 and group is data.pp_group
+        message[0] = (200000, None)
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    original_import = builtins.__import__
+
+    def no_media_import(name, *args, **kwargs):
+        assert name != "pithtrain.modules.qwen3_omni_data", "Only the reader imports media code"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_media_import)
+    model = type("MediaModel", (), {"input_modalities": {"text", "image"}})
+    data.validate_model(model, SimpleNamespace(vocab_size=200000))
+    assert data._processor is None and data._thinker_config is None

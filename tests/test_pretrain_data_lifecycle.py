@@ -30,8 +30,9 @@ from pithtrain.modules.checkpoint import (
 )
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.optimizer import local_grads, scale_grads_
-from pithtrain.modules.training_data import OmniPretrainData, global_loss_mean, global_target_count
+from pithtrain.modules.training_data import PreparedBundleData
 from tests import test_training_data as data_fixtures
+from tests.pretrain_lm_cpu import global_loss_mean, global_target_count
 from tests.test_data_config import ROOT, example_modules
 from tests.test_strict_checkpoint import assert_tree_equal
 
@@ -57,9 +58,10 @@ def task_functions(**namespace):
 class OtherData:
     """No inheritance or Omni-specific fields; only the shared data contract."""
 
+    data_fingerprint = "other-data-fingerprint"
+
     def __init__(self, events):
         self.events = events
-        self.checkpoint_state = SimpleNamespace(state_dict=lambda: {"completed": 1})
 
     def get_batch(self, step, device):
         self.events.append(("read", step))
@@ -71,13 +73,10 @@ class OtherData:
             )
         ]
 
-    def commit_step(self, step):
-        self.events.append(("commit", step))
-
 
 @pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("fail_optimizer", [False, True])
-def test_task_commits_only_after_successful_optimizer_and_scheduler(
+def test_task_saves_only_after_successful_optimizer_and_scheduler(
     monkeypatch, tmp_path, fail_optimizer, strict
 ):
     events = []
@@ -95,10 +94,10 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         if fail_optimizer:
             raise RuntimeError("optimizer failed")
 
-    def save_checkpoint(root, step, *, data_state, **kwargs):
+    def save_checkpoint(root, step, *, data_fingerprint, **kwargs):
         assert kwargs == ({"strict": True, "resume_config": {"test": "contract"}} if strict else {})
-        assert root == tmp_path and data_state is data.checkpoint_state
-        assert events[-1] == ("commit", step - 1)
+        assert root == tmp_path and data_fingerprint == data.data_fingerprint
+        assert events[-1] == "scheduler"
         events.append(("save", step))
 
     model.step = model_step
@@ -158,19 +157,17 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         assert events == [("read", 0), "optimizer"]
     else:
         task.train_step(cfg, data, 0)
-        assert events == [("read", 0), "optimizer", "scheduler", ("commit", 0), ("save", 1)]
+        assert events == [("read", 0), "optimizer", "scheduler", ("save", 1)]
 
 
-@pytest.mark.parametrize("has_data_state,strict", [(False, False), (True, False), (True, True)])
-def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_state, strict):
+@pytest.mark.parametrize("strict", [False, True])
+def test_launch_validates_data_fingerprint_before_resuming(tmp_path, strict):
     events = []
     data = OtherData(events)
-    if not has_data_state:
-        data.checkpoint_state = None
 
-    def load_checkpoint(root, step, *, data_state, **kwargs):
+    def load_checkpoint(root, step, *, data_fingerprint, **kwargs):
         assert kwargs == ({"strict": True, "resume_config": {"test": "contract"}} if strict else {})
-        assert root == tmp_path and step == 2 and data_state is data.checkpoint_state
+        assert root == tmp_path and step == 2 and data_fingerprint == data.data_fingerprint
         events.append("restore")
 
     def step(cfg, source, number):
@@ -226,7 +223,11 @@ def test_public_launch_initializes_weights_with_fresh_prepared_data(
 ):
     """Real Torch DCP/public initializer and prepared reader; only GPU setup/step are CPU stand-ins."""
     root, tc = text_bundle
-    data = OmniPretrainData(data_fixtures.prepared_config(root), tc)
+    data = PreparedBundleData(data_fixtures.prepared_config(root), tc)
+    # Data position comes from the step: a fresh run's first update reads step 0.
+    expected = data_fixtures.tensors(
+        PreparedBundleData(data_fixtures.prepared_config(root), tc).get_batch(0, "cpu")
+    )
     source = torch.nn.Linear(2, 2)
     with torch.no_grad():
         source.weight.fill_(0.375)
@@ -256,7 +257,6 @@ def test_public_launch_initializes_weights_with_fresh_prepared_data(
         snapshots.update(
             optimizer=copy.deepcopy(optimizer.state_dict()),
             scheduler=copy.deepcopy(scheduler.state_dict()),
-            data=copy.deepcopy(data.state_dict()),
             rng=rng_state(),
         )
 
@@ -267,16 +267,16 @@ def test_public_launch_initializes_weights_with_fresh_prepared_data(
         assert not optimizer.state
         assert_tree_equal(optimizer.state_dict(), snapshots["optimizer"])
         assert_tree_equal(scheduler.state_dict(), snapshots["scheduler"])
-        assert_tree_equal(data.state_dict(), snapshots["data"])
         assert_rng_equal(snapshots["rng"])
         assert not torch.cuda.is_initialized()
-        batch = data.get_batch(step, "cpu")[0]
+        batches = data.get_batch(step, "cpu")
+        assert_tree_equal(data_fixtures.tensors(batches), expected)
+        batch = batches[0]
         model(batch.model_inputs[0][..., :2].float() / 10000).square().sum().backward()
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-        data.commit_step(step)
         assert all(value["step"].item() == 1 for value in optimizer.state.values())
         events.append(step)
 
@@ -307,38 +307,6 @@ def test_public_launch_initializes_weights_with_fresh_prepared_data(
         )
     )
     assert events == [0]
-    assert data.state_dict() != snapshots["data"]
-    assert not torch.cuda.is_initialized()
-
-
-def test_public_resume_still_rejects_model_only_without_prepared_state(
-    monkeypatch, tmp_path, text_bundle
-):
-    root, tc = text_bundle
-    data = OmniPretrainData(data_fixtures.prepared_config(root), tc)
-    model = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.AdamW(model.parameters())
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
-    location = tmp_path / "resume/torch-dcp/00000000"
-    dcp.save(
-        {"app": {"model": {k: torch.zeros_like(v) for k, v in model.state_dict().items()}}},
-        checkpoint_id=location,
-        no_dist=True,
-    )
-    for key, value in dict(model=model, optimizers=(optimizer,), schedulers=(scheduler,)).items():
-        monkeypatch.setattr(training, key, value, raising=False)
-    monkeypatch.setattr(logging, "stdout", std_logging.getLogger(__name__), raising=False)
-    before = copy.deepcopy(
-        (model.state_dict(), optimizer.state_dict(), scheduler.state_dict(), data.state_dict())
-    )
-    rng = rng_state()
-    with pytest.raises(ValueError, match="no data state"):
-        load_checkpoint(tmp_path / "resume", 0, data_state=data.checkpoint_state)
-    assert_tree_equal(
-        (model.state_dict(), optimizer.state_dict(), scheduler.state_dict(), data.state_dict()),
-        before,
-    )
-    assert_rng_equal(rng)
     assert not torch.cuda.is_initialized()
 
 

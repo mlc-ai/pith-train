@@ -252,12 +252,12 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     assert [sample_id for batch in loader for sample_id in batch.sample_ids] == ["three"]
     with pytest.raises(ValueError, match="not been prepared"):
         create_omni_dataloader(cfg.output, processor, config, stage="image", split="train")
-    # This is the real writer's bundle and reader/resume path. Only GPU shuffle
-    # placement/barrier are replaced so the memmap and checkpoint boundary run on CPU.
+    # The real writer's bundle and step-indexed reader run on CPU; only the
+    # shuffle owner's rank, device placement and barrier are replaced.
     from types import SimpleNamespace
 
     from pithtrain.modules.data_config import DataCfg
-    from pithtrain.modules.training_data import OmniPretrainData
+    from pithtrain.modules.training_data import PreparedBundleData
 
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
@@ -265,20 +265,20 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *args, **kwargs: 0)
     data_cfg = DataCfg()
     root = data_cfg.dataset = Path(cfg.output)
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda: int((root / "tokens/train/indices.npy").exists())
+    )
     data_cfg.format = "prepared_bundle"
     training = SimpleNamespace(
         global_batch_size=1, micro_batch_size=1, sequence_length=4, seed=431, max_steps=2
     )
 
     def reader():
-        return OmniPretrainData(data_cfg, training)
+        return PreparedBundleData(data_cfg, training)
 
     data = reader()
     data.get_batch(0, "cpu")
-    data.commit_step(0)
-    saved = data.state_dict()
     restored = reader()
-    restored.load_state_dict(saved)
     torch.testing.assert_close(
         restored.get_batch(1, "cpu")[0].model_inputs[0],
         data.get_batch(1, "cpu")[0].model_inputs[0],
@@ -300,14 +300,14 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     ):
         checksum_path.write_text(invalid)
         with pytest.raises(ValueError, match="checksum inventory"):
-            reader().load_state_dict(saved)
+            reader()
         with pytest.raises(ValueError, match="checksum inventory"):
             create_omni_dataloader(root, processor, config, stage="text", split="train")
     checksum_path.write_text(original_checksums)
     extra = root / "tokens/train/unlisted.bin"
     extra.write_bytes((root / "tokens/train/00000.bin").read_bytes())
     with pytest.raises(ValueError, match="checksum inventory"):
-        reader().load_state_dict(saved)
+        reader()
     extra.unlink()
 
     name = bundle["manifests"]["train"]["text"][0]
@@ -319,22 +319,17 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     checksum_path.write_text(original_checksums.replace(previous_hash, prep.sha256(manifest)))
     # Updating both data and its checksum still cannot keep the old bundle identity.
     with pytest.raises(ValueError, match="content_id"):
-        reader().load_state_dict(saved)
+        reader()
     # The public standalone reader must enforce the same bundle identity.
     with pytest.raises(ValueError, match="content_id"):
         create_omni_dataloader(root, processor, config, stage="text", split="train")
-    assert saved["consumed_samples"] == 1
 
-    # Deliberately publishing a NEW content identity is valid, but must not resume
-    # the old reader state. Use the same sealing path as preparation.
+    # Deliberately publishing a new content identity makes a new valid bundle.
     files = [line.split("  ", 1)[1] for line in original_checksums.splitlines()]
     files.remove("bundle.json")
     changed_bundle = prep.write_bundle(root, bundle, files)
     assert changed_bundle["content_id"] != bundle["content_id"]
-    changed = reader()
-    with pytest.raises(ValueError, match="differs"):
-        changed.load_state_dict(saved)
-    assert changed.consumed_samples == 0
+    reader()
 
 
 def test_source_cache_detects_changes_and_offline_misses(tmp_path):

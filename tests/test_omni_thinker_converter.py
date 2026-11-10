@@ -257,11 +257,19 @@ def resume_worker(rank, folder, profile, mode):
         if mode == "save":
             strict.advance(model, opt, sch, data)
             save_checkpoint(
-                root / "original", 1, data_state=data, strict=True, resume_config=contract
+                root / "original",
+                1,
+                data_fingerprint=strict.FINGERPRINT,
+                strict=True,
+                resume_config=contract,
             )
         else:
             load_checkpoint(
-                root / "restored", 1, data_state=data, strict=True, resume_config=contract
+                root / "restored",
+                1,
+                data_fingerprint=strict.FINGERPRINT,
+                strict=True,
+                resume_config=contract,
             )
             values, _ = _runtime(model, (opt,), (sch,), data, torch.device("cpu"))
             expected = torch.load(
@@ -270,7 +278,6 @@ def resume_worker(rank, folder, profile, mode):
             assert_tree_equal(values.pop("rng"), expected["rng"])
             assert_tree_equal(_pack(values), expected["state"])
             strict.advance(model, opt, sch, data)
-            assert data.consumed == 4
         assert not torch.cuda.is_initialized()
     finally:
         dist.destroy_process_group()

@@ -223,7 +223,7 @@ def _local_collective_plan(batches, mode):
                 isinstance(ids, torch.Tensor) and ids.ndim == 2 and ids.shape[0] == 1,
                 "Speech FSDP currently requires B=1 input_ids",
             )
-            context = batch.get("model_context")
+            context = batch.get("media_context")
             _require(isinstance(context, dict), "Explicit model context is required")
             media = tuple(
                 name

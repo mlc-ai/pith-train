@@ -49,7 +49,7 @@ class ToySpeech(nn.Module):
     def forward(
         self,
         input_ids,
-        model_context,
+        media_context,
         codes,
         code_lengths,
         *,
@@ -66,7 +66,7 @@ class ToySpeech(nn.Module):
         if codebook_mask is not None:
             first[:, :-1].masked_fill_(~codebook_mask[..., 0], -100)
             residual.masked_fill_(~codebook_mask[..., 1:], -100)
-        if model_context.get("ignore_codec"):
+        if media_context.get("ignore_codec"):
             first.fill_(-100)
             residual.fill_(-100)
         return SpeechTrainingOutput(
@@ -85,7 +85,7 @@ class ToySpeech(nn.Module):
 def sample(zero=False, rank=0):
     return dict(
         input_ids=torch.tensor([[1, 2, 3]]) + rank,
-        model_context=dict(ignore_codec=zero),
+        media_context=dict(ignore_codec=zero),
         codes=torch.tensor([[[1, 2, 3], [2, 3, 4]]]),
         code_lengths=torch.tensor([2]),
         prompt_lengths=torch.tensor([1]),
@@ -391,7 +391,7 @@ def serial_loss(model, batches, weighting):
     for item in batches:
         output = model(
             item["input_ids"],
-            item["model_context"],
+            item["media_context"],
             item["codes"],
             item["code_lengths"],
             prompt_lengths=item["prompt_lengths"],
@@ -747,7 +747,7 @@ def test_conditional_adam_presence_and_per_parameter_steps_resume_exactly(tmp_pa
 
     samples = [sample(), sample(), sample()]
     for item in samples[1:]:
-        item["model_context"]["use_conditional"] = True
+        item["media_context"]["use_conditional"] = True
     torch.manual_seed(491)
     initial = copy.deepcopy(ConditionalSpeech().state_dict())
 
@@ -965,7 +965,7 @@ def independent_bfloat_loss(model, batches, weighting):
         output = torch.func.functional_call(
             model,
             cast,
-            (batch["input_ids"], batch["model_context"], batch["codes"], batch["code_lengths"]),
+            (batch["input_ids"], batch["media_context"], batch["codes"], batch["code_lengths"]),
             dict(
                 prompt_lengths=batch["prompt_lengths"],
                 speaker="ethan",

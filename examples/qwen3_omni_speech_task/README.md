@@ -249,7 +249,7 @@ call = Generate(model)
 with torch.no_grad():
     parameters = {name: p.to(torch.bfloat16) for name, p in call.named_parameters()}
     result = torch.func.functional_call(
-        call, (parameters, dict(call.named_buffers())), (input_ids, model_context),
+        call, (parameters, dict(call.named_buffers())), (input_ids, media_context),
         dict(max_text_tokens=max_new_tokens, max_codec_frames=max_codec_frames,
              do_sample=False), strict=True,
     )

@@ -63,7 +63,7 @@ def test_actual_dataset_entry_forwards_every_native_selection_flag(tmp_path):
         return object()
 
     task = task_config(
-        OmniPretrainData=Provider,
+        PreparedBundleData=Provider,
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: object()),
         model_class_for_config=choose,
     )
@@ -129,7 +129,6 @@ def probe_fixture():
     make_optimizer = namespace["make_adamw_optimizer"]
     context.optimizers = make_optimizer(config)
     context.schedulers = (torch.optim.lr_scheduler.LambdaLR(context.optimizers[0], lambda _: 1),)
-    context.consumed_samples = 0
     for parameter in model.parameters():
         parameter.grad = parameter.detach().clone()
     namespace.update(
@@ -154,19 +153,21 @@ def test_probe_preserves_formal_start_and_checkpoint_steps(driver):
         DistributedCheckpointError,
         _apply,
         _check_training_state,
+        _DataFingerprint,
         _optimizer_template,
         _runtime,
+        _validate_data,
     )
     from pithtrain.modules.strict_checkpoint import _rng_state
     from tests.acceptance.omni_native_resume import equal
-    from tests.test_distributed_strict_checkpoint import Cursor
 
     namespace = probe_fixture()
     training = namespace["training"]
     optimizer, scheduler = training.optimizers[0], training.schedulers[0]
     parameters = tuple(training.model.parameters())
     device = torch.device("cpu")
-    data = Cursor()
+    # Step-indexed data contributes only its static identity; the step selects the batch.
+    data = _DataFingerprint("multimodal-contract-data")
     formal_before = copy.deepcopy(
         dict(
             model=training.model.state_dict(),
@@ -214,7 +215,6 @@ def test_probe_preserves_formal_start_and_checkpoint_steps(driver):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
-        data.consumed += 8
         random.random()
         np.random.random()
 
@@ -227,9 +227,18 @@ def test_probe_preserves_formal_start_and_checkpoint_steps(driver):
         advance()
         assert set(optimizer.state) == set(parameters)
         assert all(state["step"].item() == step for state in optimizer.state.values())
-        assert scheduler.last_epoch == step and data.consumed == step * 8
+        assert scheduler.last_epoch == step
         _check_training_state(captured(), [_optimizer_template(optimizer)], step)
     boundary = captured()
+    # The data entry is exactly the static identity. Strict loading validates it before
+    # any mutation and rejects another identity or a legacy consumed-sample cursor.
+    assert boundary["data"] == {"fingerprint": "multimodal-contract-data"}
+    assert _validate_data(boundary["data"], step=2, fingerprint=data.fingerprint) == 2
+    with pytest.raises(DistributedCheckpointError, match="data fingerprint differs"):
+        _validate_data(boundary["data"], step=2, fingerprint="other-data")
+    legacy = dict(boundary["data"], version=1, consumed_samples=16)
+    with pytest.raises(DistributedCheckpointError, match="step-indexed data fingerprint"):
+        _validate_data(legacy, step=2, fingerprint=data.fingerprint)
     malformed = copy.deepcopy(boundary)
     for state in malformed["optimizer"][0]["state"].values():
         state["step"].add_(1)
@@ -242,6 +251,34 @@ def test_probe_preserves_formal_start_and_checkpoint_steps(driver):
     advance()
     equal(captured(), expected_next, "CPU probe isolation resumed next update")
     assert not torch.cuda.is_initialized()
+
+
+def test_staged_resume_saves_and_loads_the_static_data_fingerprint():
+    """The GPU-only staged resume validates data identity; it passes no reader cursor."""
+    tree = ast.parse((ROOT / "tests/acceptance/omni_multimodal_training.py").read_text())
+    staged = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "staged")
+    calls = sorted(
+        (n for n in ast.walk(staged) if isinstance(n, ast.Call)),
+        key=lambda call: (call.lineno, call.col_offset),
+    )
+    names = [ast.unparse(call.func) for call in calls]
+    for name in ("save_checkpoint", "load_checkpoint"):
+        (call,) = [call for call in calls if ast.unparse(call.func) == name]
+        keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
+        assert keywords["data_fingerprint"] == "data.data_fingerprint"
+        assert keywords["strict"] == "True" and "data_state" not in keywords
+    order = [
+        names.index(name)
+        for name in (
+            "save_checkpoint",
+            "require_stored_fingerprint",
+            "fingerprint_rejection",
+            "load_checkpoint",
+        )
+    ]
+    assert order == sorted(order)
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert not attributes & {"checkpoint_state", "commit_step", "consumed_samples"}
 
 
 @pytest.mark.parametrize("fail", [False, True])

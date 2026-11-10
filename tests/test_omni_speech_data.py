@@ -162,7 +162,7 @@ def test_official_expanded_media_alignment(tmp_path, official, kind):
     assert target.endswith("Hello.<|im_end|>") and "Describe" not in target
     assert not any((result["labels"] == token).any() for token in collator.media.media_token_ids)
     assert result["media_inputs"]
-    assert not set(result["media_inputs"]) & set(result["model_context"])
+    assert not set(result["media_inputs"]) & set(result["media_context"])
     if kind == "audio":
         assert result["position_kwargs"]["audio_seqlens"].item() > 0
     else:
@@ -207,10 +207,10 @@ def test_official_expanded_media_alignment(tmp_path, official, kind):
     torch.testing.assert_close(actual_delta, expected_delta, rtol=0, atol=0)
     assert actual.shape == (3, 1, talker_ids.shape[1])
     if kind == "audio":
-        assert "feature_attention_mask" in result["model_context"]
+        assert "feature_attention_mask" in result["media_context"]
         assert "audio_feature_lengths" not in result["position_kwargs"]
     if kind == "video":
-        assert "video_second_per_grid" in result["model_context"]
+        assert "video_second_per_grid" in result["media_context"]
         assert "video_second_per_grid" not in result["position_kwargs"]
         assert "second_per_grids" in result["position_kwargs"]
 
@@ -406,9 +406,9 @@ def test_native_speech_adapter_retains_codec_and_context(tmp_path, official):
     batch = data.get_batch(0, "cpu")[0]
     assert batch["codes"].shape == (1, 3, 16)
     assert batch["code_lengths"].tolist() == [3]
-    assert "pixel_values" in batch["model_context"]
+    assert "pixel_values" in batch["media_context"]
     assert "image_grid_thw" in batch["position_kwargs"]
-    assert torch.equal(batch["input_ids"], batch["model_context"]["input_ids"])
+    assert torch.equal(batch["input_ids"], batch["media_context"]["input_ids"])
     assert torch.equal(batch["labels"], collator(source[0])["labels"])
     assert batch["target_waveform"].shape == (1, 5700)
     data.commit_update(scan_index=0, update_index=0)

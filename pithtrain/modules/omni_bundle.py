@@ -1,14 +1,10 @@
-"""
-Readers of prepared Qwen3-Omni data bundles, shared by preparation and training: file checksums,
-the bundle's content identity, its verified metadata, and the processor and Thinker config its
-recipe pins. The Hugging Face imports stay inside processor_for.
-"""
+"""Bundle identity and verification shared by preparation and training."""
 
 import hashlib
 import json
 from pathlib import Path
 
-__all__ = ["content_id", "processor_for", "read_verified_bundle", "sha256", "verify_bundle"]
+__all__ = ["content_id", "read_verified_bundle", "sha256", "verify_bundle"]
 
 
 def sha256(path):
@@ -21,29 +17,6 @@ def sha256(path):
 
 def content_id(checksums):
     return hashlib.sha256(json.dumps(checksums, sort_keys=True).encode()).hexdigest()
-
-
-def processor_for(recipe, offline=False):
-    from huggingface_hub import snapshot_download
-    from transformers import AutoConfig, Qwen3OmniMoeProcessor
-
-    snapshot = snapshot_download(
-        recipe["model_id"],
-        revision=recipe["revision"],
-        local_files_only=offline,
-        allow_patterns=[
-            "config.json",
-            "tokenizer_config.json",
-            "vocab.json",
-            "merges.txt",
-            "preprocessor_config.json",
-            "processor_config.json",
-            "video_preprocessor_config.json",
-        ],
-    )
-    processor = Qwen3OmniMoeProcessor.from_pretrained(snapshot, local_files_only=True)
-    config = AutoConfig.from_pretrained(snapshot, local_files_only=True).thinker_config
-    return processor, config
 
 
 def read_verified_bundle(root):
@@ -87,7 +60,7 @@ def read_verified_bundle(root):
                             required.update(item["path"] for item in json.loads(line)["media"])
                 if kind == "text":
                     token_files.add(f"tokens/{split}/{index:05d}.bin")
-    # DensePretrainData recursively consumes every .bin, so an unlisted extra
+    # TokenBinData recursively consumes every .bin, so an unlisted extra
     # shard must fail even when all the listed hashes still match.
     actual_tokens = {path.relative_to(root).as_posix() for path in (root / "tokens").rglob("*.bin")}
     if actual_tokens != token_files or set(checksums) != required | token_files:

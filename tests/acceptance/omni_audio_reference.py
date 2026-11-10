@@ -274,7 +274,7 @@ def text_gate(config, batches, device, *, reference_attention=LEGACY, attention_
             ref_inputs["input_features"].requires_grad_()
             feature_pairs.append((inputs["input_features"], ref_inputs["input_features"]))
             labels = labels.to(device)
-            logits = native.reference_forward(inputs["input_ids"], model_context=inputs)
+            logits = native.reference_forward(inputs["input_ids"], media_context=inputs)
             target = reference(ref_inputs)
             logits_errors.append(error_ratio(logits, target))
             assert logits_errors[-1] < 1e-3, logits_errors[-1]

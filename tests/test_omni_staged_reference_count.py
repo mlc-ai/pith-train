@@ -10,8 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from pithtrain.modules import training_data
 from pithtrain.modules.microbatch import Microbatch
+from tests import pretrain_lm_cpu as loss_helpers
 from tests.acceptance.omni_image_evidence import (
     fixed_image_batches,
     target_partition_evidence,
@@ -101,7 +101,7 @@ def check_actual_staged_caller(driver, dp_size, scenario, monkeypatch):
     assert expected_count == layout["global_target_count"] > 0
     assert layout["microbatch_target_counts"][0] == 0
     counts = []
-    monkeypatch.setattr(training_data.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(loss_helpers.dist, "is_initialized", lambda: True)
     for rank in range(dp_size):
         local = [
             Microbatch(model_inputs=(), cu_seqlens=None, objective_inputs=(batch.labels,))
@@ -116,8 +116,8 @@ def check_actual_staged_caller(driver, dp_size, scenario, monkeypatch):
             assert value.item() == local_count
             value.add_(expected_count - local_count)
 
-        monkeypatch.setattr(training_data.dist, "all_reduce", reduce_counts)
-        count = training_data.global_target_count(local, expected_group)
+        monkeypatch.setattr(loss_helpers.dist, "all_reduce", reduce_counts)
+        count = loss_helpers.global_target_count(local, expected_group)
         assert count.shape == torch.Size([]) and count.dtype == torch.float32
         assert count.item() == expected_count
         partition = target_partition_evidence(local, layout, rank, count)
@@ -168,9 +168,9 @@ def check_actual_staged_caller(driver, dp_size, scenario, monkeypatch):
 
 
 def test_production_global_zero_count_remains_rejected(monkeypatch):
-    monkeypatch.setattr(training_data.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(loss_helpers.dist, "is_initialized", lambda: False)
     zero = Microbatch(
         model_inputs=(), cu_seqlens=None, objective_inputs=(torch.full((1, 3), -100),)
     )
     with pytest.raises(ValueError, match="no valid next-token targets"):
-        training_data.global_target_count([zero])
+        loss_helpers.global_target_count([zero])

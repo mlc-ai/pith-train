@@ -244,4 +244,4 @@ def test_video_consumer_has_no_hf_import_or_cached_features():
             if isinstance(node, ast.ImportFrom):
                 assert not (node.module or "").startswith("transformers")
             if isinstance(node, ast.Attribute):
-                assert node.attr not in {"video_features", "model_context"}
+                assert node.attr not in {"video_features", "media_context"}

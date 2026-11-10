@@ -39,7 +39,14 @@ def parse_args(argv=None):
     parser.add_argument("--ep", type=int, default=1)
     parser.add_argument(
         "--negative-case",
-        choices=("missing-rank", "missing-cuda-rng", "shape", "topology", "optimizer-order"),
+        choices=(
+            "missing-rank",
+            "missing-cuda-rng",
+            "shape",
+            "topology",
+            "optimizer-order",
+            "fingerprint",
+        ),
     )
     args = parser.parse_args(argv)
     if (args.mode == "negative") != (args.negative_case is not None):
@@ -106,16 +113,21 @@ def prepare(args):
 
 
 class ObservedData:
-    """Record the exact batches returned by the unchanged production source."""
+    """Record the exact batches returned by the unchanged production source.
+
+    Step-indexed data has no cursor, so the ordered requested steps are the
+    observed data position: each update must read only its own step's batch.
+    """
 
     def __init__(self, source):
-        self.source, self.batches = source, {}
+        self.source, self.batches, self.steps = source, {}, []
 
     def __getattr__(self, name):
         return getattr(self.source, name)
 
     def get_batch(self, step, device):
         batches = self.source.get_batch(step, device)
+        self.steps.append(step)
         self.batches[step] = digest(
             [
                 dict(
@@ -131,17 +143,26 @@ class ObservedData:
 
 
 def snapshot(data):
+    """Rank-local strict state; step-indexed data contributes only its fingerprint."""
     from pithtrain.contexts import distributed, training
-    from pithtrain.modules.distributed_checkpoint import _pack, _runtime
+    from pithtrain.modules.distributed_checkpoint import _DataFingerprint, _pack, _runtime
 
     values, _ = _runtime(
         training.model,
         training.optimizers,
         training.schedulers,
-        data.checkpoint_state,
+        _DataFingerprint(data.data_fingerprint),
         distributed.device,
     )
     return _pack(values)
+
+
+def stored_data_fingerprint(root, rank):
+    """The data identity this rank's strict shard recorded at the step-2 boundary."""
+    path = Path(root) / f"torch-dcp/00000002/rank-{rank:05d}.pt"
+    data = torch.load(path, map_location="cpu", weights_only=True)["state"]["data"]
+    assert set(data) == {"fingerprint"}, "Strict shard must store only the data fingerprint"
+    return data["fingerprint"]
 
 
 def verify_corruption_rejection(error, *, fault, world_size, model_key=None):
@@ -165,6 +186,11 @@ def verify_corruption_rejection(error, *, fault, world_size, model_key=None):
         expected_message = "Rank topology, configuration, membership or model layout differs"
     elif fault == "optimizer-order":
         expected_message = "Optimizer group configuration/membership differs"
+    elif fault == "fingerprint":
+        expected_message = (
+            "Checkpoint data fingerprint differs: check the dataset, modalities, sampling, "
+            "seed, sequence length and batch sizes before resuming"
+        )
     else:
         raise AssertionError(f"Unknown corruption fault: {fault}")
     assert type(error) is DistributedCheckpointError, (
@@ -243,6 +269,10 @@ def negative_case(args, cfg, data):
                 "Optimizer-order corruption must change parameter order"
             )
             order.reverse()
+        elif args.negative_case == "fingerprint":
+            stored = payload["state"]["data"]
+            assert set(stored) == {"fingerprint"} and stored["fingerprint"] != "other-data"
+            stored["fingerprint"] = "other-data"
         else:
             raise AssertionError(f"Unknown corruption fault: {args.negative_case}")
         torch.save(payload, path)
@@ -259,7 +289,7 @@ def negative_case(args, cfg, data):
         load_checkpoint(
             target,
             2,
-            data_state=data.checkpoint_state,
+            data_fingerprint=data.data_fingerprint,
             strict=True,
             resume_config=resume_contract(cfg),
         )
@@ -332,7 +362,7 @@ def run_gpu(args):
     report = args.output / f"{label}-rank-{rank:05d}.json"
     assert not report.exists(), "Retain previous evidence; choose a new output"
     expected_path = args.output / f"continuous-rank-{rank:05d}.pt"
-    rejection = None
+    rejection = stored = None
     if args.mode == "negative":
         rejection = negative_case(args, cfg, data)
     elif args.mode == "produce":
@@ -343,6 +373,7 @@ def run_gpu(args):
         pretrain_lm.train_step(cfg, data, 2)
         expected.update(after=snapshot(data), next_batch=data.batches[2])
         torch.save(expected, expected_path)
+        stored = stored_data_fingerprint(t.save_location, rank)
     else:
         expected = torch.load(expected_path, weights_only=True)
         assert expected["producer_pid"] != os.getpid(), "Use a new torchrun process"
@@ -351,18 +382,26 @@ def run_gpu(args):
             for parameter in training.model.parameters():
                 parameter.zero_()
         torch.manual_seed(9917 + rank)
+        root = args.restore_root or args.output / "checkpoints"
+        stored = stored_data_fingerprint(root, rank)
         load_checkpoint(
-            args.restore_root or args.output / "checkpoints",
+            root,
             2,
-            data_state=data.checkpoint_state,
+            data_fingerprint=data.data_fingerprint,
             strict=True,
             resume_config=resume_contract(cfg),
         )
         equal(snapshot(data), expected["boundary"], f"rank-{rank}-boundary")
+        # The fresh reader's get_batch(2) must equal the continuous run's step-2 batch.
         pretrain_lm.train_step(cfg, data, 2)
         equal(data.batches[2], expected["next_batch"], f"rank-{rank}-batch")
         equal(snapshot(data), expected["after"], f"rank-{rank}-after-native-update")
-    assert data.consumed_samples == (0 if args.mode == "negative" else 24)
+    # No cursor exists: the data position is the steps actually read (a failed load
+    # reads none; a restore reads only the step after the checkpoint), and every
+    # checkpoint must record this run's data fingerprint.
+    assert data.steps == {"negative": [], "produce": [0, 1, 2], "restore": [2]}[args.mode]
+    if args.mode != "negative":
+        assert stored == data.data_fingerprint, "Checkpoint data fingerprint differs from this run"
     dist.barrier()
     report.write_text(
         json.dumps(
@@ -382,7 +421,9 @@ def run_gpu(args):
                 fsdp=True,
                 converted_checkpoint_root=str(args.restore_root) if args.restore_root else None,
                 exact_restore=args.mode == "restore",
-                consumed_samples=data.consumed_samples,
+                data_fingerprint=data.data_fingerprint,
+                checkpoint_data_fingerprint=stored,
+                data_steps=data.steps,
                 max_allocated_bytes=torch.cuda.max_memory_allocated(),
             ),
             indent=2,

@@ -250,7 +250,7 @@ def execute_original(native, batches, device, observer=None, *, audio_input_grad
         if audio_input_gradients:
             inputs["input_features"] = inputs["input_features"].detach().requires_grad_()
             feature_inputs.append(inputs["input_features"])
-        output = native.reference_forward(inputs["input_ids"], model_context=inputs)
+        output = native.reference_forward(inputs["input_ids"], media_context=inputs)
         logits.append(output.detach().cpu())
         losses.append(
             F.cross_entropy(

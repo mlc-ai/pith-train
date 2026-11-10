@@ -3,14 +3,19 @@
 import ast
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from pithtrain.modules.microbatch import Microbatch
+from tests import test_omni_training as fixtures
 from tests.acceptance.omni_media_resume import (
+    FINGERPRINT_REJECTION,
     ObjectiveObservation,
     ObservedMediaData,
     audio_spec,
@@ -19,8 +24,13 @@ from tests.acceptance.omni_media_resume import (
     process_age,
     require_components,
     run_gpu,
+    verify_fingerprint_rejection,
 )
 from tests.acceptance.omni_native_resume import equal
+
+manifest = fixtures.manifest
+processor_config = fixtures.processor_config
+training_bundle = fixtures.training_bundle
 
 
 def microbatch():
@@ -28,7 +38,7 @@ def microbatch():
         model_inputs=(torch.tensor([[1, 2]]),),
         objective_inputs=(torch.tensor([[2, 3]]),),
         cu_seqlens=None,
-        model_context=dict(
+        media_context=dict(
             feature_attention_mask=torch.ones(1, 3), input_ids=torch.tensor([[1, 2]])
         ),
         media_inputs=dict(input_features=torch.ones(1, 4, 3)),
@@ -39,14 +49,16 @@ def microbatch():
 @pytest.mark.parametrize("field", ["media", "layout", "labels", "ids"])
 def test_resume_next_input_digest_includes_every_media_and_layout_tensor(field):
     batch = microbatch()
-    source = SimpleNamespace(get_batch=lambda step, device: [batch], consumed_samples=0)
+    source = SimpleNamespace(get_batch=lambda step, device: [batch], data_fingerprint="fixture-id")
     observed = ObservedMediaData(source)
     assert observed.get_batch(0, "cpu")[0] is batch
+    # The static identity reaches strict loading unchanged; steps are recorded as read.
+    assert observed.data_fingerprint == "fixture-id" and observed.steps_read == [0]
     saved = observed.batches[0]
     if field == "media":
         batch.media_inputs["input_features"][0, 0, 0] = 2
     elif field == "layout":
-        batch.model_context["feature_attention_mask"][0, 0] = 0
+        batch.media_context["feature_attention_mask"][0, 0] = 0
     elif field == "labels":
         batch.objective_inputs[0][0, 0] = -100
     else:
@@ -63,7 +75,7 @@ def test_later_pp_rank_records_context_and_absent_large_payload():
     observed.get_batch(0, "cpu")
     record = observed.batches[0][0]
     assert record["media_inputs"] is None
-    assert record["model_context"]["feature_attention_mask"]["shape"] == [1, 3]
+    assert record["media_context"]["feature_attention_mask"]["shape"] == [1, 3]
 
 
 def test_objective_observation_preserves_loss_graph_and_exact_return_values():
@@ -128,6 +140,14 @@ def test_resume_topologies_keep_exact_dp2_cp1(tmp_path, pp, ep, world):
     )
     assert args.world_size // args.pp == 2
     assert args.restore_root is None
+
+
+def test_negative_mode_offers_the_shared_corrupted_fingerprint_case(tmp_path):
+    common = ["--dataset", str(tmp_path / "data"), "--output", str(tmp_path / "out")]
+    args = parse_args(
+        ["--mode", "negative", "--negative-case", "fingerprint", "--world-size", "2", *common]
+    )
+    assert args.negative_case == "fingerprint"
 
 
 @pytest.mark.parametrize(
@@ -282,11 +302,11 @@ def test_global_production_step_requires_both_tower_inputs(missing):
 def test_complete_thinker_next_input_observation_detects_any_tower_or_av_change(field):
     batch = microbatch()
     batch.media_inputs.update(pixel_values=torch.ones(1, 4), pixel_values_videos=torch.ones(2, 4))
-    batch.model_context["video_second_per_grid"] = torch.tensor([0.5])
+    batch.media_context["video_second_per_grid"] = torch.tensor([0.5])
     observed = ObservedMediaData(SimpleNamespace(get_batch=lambda *args: [batch]))
     observed.get_batch(0, "cpu")
     if field == "av-layout":
-        batch.model_context["video_second_per_grid"][0] = 0.75
+        batch.media_context["video_second_per_grid"][0] = 0.75
     else:
         key = {"audio": "input_features", "image": "pixel_values", "video": "pixel_values_videos"}[
             field
@@ -366,6 +386,8 @@ def test_gpu_phases_are_marked_in_execution_order():
         ("setup-distributed-done", "dataset-ready"),
         ("dataset-ready", "training-ready"),
         ("checkpoint-found", "expected-state-saved"),
+        ("data-identity-start", "data-identity-verified"),
+        ("data-identity-verified", "checkpoint-load-start"),
         ("checkpoint-load-start", "checkpoint-loaded"),
     ):
         assert phases.index(earlier) < phases.index(later)
@@ -376,3 +398,172 @@ def test_gpu_phases_are_marked_in_execution_order():
         "final-barrier-done",
     ):
         assert phase in phases
+
+
+def test_gpu_restore_validates_data_identity_before_the_strict_load():
+    """The GPU-only path loads by static fingerprint and never passes a reader cursor."""
+    path = Path(__file__).parents[1] / "tests/acceptance/omni_media_resume.py"
+    tree = ast.parse(path.read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_gpu")
+    calls = sorted(
+        (n for n in ast.walk(run) if isinstance(n, ast.Call)),
+        key=lambda call: (call.lineno, call.col_offset),
+    )
+    names = [ast.unparse(call.func) for call in calls]
+    (load,) = [call for call in calls if ast.unparse(call.func) == "load_checkpoint"]
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in load.keywords}
+    assert keywords["data_fingerprint"] == "data.data_fingerprint" and keywords["strict"] == "True"
+    assert "data_state" not in keywords
+    # The producer reads back its committed shard; the restorer does too, then must see a
+    # mismatched identity rejected before its real strict load.
+    assert names.count("require_stored_fingerprint") == 2
+    assert names.index("fingerprint_rejection") < names.index("load_checkpoint")
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert not attributes & {"checkpoint_state", "commit_step", "consumed_samples"}
+
+
+def test_cpu_reader_audit_replays_the_next_step_from_fresh_readers(
+    training_bundle, processor_config
+):
+    from pithtrain.modules.training_data import PreparedBundleData
+    from tests.acceptance.omni_media_resume import component_spec, cpu_reader_audit, reader_config
+
+    spec = component_spec("multimodal")
+    report = cpu_reader_audit(training_bundle, spec, processor_config[1], 2)
+    assert report["status"] == "PASSED" and "consumed_samples" not in report
+    assert report["restored_step"] == report["next_step"] == 2
+    fresh = PreparedBundleData(*reader_config(training_bundle, spec))
+    assert report["data_fingerprint"] == fresh.data_fingerprint
+    # The mixed steps differ, so replaying another step cannot pass unnoticed.
+    steps = [json.dumps([row["sample_ids"] for row in step]) for step in report["steps"]]
+    assert len(set(steps)) == 3
+
+
+@pytest.mark.parametrize(
+    "fault,match",
+    [("previous-step", "reader-0-next-input"), ("other-identity", "reader-0-fingerprint")],
+)
+def test_cpu_reader_audit_rejects_a_fresh_reader_off_the_step_or_identity(
+    training_bundle, processor_config, monkeypatch, fault, match
+):
+    from pithtrain.modules import training_data
+    from tests.acceptance.omni_media_resume import component_spec, cpu_reader_audit
+
+    readers = []
+
+    class Faulty(training_data.PreparedBundleData):
+        """Readers built after the continuous DP pair carry the injected fault."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            readers.append(self)
+            if fault == "other-identity" and len(readers) > 2:
+                self.data_fingerprint = "other-data"
+
+        def get_batch(self, step, device):
+            lagging = fault == "previous-step" and readers.index(self) >= 2
+            return super().get_batch(step - 1 if lagging else step, device)
+
+    monkeypatch.setattr(training_data, "PreparedBundleData", Faulty)
+    with pytest.raises(AssertionError, match=match):
+        cpu_reader_audit(training_bundle, component_spec("multimodal"), processor_config[1], 2)
+
+
+def rejection(phase=None, ranks=(0,), error_type=None, reason=None):
+    from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
+
+    expected = FINGERPRINT_REJECTION
+    return DistributedCheckpointError(
+        (phase or expected["phase"])
+        + ": "
+        + "; ".join(
+            f"rank {rank}: {error_type or expected['error_type']}: {reason or expected['message']}"
+            for rank in ranks
+        )
+    )
+
+
+def test_fingerprint_rejection_evidence_accepts_the_exact_pre_mutation_reason():
+    evidence = verify_fingerprint_rejection(rejection())
+    assert evidence["reason_verified"] is True and evidence["message"] == str(rejection())
+    for error in (None, RuntimeError(str(rejection()))):
+        with pytest.raises(AssertionError, match="Expected a collective"):
+            verify_fingerprint_rejection(error)
+
+
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        (dict(phase="load contract arguments"), "rejection phase"),
+        (dict(phase="apply strict checkpoint"), "rejection phase"),
+        (dict(reason="Rank shard checksum mismatch"), "rejection reason"),
+        (dict(error_type="OSError"), "rejection reason"),
+        (dict(ranks=(0, 1)), "rejecting ranks"),
+        (dict(ranks=()), "Malformed collective rejection"),
+    ],
+)
+def test_fingerprint_rejection_evidence_rejects_other_failures(change, match):
+    with pytest.raises(AssertionError, match=match):
+        verify_fingerprint_rejection(rejection(**change))
+
+
+def _identity_worker(rank, directory):
+    """Real strict save/load on two Gloo ranks: a CPU protocol fixture, not GPU acceptance."""
+    from pithtrain.modules.distributed_checkpoint import load_checkpoint, save_checkpoint
+    from tests.acceptance.omni_media_resume import fingerprint_rejection, require_stored_fingerprint
+    from tests.test_distributed_strict_checkpoint import (
+        FINGERPRINT,
+        advance,
+        build,
+        initialize_mesh,
+        snapshot,
+    )
+
+    root = Path(directory)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{root / 'rendezvous'}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.set_num_threads(1)
+        assert not torch.cuda.is_initialized()
+        parts = build(*initialize_mesh("fsdp-layout", rank))
+        contract = dict(training=dict(global_batch_size=2), protocol="CPU-only")
+        checkpoint = root / "checkpoints"
+        advance(parts)
+        advance(parts)
+        save_checkpoint(
+            checkpoint, 2, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
+        )
+        assert require_stored_fingerprint(checkpoint, rank, FINGERPRINT) == FINGERPRINT
+        with pytest.raises(AssertionError, match="data fingerprint differs from this run"):
+            require_stored_fingerprint(checkpoint, rank, "other-data")
+        boundary = snapshot(parts)
+        advance(parts)
+        live = snapshot(parts)
+        evidence = fingerprint_rejection(
+            checkpoint, 2, FINGERPRINT, contract, lambda: snapshot(parts)
+        )
+        assert evidence["reason_verified"] and evidence["atomicity_verified"]
+        equal(snapshot(parts), live, "rejected-identity-left-state-unchanged")
+        # Positive control: the matching identity restores the step-2 boundary.
+        load_checkpoint(
+            checkpoint, 2, data_fingerprint=FINGERPRINT, strict=True, resume_config=contract
+        )
+        equal(snapshot(parts), boundary, "matching-identity-restored-boundary")
+        assert not torch.cuda.is_initialized()
+        (root / f"rank-{rank}.json").write_text(
+            json.dumps(dict(status="PASS_CPU_PROTOCOL_ONLY", message=evidence["message"]))
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_strict_checkpoint_holds_and_enforces_the_live_data_fingerprint(tmp_path):
+    mp.spawn(_identity_worker, args=(str(tmp_path),), nprocs=2, join=True)
+    reports = [json.loads((tmp_path / f"rank-{rank}.json").read_text()) for rank in range(2)]
+    assert all(report["status"] == "PASS_CPU_PROTOCOL_ONLY" for report in reports)
+    assert len({report["message"] for report in reports}) == 1

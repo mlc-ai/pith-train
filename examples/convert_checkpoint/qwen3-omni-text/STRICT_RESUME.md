@@ -113,19 +113,20 @@ branch as a replacement, or modify another task's worktree.
    object store and `/home/kldxbjz/code/pith-pr101-wsl-validation-20261008/repo`.
    Its repository path and full commit were requested from the parent. The
    existing `feat/omni-text-data` at `8839b7f` was read only to map interfaces.
-   Recheck these interfaces against the actual final PR100 commit:
-   `OmniPretrainData.checkpoint_state`, its version/fingerprint/consumed_samples
-   schema, `commit_step`, `pretrain_lm.train_step`'s save boundary and
-   `pretrain_lm.launch`'s load-before-next-batch boundary.
+   PR100's final design (`756d5b3`) removed that reader cursor: `get_batch(step,
+   device)` derives the data position from the step, and the checkpoint stores a
+   static `data_fingerprint` that is validated before tensors are restored.
+   Strict checkpoints follow it (strict format version 2; version-1 checkpoints
+   with `consumed_samples` are rejected).
 2. **PR101:** base is `e6d1889c6df5679749a057fd1952360c378f5cd6`; its current
    SM120/FA4 repairs and packed-gradient integrated candidate are owned by the
    other task. Use the parent's exact final commit and verified attention
    backend. Do not rely on the installed FA4 4.0.0b28 bugs being fixed merely
    because the converter passed under SDPA Math.
-3. **CPU loader integration:** pass the real `data.checkpoint_state` into
-   `StrictResumeState(model, optimizers, schedulers, data_state=...,
-   step=completed, global_batch_size=...)`. Save only after optimizer/scheduler
-   update and `data.commit_step`; restore before obtaining the next batch.
+3. **CPU loader integration:** pass the real `data.data_fingerprint` into
+   `StrictResumeState(model, optimizers, schedulers, data_fingerprint=...,
+   step=completed, global_batch_size=...)`. Save only after the optimizer/scheduler
+   update; restore before obtaining the next batch, which the restored step selects.
    Repeat the fresh-process test with the real staged text fixture, immutable
    fingerprint and actual next sample IDs/tokens/labels/masks. Do not add a new
    loader or change the existing observation protocol.

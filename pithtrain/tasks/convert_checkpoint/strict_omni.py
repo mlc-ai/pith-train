@@ -306,15 +306,13 @@ def _training(payload):
     batch = header["config"]["training"]["global_batch_size"]
     require(type(batch) is int and batch > 0, "Invalid global batch size")
     data = state["data"]
+    # Step-indexed data stores only its static fingerprint; the step selects the data.
     require(
         isinstance(data, dict)
-        and set(data) == {"version", "fingerprint", "consumed_samples"}
-        and type(data["version"]) is int
-        and data["version"] == 1
+        and set(data) == {"fingerprint"}
         and isinstance(data["fingerprint"], str)
-        and type(data["consumed_samples"]) is int
-        and data["consumed_samples"] == step * batch,
-        "Invalid committed data position/fingerprint",
+        and bool(data["fingerprint"]),
+        "Invalid data fingerprint",
     )
     membership, optimizers, schedulers = (
         header["membership"],
@@ -637,7 +635,7 @@ def validate_payloads(payloads, step, *, skeleton=False, multimodal=False):
         _training(payload)
         if data is None:
             data = payload["state"]["data"]
-        require(payload["state"]["data"] == data, "Ranks disagree on committed data")
+        require(payload["state"]["data"] == data, "Ranks disagree on the data fingerprint")
         model = payload["state"]["model"]
         require(isinstance(model, dict), f"Rank {rank}: invalid canonical model mapping")
         require(

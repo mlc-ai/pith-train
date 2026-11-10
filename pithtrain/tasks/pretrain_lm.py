@@ -6,6 +6,7 @@ from typing import List, Tuple
 
 import torch
 import torch.cuda
+import torch.distributed as dist
 import wandb
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig
@@ -28,11 +29,9 @@ from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
 from pithtrain.modules.training import TrainingCfg, model_class_for_config, setup_training
 from pithtrain.modules.training_data import (
-    DensePretrainData,
-    OmniPretrainData,
+    PreparedBundleData,
     PretrainData,
-    global_loss_mean,
-    global_target_count,
+    TokenBinData,
 )
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
@@ -79,15 +78,16 @@ def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
         cp_size=distributed.cp_size,
     )
     if cfg.data.format == "token_bin":
-        return DensePretrainData(cfg.data.dataset, cfg.training, **ranks)
-    data = OmniPretrainData(
-        cfg.data,
-        cfg.training,
-        **ranks,
-        pp_rank=distributed.pp_rank,
-        pp_size=distributed.pp_size,
-        pp_group=distributed.pp_group,
-    )
+        data = TokenBinData(cfg.data.dataset, cfg.training, **ranks)
+    else:
+        data = PreparedBundleData(
+            cfg.data,
+            cfg.training,
+            **ranks,
+            pp_rank=distributed.pp_rank,
+            pp_size=distributed.pp_size,
+            pp_group=distributed.pp_group,
+        )
     config = AutoConfig.from_pretrained(cfg.training.model)
     data.validate_model(
         model_class_for_config(
@@ -114,8 +114,11 @@ def objective(
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    The loss is summed over the micro-batch's tokens, not averaged: train_step divides by the
-    global token count. Labels are already next-token targets; do not shift them here.
+    Sum cross-entropy over this microbatch's non-ignored next-token targets.
+
+    Token and media readers already shift the labels. Return the differentiable loss sum and
+    its detached copy for logging. The training step normalizes both summed gradients and
+    summed losses once by the global target count across DP x CP.
     """
     (logits,) = model_outputs
     (labels,) = objective_inputs
@@ -127,7 +130,34 @@ def objective(
     return loss, loss.detach()
 
 
+def global_target_count(microbatches, group=None):
+    """Sum non-ignored labels over the stage's DP x CP group, excluding PP replicas.
+
+    For equal local counts this is local_count * dp_size * cp_size, matching
+    dense training. Masked media batches can have unequal (or zero) local counts,
+    so multiplying one rank's count by the group size would be incorrect.
+    """
+    count = sum((mb.objective_inputs[0] != -100).sum() for mb in microbatches)
+    if dist.is_initialized():
+        dist.all_reduce(count, group=group)
+    if count.item() == 0:
+        raise ValueError("The global batch has no valid next-token targets")
+    return count.to(dtype=torch.float32)
+
+
+def global_loss_mean(local_loss_sum, global_target_count, group=None):
+    """Sum rank-local losses and divide once by the already-global target count."""
+    total = local_loss_sum.detach().float().clone()
+    if dist.is_initialized():
+        dist.all_reduce(total, group=group)
+    return total / global_target_count
+
+
 def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
+    """
+    Execute one step of training.
+    """
+    # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
@@ -161,17 +191,22 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
     microbatches = get_global_batch(cfg, dataset, step, device)
 
     token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
-    num_tokens = global_target_count(microbatches, token_group)
+    global_num_targets = global_target_count(microbatches, token_group)
 
-    # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
+    # Run the forward and backward pass. The objective hands back one detached loss per
+    # micro-batch on pipeline rank 0; every other rank gets an empty list.
     objective_outputs = model.step(microbatches, objective)
 
-    # Loss sums and target counts are reduced over this stage's DP x CP ranks, so ranks may hold
-    # unequal numbers of targets. FSDP reduces gradients with a plain sum, so dividing by the
-    # global target count gives the token-weighted mean.
+    # Reduce true loss sums/counts across this pipeline stage's DP x CP ranks.
+    # FSDP has already summed gradients over the parameter replica groups.
     if distributed.pp_rank == 0:
-        loss = global_loss_mean(torch.stack(objective_outputs).sum(), num_tokens, token_group)
-    scale_grads_(local_grads(model), 1.0 / num_tokens)
+        loss = global_loss_mean(
+            torch.stack(objective_outputs).sum(), global_num_targets, token_group
+        )
+    # global_num_targets already sums DP x CP; multiplying those sizes again
+    # would divide gradients twice. For dense data it equals local_count * DP * CP.
+    scale = 1.0 / global_num_targets
+    scale_grads_(local_grads(model), scale)
 
     gradient_norm = clip_grad_norm(
         model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
@@ -181,7 +216,6 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
-    dataset.commit_step(step)
     if training.fp8:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
@@ -259,7 +293,7 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
             save_checkpoint(
                 cfg.training.save_location,
                 completed,
-                data_state=dataset.checkpoint_state,
+                data_fingerprint=dataset.data_fingerprint,
                 **(
                     {"strict": True, "resume_config": resume_contract(cfg)}
                     if getattr(cfg.training, "strict_resume", False)
@@ -295,7 +329,7 @@ def launch(cfg: PretrainLMCfg) -> None:
         load_checkpoint(
             cfg.training.save_location,
             step,
-            data_state=dataset.checkpoint_state,
+            data_fingerprint=dataset.data_fingerprint,
             **(
                 {"strict": True, "resume_config": resume_contract(cfg)}
                 if getattr(cfg.training, "strict_resume", False)

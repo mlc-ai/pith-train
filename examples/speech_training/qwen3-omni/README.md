@@ -113,7 +113,7 @@ text_data = Qwen3OmniSpeechSFTData(
 # Set SFTLMCfg.max_batches <= text_data.total_scans for this finite pass,
 # then call pithtrain.tasks.sft_lm.launch(cfg, text_data, ...).
 # launch owns get_batch and commit_update; do not pre-consume scan zero.
-# Each returned Microbatch retains shifted labels, model_context and stage-0 media_inputs.
+# Each returned Microbatch retains shifted labels, media_context and stage-0 media_inputs.
 
 # Pass to pithtrain.tasks.omni_speech.launch with an initialized native speech model.
 # This reader requires the explicit codec manifest in every selected sample.
@@ -121,7 +121,7 @@ speech_data = Qwen3OmniSpeechData(dataset, collator)
 speech_batches = speech_data.get_batch(scan_index=0, device="cpu")
 batch = speech_batches[0]
 # model(**{key: batch[key] for key in (
-#     "input_ids", "model_context", "codes", "code_lengths", "prompt_lengths",
+#     "input_ids", "media_context", "codes", "code_lengths", "prompt_lengths",
 #     "codebook_mask", "position_kwargs",
 # )})
 ```

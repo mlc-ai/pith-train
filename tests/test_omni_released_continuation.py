@@ -22,8 +22,16 @@ import torch.multiprocessing as mp
 
 from pithtrain.contexts import logging as log_context
 from pithtrain.modules.checkpoint import initialize_checkpoint, iter_canonical_parameters
+from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
 from tests.acceptance import omni_released_continuation as driver
-from tests.test_distributed_strict_checkpoint import advance, build, initialize_mesh
+from tests.acceptance.omni_native_resume import equal
+from tests.test_distributed_strict_checkpoint import (
+    FINGERPRINT,
+    advance,
+    build,
+    initialize_mesh,
+    snapshot,
+)
 
 
 def test_complete_typed_streamed_state_and_tampering(tmp_path):
@@ -83,8 +91,10 @@ def test_independent_split_mapping_reads_every_value(tmp_path):
 
 
 class Data:
-    def __init__(self, cursor):
-        self.checkpoint_state = cursor
+    """The driver's view of step-indexed data: only its static fingerprint."""
+
+    def __init__(self, fingerprint):
+        self.data_fingerprint = fingerprint
 
 
 def _worker(rank, directory, phase):
@@ -100,7 +110,7 @@ def _worker(rank, directory, phase):
         torch.set_num_threads(1)
         log_context.stdout = logging.getLogger("public-init-cpu-test")
         parts = build(*initialize_mesh("fsdp-layout", rank))
-        model, optimizer, _, cursor = parts
+        model, optimizer, _, _ = parts
         seed = rank + (400 if phase == "produce" else 700)
         torch.manual_seed(seed)
         random.seed(seed)
@@ -137,7 +147,7 @@ def _worker(rank, directory, phase):
                     p.to_local().fill_(-6)
             before_rng = torch.get_rng_state().clone()
             initialize_checkpoint(root / "model-only", 0)
-            assert not optimizer.state and cursor.consumed == 0
+            assert not optimizer.state
             assert torch.equal(torch.get_rng_state(), before_rng)
             driver.verify_loaded_parameters(expected, output / f"initialized-{rank}")
             bad = dict(expected)
@@ -145,30 +155,40 @@ def _worker(rank, directory, phase):
             bad[key] = dict(bad[key], sha256="0" * 64)
             with pytest.raises(AssertionError):
                 driver.verify_loaded_parameters(bad, output / f"negative-readback-{rank}")
-        data = Data(cursor)
+        config = dict(
+            checkpoint=root / "strict",
+            save_seconds=40,
+            load_seconds=40,
+            resume_contract={"training": {"global_batch_size": 2}},
+        )
         steps = []
 
         def train_one(step):
-            assert cursor.consumed == 2 * step
+            # Step-indexed: the driver hands each update its step; no cursor exists.
             steps.append(step)
             advance(parts)
 
-        driver.continuation(
-            phase,
-            dict(
-                checkpoint=root / "strict",
-                save_seconds=40,
-                load_seconds=40,
-                resume_contract={"training": {"global_batch_size": 2}},
-            ),
-            data,
-            torch.device("cpu"),
-            output,
-            root / "produce",
-            train_one,
-        )
+        def run(data):
+            driver.continuation(
+                phase, config, data, torch.device("cpu"), output, root / "produce", train_one
+            )
+
+        if phase == "restore":
+            # Another data identity is rejected on every rank before any state changes.
+            before = snapshot(parts)
+            with pytest.raises(DistributedCheckpointError, match="data fingerprint differs"):
+                run(Data("other-data"))
+            equal(snapshot(parts), before)
+            assert steps == []
+        run(Data(FINGERPRINT))
+        # Restore resumes at step 1, the update after the checkpoint, not at step 0.
         assert steps == ([0, 1] if phase == "produce" else [1])
-        assert cursor.consumed == 4 and not torch.cuda.is_initialized()
+        if phase == "produce":
+            # The strict shard records exactly the live data fingerprint, never a cursor.
+            shard = root / f"strict/torch-dcp/00000001/rank-{rank:05d}.pt"
+            stored = torch.load(shard, weights_only=True)["state"]["data"]
+            assert stored == {"fingerprint": FINGERPRINT}
+        assert not torch.cuda.is_initialized()
         (output / f"result-{rank}.json").write_text(json.dumps(dict(status="PASS", steps=steps)))
     finally:
         dist.destroy_process_group()

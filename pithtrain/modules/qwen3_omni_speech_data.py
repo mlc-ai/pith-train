@@ -622,7 +622,7 @@ class Qwen3OmniSpeechCollator:
             input_ids=context["input_ids"],
             attention_mask=context["attention_mask"],
             labels=labels.contiguous(),
-            model_context=context,
+            media_context=context,
             media_inputs=features,
             prompt_lengths=torch.tensor([prompt_length], dtype=torch.long),
             sample_ids=(sample["id"],),
@@ -682,14 +682,14 @@ class Qwen3OmniSpeechSFTData:
         batches = []
         for index in indices:
             prepared = self.collator(self.dataset[index])
-            context = {key: value.to(device) for key, value in prepared["model_context"].items()}
+            context = {key: value.to(device) for key, value in prepared["media_context"].items()}
             media = {key: value.to(device) for key, value in prepared["media_inputs"].items()}
             batches.append(
                 Microbatch(
                     model_inputs=(context["input_ids"],),
                     cu_seqlens=None,
                     objective_inputs=(prepared["labels"].to(device),),
-                    model_context=context,
+                    media_context=context,
                     media_inputs=media,
                     sample_ids=prepared["sample_ids"],
                 )
@@ -761,7 +761,7 @@ class Qwen3OmniSpeechSFTData:
 class Qwen3OmniSpeechData(Qwen3OmniSpeechSFTData):
     """Native speech task adapter: one explicit forward-kwargs dict per microbatch.
 
-    User media tensors are merged into model_context for native speech forward.
+    User media tensors are merged into media_context for native speech forward.
     Codec targets are mandatory. The same scan/update checkpoint protocol is used
     by the text adapter, including scans without an optimizer update. This adapter
     deliberately retains one sample per scan, independent of SFT pipeline grouping.
@@ -785,7 +785,7 @@ class Qwen3OmniSpeechData(Qwen3OmniSpeechSFTData):
                 return {key: move(item) for key, item in value.items()}
             return value
 
-        context = dict(prepared["model_context"], **prepared["media_inputs"])
+        context = dict(prepared["media_context"], **prepared["media_inputs"])
         keys = {
             "input_ids",
             "prompt_lengths",
@@ -799,7 +799,7 @@ class Qwen3OmniSpeechData(Qwen3OmniSpeechSFTData):
             "target_waveform",
         }
         batch = move({key: value for key, value in prepared.items() if key in keys})
-        batch["model_context"] = move(context)
+        batch["media_context"] = move(context)
         self._validate_pipeline((scan_index,))
         self.scanned_batches += 1
         return [batch]

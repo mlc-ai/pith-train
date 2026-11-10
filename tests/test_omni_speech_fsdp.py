@@ -20,7 +20,7 @@ def batch(*, frames=2, media=False):
     return dict(
         codes=torch.ones(1, frames, 16, dtype=torch.long),
         input_ids=torch.ones(1, 3, dtype=torch.long),
-        model_context={"input_features": torch.ones(1, 2)} if media else {},
+        media_context={"input_features": torch.ones(1, 2)} if media else {},
         codebook_mask=torch.ones(1, frames, 16, dtype=torch.bool),
     )
 

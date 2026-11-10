@@ -279,7 +279,7 @@ def make_sample(batch, config, index):
     position_kwargs["use_audio_in_video"] = bool(inputs.get("use_audio_in_video", False))
     return dict(
         input_ids=ids,
-        model_context=inputs,
+        media_context=inputs,
         labels=labels,
         codes=codes,
         code_lengths=torch.tensor([4]),
@@ -438,7 +438,7 @@ class HFChain(nn.Module):
     def forward(
         self,
         input_ids,
-        model_context,
+        media_context,
         codes,
         code_lengths,
         *,
@@ -461,7 +461,7 @@ class HFChain(nn.Module):
             raise PreconditionError(
                 "The fixed reference fixture is unpadded B=1 with all codebooks"
             )
-        inputs = dict(model_context)
+        inputs = dict(media_context)
         inputs.update(
             position_ids=positions(self.config.thinker_config, inputs),
             use_cache=False,
@@ -614,7 +614,7 @@ def build_pair(config, device, *, residual_reference="hf-prefix-v1"):
 
 def speech_args(batch):
     return (
-        (batch["input_ids"], batch["model_context"], batch["codes"], batch["code_lengths"]),
+        (batch["input_ids"], batch["media_context"], batch["codes"], batch["code_lengths"]),
         dict(prompt_lengths=batch["prompt_lengths"], position_kwargs=batch["position_kwargs"]),
     )
 
@@ -676,9 +676,9 @@ def reference(args, config, samples, native, hf, attention):
             for index, sample in enumerate(samples):
                 batch = move(sample, args.device, gradients=True)
                 leaves = {
-                    f"{MEDIA[index]}.{key}": batch["model_context"][key]
+                    f"{MEDIA[index]}.{key}": batch["media_context"][key]
                     for key in FLOAT_INPUTS
-                    if key in batch["model_context"]
+                    if key in batch["media_context"]
                 }
                 (actual_inputs if model_index == 0 else expected_inputs).update(leaves)
                 positional, kwargs = speech_args(batch)

@@ -7,11 +7,10 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
+from pithtrain.modules.qwen3_omni_data import create_omni_dataloader, processor_for
 from pithtrain.tasks.prepare_omni_data import (
     PrepareOmniDataCfg,
     launch,
-    processor_for,
     sha256,
     verify_bundle,
     write_json,

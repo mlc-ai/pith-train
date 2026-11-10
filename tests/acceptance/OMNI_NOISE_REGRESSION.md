@@ -32,7 +32,7 @@ numerical-function audit; `production-range.diff` is in the local delivery.
 ## What is equal and what intentionally differs
 
 All three arms use the exact existing tiny native Omni Thinker text config,
-verified PR100 text bundle, first 256 consumed samples, seed1234, sequence32,
+verified PR100 text bundle, the first 256 samples (32 step-indexed batches), seed1234, sequence32,
 global batch8, microbatch1, AdamW, BF16, real routing, global-batch load balancing
 at1e-3, and 32 updates with linear warmup from1e-6 to1e-5. No input/model weights
 are downloaded. No SDPA adapter, forced-balanced routing or synthetic training
@@ -57,7 +57,7 @@ to describe all configuration fields or execution paths as identical.
 
 Every rank compares the complete step16 runtime digest before and after
 restoration: canonical model tensors/dtypes, optimizer state, scheduler, data
-cursor and Python/NumPy/CPU/CUDA RNG. The digest includes full array/tensor bytes,
+fingerprint and Python/NumPy/CPU/CUDA RNG. The digest includes full array/tensor bytes,
 not truncated repr output. The converter itself checks unchanged canonical
 weight dtype/raw-byte hashes and the numerical resume contract. First/second
 halves must contain exactly steps1..16 and17..32; the combined feature log must

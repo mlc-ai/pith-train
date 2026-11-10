@@ -100,11 +100,11 @@ def preserve_generation_state(*models):
 def prompt_sample(sample):
     end = sample["prompt_lengths"][0]
     ids = sample["input_ids"][:, :end].clone()
-    context = dict(sample["model_context"], input_ids=ids, attention_mask=torch.ones_like(ids))
+    context = dict(sample["media_context"], input_ids=ids, attention_mask=torch.ones_like(ids))
     context.pop("position_ids", None)
     return dict(
         input_ids=ids,
-        model_context=context,
+        media_context=context,
         prompt_lengths=[end],
         position_kwargs=sample["position_kwargs"],
     )
@@ -257,7 +257,7 @@ def hf_generate(model, batch, *, eos_id=None, text_tokens=TEXT_TOKENS, codec_fra
         capture["codes"] = args[0].detach().clone()
         capture["waveform"] = output.detach().clone()
 
-    context = dict(batch["model_context"])
+    context = dict(batch["media_context"])
     context.pop("input_ids", None)
     context.pop("position_ids", None)
     options = dict(
@@ -339,7 +339,7 @@ def native_generate(
     try:
         output = model.generate(
             batch["input_ids"],
-            batch["model_context"],
+            batch["media_context"],
             max_text_tokens=text_tokens,
             max_codec_frames=codec_frames,
             text_eos_token_id=eos_id,
@@ -550,8 +550,8 @@ def multi_turn(batch, config):
     return dict(
         batch,
         input_ids=sequence,
-        model_context=dict(
-            batch["model_context"], input_ids=sequence, attention_mask=torch.ones_like(sequence)
+        media_context=dict(
+            batch["media_context"], input_ids=sequence, attention_mask=torch.ones_like(sequence)
         ),
         prompt_lengths=[sequence.shape[1]],
     )
