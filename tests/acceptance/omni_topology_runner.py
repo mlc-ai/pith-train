@@ -1,10 +1,14 @@
-"""Bounded sequential topology runner for an already allocated H100 host.
+"""Bounded sequential topology runner for an already allocated Hopper host.
 
 No Modal API, scheduler submission, new credentials, or allocation management.
 Example:
   python -m tests.acceptance.omni_topology_runner --expected-commit "$COMMIT" \\
     --case dense-single --out /work/evidence/topology-single
-Use --case all only on an existing dedicated eight-H100 allocation.
+The cases require H100 by default. --hardware-family H200 selects H200, the same SM90
+architecture; the cases, checks and thresholds do not change. Each case runs in a child
+process whose PYTHONPATH is this checkout. --extra-pythonpath appends an existing
+directory after it, such as a runtime's separately installed CUTLASS DSL packages.
+Use --case all only on an existing dedicated eight-GPU allocation of that family.
 """
 
 import argparse
@@ -18,6 +22,7 @@ import sys
 import time
 from pathlib import Path
 
+from tests.acceptance.omni_hopper_hardware import add_hardware_argument
 from tests.acceptance.omni_topology_contract import (
     BY_NAME,
     CASES,
@@ -103,9 +108,36 @@ def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def select_devices(snapshot, world, family):
+    """The first `world` devices of an nvidia-smi CSV snapshot, or None if fewer exist.
+
+    Every selected device must be of the requested Hopper family and idle.
+    """
+    if family not in ("H100", "H200"):
+        raise ValueError("Select explicit H100 or H200 acceptance hardware")
+    devices = [line.split(",") for line in snapshot.splitlines() if line.strip()]
+    if len(devices) < world:
+        return None
+    selected = devices[:world]
+    if any(family not in device[2] for device in selected):
+        raise RuntimeError(f"Selected devices are not the required {family} hardware")
+    if any(int(device[3].strip()) >= 1000 for device in selected):
+        raise RuntimeError("Selected devices are busy; no shared GPU run is allowed")
+    return selected
+
+
+def child_pythonpath(repo, extra):
+    """This checkout first, then each explicitly requested existing absolute directory."""
+    for path in extra:
+        if not path.is_absolute() or not path.is_dir():
+            raise ValueError(f"--extra-pythonpath must be an existing absolute directory: {path}")
+    return os.pathsep.join([str(repo), *(str(path) for path in extra)])
+
+
 def execute(args):
     repo = Path(__file__).resolve().parents[2]
     source = verify_source(repo, args.expected_commit)
+    pythonpath = child_pythonpath(repo, args.extra_pythonpath)
     selected = CASES if args.case == ["all"] else tuple(BY_NAME[name] for name in args.case)
     if len(set(case.name for case in selected)) != len(selected):
         raise ValueError("Cases must not be repeated")
@@ -116,7 +148,9 @@ def execute(args):
         "started_at_utc": now(),
         "status": "RUNNING",
         "scope": "Native text topology losses and all gradients; not HF parity, resume, or noise acceptance",
-        "allocation": "existing dedicated single-node H100 host; managed by caller",
+        "allocation": f"existing dedicated single-node {args.hardware_family} host; managed by caller",
+        "hardware_family": args.hardware_family,
+        "extra_pythonpath": [str(path) for path in args.extra_pythonpath],
         "maximum_case_seconds": sum(case.timeout + 10 for case in selected),
         "cases": [{"case": case.record(), "status": "NOT_RUN"} for case in CASES],
         "dependencies": {
@@ -141,7 +175,7 @@ def execute(args):
         TZ="UTC",
         OMP_NUM_THREADS="2",
         MKL_NUM_THREADS="2",
-        PYTHONPATH=str(repo),
+        PYTHONPATH=pythonpath,
         TRITON_CACHE_DIR=str(args.out / "cache/triton"),
         TORCHINDUCTOR_CACHE_DIR=str(args.out / "cache/inductor"),
     )
@@ -162,16 +196,11 @@ def execute(args):
                 timeout=15,
             )
             (args.out / f"{case.name}.gpu.csv").write_text(snapshot)
-            devices = [line.split(",") for line in snapshot.splitlines() if line.strip()]
-            if len(devices) < case.world:
+            selected_devices = select_devices(snapshot, case.world, args.hardware_family)
+            if selected_devices is None:
                 row.update(status="NOT_RUN", reason="Insufficient allocated devices")
                 save()
                 continue
-            selected_devices = devices[: case.world]
-            if any("H100" not in device[2] for device in selected_devices):
-                raise RuntimeError("Selected devices are not the required H100 hardware")
-            if any(int(device[3].strip()) >= 1000 for device in selected_devices):
-                raise RuntimeError("Selected devices are busy; no shared GPU run is allowed")
             case_env = dict(
                 env,
                 **case.environment(),
@@ -243,7 +272,7 @@ def execute(args):
     return 0 if summary["status"] in ("PASS_ALL_13", "PASS_SELECTED") else 1
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--list", action="store_true", help="CPU-only list; no GPU imports or launch"
@@ -251,6 +280,19 @@ def main():
     parser.add_argument("--case", choices=["all", *BY_NAME], nargs="+")
     parser.add_argument("--expected-commit")
     parser.add_argument("--out", type=Path)
+    add_hardware_argument(parser)
+    parser.add_argument(
+        "--extra-pythonpath",
+        type=Path,
+        action="append",
+        default=[],
+        help="Existing absolute directory appended after this checkout on the case PYTHONPATH",
+    )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if args.list:
         print(json.dumps([case.record() for case in CASES], indent=2))
