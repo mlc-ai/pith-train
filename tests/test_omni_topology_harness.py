@@ -2,6 +2,8 @@ import ast
 import copy
 import json
 import math
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +12,7 @@ import torch
 from pithtrain.contexts import training as training_context
 from pithtrain.models.qwen3_omni_stage5_policy import validate_omni_stage5_aggregation
 from tests.acceptance import omni_topology_gradients as strict_gradients
+from tests.acceptance import omni_topology_runner as runner
 from tests.acceptance.omni_topology_contract import (
     BY_NAME,
     CASES,
@@ -534,3 +537,100 @@ def test_real_torchrun_environment_requires_exact_world_and_ranks():
     for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE"):
         with pytest.raises(RuntimeError):
             validate_torchrun_environment(BY_NAME["dense-single"], dict(environment, **{key: "2"}))
+
+
+H100 = "NVIDIA H100 80GB HBM3"
+H200 = "NVIDIA H200"
+
+
+def smi(*devices):
+    """CSV rows of nvidia-smi --query-gpu=index,uuid,name,memory.used,memory.total,driver."""
+    return "\n".join(
+        f"{index}, GPU-{index}, {name}, {used}, 143771, 595.91.07"
+        for index, (name, used) in enumerate(devices)
+    )
+
+
+def test_runner_cli_defaults_to_h100_without_extra_path():
+    base = ["--case", "dense-single", "--expected-commit", "0" * 40, "--out", "out"]
+    args = runner.build_parser().parse_args(base)
+    assert args.hardware_family == "H100" and args.extra_pythonpath == []
+    args = runner.build_parser().parse_args(
+        [*base, "--hardware-family", "H200", "--extra-pythonpath", "/a", "--extra-pythonpath", "/b"]
+    )
+    assert args.hardware_family == "H200" and args.extra_pythonpath == [Path("/a"), Path("/b")]
+
+
+@pytest.mark.parametrize(
+    "family,devices,world,outcome",
+    [
+        ("H100", [(H100, 4), (H100, 4)], 2, 2),
+        ("H200", [(H200, 4), (H200, 4)], 2, 2),
+        ("H100", [(H200, 4)], 1, "required H100 hardware"),
+        ("H200", [(H100, 4)], 1, "required H200 hardware"),
+        ("H200", [(H200, 4), (H100, 4)], 2, "required H200 hardware"),
+        ("H200", [(H200, 4), (H100, 4)], 1, 1),
+        ("H200", [(H200, 1000)], 1, "busy"),
+        ("H200", [(H200, 4)], 2, None),
+    ],
+)
+def test_runner_uses_only_idle_devices_of_the_selected_family(family, devices, world, outcome):
+    if isinstance(outcome, str):
+        with pytest.raises(RuntimeError, match=outcome):
+            runner.select_devices(smi(*devices), world, family)
+    elif outcome is None:
+        assert runner.select_devices(smi(*devices), world, family) is None
+    else:
+        selected = runner.select_devices(smi(*devices), world, family)
+        assert [device[0] for device in selected] == [str(index) for index in range(outcome)]
+    with pytest.raises(ValueError, match="explicit H100 or H200"):
+        runner.select_devices(smi(*devices), world, "A100")
+
+
+def test_extra_pythonpath_is_explicit_existing_absolute_and_after_the_checkout(tmp_path):
+    repo, extra = tmp_path / "repo", tmp_path / "dsl_packages"
+    repo.mkdir()
+    extra.mkdir()
+    assert runner.child_pythonpath(repo, []) == str(repo)
+    assert runner.child_pythonpath(repo, [extra]) == os.pathsep.join([str(repo), str(extra)])
+    for bad in (Path("relative"), tmp_path / "missing"):
+        with pytest.raises(ValueError, match="existing absolute directory"):
+            runner.child_pythonpath(repo, [bad])
+
+
+@pytest.mark.parametrize("family,name,with_extra", [("H100", H100, False), ("H200", H200, True)])
+def test_selected_family_and_path_reach_the_case_process(
+    monkeypatch, tmp_path, package, family, name, with_extra
+):
+    case = BY_NAME["dense-dp2"]
+    extra = tmp_path / "dsl_packages"
+    extra.mkdir()
+    out = tmp_path / "out"
+    launched = {}
+
+    def run(command, **kwargs):
+        launched.update(command=command, env=kwargs["env"])
+        output = out / case.name
+        output.mkdir(parents=True)
+        for rank, report in good_reports(case).items():
+            (output / f"rank-{rank}.json").write_text(json.dumps(report))
+        kwargs["stdout"].write(LOSS_LOG)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runner, "verify_source", lambda repo, commit: SOURCE)
+    monkeypatch.setattr(
+        runner.subprocess, "check_output", lambda *a, **k: smi((name, 4), (name, 4))
+    )
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    argv = ["--case", case.name, "--expected-commit", "0" * 40, "--out", str(out)]
+    argv += ["--hardware-family", family] + (
+        ["--extra-pythonpath", str(extra)] if with_extra else []
+    )
+    assert runner.execute(runner.build_parser().parse_args(argv)) == 0
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["status"] == "PASS_SELECTED" and summary["hardware_family"] == family
+    assert summary["extra_pythonpath"] == ([str(extra)] if with_extra else [])
+    expected_path = [str(package), *([str(extra)] if with_extra else [])]
+    assert launched["env"]["PYTHONPATH"] == os.pathsep.join(expected_path)
+    assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert launched["command"][-2:] == ["--out", str(out / case.name)]
