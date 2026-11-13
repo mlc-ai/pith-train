@@ -11,11 +11,11 @@ If you want to understand *how the framework works internally* (to modify it), s
 - **Python:** >= 3.12, managed with [uv](https://docs.astral.sh/uv/).
 - **Multiple GPUs:** the example configs assume one 8-GPU node, and the framework is designed for multi-GPU training. You can lower the parallelism degrees for fewer GPUs, but the smaller meshes are not the tested defaults.
 
-Install (users):
+Install:
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
-uv pip install .
+uv sync
 ```
 
 ## Supported models

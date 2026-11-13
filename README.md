@@ -19,19 +19,13 @@ PithTrain is an MoE training framework designed agent-native from the start: ~11
 
 ## Installation
 
-NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Python >= 3.12 are required. We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
+NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Python >= 3.12 are required.
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
 ```
 
-**For users:**
-
-```bash
-uv pip install .
-```
-
-**For developers:**
+We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
 
 ```bash
 uv sync
@@ -74,23 +68,26 @@ For hardware requirements, supported models, scaling and multi-node runs, troubl
 ## Architecture
 
 <p align="center">
-  <img src="docs/images/PithTrain-arch.svg" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/PithTrain-arch-dark.svg">
+    <img alt="PithTrain architecture" src="docs/images/PithTrain-arch-light.svg" width="100%">
+  </picture>
 </p>
 
 PithTrain is structured in three layers:
 
-- **Application** — Training loop for pretraining, SFT, and more.
-- **Engine** — The bulk of PithTrain, composed of five modules:
-  - *Model* — Protocol interface with implementations for Qwen, DeepSeek, and GPT-OSS architectures.
-  - *Building Blocks* — FP8 linear and quantization, ring attention, expert dispatch and deduplication, etc.
-  - *Pipeline Engine* — DualPipeV scheduler with 5-stage overlapped forward-backward execution and P2P communication.
-  - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x FSDP x CP x EP).
-  - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
-- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (CuTeDSL, Triton).
+- **Application:** Training loop for pretraining (native) and RL post-training (slime).
+- **Engine:** The bulk of PithTrain, composed of five modules:
+  - *Model:* Protocol interface with implementations for Qwen, DeepSeek, and GPT-OSS architectures.
+  - *Pipeline Engine:* DualPipeV scheduler with 5-stage overlapped forward-backward execution.
+  - *Distributed Training:* Pipeline, data, context, and expert parallelism (PP x DP x CP x EP) with MoE parallel folding.
+  - *Building Blocks:* FP8 quantization, fused expert MLP, expert dispatch and deduplication, token scatter, ring attention, FP8 parameter all-gather, fused cross-entropy, and load-balancing loss.
+  - *Training Utilities:* Optimizer and LR scheduling, dataset, checkpointing, and logging.
+- **Operator:** PyTorch (tensor ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and custom kernels (TIRx, CuTe DSL).
 
 ## Contributing
 
-Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc. For a developer-level tour of the system — the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc. — see [`docs/architecture.md`](docs/architecture.md).
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup, testing and correctness-validation workflow, design principles, extension recipes, etc. For a developer-level tour of the system (the 5-stage overlapped pipeline, the model protocol, the 4D device mesh, etc.), see [`docs/architecture.md`](docs/architecture.md).
 
 ## Acknowledgement
 
