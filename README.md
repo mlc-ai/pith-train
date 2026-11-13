@@ -19,11 +19,13 @@ PithTrain is an MoE training framework designed agent-native from the start: ~11
 
 ## Installation
 
-NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Python >= 3.12 are required. We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
+NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA >= 13.0 and Python >= 3.12 are required.
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train
 ```
+
+We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
 
 ```bash
 uv sync
