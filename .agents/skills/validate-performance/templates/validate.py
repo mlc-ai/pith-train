@@ -6,7 +6,9 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/<tokenizer>")
+# One identical runner supports the historical base and the current config API.
+data_cfg = cfg.data if hasattr(cfg, "data") else cfg
+data_cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/<tokenizer>")
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = <pipeline-parallel-size>

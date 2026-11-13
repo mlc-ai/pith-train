@@ -1,0 +1,133 @@
+# make_wsd_scheduler and apply_fsdp of pithtrain/modules/training.py at e9e98c3d, the reviewed
+# feature source of the final-noise evidence, before main's #133 rewrote both functions.
+
+def make_wsd_scheduler(
+    cfg: TrainingCfg,
+    *,
+    start_lr: float = 0.0,
+    warmup_ratio: float = 0.0,
+    final_lr: float = 0.0,
+    decay_ratio: float = 0.1,
+    decay_shape: Literal["cosine", "linear"] = "cosine",
+) -> tuple[LRScheduler, ...]:
+    """
+    Warmup-stable-decay: linear warmup, hold lr, then cosine or linear decay. Set
+    decay_ratio = 1 - warmup_ratio for a pure anneal.
+    """
+    if decay_shape not in ("cosine", "linear"):
+        raise ValueError(f"Unknown decay_shape: {decay_shape!r}")
+    if warmup_ratio + decay_ratio > 1:
+        raise ValueError("warmup_ratio + decay_ratio must be <= 1")
+
+    max_steps = cfg.max_steps
+    warmup_steps, decay_steps = round(warmup_ratio * max_steps), round(decay_ratio * max_steps)
+    stable_steps = max_steps - warmup_steps - decay_steps
+    start_factor, final_factor = start_lr / cfg.lr, final_lr / cfg.lr
+
+    def lr_lambda(step: int) -> float:
+        # Warmup start_lr -> lr.
+        if step < warmup_steps:
+            return start_factor + (1 - start_factor) * (step / warmup_steps)
+        # Stable at lr.
+        if decay_steps == 0 or step < warmup_steps + stable_steps:
+            return 1.0
+        # Decay lr -> final_lr.
+        t = min((step - warmup_steps - stable_steps) / decay_steps, 1.0)
+        match decay_shape:
+            case "cosine":
+                return final_factor + (1 - final_factor) * 0.5 * (1 + math.cos(math.pi * t))
+            case "linear":
+                return 1.0 + (final_factor - 1.0) * t
+
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers),
+        make_wsd_scheduler,
+        dict(
+            lr=cfg.lr,
+            max_steps=cfg.max_steps,
+            start_lr=start_lr,
+            warmup_ratio=warmup_ratio,
+            final_lr=final_lr,
+            decay_ratio=decay_ratio,
+            decay_shape=decay_shape,
+        ),
+    )
+
+
+def apply_fsdp(model, hsdp_replica: int = 1):
+    # Two parameter classes, each with its own replica group. The expert parameters are the routed
+    # expert weights, unique per EP rank and replicated over the dp axis of the expert view; the
+    # attention parameters are everything else, replicated over the whole dp x cp stage. Hence the
+    # separate fully_shard call on the experts below: the FSDP2 module walk stops at an
+    # already-sharded submodule, so the outer call never sees the expert parameters.
+    expt_fsdp_mesh = distributed.expt_mesh["dp"]
+    if hsdp_replica > 1:
+        # Flatten under a separate name: _unflatten takes the flattened dim away from the mesh
+        # it came from, and the load-balance group in setup_model reads the default flattening.
+        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten("hsdp_stage")
+        attn_fsdp_mesh = split_replicas(attn_fsdp_mesh, hsdp_replica)
+        expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
+    else:
+        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
+    compute_mp = MixedPrecisionPolicy(
+        param_dtype=training.PARAM_DTYPE,
+        reduce_dtype=torch.float32,
+        output_dtype=None,
+        cast_forward_inputs=True,
+    )
+    # Pipeline activations already have PARAM_DTYPE. Keep root context tensors
+    # (e.g. media timing) in their original precision, consistently with the
+    # overlapped path which calls prolog/posemb directly. Compute children
+    # still cast their floating inputs through their own FSDP policies.
+    root_mp = replace(compute_mp, cast_forward_inputs=False)
+
+    # FSDP recommends shard models from the bottom to the top.
+    for i in range(2):
+        assert isinstance(model[i], PIPELINE_STAGE_MODELS)
+        # Stage-edge modules (embed / norm / lm_head): every non-"layers" child that
+        # owns parameters. reshard_after_forward=True since each runs once per step.
+        edges = (
+            model[i].fsdp_edge_modules()
+            if isinstance(model[i], Qwen3OmniMoeTalkerTextModel)
+            else tuple(
+                child
+                for name, child in model[i].named_children()
+                if name != "layers" and next(child.parameters(), None) is not None
+            )
+        )
+        for child in edges:
+            fully_shard(
+                child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
+            )
+        for layer in model[i].layers.values():
+            if hasattr(layer.mlp, "experts"):
+                fully_shard(
+                    layer.mlp.experts,
+                    mesh=expt_fsdp_mesh,
+                    reshard_after_forward=False,
+                    mp_policy=compute_mp,
+                )
+            fully_shard(
+                layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=compute_mp
+            )
+            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
+            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
+            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
+        fully_shard(
+            model[i],
+            mesh=attn_fsdp_mesh,
+            reshard_after_forward=False,
+            mp_policy=root_mp,
+        )
+
+    # Sum gradients instead of the FSDP2 default average. The two classes reduce over groups of
+    # different size, attn over dp x cp and expt over the expert dp axis, yet either sum is
+    # already the true global gradient: an expert is fed the tokens of its whole EP group through
+    # the all-to-all. Summing puts both classes on the same scale, and the training step applies
+    # the one normalization, by the global token count.
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.set_gradient_divide_factor(1.0)
+    return model
