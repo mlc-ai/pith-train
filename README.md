@@ -74,7 +74,10 @@ For hardware requirements, supported models, scaling and multi-node runs, troubl
 ## Architecture
 
 <p align="center">
-  <img src="docs/images/PithTrain-arch.svg" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/PithTrain-arch-dark.svg">
+    <img alt="PithTrain architecture" src="docs/images/PithTrain-arch-light.svg" width="100%">
+  </picture>
 </p>
 
 PithTrain is structured in three layers:
