@@ -79,14 +79,14 @@ For hardware requirements, supported models, scaling and multi-node runs, troubl
 
 PithTrain is structured in three layers:
 
-- **Application** — Training loop for pretraining, SFT, and more.
+- **Application** — Training loop for pretraining (native) and RL post-training (slime).
 - **Engine** — The bulk of PithTrain, composed of five modules:
   - *Model* — Protocol interface with implementations for Qwen, DeepSeek, and GPT-OSS architectures.
-  - *Building Blocks* — FP8 linear and quantization, ring attention, expert dispatch and deduplication, etc.
-  - *Pipeline Engine* — DualPipeV scheduler with 5-stage overlapped forward-backward execution and P2P communication.
-  - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x FSDP x CP x EP).
-  - *Training Infrastructure* — `torch.compile`, optimizer and LR scheduling, checkpointing, logging, etc.
-- **Operator** — PyTorch (basic ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and Python DSLs (CuTeDSL, Triton).
+  - *Pipeline Engine* — DualPipeV scheduler with 5-stage overlapped forward-backward execution.
+  - *Distributed Training* — Pipeline, data, context, and expert parallelism (PP x DP x CP x EP) with MoE parallel folding.
+  - *Building Blocks* — FP8 quantization, fused expert MLP, expert dispatch and deduplication, token scatter, ring attention, FP8 parameter all-gather, fused cross-entropy, and load-balancing loss.
+  - *Training Utilities* — Optimizer and LR scheduling, dataset, checkpointing, and logging.
+- **Operator** — PyTorch (tensor ops, NCCL), operator libraries (DeepGEMM, FlashAttention), and custom kernels (TIRx, CuTe DSL).
 
 ## Contributing
 
