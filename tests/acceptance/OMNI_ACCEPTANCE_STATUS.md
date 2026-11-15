@@ -126,6 +126,15 @@ discrete expert choice; native routers still compute their own probabilities and
 For image, audio and video, attributing their free-running failures to route flips remains
 an inference until their route-conditioned runs exist.
 
+**Released Thinker text weights.** `omni_released_text_parity.py` applies the
+route-conditioned text verdict above, with the same fixture, phases, metric and
+thresholds, to the released Thinker text decoder. Both models are loaded from the pinned
+public split-HF shards, read directly rather than through the converter, after the
+metadata manifest, every shard's SHA-256 and every header are verified; the free-running
+phase, the original criterion, stays a recorded diagnostic. This extension of the
+2026-11-08 verdict to released weights was decided on 2026-11-14, before any run of the
+gate, and applies only to new runs; no run is recorded yet.
+
 **Audio key-bias structural zero.** Audio self-attention adds `k_proj.bias` to every key a
 query sees, with no RoPE, key norm or bias-dependent mask, so the exact gradient of
 `audio_tower.layers.*.self_attn.k_proj.bias` is zero by softmax shift invariance. A computed
