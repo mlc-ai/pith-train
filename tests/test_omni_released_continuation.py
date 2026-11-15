@@ -371,3 +371,51 @@ def test_resource_errors_reject_missing_limit_usage_or_cpu_bound(monkeypatch):
     assert driver.original.resource_errors(resources) == [
         "At least 192 GiB actual available cgroup/host RAM is required"
     ]
+
+
+def production_adamw_arguments():
+    """The keyword arguments make_adamw_optimizer passes to AdamW, read from its source.
+
+    pithtrain.modules.training imports the CUDA kernels, so a CPU test reads the factory.
+    """
+    import ast
+
+    path = Path(driver.__file__).resolve().parents[2] / "pithtrain/modules/training.py"
+    factory = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "make_adamw_optimizer"
+    )
+    defaults = dict(zip((a.arg for a in factory.args.kwonlyargs), factory.args.kw_defaults))
+    call = next(
+        node
+        for node in ast.walk(factory)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "AdamW"
+    )
+    keywords = {k.arg: ast.literal_eval(k.value) for k in call.keywords if k.arg is not None}
+    return keywords, ast.literal_eval(defaults["weight_decay"])
+
+
+def test_adamw_inspection_matches_the_production_factory(tmp_path):
+    # The released gate checks the optimizer the production factory builds, so the check
+    # must accept the factory's options and reject Torch's unfused default.
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    keywords, weight_decay = production_adamw_arguments()
+    assert keywords == {"fused": True} and weight_decay == 0.1
+    assert not dist.is_initialized()
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        weight = torch.nn.Parameter(distribute_tensor(torch.ones(4, 2), mesh, [Shard(0)]))
+        parameters = {"weight": weight}
+        production = torch.optim.AdamW([weight], lr=1e-4, weight_decay=weight_decay, **keywords)
+        result = driver.original.inspect_production_adamw(production, parameters, expected_lr=1e-4)
+        assert result["implementation"] == "fused"
+        assert result["original_production_options"]["fused"] is True
+        unfused = torch.optim.AdamW([weight], lr=1e-4, weight_decay=weight_decay)
+        with pytest.raises(AssertionError, match="fused"):
+            driver.original.inspect_production_adamw(unfused, parameters, expected_lr=1e-4)
+    finally:
+        dist.destroy_process_group()

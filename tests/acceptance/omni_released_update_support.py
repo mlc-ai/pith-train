@@ -67,7 +67,7 @@ def estimate(modality):
         "microbatches_per_attention_dp_rank": 4,
         "weight_source": "production_random_fp32",
         "optimizer": "production_AdamW",
-        "optimizer_default_cuda_implementation": "foreach",
+        "optimizer_default_cuda_implementation": "fused",
         "all_ranks_initial_cpu_fp32_bytes": 16 * (heavy_unsharded + light_unsharded),
         "host_limit_bytes": 512 * GIB,
         "host_available_admission_bytes": 192 * GIB,
@@ -77,7 +77,7 @@ def estimate(modality):
         "kill_after_seconds": 10,
         "estimate_only": True,
         "state_estimates_exclude_activation_and_allocator": True,
-        "admission_note": "20S + 6U + original 8 GiB margin; deliberately allows all BF16 unsharded weights and FP32 full gradients to overlap foreach even though step finalization reshards",
+        "admission_note": "20S + 6U + original 8 GiB margin; deliberately allows all BF16 unsharded weights and FP32 full gradients to overlap the optimizer step even though step finalization reshards; 4S was sized for a foreach transient and stays as margin for fused AdamW",
         "steady_state": "NOT_RUN",
         "hf_parity": "SEPARATE_GATE",
         "checkpoint": "NOT_RUN",
@@ -332,17 +332,14 @@ def validate_rows(rows, groups):
 
 
 def inspect_production_adamw(optimizer, parameters, *, expected_lr):
-    """Validate defaults and exact inventory; observe, never override, Torch selection.
+    """Validate the production AdamW options and exact inventory; never override them.
 
-    Selection is predicted from the actual group arguments, not evidence of a
-    completed step. The existing post-step all-parameter state checks remain the
-    only acceptance of an executed update. CPU and CUDA can select different paths.
+    make_adamw_optimizer opts in to fused AdamW, so Torch's default implementation selector is
+    not consulted. This checks configuration, not a completed step: the existing post-step
+    all-parameter state checks remain the only acceptance of an executed update.
     """
-    import inspect
-
     import torch
     from torch.distributed.tensor import DTensor
-    from torch.optim.optimizer import _default_to_fused_or_foreach
 
     assert type(optimizer) is torch.optim.AdamW, "Production factory must return AdamW"
     assert not optimizer.state, "First-step optimizer state must be empty"
@@ -364,7 +361,7 @@ def inspect_production_adamw(optimizer, parameters, *, expected_lr):
     group = optimizer.param_groups[0]
     defaults = dict(
         foreach=None,
-        fused=None,
+        fused=True,
         differentiable=False,
         capturable=False,
         maximize=False,
@@ -376,26 +373,17 @@ def inspect_production_adamw(optimizer, parameters, *, expected_lr):
         eps=1e-8,
     )
     for key, value in defaults.items():
-        assert group.get(key) == value, f"Production AdamW default changed: {key}"
-    fused, foreach = _default_to_fused_or_foreach(actual, group["differentiable"])
-    assert type(fused) is bool and type(foreach) is bool
-    assert not fused, "Production default does not opt in to fused AdamW"
+        assert group.get(key) == value, f"Production AdamW option changed: {key}"
     local_bytes = sum(local_tensor(p).numel() * p.element_size() for p in actual)
     return dict(
         status="PASS",
         interpretation="CONTRACT_ONLY_NOT_EXECUTED",
-        selection_kind="PREDICTED_FROM_TORCH_DEFAULTS",
-        predicted_implementation="foreach" if foreach else "single_tensor",
-        fused=fused,
-        foreach=foreach,
+        selection_kind="EXPLICIT_PRODUCTION_OPTION",
+        implementation="fused",
         overrides_applied=False,
         parameter_count=len(actual),
         parameter_names=sorted(parameters),
         local_parameter_bytes=local_bytes,
-        foreach_sqrt_transient_bytes=local_bytes if foreach else 0,
         original_production_options=defaults,
         torch_version=torch.__version__,
-        selector_source_sha256=hashlib.sha256(
-            inspect.getsource(_default_to_fused_or_foreach).encode()
-        ).hexdigest(),
     )
