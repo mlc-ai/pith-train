@@ -67,11 +67,23 @@ for script in $CASES; do
     TORCHRUN_ARGS=(--nnodes=$NNODES --nproc-per-node=gpu)
     TORCHRUN_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=$MASTER:$PORT --rdzv-id=$PORT)
     start=$(date +%s)
+    # A node whose ranks fail leaves abort.<attempt>; the other nodes stop their own ranks on seeing
+    # it, rather than wait out the collective timeout in a step that can no longer finish.
+    abort=$dir/abort.$((attempt + 1))
     timeout --signal=TERM --kill-after=60 $CASE_TIMEOUT \
-        torchrun "${TORCHRUN_ARGS[@]}" "$script" > "$dir/node$NODEID.log" 2>&1
+        torchrun "${TORCHRUN_ARGS[@]}" "$script" > "$dir/node$NODEID.log" 2>&1 &
+    pid=$!
+    while kill -0 $pid 2>/dev/null; do
+        [ -e "$abort" ] && kill -TERM $pid 2>/dev/null
+        sleep 5
+    done
+    wait $pid
     code=$?
+    [ $code -ne 0 ] && touch "$abort"
     if [ "$NODEID" = 0 ]; then
-        python3 -m benchmarks.end2end.summarize "$dir/node0.log" --case "$case" \
+        # Every node's log, so a case that failed on another node records that node's error.
+        sleep 10
+        python3 -m benchmarks.end2end.summarize "$dir"/node*.log --case "$case" \
             --exit-code $code --commit $COMMIT --dirty $DIRTY \
             --wall-seconds $(($(date +%s) - start)) --output "$result"
         # Bumped only once the case has ended on this node, after every node read it above. A

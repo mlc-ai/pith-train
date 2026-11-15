@@ -1,8 +1,9 @@
 """
-Turn the rank-0 log of one end-to-end case into its result.json. launch.sh calls it on node 0
-after every case; run it by hand to re-summarize a log.
+Turn the logs of one end-to-end case into its result.json. launch.sh calls it on node 0 after
+every case; run it by hand to re-summarize. The first log is node 0's, which holds rank 0's step
+lines; the error of a failed case is gathered from every log, since any node may hold it.
 
-    python3 -m benchmarks.end2end.summarize <node0.log> --case <case> --output <result.json>
+    python3 -m benchmarks.end2end.summarize <node0.log> [<node1.log> ...] --case <case> --output <result.json>
 """
 
 import argparse
@@ -93,7 +94,7 @@ def environment() -> dict:
     return env
 
 
-def summarize(text: str, case: str, exit_code: int) -> dict:
+def summarize(text: str, case: str, exit_code: int, others: tuple[str, ...] = ()) -> dict:
     config = parse_case(case)
     steps = parse_steps(text)
     max_steps = max((int(n) for n in re.findall(r"step \d+/(\d+)", text)), default=None)
@@ -106,9 +107,22 @@ def summarize(text: str, case: str, exit_code: int) -> dict:
         result["status"] = "unsupported" if unsupported else "failed"
         if unsupported:
             result["reason"] = unsupported[1].strip()
+        texts = (text,) + others
+        unsupported = unsupported or next(
+            (m for m in (re.search(r"NotImplementedError: (.*)", t) for t in others) if m), None
+        )
+        result["status"] = "unsupported" if unsupported else "failed"
+        if unsupported:
+            result["reason"] = unsupported[1].strip()
+        # The root cause first: the first error line of each log, ordered by how early it appears.
+        errors = []
+        for t in texts:
+            lines = [line for line in t.splitlines() if line.strip()]
+            hits = [line for line in lines if re.search(r"Error|error:|OutOfMemory", line)]
+            hits = [line for line in hits if "Warning" not in line]
+            errors += hits[:3] + hits[-2:] if len(hits) > 5 else hits
         lines = [line for line in text.splitlines() if line.strip()]
-        errors = [line for line in lines if re.search(r"Error|error:|OutOfMemory|Traceback", line)]
-        result["error"] = (errors[-5:] if errors else []) + lines[-20:]
+        result["error"] = list(dict.fromkeys(errors))[:20] + lines[-10:]
         return result
     timed = [s for s in steps if s["step"] > WARMUP_STEPS]
     step_time = statistics.median(s["step_time"] for s in timed)
@@ -145,7 +159,7 @@ def summarize(text: str, case: str, exit_code: int) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("log", type=Path)
+    parser.add_argument("logs", type=Path, nargs="+")
     parser.add_argument("--case", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--exit-code", type=int, default=0)
@@ -153,8 +167,8 @@ def main() -> None:
     parser.add_argument("--dirty", type=int, default=0)
     parser.add_argument("--wall-seconds", type=int)
     args = parser.parse_args()
-    text = args.log.read_text(errors="replace") if args.log.exists() else ""
-    result = summarize(text, args.case, args.exit_code)
+    texts = [p.read_text(errors="replace") if p.exists() else "" for p in args.logs]
+    result = summarize(texts[0], args.case, args.exit_code, tuple(texts[1:]))
     result.update(exit_code=args.exit_code, commit=args.commit, dirty=bool(args.dirty))
     result.update(wall_seconds=args.wall_seconds, date=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     result["environment"] = environment()
