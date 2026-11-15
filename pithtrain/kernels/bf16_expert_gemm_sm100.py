@@ -1491,8 +1491,7 @@ def build_expert_gemm(kind, H, inter, has_bias, clamped, swap=False, materialize
     traced = txl.kernel()(entry)
     if USE_IKET:
         from tvm_tirx.backend.cuda.iket import IketProfiler
-        with TARGET:
-            return IketProfiler().compile(traced.mod, target=TARGET)
+        return IketProfiler().compile(traced.mod, target=TARGET)
     return entry_function(traced.compile(TARGET))
 
 
