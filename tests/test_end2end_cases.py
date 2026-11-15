@@ -14,7 +14,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("importing pithtrain needs a GPU", allow_module_level=True)
 
-from benchmarks.end2end.common import MODELS  # noqa: E402
+from benchmarks.end2end.common import MAX_STEPS, MODELS, WARMUP_STEPS  # noqa: E402
 from benchmarks.end2end.summarize import parse_case  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +23,17 @@ SCRIPTS = sorted(ROOT.glob("benchmarks/end2end/*/*/*/script.py"))
 
 def test_cases_exist():
     assert len(SCRIPTS) > 0
+
+
+def test_default_set():
+    """
+    Every line of default.txt names a case of the grid, once, and each case times 6 steps after 6 of warmup.
+    """
+    lines = (ROOT / "benchmarks/end2end/default.txt").read_text().splitlines()
+    cases = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+    assert len(cases) == len(set(cases)) > 0
+    assert all((ROOT / "benchmarks/end2end" / case / "script.py").exists() for case in cases)
+    assert (WARMUP_STEPS, MAX_STEPS) == (6, 12)
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: str(p.parent.relative_to(ROOT)))
@@ -42,7 +53,7 @@ def test_case_matches_path(script: Path, monkeypatch):
     assert training.sequence_length == case["sequence_length"]
     assert training.fp8 == (case["dtype"] == "fp8")
     assert training.global_batch_size == case["global_batch_size"]
-    assert training.benchmark and cfg.dataset is None
+    assert training.benchmark and cfg.dataset is None and training.max_steps == MAX_STEPS
     assert training.save_interval is None and cfg.logging.wandb is None
     assert (pp, cp, ep) == (case["pp"], case["cp"], case["ep"])
     assert world % pp == 0 and (world // pp) % cp == 0 and (world // pp) % ep == 0

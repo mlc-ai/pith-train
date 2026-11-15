@@ -2,12 +2,14 @@
 # Run end-to-end benchmark cases, one after another, and record one result.json per case.
 #
 # Usage, from the repo root with .venv active, one srun step per node count:
-#   srun -N 1 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end
+#   srun -N 1 -W 0 bash benchmarks/end2end/launch.sh                  # the default set (default.txt)
 #   srun -N 4 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end/qwen3-30b-a3b-seq4096-bf16
+#   srun -N 2 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end   # the full-grid sweep
 #   bash benchmarks/end2end/launch.sh <case-dir>          # one node, no SLURM
 #
-# Each argument is a case directory (one holding script.py) or any directory above cases. Only the
-# cases whose h200-<nodes>n8g matches the node count of this step run; the rest are skipped.
+# With no argument it runs the default set, the cases listed in benchmarks/end2end/default.txt.
+# Otherwise each argument is a case directory (one holding script.py) or any directory above
+# cases. Either way only the cases whose h200-<nodes>n8g matches the node count of this step run.
 #
 # Results land in $BENCH_OUTPUT/<case>/{result.json,node<k>.log}, by default
 # workspace/benchmarks/end2end/<commit>. A case with a result.json is skipped, so a preempted
@@ -20,9 +22,8 @@ export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD${PYTHONPATH:+:$PYTHONPATH}
 
-if [ $# -lt 1 ]; then
-    sed -n '2,16p' "$0" >&2
-    exit 1
+if [ $# -eq 0 ]; then
+    set -- $(grep -v '^\s*\(#\|$\)' benchmarks/end2end/default.txt | sed 's#^#benchmarks/end2end/#')
 fi
 
 NNODES=${SLURM_NNODES:-1}

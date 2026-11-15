@@ -26,13 +26,13 @@ MODELS = {
     ),
 }
 
-MAX_STEPS = 20
+MAX_STEPS = 12
 """
-Steps per case. Step 1 carries the torch.compile trace and the JIT warmup, and kernel tuning runs
-between steps 1 and 2, so the timing statistics use the steps after WARMUP_STEPS.
+Steps per case: WARMUP_STEPS, then 6 timed steps whose median is the step time. Step 1 carries
+the torch.compile trace and the JIT warmup, and kernel tuning runs between steps 1 and 2.
 """
 
-WARMUP_STEPS = 2
+WARMUP_STEPS = 6
 
 
 def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):

@@ -22,6 +22,8 @@ import math
 import statistics
 from pathlib import Path
 
+from benchmarks.end2end.common import MAX_STEPS
+
 
 def load(path: Path) -> dict[str, dict]:
     if path.is_dir():
@@ -86,7 +88,8 @@ def table_two(base: dict, feat: dict, args) -> tuple[list[str], list[list[str]],
         ratio = fm["step_time"] / bm["step_time"]
         ratios.append(ratio)
         d1 = fm["loss_first"] - bm["loss_first"]
-        dmax = max(abs(x["loss"] - y["loss"]) for x, y in zip(b["steps"], f["steps"]))
+        pairs = zip(b["steps"][:MAX_STEPS], f["steps"][:MAX_STEPS])
+        dmax = max(abs(x["loss"] - y["loss"]) for x, y in pairs)
         if abs(d1) > args.loss_first_tol:
             flags.append("loss1")
         if dmax > args.loss_tol:

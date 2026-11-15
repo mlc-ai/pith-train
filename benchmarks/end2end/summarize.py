@@ -4,6 +4,7 @@ every case; run it by hand to re-summarize. The first log is node 0's, which hol
 lines; the error of a failed case is gathered from every log, since any node may hold it.
 
     python3 -m benchmarks.end2end.summarize <node0.log> [<node1.log> ...] --case <case> --output <result.json>
+    python3 -m benchmarks.end2end.summarize --remeasure <result.json> ...   # after a fixture change
 """
 
 import argparse
@@ -18,7 +19,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from benchmarks.end2end.common import MODELS, WARMUP_STEPS
+from benchmarks.end2end.common import MAX_STEPS, MODELS, WARMUP_STEPS
 
 CASE = re.compile(
     r"(?P<model>.+)-seq(?P<seq>\d+)-(?P<dtype>bf16|fp8)/(?P<gpu>[a-z0-9]+)-(?P<nodes>\d+)n(?P<gpn>\d+)g/"
@@ -95,35 +96,37 @@ def environment() -> dict:
 
 
 def summarize(text: str, case: str, exit_code: int, others: tuple[str, ...] = ()) -> dict:
-    config = parse_case(case)
     steps = parse_steps(text)
     max_steps = max((int(n) for n in re.findall(r"step \d+/(\d+)", text)), default=None)
-    result = dict(case=case, config=config, steps=steps)
-    complete = exit_code == 0 and max_steps is not None and len(steps) == max_steps
-    if not complete:
-        # A model that raises NotImplementedError for this mesh does not support it on this build
-        # (e.g. context parallelism for GPT-OSS on main): recorded, not retried, not a regression.
-        unsupported = re.search(r"NotImplementedError: (.*)", text)
-        result["status"] = "unsupported" if unsupported else "failed"
-        if unsupported:
-            result["reason"] = unsupported[1].strip()
-        texts = (text,) + others
-        unsupported = unsupported or next(
-            (m for m in (re.search(r"NotImplementedError: (.*)", t) for t in others) if m), None
-        )
-        result["status"] = "unsupported" if unsupported else "failed"
-        if unsupported:
-            result["reason"] = unsupported[1].strip()
-        # The root cause first: the first error line of each log, ordered by how early it appears.
-        errors = []
-        for t in texts:
-            lines = [line for line in t.splitlines() if line.strip()]
-            hits = [line for line in lines if re.search(r"Error|error:|OutOfMemory", line)]
-            hits = [line for line in hits if "Warning" not in line]
-            errors += hits[:3] + hits[-2:] if len(hits) > 5 else hits
-        lines = [line for line in text.splitlines() if line.strip()]
-        result["error"] = list(dict.fromkeys(errors))[:20] + lines[-10:]
-        return result
+    result = dict(case=case, config=parse_case(case), steps=steps)
+    if exit_code == 0 and max_steps is not None and len(steps) == max_steps:
+        return measure(result)
+    # A model that raises NotImplementedError for this mesh does not support it on this build
+    # (e.g. context parallelism for GPT-OSS on main): recorded, not retried, not a regression.
+    texts = (text,) + others
+    found = (re.search(r"NotImplementedError: (.*)", t) for t in texts)
+    unsupported = next((m for m in found if m), None)
+    result["status"] = "unsupported" if unsupported else "failed"
+    if unsupported:
+        result["reason"] = unsupported[1].strip()
+    # Any node may hold the root cause, so take the first and last error lines of every log.
+    errors = []
+    for t in texts:
+        hits = [line for line in t.splitlines() if re.search(r"Error|error:|OutOfMemory", line)]
+        hits = [line for line in hits if "Warning" not in line]
+        errors += hits[:3] + hits[-2:] if len(hits) > 5 else hits
+    lines = [line for line in text.splitlines() if line.strip()]
+    result["error"] = list(dict.fromkeys(errors))[:20] + lines[-10:]
+    return result
+
+
+def measure(result: dict) -> dict:
+    """
+    Fill the metrics, checks and status of a complete case from its steps. Only the first
+    MAX_STEPS steps count, timing the steps after WARMUP_STEPS, so a case that ran longer (the
+    baseline ran 20) is summarized exactly as one that ran MAX_STEPS.
+    """
+    config, steps = result["config"], result["steps"][:MAX_STEPS]
     timed = [s for s in steps if s["step"] > WARMUP_STEPS]
     step_time = statistics.median(s["step_time"] for s in timed)
     tokens = config["global_batch_size"] * config["sequence_length"]
@@ -132,6 +135,8 @@ def summarize(text: str, case: str, exit_code: int, others: tuple[str, ...] = ()
     vocab = vocab.get("text_config", vocab)["vocab_size"]
     finite = all(math.isfinite(s[k]) for s in steps for k in ("loss", "grad_norm"))
     lb = [s["lb_loss"] for s in steps if s["lb_loss"] is not None]
+    result["steps_run"] = len(result["steps"])
+    result["timed_steps"] = [timed[0]["step"], timed[-1]["step"]]
     result["metrics"] = dict(
         step_time=step_time,
         step_time_min=min(s["step_time"] for s in timed),
@@ -159,14 +164,29 @@ def summarize(text: str, case: str, exit_code: int, others: tuple[str, ...] = ()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("logs", type=Path, nargs="+")
-    parser.add_argument("--case", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("logs", type=Path, nargs="*")
+    parser.add_argument("--case")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--remeasure",
+        type=Path,
+        nargs="+",
+        help="recompute the metrics of these result.json files from their stored steps, in place",
+    )
     parser.add_argument("--exit-code", type=int, default=0)
     parser.add_argument("--commit")
     parser.add_argument("--dirty", type=int, default=0)
     parser.add_argument("--wall-seconds", type=int)
     args = parser.parse_args()
+    if args.remeasure:
+        for path in args.remeasure:
+            result = json.loads(path.read_text())
+            if result.get("metrics"):
+                path.write_text(json.dumps(measure(result), indent=1) + "\n")
+                print(f"{result['case']}: {result['status']}")
+        return
+    if not (args.logs and args.case and args.output):
+        parser.error("give the logs of a case with --case and --output, or --remeasure")
     texts = [p.read_text(errors="replace") if p.exists() else "" for p in args.logs]
     result = summarize(texts[0], args.case, args.exit_code, tuple(texts[1:]))
     result.update(exit_code=args.exit_code, commit=args.commit, dirty=bool(args.dirty))

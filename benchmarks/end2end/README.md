@@ -1,9 +1,19 @@
 # End-to-end benchmarks
 
 Short training runs of every supported model at the parallel layouts that MoE parallel folding
-allows, on H200. Each case records step time, tokens per second per GPU, peak memory and the loss
-curve in a `result.json`, so a later build (a dependency bump, a kernel, an agent-evolved change)
-is diffed against a recorded baseline case by case, for speed and for correctness.
+allows, on H200 at 1, 2 and 4 nodes. Each case records step time, tokens per second per GPU, peak
+memory and the loss curve in a `result.json`, so a later build (a dependency bump, a kernel, an
+agent-evolved change) is diffed against a recorded baseline case by case, for speed and for
+correctness.
+
+Two sets of cases:
+
+- **The default set** ([`default.txt`](default.txt), 54 cases): per model and dtype, two layouts
+  per node count where the model fits, the fastest measured one and one that exercises context
+  parallelism (1 node) or expert parallelism across nodes (2 and 4 nodes). This is what
+  `launch.sh` runs without arguments, for routine before/after checks.
+- **The full grid** (every case directory, 316 cases): every layout of the grid, for an occasional
+  sweep, run on purpose by naming `benchmarks/end2end` or a subdirectory.
 
 ## Layout
 
@@ -26,10 +36,11 @@ Every case shares the fixture in `common.py`:
   removes the largest source of step-time variance and makes step time comparable across meshes
   and builds. It also pins `load-balance-loss` at 1.0, which the summary checks.
 - **Fixed shape.** 4 samples per GPU (`global_batch = 4 * world`), micro-batch 1, Muon at a
-  constant 3e-4, 20 steps from fresh weights. Nothing is checkpointed or sent to wandb.
+  constant 3e-4, 12 steps from fresh weights. Nothing is checkpointed or sent to wandb.
 
-The first two steps carry the `torch.compile` trace, the JIT warmup and kernel tuning, so timing
-is the median of steps 3 to 20.
+The first 6 steps are warmup (the `torch.compile` trace, the JIT warmup and kernel tuning), so
+timing is the median of steps 7 to 12. After a change to the step counts, `summarize.py
+--remeasure <result.json> ...` recomputes stored results from their per-step records.
 
 ## Run
 
@@ -37,9 +48,9 @@ From the repo root with `.venv` active, one `srun` step per node count (a step r
 whose `h200-<nodes>n8g` matches its node count):
 
 ```bash
-srun -N 1 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end                      # every 1-node case
+srun -N 1 -W 0 bash benchmarks/end2end/launch.sh                                          # default set, 1-node cases
 srun -N 4 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end/qwen3-30b-a3b-seq4096-fp8
-srun -N 2 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end/gpt-oss-120b-seq4096-bf16/h200-2n8g/pp2-dp8-cp1-ep8
+srun -N 2 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end                       # full grid, 2-node cases
 ```
 
 Results go to `workspace/benchmarks/end2end/<commit>/<case>/` (`BENCH_OUTPUT` overrides it). A case
