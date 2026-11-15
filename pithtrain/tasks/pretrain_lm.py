@@ -2,12 +2,13 @@ import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.cuda
 import wandb
 from torch.distributed.elastic.multiprocessing.errors import record
+from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
@@ -17,7 +18,7 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
+from pithtrain.modules.dataset import ConcatDataset, MemmapDataset, SyntheticDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
 from pithtrain.modules.hf_loader import load_hf_into_model
@@ -47,13 +48,20 @@ class PretrainLMCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
 
-    dataset: Path
+    dataset: Optional[Path] = None
     """
-    The root directory hosting the tokenized corpus, globbed for *.bin shards.
+    The root directory hosting the tokenized corpus, globbed for *.bin shards. None trains on
+    SyntheticDataset instead: seeded token ids drawn on the GPU, for benchmarks, so no corpus is
+    read and no step touches a file.
     """
 
 
-def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
+def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset | SyntheticDataset:
+    if cfg.dataset is None:
+        vocab_size = AutoConfig.from_pretrained(cfg.training.model).get_text_config().vocab_size
+        kwargs = dict(sequence_length=cfg.training.sequence_length)
+        kwargs.update(global_batch_size=cfg.training.global_batch_size, seed=cfg.training.seed)
+        return SyntheticDataset(vocab_size, **kwargs)
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)
@@ -63,7 +71,10 @@ def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
 
 
 def get_global_batch(
-    cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
+    cfg: PretrainLMCfg,
+    dataset: ConcatDataset | SyntheticDataset,
+    step: int,
+    device: torch.device,
 ) -> List[Microbatch]:
     """
     The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP blocks.
@@ -85,21 +96,33 @@ def get_global_batch(
     block = len(front)
     local_seq_len = 2 * block
 
-    local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-    local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-
+    indices = []
     for row in range(local_batch_size):
         microbatch_idx, row_in_microbatch = divmod(row, micro_batch_size)
-        index = start0 + microbatch_idx * effective_batch_size + row_in_microbatch
-        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
-        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
-        local_tokens[row, :block] = tokens_a
-        local_tokens[row, block:] = tokens_b
-        local_labels[row, :block] = labels_a
-        local_labels[row, block:] = labels_b
+        indices.append(start0 + microbatch_idx * effective_batch_size + row_in_microbatch)
 
-    local_tokens = local_tokens.to(device, non_blocking=True)
-    local_labels = local_labels.to(device, non_blocking=True)
+    if isinstance(dataset, SyntheticDataset):
+        # Rows of this step's global batch, and this rank's zigzag columns of each row.
+        samples = dataset.get_step(step)
+        rows = torch.tensor(indices, device=samples.device) - step * global_batch_size
+        cols = torch.cat(
+            [torch.arange(front.start, front.stop), torch.arange(back.start, back.stop)]
+        )
+        cols = cols.to(samples.device)
+        local_tokens = samples[rows][:, cols].to(device)
+        local_labels = samples[rows][:, cols + 1].to(device)
+    else:
+        local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+        local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+        for row, index in enumerate(indices):
+            tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
+            tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
+            local_tokens[row, :block] = tokens_a
+            local_tokens[row, block:] = tokens_b
+            local_labels[row, :block] = labels_a
+            local_labels[row, block:] = labels_b
+        local_tokens = local_tokens.to(device, non_blocking=True)
+        local_labels = local_labels.to(device, non_blocking=True)
 
     return [
         Microbatch(
@@ -128,7 +151,7 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
+def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, step: int) -> None:
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()

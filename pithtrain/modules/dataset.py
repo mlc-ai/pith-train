@@ -1,9 +1,12 @@
 """
-Memory-mapped token datasets for distributed training.
+Token datasets for distributed training.
 
-Only the pages a sample touches are read. Global rank 0 writes the sequence offsets and the
-shuffled indices to offsets.npy and indices.npy in the corpus directory at startup, and every rank
-maps them after a barrier. The shuffle runs on the GPU, so the index array must fit in GPU memory.
+MemmapDataset and ConcatDataset read a tokenized corpus: only the pages a sample touches are read.
+Global rank 0 writes the sequence offsets and the shuffled indices to offsets.npy and indices.npy
+in the corpus directory at startup, and every rank maps them after a barrier. The shuffle runs on
+the GPU, so the index array must fit in GPU memory.
+
+SyntheticDataset reads nothing: it draws seeded token ids on the GPU, for benchmarks.
 """
 
 import os
@@ -13,7 +16,7 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-__all__ = ["MemmapDataset", "ConcatDataset"]
+__all__ = ["MemmapDataset", "ConcatDataset", "SyntheticDataset"]
 
 
 class MemmapDataset:
@@ -79,3 +82,36 @@ class ConcatDataset:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         ds, local_idx = self.resolve_index(idx)
         return ds.get_chunk(local_idx, seq_offset, seq_length)
+
+
+class SyntheticDataset:
+    """
+    Seeded synthetic token ids drawn on the GPU, so a benchmark needs no corpus and its steps touch
+    no file. Ids follow a Zipf law over the vocabulary (id k has weight 1 / (k + 1)), so the loss
+    falls from about ln(vocab_size) toward the distribution's entropy as the model learns the
+    unigram, and two builds can be compared step by step. It is not a convergence signal.
+
+    The samples of a step depend only on the seed and the step, never on the mesh: every rank draws
+    the whole global batch and keeps its own rows and columns.
+    """
+
+    def __init__(self, vocab_size: int, sequence_length: int, global_batch_size: int, seed: int):
+        self.sequence_length = sequence_length
+        self.global_batch_size = global_batch_size
+        self.seed = seed
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        weights = 1.0 / torch.arange(1, vocab_size + 1, device=self.device, dtype=torch.float64)
+        cdf = torch.cumsum(weights, 0)
+        self.cdf = (cdf / cdf[-1]).to(torch.float32)
+        self.cdf[-1] = 1.0
+
+    def get_step(self, step: int) -> torch.Tensor:
+        """
+        Every sample of the step as int64 ids of shape (global_batch_size, sequence_length + 1);
+        a sample's labels are its ids shifted left by one.
+        """
+        generator = torch.Generator(self.device).manual_seed(self.seed * 1_000_003 + step)
+        shape = (self.global_batch_size, self.sequence_length + 1)
+        uniform = torch.rand(shape, generator=generator, device=self.device)
+        ids = torch.searchsorted(self.cdf, uniform, right=True)
+        return ids.clamp_max_(len(self.cdf) - 1)
