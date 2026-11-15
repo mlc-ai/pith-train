@@ -11,7 +11,8 @@
 #
 # Results land in $BENCH_OUTPUT/<case>/{result.json,node<k>.log}, by default
 # workspace/benchmarks/end2end/<commit>. A case with a result.json is skipped, so a preempted
-# set resumes where it stopped when rerun; a failed case is retried once (BENCH_ATTEMPTS=2).
+# set resumes where it stopped when rerun; a failed case is retried once (BENCH_ATTEMPTS=2). A case
+# the model rejects with NotImplementedError is recorded as unsupported and not retried.
 # Compare two output directories with: python3 -m benchmarks.end2end.compare <base> <feat>
 
 set -uo pipefail
@@ -52,7 +53,7 @@ for script in $CASES; do
     case=$(dirname "${script#benchmarks/end2end/}")
     dir=$OUTPUT/$case
     result=$dir/result.json
-    if [ -f "$result" ] && grep -q '"status": "ok"' "$result"; then
+    if [ -f "$result" ] && grep -q '"status": "\(ok\|unsupported\)"' "$result"; then
         echo "skip $case: done"
         continue
     fi

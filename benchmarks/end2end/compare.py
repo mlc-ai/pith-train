@@ -10,7 +10,8 @@ every given substring; --markdown prints a Markdown table.
 
 Speed is reported, not gated: step time is the median of the steps after the warmup, and a few
 percent between two runs of identical code is normal. Correctness is flagged: a case that failed
-or broke a check, a first-step loss further than --loss-first-tol from the baseline (the first
+or broke a check (a case the model does not support on a build, status unsupported, is listed
+but not flagged, and one that becomes supported is marked "newly supported"), a first-step loss further than --loss-first-tol from the baseline (the first
 step precedes any update, so it moves only if the forward changed), or a loss curve further
 than --loss-tol from it at any step.
 """
@@ -63,6 +64,20 @@ def table_two(base: dict, feat: dict, args) -> tuple[list[str], list[list[str]],
                 [case] + ["-"] * 7 + ["only in " + ("candidate" if b is None else "baseline")]
             )
             continue
+        if b["status"] == "unsupported" or f["status"] == "unsupported":
+            note = {
+                ("unsupported", "ok"): "newly supported",
+                ("ok", "unsupported"): "feat:unsupported",
+            }
+            note = note.get((b["status"], f["status"]), "unsupported")
+            rows.append([case] + ["-"] * 7 + [note if note != "unsupported" else ""])
+            if f["status"] == "ok":
+                fm = f["metrics"]
+                rows[-1][2], rows[-1][4] = (
+                    f"{fm['step_time']:.3f}",
+                    f"{fm['tokens_per_second_per_gpu']:,.0f}",
+                )
+            continue
         flags = [f"base:{p}" for p in problems(b)] + [f"feat:{p}" for p in problems(f)]
         if flags:
             rows.append([case] + ["-"] * 7 + [",".join(flags)])
@@ -111,8 +126,9 @@ def main() -> None:
     if len(sets) == 1:
         head, rows = table_one(sets[0])
         print(render(head, rows, args.markdown))
-        bad = sum(row[1] != "ok" for row in rows)
-        print(f"\n{len(rows)} cases, {bad} not ok")
+        unsupported = sum(row[1] == "unsupported" for row in rows)
+        bad = sum(row[1] not in ("ok", "unsupported") for row in rows)
+        print(f"\n{len(rows)} cases, {unsupported} unsupported on this build, {bad} not ok")
         return
     head, rows, ratios = table_two(*sets, args)
     print(render(head, rows, args.markdown))

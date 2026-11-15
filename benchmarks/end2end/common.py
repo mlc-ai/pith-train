@@ -10,9 +10,6 @@ in the code under test.
 
 from pathlib import Path
 
-from pithtrain.modules.training import make_constant_scheduler, make_muon_optimizer
-from pithtrain.tasks.pretrain_lm import PretrainLMCfg
-
 __all__ = ["MODELS", "MAX_STEPS", "WARMUP_STEPS", "end2end_cfg"]
 
 MODELS = {
@@ -38,9 +35,9 @@ between steps 1 and 2, so the timing statistics use the steps after WARMUP_STEPS
 WARMUP_STEPS = 2
 
 
-def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int) -> PretrainLMCfg:
+def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
     """
-    The config of one case before its mesh is set.
+    The PretrainLMCfg of one case before its mesh is set.
 
     Data is SyntheticDataset (cfg.dataset is None): seeded ids drawn on the GPU, so no corpus is
     prepared and no step reads a file. Routing is force-balanced (training.benchmark), which
@@ -52,6 +49,11 @@ def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int) ->
     and node count, and every mesh of one node count trains on the same samples. It satisfies the
     DualPipeV bound global_batch / dp >= 2 * pp at every mesh, as global_batch / dp = 4 * pp * cp.
     """
+    # Imported here, not at the top: importing pithtrain reads the GPU, and summarize.py, compare.py
+    # and collect.py read this module's tables on machines without one.
+    from pithtrain.modules.training import make_constant_scheduler, make_muon_optimizer
+    from pithtrain.tasks.pretrain_lm import PretrainLMCfg
+
     path, lb_type, lb_coef = MODELS[model]
     cfg = PretrainLMCfg()
     cfg.dataset = None

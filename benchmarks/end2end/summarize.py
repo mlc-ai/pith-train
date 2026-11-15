@@ -100,7 +100,12 @@ def summarize(text: str, case: str, exit_code: int) -> dict:
     result = dict(case=case, config=config, steps=steps)
     complete = exit_code == 0 and max_steps is not None and len(steps) == max_steps
     if not complete:
-        result["status"] = "failed"
+        # A model that raises NotImplementedError for this mesh does not support it on this build
+        # (e.g. context parallelism for GPT-OSS on main): recorded, not retried, not a regression.
+        unsupported = re.search(r"NotImplementedError: (.*)", text)
+        result["status"] = "unsupported" if unsupported else "failed"
+        if unsupported:
+            result["reason"] = unsupported[1].strip()
         lines = [line for line in text.splitlines() if line.strip()]
         errors = [line for line in lines if re.search(r"Error|error:|OutOfMemory|Traceback", line)]
         result["error"] = (errors[-5:] if errors else []) + lines[-20:]
