@@ -65,11 +65,12 @@ python3 -m benchmarks.end2end.compare <results> --filter seq4096 h200-4n8g      
 python3 -m benchmarks.end2end.collect workspace/benchmarks/end2end/<commit> -o benchmarks/end2end/baseline.json
 ```
 
-Speed is reported, not gated: two runs of identical code differ by about 1% in step time. Loss is
-flagged: synthetic tokens make the loss no convergence signal, but from the same seed two correct
-builds follow the same curve, so it is a step-by-step correctness signal. Two runs of identical
-code agree within 0.001 at every step (DeepSeek-V2-Lite, 1x8, BF16); `compare.py` flags a
-first-step loss more than 0.01 apart (the first step precedes any update, so only a forward change
-moves it) or any step more than 0.05 apart. Each case also checks that its losses are finite, that
+Speed is reported, not gated: over 37 cases run twice on the same main build, step time differed
+by -2.5% to +1.6%. Loss is flagged: synthetic tokens make the loss no convergence signal, but from
+the same seed two correct builds follow the same curve, so it is a step-by-step correctness
+signal. In those 37 pairs the first-step loss agreed within 0.006, and the largest gap at any step
+was 0.023 in BF16 and 0.069 in FP8 (median 0.003 and 0.021). `compare.py` flags a first-step loss
+more than 0.01 apart (the first step precedes any update, so only a forward change moves it) or
+any step more than 0.1 apart. Each case also checks that its losses are finite, that
 the loss fell over the run, and that routing was force-balanced. For a precise loss-parity verdict
 on one mesh with real routing and real data, use the `validate-correctness` skill.

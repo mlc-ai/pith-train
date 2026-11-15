@@ -135,8 +135,9 @@ def main() -> None:
         return
     head, rows, ratios = table_two(*sets, args)
     print(render(head, rows, args.markdown))
-    flagged = sum(bool(row[-1]) for row in rows)
-    print(f"\n{len(rows)} cases, {len(ratios)} compared, {flagged} flagged")
+    only = sum(row[-1].startswith("only in") for row in rows)
+    flagged = sum(bool(row[-1]) and not row[-1].startswith("only in") for row in rows)
+    print(f"\n{len(rows)} cases, {len(ratios)} compared, {flagged} flagged, {only} in one set only")
     if ratios:
         geomean = math.exp(statistics.fmean(math.log(r) for r in ratios))
         print(

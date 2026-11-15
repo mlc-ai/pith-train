@@ -18,8 +18,19 @@ def main() -> None:
     args = parser.parse_args()
     results = [json.loads(p.read_text()) for p in sorted(args.results.rglob("result.json"))]
     cases = {r["case"]: r for r in results}
+    # A committed baseline names no machine: no hostnames, and error lines keep paths relative to
+    # the repo and home.
+    roots = sorted({str(Path.cwd()), str(Path.cwd().resolve())}, key=len, reverse=True)
+    roots = [(root, ".") for root in roots] + [(str(Path.home()), "~")]
     for r in cases.values():
-        r.pop("error", None) if r["status"] == "ok" else None
+        if r["status"] == "ok":
+            r.pop("error", None)
+        r["environment"].pop("host", None)
+        r["environment"].pop("nodelist", None)
+        for i, line in enumerate(r.get("error", [])):
+            for root, short in roots:
+                line = line.replace(root, short)
+            r["error"][i] = line
     commits = Counter((r["commit"], r["dirty"]) for r in cases.values())
     packages = Counter(r["environment"]["torch"] for r in cases.values())
     header = dict(commits=[dict(commit=c, dirty=d, cases=n) for (c, d), n in commits.items()])
