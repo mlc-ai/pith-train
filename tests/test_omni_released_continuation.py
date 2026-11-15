@@ -7,6 +7,7 @@ mechanics, never released-weight values, native GPU math or full-size resources.
 import hashlib
 import json
 import logging
+import os
 import random
 import signal
 import time
@@ -258,3 +259,115 @@ def test_prepared_sequence_contract_rejects_unbound_length(tmp_path, declared, r
     )
     with pytest.raises(AssertionError):
         driver.validate_dataset_sequence_length(tmp_path, requested)
+
+
+def fake_host(monkeypatch, files, cpus):
+    """Serve /proc and /sys reads from files and pin the visible CPU affinity."""
+    monkeypatch.setattr(driver.original, "read_optional_text", lambda path: files.get(str(path)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(cpus)))
+
+
+def test_resource_inventory_reads_slurm_ancestor_cgroups(monkeypatch):
+    # A Slurm task without a cgroup namespace: the cgroup root and the task cgroup hold no
+    # limit, the job and user cgroups carry the allocation, and CPUs are bound by affinity.
+    gib = driver.original.GIB
+    job = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_3056658"
+    mounts = [
+        "26 1 259:1 / / rw,relatime shared:1 - ext4 /dev/root rw",
+        "35 24 0:30 / /sys/fs/cgroup rw,nosuid,nodev shared:9 - cgroup2 cgroup2 rw,nsdelegate",
+        "512 26 0:52 / /mnt/weka rw,relatime shared:300 - virtiofs fs-0 rw",
+    ]
+    files = {
+        "/proc/self/cgroup": "0::/system.slice/slurmstepd.scope/job_3056658/step_0/user/task_0",
+        "/proc/self/mountinfo": "\n".join(mounts),
+        "/proc/meminfo": "MemTotal:       1651351256 kB\nMemAvailable:   1637442888 kB",
+        f"{job}/memory.max": str(384 * gib),
+        f"{job}/memory.current": str(gib),
+        f"{job}/step_0/memory.max": "max",
+        f"{job}/step_0/user/memory.max": str(384 * gib),
+        f"{job}/step_0/user/memory.current": str(gib // 2),
+        f"{job}/step_0/user/task_0/memory.max": "max",
+        f"{job}/step_0/user/task_0/cpu.max": "max 100000",
+    }
+    fake_host(monkeypatch, files, cpus=32)
+    resources = driver.original.resource_inventory()
+    assert [row["path"] for row in resources["memory_limits"]] == [job, f"{job}/step_0/user"]
+    assert resources["memory_limit_bytes"] == 384 * gib
+    assert resources["memory_current_bytes"] == gib
+    assert resources["available_bytes"] == 383 * gib
+    assert resources["cpu_quota"] is None and resources["cpu_limit"] == 32
+    assert driver.original.resource_errors(resources) == []
+
+
+def test_resource_inventory_keeps_namespaced_container_limits(monkeypatch):
+    gib = driver.original.GIB
+    files = {
+        "/proc/self/cgroup": "0::/",
+        "/proc/self/mountinfo": "30 25 0:26 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup rw",
+        "/proc/meminfo": "MemAvailable:   1048576000 kB",
+        "/sys/fs/cgroup/memory.max": str(256 * gib),
+        "/sys/fs/cgroup/memory.current": str(10 * gib),
+        "/sys/fs/cgroup/memory.peak": str(12 * gib),
+        "/sys/fs/cgroup/cpu.max": "1600000 100000",
+    }
+    fake_host(monkeypatch, files, cpus=64)
+    resources = driver.original.resource_inventory()
+    assert resources["memory_limit_bytes"] == 256 * gib
+    assert resources["cgroup_lifetime_peak_bytes"] == 12 * gib
+    assert resources["available_bytes"] == 246 * gib
+    assert resources["cpu_quota"] == 16 and resources["cpu_limit"] == 16
+    assert driver.original.resource_errors(resources) == []
+
+
+def test_resource_inventory_reads_cgroup_v1_slurm_hierarchy(monkeypatch):
+    gib = driver.original.GIB
+    task = "/slurm/uid_4688/job_7/step_0/task_0"
+    memory, cpu = "/sys/fs/cgroup/memory", "/sys/fs/cgroup/cpu,cpuacct"
+    mounts = [
+        f"31 25 0:27 / {memory} rw,nosuid - cgroup cgroup rw,memory",
+        f"32 25 0:28 / {cpu} rw,nosuid - cgroup cgroup rw,cpu,cpuacct",
+    ]
+    files = {
+        "/proc/self/cgroup": f"9:memory:{task}\n4:cpu,cpuacct:{task}",
+        "/proc/self/mountinfo": "\n".join(mounts),
+        "/proc/meminfo": "MemAvailable:   1048576000 kB",
+        f"{memory}/slurm/uid_4688/job_7/memory.limit_in_bytes": str(384 * gib),
+        f"{memory}/slurm/uid_4688/job_7/memory.usage_in_bytes": str(2 * gib),
+        f"{memory}/slurm/uid_4688/job_7/memory.max_usage_in_bytes": str(3 * gib),
+        f"{memory}{task}/memory.limit_in_bytes": "9223372036854771712",
+        f"{memory}{task}/memory.usage_in_bytes": str(gib),
+        f"{cpu}{task}/cpu.cfs_quota_us": "-1",
+        f"{cpu}{task}/cpu.cfs_period_us": "100000",
+    }
+    fake_host(monkeypatch, files, cpus=32)
+    resources = driver.original.resource_inventory()
+    assert resources["memory_limit_bytes"] == 384 * gib
+    assert resources["cgroup_lifetime_peak_bytes"] == 3 * gib
+    assert resources["available_bytes"] == 382 * gib
+    assert resources["cpu_quota"] is None and resources["cpu_limit"] == 32
+    assert driver.original.resource_errors(resources) == []
+
+
+def test_resource_errors_reject_missing_limit_usage_or_cpu_bound(monkeypatch):
+    gib = driver.original.GIB
+    job = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_9"
+    files = {
+        "/proc/self/cgroup": "0::/system.slice/slurmstepd.scope/job_9/step_0/user/task_0",
+        "/proc/self/mountinfo": "35 24 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw",
+        "/proc/meminfo": "MemAvailable:   1637442888 kB",
+    }
+    fake_host(monkeypatch, files, cpus=128)
+    resources = driver.original.resource_inventory()
+    assert resources["memory_limit_bytes"] is None and resources["cpu_limit"] == 128
+    assert driver.original.resource_errors(resources) == [
+        "A readable finite host memory hard limit in [192,512] GiB is required",
+        "Kernel CPU quota/affinity capacity in (0,32] is required",
+    ]
+    # A finite limit without its usage counter must not fall back to host-wide free memory.
+    files[f"{job}/memory.max"] = str(384 * gib)
+    fake_host(monkeypatch, files, cpus=32)
+    resources = driver.original.resource_inventory()
+    assert resources["memory_limit_bytes"] == 384 * gib and resources["available_bytes"] == 0
+    assert driver.original.resource_errors(resources) == [
+        "At least 192 GiB actual available cgroup/host RAM is required"
+    ]

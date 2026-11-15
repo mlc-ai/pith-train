@@ -7,6 +7,7 @@ The acceptance entrance is omni_released_continuation, not this helper.
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 GIB = 2**30
@@ -108,45 +109,101 @@ def save_json(path, value):
     temporary.replace(path)
 
 
+def read_optional_text(path):
+    """Return a file's stripped text, or None when it does not exist."""
+    path = Path(path)
+    return path.read_text().strip() if path.exists() else None
+
+
 def resource_inventory():
-    """Read effective Linux limits without using host-wide free memory as a cgroup limit."""
+    """Read ancestor cgroup limits and this process's kernel CPU affinity.
 
-    def read(path):
-        p = Path(path)
-        return p.read_text().strip() if p.exists() else None
-
-    raw_limit = read("/sys/fs/cgroup/memory.max")
-    raw_used = read("/sys/fs/cgroup/memory.current")
-    raw_peak = read("/sys/fs/cgroup/memory.peak")
-    raw_cpu = read("/sys/fs/cgroup/cpu.max")
-    if raw_limit is None:
-        raw_limit = read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        raw_used = read("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-    limit = int(raw_limit) if raw_limit and raw_limit != "max" else None
-    used = int(raw_used) if raw_used else None
-    quota = None
-    if raw_cpu:
-        q, period = raw_cpu.split()
-        if q != "max":
-            quota = int(q) / int(period)
-    else:
-        q = read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-        period = read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-        if q and period and int(q) > 0:
-            quota = int(q) / int(period)
-    available = None
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        if line.startswith("MemAvailable:"):
-            available = int(line.split()[1]) * 1024
-    if limit is not None and used is not None:
-        available = min(available, limit - used) if available is not None else limit - used
+    Slurm puts memory limits above the task cgroup and limits CPUs by affinity rather than CFS
+    quota, so without a cgroup namespace neither the cgroup root nor the task cgroup holds the
+    limit. Host-wide free memory and environment variables are never treated as limits.
+    """
+    directories = set()
+    for line in (read_optional_text("/proc/self/cgroup") or "").splitlines():
+        _, controllers, relative = line.split(":", 2)
+        for mount in (read_optional_text("/proc/self/mountinfo") or "").splitlines():
+            left, right = mount.split(" - ", 1)
+            fields, info = left.split(), right.split()
+            if info[0] not in ("cgroup", "cgroup2"):
+                continue
+            if controllers and not set(controllers.split(",")).intersection(info[2].split(",")):
+                continue
+            if not controllers and info[0] != "cgroup2":
+                continue
+            root, target = Path(fields[3]), Path(fields[4])
+            current = Path(relative)
+            if not current.is_relative_to(root):
+                continue
+            current = target / current.relative_to(root)
+            while current.is_relative_to(target):
+                directories.add(current)
+                if current == target:
+                    break
+                current = current.parent
+    # Also retain the original container-root/v1 paths for namespaced mounts.
+    directories.update(
+        Path(p) for p in ("/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/sys/fs/cgroup/cpu")
+    )
+    memories, quotas = [], []
+    for directory in sorted(directories):
+        raw = read_optional_text(directory / "memory.max")
+        used = read_optional_text(directory / "memory.current")
+        peak = read_optional_text(directory / "memory.peak")
+        if raw is None:
+            raw = read_optional_text(directory / "memory.limit_in_bytes")
+            used = read_optional_text(directory / "memory.usage_in_bytes")
+            peak = read_optional_text(directory / "memory.max_usage_in_bytes")
+        if raw and raw != "max" and int(raw) < 2**60:
+            memories.append(
+                dict(
+                    path=str(directory),
+                    limit=int(raw),
+                    used=int(used) if used else None,
+                    peak=int(peak) if peak else None,
+                )
+            )
+        raw_cpu = read_optional_text(directory / "cpu.max")
+        if raw_cpu:
+            q, period = raw_cpu.split()
+        else:
+            q = read_optional_text(directory / "cpu.cfs_quota_us")
+            period = read_optional_text(directory / "cpu.cfs_period_us")
+        if q and q != "max" and int(q) > 0 and period and int(period) > 0:
+            quotas.append(int(q) / int(period))
+    available = next(
+        (
+            int(line.split()[1]) * 1024
+            for line in (read_optional_text("/proc/meminfo") or "").splitlines()
+            if line.startswith("MemAvailable:")
+        ),
+        None,
+    )
+    for row in memories:
+        if row["used"] is not None:
+            remaining = row["limit"] - row["used"]
+            available = min(available, remaining) if available is not None else remaining
+        else:
+            # A missing usage counter must not substitute host-wide free RAM.
+            available = 0
+    limiting = (
+        min(memories, key=lambda row: (row["limit"], -(row["used"] or 0))) if memories else {}
+    )
+    affinity = len(os.sched_getaffinity(0))
+    quota = min(quotas) if quotas else None
     return dict(
-        memory_limit_bytes=limit,
-        memory_current_bytes=used,
-        cgroup_lifetime_peak_bytes=int(raw_peak) if raw_peak else None,
+        memory_limit_bytes=limiting.get("limit"),
+        memory_current_bytes=limiting.get("used"),
+        cgroup_lifetime_peak_bytes=limiting.get("peak"),
+        memory_limits=memories,
         available_bytes=available,
-        cpu_limit=quota,
-        cpu_max_raw=raw_cpu,
+        cpu_limit=min(affinity, quota) if quota is not None else affinity,
+        cpu_quota=quota,
+        cpu_affinity_count=affinity,
+        cpu_limit_basis="minimum_of_kernel_affinity_and_all_finite_ancestor_quotas",
     )
 
 
@@ -158,7 +215,7 @@ def resource_errors(resources):
     if available is None or available < 192 * GIB:
         errors.append("At least 192 GiB actual available cgroup/host RAM is required")
     if resources["cpu_limit"] is None or not 0 < resources["cpu_limit"] <= 32:
-        errors.append("A readable CPU quota in (0,32] is required")
+        errors.append("Kernel CPU quota/affinity capacity in (0,32] is required")
     return errors
 
 
