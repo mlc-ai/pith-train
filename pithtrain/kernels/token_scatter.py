@@ -14,7 +14,7 @@ __all__ = ["GEMM_ALLOC_ALIGNMENT", "scatter_by_expert"]
 GEMM_ALLOC_ALIGNMENT = 1024
 
 
-def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, padding_alignment: int = 128, group_counts: Optional[list[int]] = None, *, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     """
     Reorder input_tokens by expert_idxs into expert-major groups, each padded with zero rows to
     a multiple of padding_alignment. Returns (output_tokens, reverse_shuffle_idxs,
@@ -36,9 +36,10 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
 
     Rows are copied exactly. Placement within a group: token order on SM90 (so every output is
     deterministic); unspecified on SM100 (atomic_add order, not deterministic; with more than 1024
-    groups SM100 takes a PyTorch path, in token order). Consumers locate a token only through
-    reverse_shuffle_idxs. An expert_idxs length other than num_tokens raises ValueError (also for
-    num_tokens == 0).
+    groups SM100 takes a PyTorch path, in token order). deterministic=True requests token order
+    on both architectures, using the stable PyTorch path on SM100. Consumers locate a token only
+    through reverse_shuffle_idxs. An expert_idxs length other than num_tokens raises ValueError
+    (also for num_tokens == 0).
     """
     match ARCH_MAJOR:
         case 9:
@@ -46,6 +47,6 @@ def scatter_by_expert(input_tokens: torch.Tensor, expert_idxs: torch.Tensor, num
             return scatter_by_expert_sm90(input_tokens, expert_idxs, num_groups, padding_alignment, group_counts)
         case 10:
             from pithtrain.kernels.token_scatter_sm100 import scatter_by_expert_sm100
-            return scatter_by_expert_sm100(input_tokens, expert_idxs, num_groups, padding_alignment, group_counts)
+            return scatter_by_expert_sm100(input_tokens, expert_idxs, num_groups, padding_alignment, group_counts, deterministic=deterministic)
         case _:
             raise NotImplementedError(f"pithtrain.kernels supports SM90 and SM100, not compute capability {ARCH_MAJOR}.x")

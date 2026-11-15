@@ -13,6 +13,7 @@ import torch.distributed as dist
 from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_sync
+from pithtrain.operators.stable_scatter import stable_dedup_prepare_dispatch
 from pithtrain.operators.token_scatter import padded_index_gather
 
 __all__ = ["PendingDispatch", "prepare_dispatch", "prepare_dispatch_issue"]
@@ -98,10 +99,12 @@ def prepare_dispatch_issue(
     ep_size: int,
     experts_per_rank: int,
     ep_group: dist.ProcessGroup,
+    *,
+    deterministic: bool = False,
 ) -> PendingDispatch:
     """
     Issue the device side of an expert-parallel dispatch on the current stream without
-    blocking the host.
+    blocking the host. deterministic preserves original token/slot order within each rank/expert.
     """
     assert ep_size > 1
     assert not outstanding_dispatches, "a deferred dispatch is still outstanding"
@@ -113,9 +116,16 @@ def prepare_dispatch_issue(
     # followed by its dedup count. The kernel writes the first two parts in place.
     stride = experts_per_rank + 1
     meta = torch.empty(2 * ep_size + ep_size * stride, dtype=torch.int64, device=topk_ids.device)
-    _, _, dispatch_token_idxs, idxs, expand_idx, send_meta = ep_dispatch_send_idx(
-        topk_ids, num_experts, ep_size, experts_per_rank, meta
-    )
+    if deterministic:
+        counts, dedup_counts, dispatch_token_idxs, idxs, expand_idx, send_meta = (
+            stable_dedup_prepare_dispatch(topk_ids, num_experts, ep_size, experts_per_rank)
+        )
+        meta[:ep_size].copy_(counts)
+        meta[ep_size : 2 * ep_size].copy_(dedup_counts)
+    else:
+        _, _, dispatch_token_idxs, idxs, expand_idx, send_meta = ep_dispatch_send_idx(
+            topk_ids, num_experts, ep_size, experts_per_rank, meta
+        )
 
     recv_meta = meta[2 * ep_size :]
     all_to_all_sync(recv_meta, send_meta, group=ep_group)
@@ -142,10 +152,12 @@ def prepare_dispatch(
     ep_size: int,
     experts_per_rank: int,
     ep_group: dist.ProcessGroup,
+    *,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, RoutingInfo]:
     """
     With ep_size > 1 a token sent to several experts on one EP rank is sent once, and expand_idx
-    restores the copies on the receiver.
+    restores the copies on the receiver. deterministic also fixes dedup and expert-slot order.
     """
     k = topk_ids.shape[1]
     expert_idxs = topk_ids.view(-1)
@@ -158,6 +170,13 @@ def prepare_dispatch(
         return dispatch_tokens, RoutingInfo(topk_weight, expert_idxs)
 
     pending = prepare_dispatch_issue(
-        hidden_states, topk_ids, topk_weight, num_experts, ep_size, experts_per_rank, ep_group
+        hidden_states,
+        topk_ids,
+        topk_weight,
+        num_experts,
+        ep_size,
+        experts_per_rank,
+        ep_group,
+        deterministic=deterministic,
     )
     return pending.finish()

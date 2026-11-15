@@ -4,7 +4,7 @@ expert's first count rows (reverse_shuffle_idxs a bijection onto the token rows)
 and every row of the allocation tail up to a multiple of 1024 rows must be zero bytes, and the offsets
 and sizes must be exact. The order of a group's tokens is not part of the architecture-neutral
 contract (token order on SM90, atomic order on SM100), so it is not checked here; consumers locate a
-token only through reverse_shuffle_idxs.
+token only through reverse_shuffle_idxs. With deterministic=True, token order is checked too.
 """
 
 import pytest
@@ -25,14 +25,14 @@ def routing(m, G, skew=0.0, seed=0, empty=()):
     return torch.multinomial(probs, m, replacement=True, generator=gen)
 
 
-def check(x, expert_idxs, G, alignment=128, group_counts=None):
+def check(x, expert_idxs, G, alignment=128, group_counts=None, deterministic=False):
     m, H = x.shape
     counts = torch.bincount(expert_idxs, minlength=G).cpu()
     ks_want = ((counts + alignment - 1) // alignment * alignment).tolist()
     offs_want = torch.tensor(ks_want, dtype=torch.int64).cumsum(0)
     x_before, expert_idxs_before = x.clone(), expert_idxs.clone()
 
-    out, reverse_idxs, offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, G, alignment, group_counts)  # fmt: skip
+    out, reverse_idxs, offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, G, alignment, group_counts, deterministic=deterministic)  # fmt: skip
     assert ks == ks_want
     assert ks_tensor.dtype == torch.int32 and ks_tensor.shape == (G,) and ks_tensor.tolist() == ks_want  # fmt: skip
     assert offs.dtype == torch.int32 and offs.shape == (G,) and offs.tolist() == offs_want.tolist()
@@ -58,6 +58,10 @@ def check(x, expert_idxs, G, alignment=128, group_counts=None):
     assert not bool(as_bytes(tail).any()), "tail rows must be zero bytes"
 
     assert torch.equal(as_bytes(x), as_bytes(x_before)) and torch.equal(expert_idxs, expert_idxs_before), "inputs must not change"  # fmt: skip
+    if deterministic:
+        for group in range(G):
+            rows = reverse_idxs[expert_idxs == group]
+            assert torch.all(rows[1:] > rows[:-1])
     return out, reverse_idxs, offs, ks_tensor, ks
 
 
@@ -82,12 +86,13 @@ def test_models(T, top_k, H, G):
     check(x, routing(m, G, skew=0.3, seed=T + G), G)
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("alignment", [1, 16, 128, 256])
-def test_ragged_and_empty_groups(alignment):
+def test_ragged_and_empty_groups(alignment, deterministic):
     G = 16
     expert_idxs = routing(3001, G, skew=1.0, seed=1, empty=(0, 5, 15))
     x = torch.randn(3001, 1000, device="cuda").to(torch.bfloat16)
-    _, _, _, _, ks = check(x, expert_idxs, G, alignment)
+    _, _, _, _, ks = check(x, expert_idxs, G, alignment, deterministic=deterministic)
     assert ks[0] == ks[5] == ks[15] == 0
 
 
@@ -133,7 +138,8 @@ def test_group_counts_range(G, m):
     check(x, routing(m, G, skew=0.5, seed=G + m), G, alignment=16)
 
 
-def test_group_counts_on_host():
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_group_counts_on_host(deterministic):
     """
     With group_counts the host sizes need no device copy; results are the same.
     """
@@ -141,8 +147,8 @@ def test_group_counts_on_host():
     expert_idxs = routing(10000, G, skew=0.7, seed=3, empty=(3, 31))
     x = torch.randn(10000, 2048, device="cuda").to(torch.bfloat16)
     counts = torch.bincount(expert_idxs, minlength=G).tolist()
-    without_counts = check(x, expert_idxs, G)
-    with_counts = check(x, expert_idxs, G, group_counts=counts)
+    without_counts = check(x, expert_idxs, G, deterministic=deterministic)
+    with_counts = check(x, expert_idxs, G, group_counts=counts, deterministic=deterministic)
     assert without_counts[4] == with_counts[4] and torch.equal(without_counts[2], with_counts[2]) and torch.equal(without_counts[3], with_counts[3])  # fmt: skip
 
 
@@ -155,7 +161,8 @@ def test_single_token_single_group_and_one_group_all():
 
 
 @pytest.mark.parametrize("dtype,bits", [(torch.bfloat16, torch.int16), (torch.float16, torch.int16), (torch.float32, torch.int32)])  # fmt: skip
-def test_special_values_copied_bitwise(dtype, bits):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_special_values_copied_bitwise(dtype, bits, deterministic):
     """
     Signed zeros, infinities and NaNs with distinct payloads keep their bytes.
     """
@@ -165,13 +172,14 @@ def test_special_values_copied_bitwise(dtype, bits):
     raw[0, : len(specials)] = torch.tensor(specials, dtype=bits, device="cuda")
     x[1, :3] = torch.tensor([float("inf"), float("-inf"), -0.0], dtype=dtype, device="cuda")
     x[2] = 0
-    check(x, routing(512, 4, seed=4), 4)
+    check(x, routing(512, 4, seed=4), 4, deterministic=deterministic)
 
 
-def test_empty_input():
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_empty_input(deterministic):
     x = torch.empty(0, 2048, device="cuda", dtype=torch.bfloat16)
     out, reverse_idxs, offs, ks_tensor, ks = scatter_by_expert(
-        x, torch.empty(0, dtype=torch.long, device="cuda"), 8
+        x, torch.empty(0, dtype=torch.long, device="cuda"), 8, deterministic=deterministic
     )
     assert out.shape == (0, 2048) and reverse_idxs.shape == (0,) and ks == []
     # With no tokens the offsets and sizes come back empty, not (G,) zeros.

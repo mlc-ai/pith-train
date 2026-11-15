@@ -1,9 +1,9 @@
 """
-Contract: the fp32 mean cross-entropy of the (N, V) logits against target over the rows whose
-target is not ignore_index (dividing by at least one, so all-ignored gives 0). The logits are
-overwritten with the gradient of that mean, (softmax(x) - onehot(y)) / n on the n counted rows and
-zero on ignored rows, rounded once to the logits' dtype. grad is inp itself when inp is
-row-contiguous, otherwise a contiguous copy.
+Contract: the fp32 mean (default) or summed cross-entropy of the (N, V) logits against target over
+non-ignored rows (all-ignored gives 0). The logits are overwritten with the gradient of that
+reduction: (softmax(x) - onehot(y)) / n, where n is max(non-ignored rows, 1) for mean or 1 for sum.
+Ignored gradients are zero; each gradient is rounded once to the logits' dtype. grad is inp itself
+when inp is row-contiguous, otherwise a contiguous copy.
 """
 
 import pytest
@@ -15,10 +15,10 @@ from pithtrain.kernels import cross_entropy_fwd_bwd
 IGNORE = -100
 
 
-def reference(logits, target, ignore_index):
+def reference(logits, target, ignore_index, reduction="mean"):
     x = logits.float()
     keep = target != ignore_index
-    num_counted = max(int(keep.sum()), 1)
+    num_counted = max(int(keep.sum()), 1) if reduction == "mean" else 1
     loss = F.cross_entropy(x, target, ignore_index=ignore_index, reduction="sum") / num_counted
     grad = torch.softmax(x, dim=-1) / num_counted
     rows = torch.nonzero(keep).squeeze(1)
@@ -27,10 +27,10 @@ def reference(logits, target, ignore_index):
     return loss, grad, num_counted
 
 
-def check(logits, target, ignore_index=IGNORE):
-    want_loss, want_grad, num_counted = reference(logits, target, ignore_index)
+def check(logits, target, ignore_index=IGNORE, reduction="mean"):
+    want_loss, want_grad, num_counted = reference(logits, target, ignore_index, reduction)
     inp = logits.clone()
-    loss, grad = cross_entropy_fwd_bwd(inp, target, ignore_index)
+    loss, grad = cross_entropy_fwd_bwd(inp, target, ignore_index, reduction)
     assert loss.dtype == torch.float32 and loss.dim() == 0
     assert grad.shape == logits.shape and grad.dtype == logits.dtype
     assert grad.data_ptr() == inp.data_ptr()  # in place on row-contiguous logits
@@ -52,23 +52,25 @@ def check(logits, target, ignore_index=IGNORE):
 
 # vocab sizes: small, not a power of two, and the four models' vocabularies
 # (deepseek-v2-lite 102400, qwen3-30b-a3b 151936, gpt-oss-20b 201088, qwen3.5-35b-a3b 248320).
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
 @pytest.mark.parametrize("vocab", [1000, 32000, 102400, 151936, 201088, 248320])
-def test_loss_and_grad(vocab):
+def test_loss_and_grad(vocab, reduction):
     gen = torch.Generator(device="cuda").manual_seed(0)
     tokens = 4096 if vocab <= 32000 else 1024
     logits = (torch.randn(tokens, vocab, generator=gen, device="cuda") * 2).to(torch.bfloat16)
     target = torch.randint(0, vocab, (tokens,), generator=gen, device="cuda")
     target[::7] = IGNORE
-    check(logits, target)
+    check(logits, target, reduction=reduction)
 
 
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_dtypes(dtype):
+def test_dtypes(dtype, reduction):
     gen = torch.Generator(device="cuda").manual_seed(1)
     logits = (torch.randn(777, 5003, generator=gen, device="cuda") * 3).to(dtype)
     target = torch.randint(0, 5003, (777,), generator=gen, device="cuda")
     target[5::11] = IGNORE
-    check(logits, target)
+    check(logits, target, reduction=reduction)
 
 
 def test_large_logits_stable():
@@ -93,10 +95,11 @@ def test_target_at_edges_and_one_column():
     assert loss.item() == 0 and torch.all(grad == 0)
 
 
-def test_all_ignored_gives_zero():
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+def test_all_ignored_gives_zero(reduction):
     logits = torch.randn(32, 1000, device="cuda").to(torch.bfloat16)
     target = torch.full((32,), IGNORE, device="cuda")
-    loss, grad = cross_entropy_fwd_bwd(logits.clone(), target, IGNORE)
+    loss, grad = cross_entropy_fwd_bwd(logits.clone(), target, IGNORE, reduction)
     assert loss.item() == 0.0
     assert torch.all(grad == 0)
 

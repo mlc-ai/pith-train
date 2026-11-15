@@ -190,7 +190,7 @@ def pack_from_f32(words, src, num_words, logit_dtype):
 
 
 @functools.cache
-def build_count_kernel(target_dtype):
+def build_count_kernel(target_dtype, reduction: str = "mean"):
     LOADS_IN_FLIGHT = 4  # target loads in flight per thread
 
     @txl.kernel()
@@ -222,7 +222,7 @@ def build_count_kernel(target_dtype):
             txl.ptx.ld.shared.s32(warp_count, s_counts.ptr_to([lane]))
             txl.ptx.redux_sync.add.u32(count_sum, txl.reinterpret(warp_count, ty="uint32"), txl.uint32(FULL_MASK))
             with txl.if_(lane == 0), txl.then_():
-                num_valid = txl.Cast("float32", max_drop_nan(txl.reinterpret(count_sum, ty="int32"), txl.int32(1)))
+                num_valid = txl.Cast("float32", max_drop_nan(txl.reinterpret(count_sum, ty="int32"), txl.int32(1))) if reduction == "mean" else txl.float32(1.0)
                 txl.ptx.st.global_.f32(stats.ptr_to([0]), txl.float32(1.0) / num_valid)
                 # The main kernel's last row to finish sums the row losses into loss (0 if N == 0).
                 txl.ptx.st.global_.s32(done.ptr_to([0]), txl.int32(0))
@@ -707,13 +707,13 @@ def pick_cluster(V, elem_bytes):
     return None
 
 
-def cross_entropy_fwd_bwd_torch(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> torch.Tensor:
+def cross_entropy_fwd_bwd_torch(inp: torch.Tensor, target: torch.Tensor, ignore_index: int, reduction: str = "mean") -> torch.Tensor:
     """
-    The contract in PyTorch for logit dtypes the kernels do not take: the fp32 mean loss, the
-    gradient of that mean written into the row-contiguous inp.
+    The contract in PyTorch for logit dtypes the kernels do not take: the fp32 loss and the
+    gradient of the requested reduction written into the row-contiguous inp.
     """
     x, keep = inp.float(), target != ignore_index
-    num_valid = keep.sum().clamp(min=1).float()
+    num_valid = keep.sum().clamp(min=1).float() if reduction == "mean" else 1
     loss = F.cross_entropy(x, target.long(), ignore_index=ignore_index, reduction="sum") / num_valid
     grad = torch.softmax(x, dim=-1)
     grad.scatter_add_(1, torch.where(keep, target, 0).long().unsqueeze(1), -keep.float().unsqueeze(1))
@@ -721,10 +721,10 @@ def cross_entropy_fwd_bwd_torch(inp: torch.Tensor, target: torch.Tensor, ignore_
     return loss
 
 
-def cross_entropy_fwd_bwd_sm100(inp: torch.Tensor, target: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+def cross_entropy_fwd_bwd_sm100(inp: torch.Tensor, target: torch.Tensor, ignore_index: int, reduction: str = "mean") -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Mean cross-entropy of the (N, V) logits inp against target, overwriting the logits (or the
-    contiguous copy a non-row-contiguous inp is replaced by) with the gradient of that mean.
+    Mean or summed cross-entropy of the (N, V) logits inp against target, overwriting the logits
+    (or the contiguous copy) with the gradient of the requested reduction.
     Returns (loss, grad), the same contract as cross_entropy_fwd_bwd_sm90.
     """
     N, V = inp.shape
@@ -733,7 +733,7 @@ def cross_entropy_fwd_bwd_sm100(inp: torch.Tensor, target: torch.Tensor, ignore_
     if N == 0:  # no rows: loss 0 and the empty gradient, as cross_entropy_fwd_bwd_sm90 returns
         return torch.zeros((), dtype=torch.float32, device=inp.device), inp
     if inp.dtype not in LOGIT_DTYPE_NAME:
-        return cross_entropy_fwd_bwd_torch(inp, target, ignore_index), inp
+        return cross_entropy_fwd_bwd_torch(inp, target, ignore_index, reduction), inp
     if target.dtype not in TARGET_DTYPE_NAME:  # other integer targets: the same values as int64
         target = target.long()
     device = inp.device
@@ -743,7 +743,7 @@ def cross_entropy_fwd_bwd_sm100(inp: torch.Tensor, target: torch.Tensor, ignore_
     target_dtype, logit_dtype = TARGET_DTYPE_NAME[target.dtype], LOGIT_DTYPE_NAME[inp.dtype]
     stats, done, row_loss, loss = torch.empty(2, dtype=torch.float32, device=device), torch.empty(1, dtype=torch.int32, device=device), torch.empty(max(N, 1), dtype=torch.float32, device=device), torch.empty((), dtype=torch.float32, device=device)
     logits_flat = inp.view(-1)
-    build_count_kernel(target_dtype)(target_flat, tstride, N, ignore_index, stats, done, loss.view(1))
+    build_count_kernel(target_dtype, reduction)(target_flat, tstride, N, ignore_index, stats, done, loss.view(1))
     if N > 0:
         # TMA bulk copies and 16-byte vector stores need a 16-byte aligned base; otherwise ce_stream
         cluster_config = pick_cluster(V, ELEMENT_BYTES[inp.dtype]) if inp.data_ptr() % 16 == 0 else None
