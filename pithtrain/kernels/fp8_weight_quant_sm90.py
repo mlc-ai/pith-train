@@ -551,6 +551,11 @@ def resolve(dtype: torch.dtype, shape: tuple, stride: tuple, x_addr: int) -> tup
 # the CUDA kernel.
 OPS_SOURCE = r"""
 #include <Python.h>
+// tvm-ffi first: its DLPack header (1.4) and ATen's (1.3) share an include guard, and tvm-ffi needs 1.4.
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/function.h>
 #include <ATen/ATen.h>
 #include <ATen/DLConvertor.h>
 #include <ATen/core/dispatch/Dispatcher.h>
@@ -559,10 +564,6 @@ OPS_SOURCE = r"""
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/library.h>
-#include <tvm/ffi/container/array.h>
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/extra/c_env_api.h>
-#include <tvm/ffi/function.h>
 #include <cstring>
 #include <mutex>
 #include <tuple>

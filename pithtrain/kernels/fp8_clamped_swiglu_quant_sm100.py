@@ -1432,8 +1432,7 @@ def guard_tile(cond, is_running):
 
 def compile_kernel(kernel):
     target = TARGET
-    with target:
-        return entry_function(tvm_tirx.tirx.compile(kernel.mod, target=target, pipeline="tirx"))
+    return entry_function(tvm_tirx.tirx.compile(kernel.mod, target=target, pipeline="tirx"))
 
 
 SCHED_COUNTERS = {}
