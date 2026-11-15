@@ -39,10 +39,10 @@ SM90_ONLY = "the context-parallel gated delta rule kernels run on SM90 only; gat
 def gated_delta_rule_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether the gdr_cp_* entry points apply to a rank's slice (q, k (1, T, H, K), v (1, T, HV, V),
-    g, beta (1, T, HV)): on SM90, all contiguous on one CUDA device, T > 0, HV a multiple of 32 and
-    H == HV / 2 (Qwen3.5's 16 key / 32 value heads, or a batch of b folded into the heads, H 16 b /
-    HV 32 b), K == V == 128, bf16 q / k / v / beta and an fp32 gate. False on every other
-    architecture. Constant per geometry: torch.compile guards on the shape, device and dtype checks.
+    g, beta (1, T, HV)): on SM90, all contiguous on one CUDA device, T > 0, H >= 1 and HV a
+    multiple of H (Qwen3.5-35B-A3B's 16 key / 32 value heads, Qwen3.5-122B-A10B's 16 / 64, or
+    either with a batch of b folded into the heads, H b / HV b), K == V == 128, bf16 q / k / v /
+    beta and an fp32 gate. False on every other architecture. Constant per geometry: torch.compile guards on the shape, device and dtype checks.
     """
     if ARCH_MAJOR != 9:
         return False

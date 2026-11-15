@@ -12,8 +12,8 @@ Checked against PyTorch (FLA is no longer a dependency, so its kernels no longer
 oracles; the references below evaluate FLA's chunk algorithm in float64 or run the fp32
 recurrence):
 
-- the capability query: True at Qwen3.5's geometry and its batch folds (H 16 b / HV 32 b), False
-  off it;
+- the capability query: True at Qwen3.5-35B-A3B's and Qwen3.5-122B-A10B's heads (16 / 32 and 16 /
+  64), at groups of 3, and at their batch folds (H b / HV b), False off it;
 - single GPU, synthetic inputs, model and mild gates, resets, aligned and ragged slices, HV 32 and
   96:
   - the forward map hm (he and the M chain) against its float64 evaluation from the rank's own w,
@@ -29,7 +29,8 @@ recurrence):
     such a rank yields exactly that rank's he;
 - the whole chain emulated in one process (W ranks run one after another, the all-gather a stack)
   against the fp32 recurrence over the whole sequence, output and the five gradients, documents
-  crossing rank boundaries, aligned and ragged slices, batch 1 and 3 folded;
+  crossing rank boundaries, aligned and ragged slices, batch 1 and 3 folded; and so at 122B-A10B's
+  16 key heads over 64 value heads (batch 1 and 2 folded) and groups of 3 and 5;
 - determinism (repeated calls bit-identical), only the CuTe kernels launching, and one compile
   per kernel variant over a sweep of lengths, ranks and group sizes.
 
@@ -101,15 +102,21 @@ RCP_LN2 = 1.4426950216
 
 
 def make_inputs(
-    T: int, b: int = 1, gate: str = "model", seed: int = 0, resets: tuple[int, ...] = ()
+    T: int,
+    b: int = 1,
+    gate: str = "model",
+    seed: int = 0,
+    resets: tuple[int, ...] = (),
+    heads: tuple[int, int] = (16, 32),
 ) -> tuple[torch.Tensor, ...]:
     """
-    One slice of b samples folded into the heads: q / k (1, T, 16 b, D) L2-normalized bf16, v (1,
-    T, 32 b, D) bf16, the raw gate g (1, T, 32 b) fp32, beta bf16 and do like v. gate="model" as
-    the model computes it, "mild" a long memory (the transition M of order 1). resets: g = -128.
+    One slice of b samples of heads = (H, HV) key / value heads (Qwen3.5-35B-A3B's 16 / 32 unless
+    given) folded into the heads: q / k (1, T, H b, D) L2-normalized bf16, v (1, T, HV b, D) bf16,
+    the raw gate g (1, T, HV b) fp32, beta bf16 and do like v. gate="model" as the model computes
+    it, "mild" a long memory (the transition M of order 1). resets: g = -128.
     """
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    H, HV = 16 * b, 32 * b
+    H, HV = heads[0] * b, heads[1] * b
 
     def randn(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, device="cuda", generator=gen)
@@ -262,9 +269,10 @@ def naive_gdr(q, k, v, g, beta, h0=None):
 
 @SM90
 def test_supported_at_qwen35_and_folded_geometries() -> None:
-    for b in (1, 2, 3):
-        for T in (1, 64, 4000):
-            assert gated_delta_rule_cp_supported(*make_inputs(T, b)[:5]), (b, T)
+    for heads in ((16, 32), (16, 64), (16, 48), (8, 40), (32, 32)):
+        for b in (1, 2, 3):
+            for T in (1, 64, 4000):
+                assert gated_delta_rule_cp_supported(*make_inputs(T, b, heads=heads)[:5]), (heads, b, T)  # fmt: skip
 
 
 @SM90
@@ -284,20 +292,8 @@ def test_not_supported_off_the_geometry() -> None:
             g,
             beta,
         ),  # fmt: skip
-        "value heads not twice the key heads": (
-            q[:, :, :8].contiguous(),
-            k[:, :, :8].contiguous(),
-            v,
-            g,
-            beta,
-        ),  # fmt: skip
-        "16 value heads": (
-            q[:, :, :8].contiguous(),
-            k[:, :, :8].contiguous(),
-            v[:, :, :16].contiguous(),
-            g[:, :, :16].contiguous(),
-            beta[:, :, :16].contiguous(),
-        ),  # fmt: skip
+        "more key heads than value heads": make_inputs(256, heads=(64, 32))[:5],
+        "no key heads": (q[:, :, :0], k[:, :, :0], v, g, beta),
         "batch 2 unfolded": tuple(torch.cat([x, x]) for x in (q, k, v, g, beta)),
         "rank-3 q / k": (q[0], k[0], v, g, beta),
         "on the host": (q.cpu(), k.cpu(), v.cpu(), g.cpu(), beta.cpu()),
@@ -476,26 +472,39 @@ def run_chain(slices: list, b: int) -> tuple[torch.Tensor, tuple]:
         dht = gdr_cp_merge(ag_back, r, W - 1 - r, True) if r < W - 1 else None
         dq, dk, dv, dg, dbeta = gdr_cp_bwd_output(q, k, v, w, v_new, do, dv_local, h, st[0], beta, st[1], u, dht)  # fmt: skip
         T, H = k.shape[1], k.shape[2]
-        grads.append((dq.view(1, T, H, 2, D).sum(3), dk.view(1, T, H, 2, D).sum(3), dv, dg, dbeta))
+        grads.append(
+            (dq.view(1, T, H, -1, D).sum(3), dk.view(1, T, H, -1, D).sum(3), dv, dg, dbeta)
+        )
     return torch.cat(outs, 1), tuple(torch.cat(parts, 1) for parts in zip(*grads))
 
 
-# (W, T per rank, b, gate, resets in the whole sequence)
+# (W, T per rank, b, gate, resets in the whole sequence, (H, HV) per sample)
 CHAIN_CASES = [
-    (2, 64, 3, "model", ()),
-    (2, 1000, 1, "mild", (1000,)),
-    (4, 256, 1, "mild", (300, 777)),
-    (4, 300, 1, "model", (0, 299, 600)),
-    (4, 500, 3, "mild", (250, 1500)),
+    (2, 64, 3, "model", (), (16, 32)),
+    (2, 1000, 1, "mild", (1000,), (16, 32)),
+    (4, 256, 1, "mild", (300, 777), (16, 32)),
+    (4, 300, 1, "model", (0, 299, 600), (16, 32)),
+    (4, 500, 3, "mild", (250, 1500), (16, 32)),
 ]
 
 
-@pytest.mark.parametrize("W,T,b,gate,resets", CHAIN_CASES)
+# (W, T per rank, b, gate, resets, (H, HV)): other key / value head groupings, Qwen3.5-122B-A10B's
+# 16 / 64 (batch 1 and 2 folded), a group of 3 and one of 5
+GROUPED_CHAIN_CASES = [
+    (2, 1000, 1, "model", (1000,), (16, 64)),
+    (4, 500, 1, "mild", (250, 1500), (16, 64)),
+    (2, 192, 2, "model", (0, 191), (16, 64)),
+    (4, 300, 1, "model", (0, 299, 600), (16, 48)),
+    (2, 1000, 1, "mild", (), (8, 40)),
+]
+
+
+@pytest.mark.parametrize("W,T,b,gate,resets,heads", CHAIN_CASES + GROUPED_CHAIN_CASES)
 @SM90
 def test_chain_against_recurrence(
-    W: int, T: int, b: int, gate: str, resets: tuple[int, ...]
+    W: int, T: int, b: int, gate: str, resets: tuple[int, ...], heads: tuple[int, int]
 ) -> None:
-    q, k, v, g, beta, do = make_inputs(W * T, b, gate, seed=W * T + b, resets=resets)
+    q, k, v, g, beta, do = make_inputs(W * T, b, gate, seed=W * T + b, resets=resets, heads=heads)
     cut = lambda x, r: x[:, r * T : (r + 1) * T].contiguous()
     slices = [tuple(cut(x, r) for x in (q, k, v, g, beta, do)) for r in range(W)]
     o, grads = run_chain(slices, b)

@@ -1,7 +1,7 @@
 """
 The context-parallel gated delta rule through gated_delta_rule(..., cp_group) at Qwen3.5's geometry
-(16 key / 32 value heads, dims 128, b samples folded to 16 b / 32 b), on CP2 and CP4 (one process
-per GPU, the contiguous layout). The output and all five input gradients (dq, dk, dv, dg, dbeta),
+(Qwen3.5-35B-A3B's 16 key / 32 value heads, Qwen3.5-122B-A10B's 16 / 64 and a group of 3, dims
+128, b samples folded to H b / HV b), on CP2 and CP4 (one process per GPU, the contiguous layout). The output and all five input gradients (dq, dk, dv, dg, dbeta),
 the per-rank shards stitched, are compared with a single-rank fp32 recurrence over the whole
 sequence: calc_diff below 1e-4 (output) and 1e-3 (gradients), max abs error within 2e-2 of the
 reference's largest magnitude. The reference is the recurrence in chunked form, exact in
@@ -62,6 +62,7 @@ class Case:
     gate: str = "model"
     resets: tuple = ()  # global positions, as fractions of a rank slice: (rank, offset)
     last_only: bool = False  # the loss on the last rank's output only
+    heads: tuple = (16, 32)  # (key heads, value heads) per sample
 
 
 @dataclass
@@ -71,26 +72,25 @@ class Request:
 
 def make_inputs(case: Case, W: int, device) -> tuple[torch.Tensor, ...]:
     gen = torch.Generator(device=device).manual_seed(case.T * 7 + case.b + len(case.resets))
-    S, H, HV = W * case.T, 16 * case.b, 32 * case.b
+    S, (H, HV) = W * case.T, case.heads
 
     def randn(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, device=device, generator=gen)
 
-    q = F.normalize(randn(case.b, S, 16, D).to(torch.bfloat16), dim=-1)
-    k = F.normalize(randn(case.b, S, 16, D).to(torch.bfloat16), dim=-1)
-    v = randn(case.b, S, 32, D).to(torch.bfloat16)
+    q = F.normalize(randn(case.b, S, H, D).to(torch.bfloat16), dim=-1)
+    k = F.normalize(randn(case.b, S, H, D).to(torch.bfloat16), dim=-1)
+    v = randn(case.b, S, HV, D).to(torch.bfloat16)
     if case.gate == "model":
-        a_log = torch.log(torch.rand(32, device=device, generator=gen) * 16)
-        g = -a_log.exp() * F.softplus(randn(case.b, S, 32) + 1.0)
+        a_log = torch.log(torch.rand(HV, device=device, generator=gen) * 16)
+        g = -a_log.exp() * F.softplus(randn(case.b, S, HV) + 1.0)
     else:
-        g = -torch.rand(case.b, S, 32, device=device, generator=gen) * 0.02
+        g = -torch.rand(case.b, S, HV, device=device, generator=gen) * 0.02
     for rank, offset in case.resets:
         g[:, rank * case.T + offset] = -128.0
-    beta = randn(case.b, S, 32).to(torch.bfloat16).sigmoid()
-    do = randn(case.b, S, 32, D).to(torch.bfloat16)
+    beta = randn(case.b, S, HV).to(torch.bfloat16).sigmoid()
+    do = randn(case.b, S, HV, D).to(torch.bfloat16)
     if case.last_only:
         do[:, : (W - 1) * case.T] = 0
-    assert H == 16 * case.b and HV == 32 * case.b
     return q, k, v, g, beta, do
 
 
@@ -134,7 +134,8 @@ def reference_tokens(q, k, v, g, beta):
 
 def reference(inputs, do, chunked=True):
     leaves = [x.detach().float().requires_grad_() for x in inputs]
-    q, k = (x.repeat_interleave(2, dim=2) for x in leaves[:2])
+    groups = leaves[2].shape[2] // leaves[0].shape[2]
+    q, k = (x.repeat_interleave(groups, dim=2) for x in leaves[:2])
     o = (reference_chunked if chunked else reference_tokens)(q, k, *leaves[2:])
     o.backward(do.float())
     return [o.detach()] + [leaf.grad for leaf in leaves]
@@ -199,6 +200,16 @@ def cases_for(W: int) -> list[Case]:
             resets=((0, 5 * BT), (W // 2, 7 * BT + 1), (W - 1, 9 * BT + 63)),
         ),  # fmt: skip
         Case("loss on the last rank only", T, gate="mild", last_only=True),
+        Case("122B heads T2048", 2048, heads=(16, 64)),
+        Case(
+            "122B heads T4000 ragged",
+            4000,
+            gate="mild",
+            resets=((1, 0), (W - 1, 3999)),
+            heads=(16, 64),
+        ),
+        Case("122B heads T64 b2 folded", 64, b=2, resets=((0, 10),), heads=(16, 64)),
+        Case("group of 3 T1000", 1000, gate="mild", resets=((W - 1, 500),), heads=(16, 48)),
     ]
 
 

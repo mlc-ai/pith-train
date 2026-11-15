@@ -1,8 +1,8 @@
 """
 Picker of the pinned dense chunked gated delta rule (chunk size 64, no initial or final state) at
-Qwen3.5's geometry: on SM90 CuTe-DSL kernels in both directions at every T (a ragged variant of
-each when T is not a multiple of 64); TIRx kernels on SM100. The callers' custom ops keep both
-opaque to torch.compile.
+Qwen3.5's head dims: on SM90 CuTe-DSL kernels in both directions at every T (a ragged variant of
+each when T is not a multiple of 64) and any key / value head grouping; TIRx kernels on SM100 at
+Qwen3.5-35B-A3B's heads. The callers' custom ops keep both opaque to torch.compile.
 """
 
 import torch
@@ -32,46 +32,37 @@ def consistent_geometry(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: to
     return T > 0 and tuple(v.shape[:2]) == (B, T) and tuple(g.shape) == (B, T, HV) and tuple(beta.shape) == (B, T, HV) and len({tensor.device for tensor in tensors}) == 1 and k.device.type == "cuda" and all(tensor.is_contiguous() for tensor in tensors)
 
 
-def pinned_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
+def grouped_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether a call has the geometry the kernels take: B == 1, HV == 32, HV a multiple of H, K == V
-    == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry.
-    """
-    if not consistent_geometry(q, k, v, g, beta):
-        return False
-    B, _, H, K = k.shape
-    HV, V = v.shape[2:]
-    return B == 1 and HV == 32 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
-
-
-def folded_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
-    """
-    Whether a call has the geometry of Qwen3.5's heads with the batch folded into the head axis:
-    B == 1, HV a multiple of 32 and H == HV / 2 (b samples of H 16 / HV 32 fold to H 16 b / HV 32
-    b), K == V == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry. The SM90
-    kernels index every head by HV and H, so this is pinned_shapes' geometry repeated b times.
+    Whether a call has the geometry the SM90 kernels take: B == 1, H >= 1 key heads each serving a
+    group of HV / H consecutive value heads (HV a multiple of H: Qwen3.5-35B-A3B's 16 / 32,
+    Qwen3.5-122B-A10B's 16 / 64, or either with a batch of b folded into the heads, H b / HV b),
+    K == V == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry. The SM90
+    kernels are compiled per (H, HV) and read key head j // (HV / H) for value head j, so no head
+    count or ratio is special to them.
     """
     if not consistent_geometry(q, k, v, g, beta):
         return False
     B, _, H, K = k.shape
     HV, V = v.shape[2:]
-    return B == 1 and HV % 32 == 0 and HV == 2 * H and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
+    return B == 1 and H >= 1 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
 def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call. On SM90 the geometry of
-    pinned_shapes, and also the folded geometry of folded_shapes (a batch folded into the heads).
-    On SM100 the geometry the TIRx kernels were verified at, one sample's heads: pinned_shapes with
-    H 16 or 32 key heads over the 32 value heads (not a folded batch, whose samples a caller runs
-    one at a time). Otherwise False. Constant per geometry: torch.compile guards on the shape,
-    device and dtype checks.
+    grouped_shapes: any number of key heads over a multiple of it of value heads, which covers a
+    batch folded into the heads. On SM100 the geometry the TIRx kernels were verified at, one
+    sample's heads: grouped_shapes with H 16 or 32 key heads over HV 32 value heads (not a folded
+    batch, whose samples a caller runs one at a time, nor Qwen3.5-122B-A10B's 64 value heads).
+    Otherwise False. Constant per geometry: torch.compile guards on the shape, device and dtype
+    checks.
     """
     match ARCH_MAJOR:
         case 9:
-            return pinned_shapes(q, k, v, g, beta) or folded_shapes(q, k, v, g, beta)
+            return grouped_shapes(q, k, v, g, beta)
         case 10:
-            return pinned_shapes(q, k, v, g, beta) and k.shape[2] in (16, 32)
+            return grouped_shapes(q, k, v, g, beta) and v.shape[2] == 32 and k.shape[2] in (16, 32)
         case _:
             return False
 

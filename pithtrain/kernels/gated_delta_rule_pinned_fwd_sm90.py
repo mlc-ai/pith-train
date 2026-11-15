@@ -30,7 +30,7 @@ __all__ = ["BT", "ChunkStateOutput", "HEAD_DIM", "STATE_BV", "STATE_STAGES", "ST
 BT = 64  # chunk size
 RCP_LN2 = 1.4426950216  # 1 / ln 2 as FLA 0.5.2 writes it (fp32 0x3FB8AA3B): g_cum is in log2 units
 
-HEAD_DIM = 128  # K == V, fixed by pinned_shapes
+HEAD_DIM = 128  # K == V, fixed by grouped_shapes
 TF32_STRIDE = 68  # fp32 row stride of the 64 x 64 solve buffers: conflict-free TF32 A-fragment loads
 WY_THREADS = 128
 STATE_THREADS = 128

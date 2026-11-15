@@ -6,13 +6,13 @@ The recurrence is independent per head, so the batch folds into the head axis fi
 times the heads); where the kernels take only one sample's heads the samples run one at a time.
 Without context parallelism it runs the pinned kernels where gated_delta_rule_pinned_supported says
 so. Under context parallelism (contiguous layout) it runs the library's CP kernels: where
-chunk_gdr_cp_supported says so (SM100 at Qwen3.5's geometry) the TIRx kernels, each direction as
-two stages around one all-gather of the ranks' state summaries over the CP group; where
-gated_delta_rule_cp_supported says so (SM90 at Qwen3.5's geometry, q and k with the unrepeated key
-heads) the CuTe kernels of FLA's context-parallel structure, each direction around one all-gather
-of the ranks' state maps. The all-gathers run here. Any other call raises ValueError naming the
-geometry the kernels cover: no other implementation is kept. On SM100 the dense path raises a beta
-below 2^-20 to 2^-20 in both directions (see dense_gated_delta_rule).
+chunk_gdr_cp_supported says so (SM100 at Qwen3.5-35B-A3B's heads) the TIRx kernels, each direction
+as two stages around one all-gather of the ranks' state summaries over the CP group; where
+gated_delta_rule_cp_supported says so (SM90 at any key / value head grouping, q and k with the
+unrepeated key heads) the CuTe kernels of FLA's context-parallel structure, each direction around
+one all-gather of the ranks' state maps. The all-gathers run here. Any other call raises ValueError
+naming the geometry the kernels cover: no other implementation is kept. On SM100 the dense path
+raises a beta below 2^-20 to 2^-20 in both directions (see dense_gated_delta_rule).
 """
 
 from functools import lru_cache
@@ -48,9 +48,9 @@ __all__ = ["dense_gated_delta_rule", "gated_delta_rule"]
 CHUNK_SIZE = 64  # the kernels' chunk size (FLA's BT)
 
 SUPPORTED_GEOMETRY = (
-    "Qwen3.5's Gated DeltaNet geometry: q, k [b, s, 16, 128] (or 32 key heads), v [b, s, 32, 128], "
-    "beta [b, s, 32] in bf16 and g [b, s, 32] in fp32, s > 0, on a device the kernels run on "
-    "(under context parallelism, 16 key heads)"
+    "Qwen3.5's Gated DeltaNet geometry: q, k [b, s, H, 128], v [b, s, HV, 128], beta [b, s, HV] in "
+    "bf16 and g [b, s, HV] in fp32, s > 0; on SM90 any H with HV a multiple of H, on SM100 H 16 or "
+    "32 over HV 32"
 )
 
 

@@ -10,6 +10,9 @@ Qwen3.5 geometry, H = 16 key heads over HV = 32 value heads, where they run the 
 - batch 2 and 3 through gated_delta_rule, folded into the heads before the key-head repeat onto the
   pinned kernels (batch 1, H 16 b / HV 32 b; one sample at a time where the kernels take only one
   sample's heads), against the same recurrence;
+- other key / value head groupings (Qwen3.5-122B-A10B's 16 key heads over 64 value heads, batched
+  and ragged, groups of 3, one value head per key head) against the recurrence where the kernels
+  take them (on SM90), raising ValueError where they do not;
 - geometries no kernel covers, also batched, raising ValueError; a supported one given as strided
   views taking the pinned path against the recurrence.
 """
@@ -223,9 +226,8 @@ def to_dtypes(case: str, q, k, v, g, beta):
 # (B, S, H, HV, K, V): geometries no kernel covers, plus a supported one given as strided views.
 REJECTED_CASES = {
     "batch 2, key dim 64": (2, 192, 16, 32, 64, 128),
-    "48 value heads": (1, 192, 16, 48, 128, 128),
-    "batch 3, 96 value heads over 32 key heads": (3, 64, 32, 96, 128, 128),
-    "16 value heads": (1, 192, 16, 16, 128, 128),
+    "more key heads than value heads": (1, 192, 32, 16, 128, 128),
+    "key heads not dividing value heads": (2, 192, 12, 32, 128, 128),
     "key dim 64": (1, 192, 16, 32, 64, 128),
     "value dim 64": (1, 192, 16, 32, 128, 64),
     "fp32 beta": (1, 192, 16, 32, 128, 128),
@@ -244,6 +246,44 @@ def test_rejected_geometries_raise(case: str) -> None:
     assert not gated_delta_rule_pinned_supported(q, k, v, g, beta), case
     with pytest.raises(ValueError, match="Qwen3.5's Gated DeltaNet geometry"):
         gated_delta_rule(q, k, v, g, beta)
+
+
+# (B, S, H, HV): key / value head groupings beyond Qwen3.5-35B-A3B's 16 / 32.
+GROUPED_CASES = {
+    "122B heads": (1, 2048, 16, 64),
+    "122B heads, ragged": (1, 1000, 16, 64),
+    "122B heads, batch 2": (2, 192, 16, 64),
+    "48 value heads": (1, 192, 16, 48),
+    "batch 3, 96 value heads over 32 key heads": (3, 64, 32, 96),
+    "16 value heads": (1, 192, 16, 16),
+}
+
+
+@pytest.mark.parametrize("case", list(GROUPED_CASES))
+def test_grouped_heads_against_recurrence(case: str) -> None:
+    """
+    gated_delta_rule at another key / value head grouping: output and gradients against the fp32
+    recurrence where the kernels take one sample's heads, ValueError (before launching anything)
+    where they do not.
+    """
+    B, S, H, HV = GROUPED_CASES[case]
+    q, k, v, g, beta, do = general_inputs(B, S, H, HV, D, D, seed=13)
+    if not gated_delta_rule_pinned_supported(*(x[:1].contiguous() for x in (q, k, v, g, beta))):
+        with pytest.raises(ValueError, match="Qwen3.5's Gated DeltaNet geometry"):
+            gated_delta_rule(q, k, v, g, beta)
+        return
+    leaves = [x.clone().requires_grad_() for x in (q, k, v, g, beta)]
+    out = gated_delta_rule(*leaves)
+    out.backward(do)
+    refs = [x.detach().float().requires_grad_() for x in (q, k, v, g, beta)]
+    ref = general_recurrence(*refs)
+    ref.backward(do.float())
+    assert out.shape == v.shape
+    assert calc_diff(out, ref) < 1e-4, f"out calc_diff {calc_diff(out, ref):.2e}"
+    for name, leaf, ref_leaf in zip(("dq", "dk", "dv", "dg", "dbeta"), leaves, refs):
+        assert leaf.grad.shape == leaf.shape, name
+        diff = calc_diff(leaf.grad, ref_leaf.grad)
+        assert diff < 1e-3, f"{name} calc_diff {diff:.2e}"
 
 
 def test_strided_views_take_the_pinned_path() -> None:
