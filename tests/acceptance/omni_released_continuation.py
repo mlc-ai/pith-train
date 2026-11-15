@@ -630,6 +630,8 @@ def run_gpu(args):
         True,
     )
     t.fp8, t.moe_load_balance_coef, t.benchmark = False, 0.0, False
+    # Restore compares the post-update state bytewise, so ask for deterministic kernels.
+    t.deterministic = True
     t.optimizer, t.scheduler = make_adamw_optimizer, make_constant_scheduler
     t.lr, t.seed, t.max_steps = 1e-4, 1234, 2
     t.sequence_length, t.global_batch_size, t.micro_batch_size = args.sequence_length, 16, 1
