@@ -188,6 +188,10 @@ def main() -> None:
     if not (args.logs and args.case and args.output):
         parser.error("give the logs of a case with --case and --output, or --remeasure")
     texts = [p.read_text(errors="replace") if p.exists() else "" for p in args.logs]
+    # The steps come from global rank 0, which torchrun's rendezvous may place on any node: the
+    # first log that holds step lines is the primary one, the others are read for errors.
+    first = next((i for i, t in enumerate(texts) if parse_steps(t)), 0)
+    texts.insert(0, texts.pop(first))
     result = summarize(texts[0], args.case, args.exit_code, tuple(texts[1:]))
     result.update(exit_code=args.exit_code, commit=args.commit, dirty=bool(args.dirty))
     result.update(wall_seconds=args.wall_seconds, date=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
