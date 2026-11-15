@@ -334,35 +334,43 @@ def test_all_ignored_large():
     assert loss.item() == 0.0 and torch.all(grad == 0)
 
 
-def test_64bit_offsets():
-    # 8192 x 248320 bf16 is 4.07 GB: element offsets of the last rows pass 2^31.
+# The four models' vocabularies past the old int32 element limit: N * V > 2^31 - 1 (N > 20971,
+# 14134, 10679, 8648), so the last rows' element offsets pass 2^31.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("vocab", [102400, 151936, 201088, 248320])
+def test_past_int32_elements(vocab, dtype):
     gen = torch.Generator(device="cuda").manual_seed(14)
-    logits = (torch.randn(8192, 248320, generator=gen, device="cuda") * 2).to(torch.bfloat16)
-    target = torch.randint(0, 248320, (8192,), generator=gen, device="cuda")
+    tokens = (2**31 - 1) // vocab + 67  # 67 rows past the limit, with a ragged chunk at the end
+    logits = torch.empty(tokens, vocab, dtype=dtype, device="cuda")
+    for i in range(0, tokens, 2048):
+        rows = logits[i : i + 2048]
+        rows.copy_(torch.randn(rows.shape, generator=gen, device="cuda") * 2)
+    assert logits.numel() > 2**31 - 1
+    target = torch.randint(0, vocab, (tokens,), generator=gen, device="cuda")
     target[::7] = IGNORE
-    last = logits[-64:].clone()
-    num_counted = int((target != IGNORE).sum())
-    want_loss = (
-        sum(
-            F.cross_entropy(
-                logits[i : i + 1024].float(),
-                target[i : i + 1024],
-                ignore_index=IGNORE,
-                reduction="sum",
-            )
-            for i in range(0, 8192, 1024)
-        )
-        / num_counted
-    )
+    target[-5:] = torch.tensor([0, vocab - 1, IGNORE, vocab // 2, vocab - 2])
+    keep = target != IGNORE
+    num_counted = int(keep.sum())
+    original = logits.clone()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    live = torch.cuda.memory_allocated()
     loss, grad = cross_entropy_fwd_bwd(logits, target, IGNORE)
-    torch.testing.assert_close(loss, want_loss, rtol=1e-5, atol=1e-5)
-    want_grad = torch.softmax(last.float(), dim=-1) / num_counted
-    rows = torch.nonzero(target[-64:] != IGNORE).squeeze(1)
-    want_grad[rows, target[-64:][rows]] -= 1.0 / num_counted
-    want_grad[target[-64:] == IGNORE] = 0
-    torch.testing.assert_close(
-        grad[-64:].float(), want_grad, rtol=torch.finfo(torch.bfloat16).eps, atol=1e-6 / num_counted
-    )
+    torch.cuda.synchronize()
+    assert grad.data_ptr() == logits.data_ptr()  # in place, no copy or chunk of the logits
+    assert torch.cuda.max_memory_allocated() - live <= 64 * tokens + 2**20
+    rtol = 1e-5 if dtype == torch.float32 else torch.finfo(dtype).eps
+    atol = 1e-6 / num_counted
+    loss_sum = torch.zeros((), dtype=torch.float32, device="cuda")
+    for i in range(0, tokens, 1024):
+        x, y = original[i : i + 1024].float(), target[i : i + 1024]
+        loss_sum += F.cross_entropy(x, y, ignore_index=IGNORE, reduction="sum")
+        want = torch.softmax(x, dim=-1) / num_counted
+        rows = torch.nonzero(y != IGNORE).squeeze(1)
+        want[rows, y[rows]] -= 1.0 / num_counted
+        want[y == IGNORE] = 0
+        torch.testing.assert_close(grad[i : i + 1024].float(), want, rtol=rtol, atol=atol)
+    torch.testing.assert_close(loss, loss_sum / num_counted, rtol=1e-5, atol=1e-5)
 
 
 def test_rows_too_large_for_shared_memory():
