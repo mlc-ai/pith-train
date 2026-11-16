@@ -225,9 +225,18 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, st
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
-    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
-    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    # Peak memory, GiB: allocated by tensors, reserved by PyTorch's caching allocator (allocated
+    # plus what fragmentation holds), and used on the device. The allocator does not hand reserved
+    # memory back during a run, so the device's peak is the reserved peak plus what the process
+    # holds outside the allocator (CUDA context, NCCL buffers), measured now.
+    free, total = torch.cuda.mem_get_info()
+    outside = (total - free) - torch.cuda.memory_reserved()
+    peak_mem = torch.tensor(
+        [torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()], device=device
+    )
+    peak_mem = torch.cat([peak_mem, peak_mem[1:] + outside]) / 1024**3
+    torch.distributed.all_reduce(peak_mem, op=torch.distributed.ReduceOp.MAX)
+    peak_gpu_mem, peak_reserved, peak_device = peak_mem.tolist()
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -255,6 +264,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, st
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
+        statements.append("peak-reserved-memory %.2f GB" % peak_reserved)
+        statements.append("peak-device-memory %.2f GB" % peak_device)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
@@ -267,6 +278,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, st
             metrics["train/gradient-norm"] = gradient_norm
             metrics["infra/tokens-per-second"] = tokens_per_second
             metrics["infra/peak-gpu-memory"] = peak_gpu_mem
+            metrics["infra/peak-reserved-memory"] = peak_reserved
+            metrics["infra/peak-device-memory"] = peak_device
             metrics["infra/step-time"] = elapsed
             wandb.log(metrics)
 

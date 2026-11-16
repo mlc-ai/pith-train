@@ -34,6 +34,8 @@ STEP = re.compile(
     r" \| gradient-norm (?P<grad_norm>[-\w.]+)"
     r" \| tokens-per-second (?P<tokens_per_second>[\d,]+)"
     r" \| peak-gpu-memory (?P<peak_memory_gb>[\d.]+) GB"
+    r"(?: \| peak-reserved-memory (?P<peak_reserved_gb>[\d.]+) GB)?"
+    r"(?: \| peak-device-memory (?P<peak_device_gb>[\d.]+) GB)?"
 )
 
 PACKAGES = ["torch", "deep-gemm", "flash-attn-4", "nvidia-cutlass-dsl", "quack-kernels"]
@@ -73,7 +75,8 @@ def parse_steps(text: str) -> list[dict]:
     steps = {}
     for m in STEP.finditer(text):
         row = dict(step=int(m["step"]))
-        for key in ("step_time", "loss", "lb_loss", "grad_norm", "peak_memory_gb"):
+        keys = ("step_time", "loss", "lb_loss", "grad_norm", "peak_memory_gb")
+        for key in keys + ("peak_reserved_gb", "peak_device_gb"):
             row[key] = None if m[key] is None else float(m[key])
         row["tokens_per_second"] = float(m["tokens_per_second"].replace(",", ""))
         steps[row["step"]] = row
@@ -151,6 +154,9 @@ def measure(result: dict) -> dict:
         step_time_max=max(s["step_time"] for s in timed),
         tokens_per_second_per_gpu=tokens / step_time / config["world_size"],
         peak_memory_gb=max(s["peak_memory_gb"] for s in steps),
+        # GiB, like peak_memory_gb; None for logs from before pretrain_lm reported them.
+        peak_reserved_gb=max((s["peak_reserved_gb"] or 0 for s in steps), default=0) or None,
+        peak_device_gb=max((s["peak_device_gb"] or 0 for s in steps), default=0) or None,
         first_step_time=steps[0]["step_time"],
         loss_first=losses[0],
         loss_last=losses[-1],
