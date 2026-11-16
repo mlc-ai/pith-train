@@ -3,8 +3,7 @@ Chunked gated delta rule of the Qwen3.5 Gated DeltaNet as custom ops, so that th
 region compiles as one graph.
 
 The recurrence is independent per head, so the batch folds into the head axis first (batch 1 at b
-times the heads); where the fold has more heads than the kernels take (SM100 past 128 value heads)
-the samples run one at a time.
+times the heads), which every kernel takes.
 Without context parallelism it runs the pinned kernels where gated_delta_rule_pinned_supported says
 so. Under context parallelism (contiguous layout) it runs the library's CP kernels: where
 chunk_gdr_cp_supported says so (SM100 at any key / value head grouping, q and k repeated to the
@@ -51,7 +50,7 @@ CHUNK_SIZE = 64  # the kernels' chunk size (FLA's BT)
 
 SUPPORTED_GEOMETRY = (
     "Qwen3.5's Gated DeltaNet geometry: q, k [b, s, H, 128], v [b, s, HV, 128], beta [b, s, HV] in "
-    "bf16 and g [b, s, HV] in fp32, s > 0, any H with HV a multiple of H (on SM100 HV at most 128)"
+    "bf16 and g [b, s, HV] in fp32, s > 0, any H with HV a multiple of H"
 )
 
 
@@ -302,9 +301,8 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
     The recurrence is independent per head, so the batch folds into the head axis before anything
     else: value head j = b * value_heads + h of the fold reads key head j // (value_heads / heads)
     = b * heads + h // (value_heads / heads), the same grouping, and the kernels run batch b at b
-    times the heads where they take that geometry; where the fold has more value heads than they
-    take (SM100's bound) the samples run one at a time. Raises ValueError (before launching
-    anything) for a geometry, dtype or device no kernel covers; see SUPPORTED_GEOMETRY.
+    times the heads. Raises ValueError (before launching anything) for a geometry, dtype or device
+    no kernel covers; see SUPPORTED_GEOMETRY.
     """
     b = q.shape[0]
     if cp_group is None:
@@ -313,9 +311,6 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
         folded = tuple(fold_batch(t).contiguous() for t in (q, k, v, g, beta))
         if gated_delta_rule_pinned_supported(*folded):
             return unfold_batch(dense_gated_delta_rule(*folded), b)
-        if b > 1 and gated_delta_rule_pinned_supported(*(t[:1].contiguous() for t in (q, k, v, g, beta))):  # fmt: skip
-            # The kernels take one sample's heads but not the fold (SM100's head bound): one at a time.
-            return torch.cat([dense_gated_delta_rule(*(t[i : i + 1] for t in (q, k, v, g, beta))) for i in range(b)])  # fmt: skip
         raise unsupported(q, k, v, g, beta, cp=False)
     # Under CP the SM90 CuTe kernels take q and k with the key heads, folded.
     folded = [fold_batch(t).contiguous() for t in (q, k, v, g, beta)]
@@ -329,8 +324,4 @@ def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch
     if chunk_gdr_cp_supported(*folded):
         o, *_ = gdr_fwd(*folded, cp_group.group_name)
         return unfold_batch(o, b)
-    if b > 1 and chunk_gdr_cp_supported(*(t[:1] for t in (qr, kr, v, g, beta))):
-        # The CP kernels take one sample's heads but not the fold (SM100's head bound): one sample
-        # at a time, each with its own pair of all-gathers (every rank holds the same batch size).
-        return torch.cat([gdr_fwd(*(t[i : i + 1] for t in (qr, kr, v, g, beta)), cp_group.group_name)[0] for i in range(b)])  # fmt: skip
     raise unsupported(q, k, v, g, beta, cp=True)

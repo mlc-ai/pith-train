@@ -284,7 +284,7 @@ def verify_recurrence(req: RecurrenceRequest) -> None:
 
 # Qwen3.5's geometry (16 key heads, 32 value heads), the one the kernels cover: the CP kernels
 # against the pinned dense kernels, with the bounds above. SM100 repeats q / k to the value heads in the operator; SM90's CuTe kernels take the key
-# heads. B > 1 folds into the heads on SM90 and runs one sample at a time on SM100.
+# heads. B > 1 folds into the heads on both.
 RECURRENCE = [
     pytest.param(2, RecurrenceRequest(B=1, S=512, H=32, HK=16), id="CP2-B1"),
     pytest.param(2, RecurrenceRequest(B=3, S=512, H=32, HK=16), id="CP2-B3"),

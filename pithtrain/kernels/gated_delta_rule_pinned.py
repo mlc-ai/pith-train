@@ -1,9 +1,8 @@
 """
 Picker of the pinned dense chunked gated delta rule (chunk size 64, no initial or final state) at
 Qwen3.5's head dims: on SM90 CuTe-DSL kernels in both directions at every T (a ragged variant of
-each when T is not a multiple of 64) and any key / value head grouping; TIRx kernels on SM100 at
-any grouping up to SM100_MAX_VALUE_HEADS value heads. The callers' custom ops keep both opaque to
-torch.compile.
+each when T is not a multiple of 64), TIRx kernels on SM100, both at any key / value head
+grouping. The callers' custom ops keep both opaque to torch.compile.
 """
 
 import torch
@@ -17,11 +16,6 @@ __all__ = ["chunk_gdr_bwd_pinned", "chunk_gdr_fwd_pinned", "gated_delta_rule_pin
 # this floor (a power of two, exact in bf16), where that division is accurate to ~1e-4; the
 # returned dbeta is the gradient there, passed straight through to the caller's beta.
 SM100_BETA_FLOOR = 2.0**-20
-
-# The most value heads the SM100 kernels take, a batch folded into the heads included: Qwen3.5-122B-A10B's 64, or
-# two samples of it folded. Verified up to 256 heads; the long-sequence CP chain at two value heads per key head
-# tiles the heads over the SMs and needs HV at most the SM count (148 on a B200).
-SM100_MAX_VALUE_HEADS = 128
 
 
 def consistent_geometry(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
@@ -40,12 +34,12 @@ def consistent_geometry(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: to
 
 def grouped_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether a call has the geometry the SM90 kernels take: B == 1, H >= 1 key heads each serving a
+    Whether a call has the geometry the kernels take: B == 1, H >= 1 key heads each serving a
     group of HV / H consecutive value heads (HV a multiple of H: Qwen3.5-35B-A3B's 16 / 32,
     Qwen3.5-122B-A10B's 16 / 64, or either with a batch of b folded into the heads, H b / HV b),
-    K == V == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry. The SM90
-    kernels are compiled per (H, HV) and read key head j // (HV / H) for value head j, so no head
-    count or ratio is special to them.
+    K == V == 128, bf16 q / k / v / beta and an fp32 gate, with consistent_geometry. The kernels
+    of both architectures are compiled per (H, HV) and read key head j // (HV / H) for value head
+    j, so no head count or ratio is special to them.
     """
     if not consistent_geometry(q, k, v, g, beta):
         return False
@@ -56,18 +50,17 @@ def grouped_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.T
 
 def gated_delta_rule_pinned_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call. On SM90 the geometry of
-    grouped_shapes: any number of key heads over a multiple of it of value heads, which covers a
-    batch folded into the heads. On SM100 grouped_shapes with at most SM100_MAX_VALUE_HEADS value
-    heads (Qwen3.5-35B-A3B's 16 / 32 and Qwen3.5-122B-A10B's 16 / 64, other groupings, and folded
-    batches within the bound; a caller runs a larger fold one sample at a time). Otherwise False.
-    Constant per geometry: torch.compile guards on the shape, device and dtype checks.
+    Whether chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned apply to this call. On SM90 and SM100 the
+    geometry of grouped_shapes: any number of key heads over a multiple of it of value heads
+    (Qwen3.5-35B-A3B's 16 / 32, Qwen3.5-122B-A10B's 16 / 64), which covers a batch folded into the
+    heads. Otherwise False. Constant per geometry: torch.compile guards on the shape, device and
+    dtype checks.
     """
     match ARCH_MAJOR:
         case 9:
             return grouped_shapes(q, k, v, g, beta)
         case 10:
-            return grouped_shapes(q, k, v, g, beta) and v.shape[2] <= SM100_MAX_VALUE_HEADS
+            return grouped_shapes(q, k, v, g, beta)
         case _:
             return False
 

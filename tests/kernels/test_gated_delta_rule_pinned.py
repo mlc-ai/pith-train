@@ -310,7 +310,7 @@ def test_folded_batch_against_naive_recurrence(
     """
     q, k, v, g, beta, do = make_inputs(S, H=16 * b, gate=gate, seed=S + b, resets=resets, hv=32 * b)
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("the folded geometry is past the pinned kernels' head bound here")
+        pytest.skip("the pinned kernels do not take the folded geometry here")
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     assert o.shape == v.shape and A.shape == (1, S, 32 * b, 64)
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
@@ -335,7 +335,7 @@ def test_folded_batch_is_per_sample(S: int) -> None:
         S, H=16 * b, gate="model", seed=7, resets=(0, S // 2), hv=32 * b
     )
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("the folded geometry is past the pinned kernels' head bound here")
+        pytest.skip("the pinned kernels do not take the folded geometry here")
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     folded = (o, g_cum, A, *chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do))
     for i in range(b):
@@ -373,13 +373,13 @@ GROUPED_CASES = [
 @pytest.mark.parametrize("S,H,hv,gate,resets", GROUPED_CASES)
 def test_grouped_heads_against_recurrence(S: int, H: int, hv: int, gate: str, resets) -> None:
     """
-    Other key / value head groupings (the kernels take any H dividing HV, on SM100 up to 128 value
-    heads; skipped where the capability query is False): forward and backward against the
-    recurrence, with the bounds of test_against_naive_recurrence.
+    Other key / value head groupings (the kernels take any H dividing HV; skipped where the
+    capability query is False): forward and backward against the recurrence, with the bounds of
+    test_against_naive_recurrence.
     """
     q, k, v, g, beta, do = make_inputs(S, H=H, gate=gate, seed=S + hv, resets=resets, hv=hv)
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("this head grouping is past the pinned kernels' head bound here")
+        pytest.skip("the pinned kernels do not take this head grouping here")
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     assert o.shape == v.shape and A.shape == (1, S, hv, 64)
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
@@ -398,7 +398,7 @@ def test_grouped_heads_mapping_is_checked() -> None:
     """
     q, k, v, g, beta, do = make_inputs(256, H=16, gate="model", seed=4, hv=64)
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("this head grouping is past the pinned kernels' head bound here")
+        pytest.skip("the pinned kernels do not take this head grouping here")
     o, _, _ = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     tiled = naive_gdr(*(x.float().repeat(1, 1, 4, 1) for x in (q, k)), v.float(), g, beta.float())
     assert calc_diff(o, tiled) > BOUNDS["o"]

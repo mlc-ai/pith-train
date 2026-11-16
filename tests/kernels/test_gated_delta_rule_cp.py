@@ -58,7 +58,7 @@ Checked:
 
 - the capability query: True at the Qwen3.5 geometry (batch 1, dim 128, bf16 q / k / v / beta,
   fp32 gate) at 16 to 128 value heads (35B-A3B's 32, 122B-A10B's 64, its batch of 2 folded),
-  False off it and past 128 value heads;
+  False off it;
 - the reference: the recurrence in its chunked form (64-token chunks, the intra-chunk system solved
   as a unit lower-triangular one), in fp64 PyTorch, whose autograd stays small at long lengths;
   itself checked against the naive token-by-token recurrence on a short packed sequence;
@@ -821,7 +821,6 @@ def test_tirx_not_supported_off_the_geometry() -> None:
     q, k, v, g, beta = tirx_meta_inputs()
     off = {
         "batch 2": tirx_meta_inputs(B=2),
-        "160 value heads (a folded batch past the bound)": tirx_meta_inputs(heads=160),
         "no heads": tirx_meta_inputs(heads=0),
         "dim 64": tirx_meta_inputs(dim=64),
         "empty": tirx_meta_inputs(S=0),
