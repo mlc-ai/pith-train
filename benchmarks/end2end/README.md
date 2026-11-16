@@ -23,7 +23,8 @@ experts factor the same `world / pp` ranks of a stage as `ep x expert-dp`
 (`expert-dp = world / (pp * ep)`), so `cp` and `ep` are chosen independently: EP may span CP, and
 either may be larger. The path names the config the script builds.
 
-Every case shares the fixture in `common.py`, set by `training.benchmark = True`:
+Each case is one self-contained script that writes its whole run out, in the style of
+`examples/pretrain_lm`. Every case sets `training.benchmark = True` and the same shape:
 
 - **Synthetic data.** `SyntheticDataset`: seeded token ids drawn on the GPU for each step,
   Zipf-distributed over the vocabulary. No corpus to tokenize and no file read on the step path,
@@ -35,7 +36,7 @@ Every case shares the fixture in `common.py`, set by `training.benchmark = True`
   per-rank imbalance follows from the EP degree: max/mean 1.04, 1.07, 1.13, 1.23 at EP 4, 8, 16,
   32 for 128 experts (the run measured 1.037, 1.073, 1.130, 1.219). `SIGMA = 0` routes
   force-balanced instead, every expert an equal load.
-- **Fixed work per GPU.** 262,144 tokens per GPU per step (`TOKENS_PER_GPU`: 64 sequences of 32K
+- **Fixed work per GPU.** 262,144 tokens per GPU per step (the global batch: 64 sequences of 32K
   or 512 of 4K per node), so every rank runs at least 8 micro-batches a step and DualPipeV has
   micro-batches to overlap. Muon at a constant 3e-4, 12 steps from fresh weights. Nothing is
   checkpointed or sent to wandb.

@@ -1,18 +1,30 @@
-"""
-qwen3-30b-a3b, 4096 tokens, BF16, 4x8 H200: pp 1, attention dp 32 x cp 1, experts ep 8 x dp 4, micro-batch 2.
-"""
+"""Benchmark Qwen3-30B-A3B at 4K tokens on four 8-GPU H200 nodes: pp 1, cp 1, ep 8, micro-batch 2."""
 
-from benchmarks.end2end.common import end2end_cfg
-from pithtrain.tasks.pretrain_lm import launch
+from pathlib import Path
 
-cfg = end2end_cfg(
-    "qwen3-30b-a3b", sequence_length=4096, fp8=False, world_size=32, micro_batch_size=2
-)
+from pithtrain.modules.training import make_constant_scheduler, make_muon_optimizer
+from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
+
+cfg = PretrainLMCfg()
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = 1
 distributed.context_parallel_size = 1
 distributed.expert_parallel_size = 8
+
+training = cfg.training
+training.model = Path("examples/pretrain_lm/qwen3-30b-a3b")
+training.optimizer = make_muon_optimizer
+training.scheduler = make_constant_scheduler
+training.lr = 3.0e-4
+training.max_steps = 12
+training.micro_batch_size = 2
+training.global_batch_size = 2048
+training.sequence_length = 4096
+training.moe_load_balance_type = "global-batch"
+training.moe_load_balance_coef = 1e-3
+training.fp8 = False
+training.benchmark = True
 
 if __name__ == "__main__":
     launch(cfg)

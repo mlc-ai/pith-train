@@ -1,16 +1,30 @@
-"""
-deepseek-v2-lite, 32768 tokens, BF16, 2x8 H200: pp 1, attention dp 8 x cp 2, experts ep 8 x dp 2.
-"""
+"""Benchmark DeepSeek-V2-Lite at 32K tokens on two 8-GPU H200 nodes: pp 1, cp 2, ep 8."""
 
-from benchmarks.end2end.common import end2end_cfg
-from pithtrain.tasks.pretrain_lm import launch
+from pathlib import Path
 
-cfg = end2end_cfg("deepseek-v2-lite", sequence_length=32768, fp8=False, world_size=16)
+from pithtrain.modules.training import make_constant_scheduler, make_muon_optimizer
+from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
+
+cfg = PretrainLMCfg()
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = 1
 distributed.context_parallel_size = 2
 distributed.expert_parallel_size = 8
+
+training = cfg.training
+training.model = Path("examples/pretrain_lm/deepseek-v2-lite")
+training.optimizer = make_muon_optimizer
+training.scheduler = make_constant_scheduler
+training.lr = 3.0e-4
+training.max_steps = 12
+training.micro_batch_size = 1
+training.global_batch_size = 128
+training.sequence_length = 32768
+training.moe_load_balance_type = "sequence"
+training.moe_load_balance_coef = 3e-3
+training.fp8 = False
+training.benchmark = True
 
 if __name__ == "__main__":
     launch(cfg)
