@@ -1,4 +1,6 @@
-"""Benchmark GPT-OSS-20B at 4K tokens on two 8-GPU H200 nodes: pp 1, cp 1, ep 8, micro-batch 4."""
+"""
+Benchmark GPT-OSS-20B at 4K tokens on two 8-GPU H200 nodes: pp 1, cp 1, ep 8, micro-batch 4.
+"""
 
 from pathlib import Path
 

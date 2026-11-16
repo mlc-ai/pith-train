@@ -1,4 +1,6 @@
-"""Benchmark Qwen3-30B-A3B at 32K tokens on one 8-GPU H200 node: pp 2, cp 4, ep 4."""
+"""
+Benchmark Qwen3-30B-A3B at 32K tokens on one 8-GPU H200 node: pp 2, cp 4, ep 4.
+"""
 
 from pathlib import Path
 

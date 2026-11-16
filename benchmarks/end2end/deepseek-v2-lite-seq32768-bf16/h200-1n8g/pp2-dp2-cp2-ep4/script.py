@@ -1,4 +1,6 @@
-"""Benchmark DeepSeek-V2-Lite at 32K tokens on one 8-GPU H200 node: pp 2, cp 2, ep 4."""
+"""
+Benchmark DeepSeek-V2-Lite at 32K tokens on one 8-GPU H200 node: pp 2, cp 2, ep 4.
+"""
 
 from pathlib import Path
 
