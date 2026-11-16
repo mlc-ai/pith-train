@@ -1,7 +1,9 @@
 """
 The context-parallel gated delta rule through gated_delta_rule(..., cp_group) at Qwen3.5's geometry
 (Qwen3.5-35B-A3B's 16 key / 32 value heads, Qwen3.5-122B-A10B's 16 / 64 and a group of 3, dims
-128, b samples folded to H b / HV b), on CP2 and CP4 (one process per GPU, the contiguous layout). The output and all five input gradients (dq, dk, dv, dg, dbeta),
+128, b samples folded to H b / HV b), on CP2 and CP4 (one process per GPU, the contiguous layout),
+on whichever CP kernels the device runs: the CuTe gdr_cp_* pieces on the H200, the TIRx
+chunk_gdr_cp_* stages on the B200. The output and all five input gradients (dq, dk, dv, dg, dbeta),
 the per-rank shards stitched, are compared with a single-rank fp32 recurrence over the whole
 sequence: calc_diff below 1e-4 (output) and 1e-3 (gradients), max abs error within 2e-2 of the
 reference's largest magnitude. The reference is the recurrence in chunked form, exact in
@@ -15,14 +17,15 @@ one rank (the others hold none of its tokens), a rank entirely inside one docume
 chunk residues 0, 1 and 63. Also checked:
 - dh0 crosses ranks: a loss on the last rank's output alone gives the first rank's dk, dv, dg and
   dbeta non-zero gradients that match the reference;
-- the first rank skips the forward merge, the last rank skips the forward transition (and, in
-  the backward, the reverse merge, the first rank the backward transition), and every rank issues
-  the same collectives in the same order;
+- every rank issues the same collectives in the same order, one per direction;
 - gathered slots a rank must not read, NaN-poisoned after the collective, change nothing;
-- without the forward or the backward merge, or with a reset shifted by one token, the
-  comparisons fail.
+- on the CuTe kernels, the first rank skips the forward merge, the last rank skips the forward
+  transition (and, in the backward, the reverse merge, the first rank the backward transition);
+- without the forward or the backward merge (the CuTe merge returning zeros, or the TIRx stages
+  given a zeroed all-gather), or with a reset shifted by one token, the comparisons fail.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import pytest
@@ -33,7 +36,7 @@ from torch.profiler import ProfilerActivity, profile
 
 import pithtrain.operators.gated_delta_rule as op
 from pithtrain.contexts import distributed
-from pithtrain.kernels import gated_delta_rule_cp_supported
+from pithtrain.kernels import chunk_gdr_cp_supported, gated_delta_rule_cp_supported
 from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
 from tests.utilities import launch
@@ -42,16 +45,31 @@ D, BT = 128, 64
 NAMES = ("o", "dq", "dk", "dv", "dg", "dbeta")
 
 
-def available() -> bool:
-    if not torch.cuda.is_available():
-        return False
+def runs_cute_cp() -> bool:
+    """
+    Whether the operator takes the CuTe CP kernels (the H200's) at 35B-A3B's heads.
+    """
     x = torch.zeros(1, 64, 16, D, device="cuda", dtype=torch.bfloat16)
     v = torch.zeros(1, 64, 32, D, device="cuda", dtype=torch.bfloat16)
     g = torch.zeros(1, 64, 32, device="cuda")
     return gated_delta_rule_cp_supported(x, x, v, g, g.bfloat16())
 
 
-pytestmark = pytest.mark.skipif(not available(), reason="the CP kernels run on SM90 only")
+def runs_tirx_cp() -> bool:
+    """
+    Whether the operator takes the TIRx CP stages (the B200's) at 35B-A3B's heads, q and k
+    repeated to the value heads.
+    """
+    v = torch.zeros(1, 64, 32, D, device="cuda", dtype=torch.bfloat16)
+    g = torch.zeros(1, 64, 32, device="cuda")
+    return chunk_gdr_cp_supported(v, v, v, g, g.bfloat16())
+
+
+def available() -> bool:
+    return torch.cuda.is_available() and (runs_cute_cp() or runs_tirx_cp())
+
+
+pytestmark = pytest.mark.skipif(not available(), reason="no CP kernels for this geometry here")
 
 
 @dataclass
@@ -222,6 +240,31 @@ class Done:
         pass
 
 
+@contextmanager
+def patched_gather(cute: bool, edit):
+    """
+    Route the operator's CP all-gather through edit(gathered) -> gathered, after the collective
+    finished: the CuTe path's gather_maps or the TIRx path's cp_all_gather.
+    """
+    name = "gather_maps" if cute else "cp_all_gather"
+    original = getattr(op, name)
+
+    def gather_maps(local, group_name, async_op):
+        gathered, work = original(local, group_name, async_op)
+        if work is not None:
+            work.wait()
+        return edit(gathered), Done()
+
+    def cp_all_gather(payload, group_name):
+        return edit(original(payload, group_name))
+
+    setattr(op, name, gather_maps if cute else cp_all_gather)
+    try:
+        yield
+    finally:
+        setattr(op, name, original)
+
+
 def worker(req: Request) -> None:
     group = distributed.cp_group
     rank, W = group.rank(), group.size()
@@ -242,38 +285,33 @@ def worker(req: Request) -> None:
             first = [x[:, : case.T] for x in got[2:]]
             if any(float(x.abs().max()) == 0 for x in first):
                 failures.append("loss on the last rank only: a first-rank gradient is zero")
-    # edge-rank asymmetry, collective order, poisoned slots
+    # collective order, poisoned slots; on the CuTe kernels also the edge-rank asymmetry
+    cute = runs_cute_cp()
     case = Case("roles", 1000, gate="mild", resets=((W - 1, 500),))
     inputs = make_inputs(case, W, device)
     log = []
-    original = op.gather_maps
 
-    def logged(local, group_name, async_op):
-        gathered, work = original(local, group_name, async_op)
-        if work is not None:
-            work.wait()
+    def poison(gathered: torch.Tensor) -> torch.Tensor:
         log.append(tuple(gathered.shape))
         backward = len(log) % 2 == 0
         readable = range(rank + 1, W) if backward else range(rank)
         for s in set(range(W)) - set(readable):
             gathered[s] = float("nan")
-        return gathered, Done()
+        return gathered
 
-    op.gather_maps = logged
-    try:
+    with patched_gather(cute, poison):
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             got = run_cp(inputs[:5], inputs[5], rank, W)
             torch.cuda.synchronize()
-    finally:
-        op.gather_maps = original
     failures += check(case, got, reference(inputs[:5], inputs[5]), rank)
-    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-    count = lambda kernel: sum(kernel in n for n in names)
-    merges, chains = count("StateMerge"), count("TransitionChain")
-    expected_merges = (rank > 0) + (rank < W - 1)
-    expected_chains = (rank < W - 1) + (rank > 0)
-    if (merges, chains) != (expected_merges, expected_chains):
-        failures.append(f"rank {rank} launched {merges} merges / {chains} chains, expected {expected_merges} / {expected_chains}")  # fmt: skip
+    if cute:
+        names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+        count = lambda kernel: sum(kernel in n for n in names)
+        merges, chains = count("StateMerge"), count("TransitionChain")
+        expected_merges = (rank > 0) + (rank < W - 1)
+        expected_chains = (rank < W - 1) + (rank > 0)
+        if (merges, chains) != (expected_merges, expected_chains):
+            failures.append(f"rank {rank} launched {merges} merges / {chains} chains, expected {expected_merges} / {expected_chains}")  # fmt: skip
     logs = [None] * W
     dist.all_gather_object(logs, log, group=group)
     if any(entry != logs[0] for entry in logs) or len(logs[0]) != 2:
@@ -284,11 +322,21 @@ def worker(req: Request) -> None:
     ref = reference(inputs[:5], inputs[5])
     merge = op.gdr_cp_merge
     for which in (False, True):
-        op.gdr_cp_merge = lambda ag, r, c, reverse, which=which: torch.zeros(ag.shape[1], D, D, device=ag.device) if reverse == which else merge(ag, r, c, reverse)  # fmt: skip
-        try:
-            got = run_cp(inputs[:5], inputs[5], rank, W)
-        finally:
-            op.gdr_cp_merge = merge
+        if cute:
+            op.gdr_cp_merge = lambda ag, r, c, reverse, which=which: torch.zeros(ag.shape[1], D, D, device=ag.device) if reverse == which else merge(ag, r, c, reverse)  # fmt: skip
+            try:
+                got = run_cp(inputs[:5], inputs[5], rank, W)
+            finally:
+                op.gdr_cp_merge = merge
+        else:
+            calls = []
+
+            def drop(gathered: torch.Tensor, which=which) -> torch.Tensor:
+                calls.append(None)
+                return gathered.zero_() if (len(calls) % 2 == 0) == which else gathered
+
+            with patched_gather(False, drop):
+                got = run_cp(inputs[:5], inputs[5], rank, W)
         detected = check(case, got, ref, rank)
         if not detected:
             failures.append(
