@@ -16,21 +16,21 @@ The wandb run is grouped as `performance/<model>`, so several meshes for one mod
 ## Prerequisites
 
 - Activate `.venv` in the repo root: `source .venv/bin/activate`.
-- A tokenized corpus for the model — run **setup-benchmark-inputs** if `workspace/datasets/dclm-baseline/toktxt/<tokenizer>` is missing. No checkpoint is needed.
+- No corpus and no checkpoint: `training.benchmark` trains on synthetic tokens, and the template sets `imbalance.SIGMA = 0` so routing stays force-balanced.
 - `world_size % PP == 0` with `CP` and `EP` each dividing `world_size / PP`, `sequence_length % (2 * cp_size) == 0`, and `global_batch / dp >= 2 * pp` (where `dp = world_size / (pp * cp)`).
 - Keep sequence length, dtype and global batch identical across the two arms, and across meshes you intend to compare to each other.
 - **A clean tree.** The arms are switched with `git checkout`, so commit the feature work first.
 
 The two runs must be **strictly sequential**. One tree serves both arms, so a checkout landing while a run is pending or in flight silently benchmarks the wrong branch.
 
-`<tokenizer>` is not `<model>`, and `<moe-load-balance-type>` differs per model:
+`<moe-load-balance-type>` differs per model:
 
-| `<model>` | `<tokenizer>` | `<moe-load-balance-type>` |
-|---|---|---|
-| `qwen3-30b-a3b` | `qwen3` | `global-batch` |
-| `qwen3.5-35b-a3b` | `qwen3.5` | `global-batch` |
-| `deepseek-v2-lite` | `deepseek-v2` | `sequence` |
-| `gpt-oss-20b`, `gpt-oss-120b` | `gpt-oss` | `global-batch` |
+| `<model>` | `<moe-load-balance-type>` |
+|---|---|
+| `qwen3-30b-a3b` | `global-batch` |
+| `qwen3.5-35b-a3b` | `global-batch` |
+| `deepseek-v2-lite` | `sequence` |
+| `gpt-oss-20b`, `gpt-oss-120b` | `global-batch` |
 
 ## Step 1: Create the two run files
 
@@ -88,7 +88,7 @@ It prints median step time, tokens per second and peak memory for each arm, plus
 
 ## Why the fixture looks like this
 
-`templates/validate.py` sets `training.benchmark = True`, which force-balances routing by overwriting the router's top-k with a round-robin over token index. Expert imbalance is the largest source of step-time variance, and removing it is what makes a short run readable. It also makes the loss meaningless, which is why correctness lives in a separate skill.
+`templates/validate.py` sets `training.benchmark = True` with `imbalance.SIGMA = 0`, which force-balances routing by overwriting the router's top-k with a round-robin over token index. Force-balanced routing keeps the A/B comparable with this skill's earlier results and isolates a kernel or schedule change from routing. It also makes the loss meaningless, which is why correctness lives in a separate skill.
 
 `training.max_steps = 8`, because step time settles within a few steps once routing is balanced.
 

@@ -54,7 +54,7 @@ def test_case_matches_path(script: Path, monkeypatch):
     assert training.fp8 == (case["dtype"] == "fp8")
     assert training.global_batch_size == case["global_batch_size"]
     assert training.micro_batch_size == case["micro_batch_size"]
-    assert training.benchmark and cfg.dataset is None and training.max_steps == MAX_STEPS
+    assert training.benchmark and training.max_steps == MAX_STEPS
     assert training.save_interval is None and cfg.logging.wandb is None
     assert (pp, cp, ep) == (case["pp"], case["cp"], case["ep"])
     assert world % pp == 0 and (world // pp) % cp == 0 and (world // pp) % ep == 0

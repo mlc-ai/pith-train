@@ -59,7 +59,7 @@ python3 -m benchmarks.operators.fp8.test_deepgemm
 bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
 
 # end-to-end training: each model's fastest fitting layout at 32K (CP) and 4K, H200 1/2/4 nodes, on
-# synthetic tokens with force-balanced routing; one result.json per case (benchmarks/end2end/README.md)
+# synthetic tokens with realistic expert-load routing; one result.json per case (benchmarks/end2end/README.md)
 srun -N 2 -W 0 bash benchmarks/end2end/launch.sh                                 # every 2-node case
 python3 -m benchmarks.end2end.compare benchmarks/end2end/baseline.json workspace/benchmarks/end2end/<commit>
 ```

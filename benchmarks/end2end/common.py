@@ -49,11 +49,11 @@ def end2end_cfg(
     """
     The PretrainLMCfg of one case before its mesh is set.
 
-    Data is SyntheticDataset (cfg.dataset is None): seeded ids drawn on the GPU, so no corpus is
-    prepared and no step reads a file. Routing is force-balanced (training.benchmark), which
-    removes expert imbalance, the largest source of step-time variance, and makes step time
-    comparable across meshes and builds. Nothing is checkpointed and nothing goes to wandb, so no
-    step touches the disk.
+    training.benchmark selects SyntheticDataset, seeded ids drawn on the GPU, so no corpus is
+    prepared and no step reads a file, and replays the routing with the expert-load imbalance of a
+    real training run (pithtrain.modules.imbalance, SIGMA = 0.2), seeded by layer and step so every
+    run of a case routes alike. Nothing is checkpointed and nothing goes to wandb, so no step touches
+    the disk.
 
     The global batch is TOKENS_PER_GPU tokens per GPU, so tokens per GPU per step are the same at
     every mesh, node count and sequence length, and every mesh of one node count and sequence length
@@ -67,7 +67,6 @@ def end2end_cfg(
 
     path, lb_type, lb_coef = MODELS[model]
     cfg = PretrainLMCfg()
-    cfg.dataset = None
     training = cfg.training
     training.model = path
     training.optimizer = make_muon_optimizer

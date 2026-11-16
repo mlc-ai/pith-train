@@ -50,18 +50,19 @@ class PretrainLMCfg(SlottedDefault):
 
     dataset: Optional[Path] = None
     """
-    The root directory hosting the tokenized corpus, globbed for *.bin shards. None trains on
-    SyntheticDataset instead: seeded token ids drawn on the GPU, for benchmarks, so no corpus is
-    read and no step touches a file.
+    The root directory hosting the tokenized corpus, globbed for *.bin shards. Required unless
+    training.benchmark is set, which trains on SyntheticDataset instead (seeded token ids drawn on
+    the GPU, so no corpus is read and no step touches a file) and ignores this field.
     """
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset | SyntheticDataset:
-    if cfg.dataset is None:
+    if cfg.training.benchmark:
         vocab_size = AutoConfig.from_pretrained(cfg.training.model).get_text_config().vocab_size
         kwargs = dict(sequence_length=cfg.training.sequence_length)
         kwargs.update(global_batch_size=cfg.training.global_batch_size, seed=cfg.training.seed)
         return SyntheticDataset(vocab_size, **kwargs)
+    assert cfg.dataset is not None, "set cfg.dataset, or training.benchmark for synthetic data"
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)

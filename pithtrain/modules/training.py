@@ -23,6 +23,7 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
+from pithtrain.modules import imbalance
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
     install_raw_fp8_param_gather,
@@ -206,8 +207,10 @@ class TrainingCfg(SlottedDefault):
 
     benchmark: bool = False
     """
-    Force-balance MoE routing so every expert gets an equal token load, as NeMo Megatron-Bridge
-    does for its MoE benchmarks. For throughput measurement only; wrong for real training.
+    Benchmark mode, for throughput measurement only: training reads no corpus but seeded synthetic
+    tokens (SyntheticDataset, Zipf-distributed), and MoE routing is replayed with the expert-load
+    imbalance of a real training run (pithtrain.modules.imbalance, SIGMA = 0.2), or force-balanced
+    with imbalance.SIGMA = 0, as NeMo Megatron-Bridge does for its MoE benchmarks.
     """
 
     fp8: bool = False
@@ -422,9 +425,17 @@ def setup_model(
                     gate.load_balance_loss_fn = loss_fn
 
     if cfg.benchmark:
-        for module in modules.modules():
-            if hasattr(module, "router_replay"):
-                module.router_replay = force_balance(module.num_experts)
+        for i in range(2):
+            for layer in modules[i].layers.values():
+                for module in layer.modules():
+                    if not hasattr(module, "router_replay"):
+                        continue
+                    if imbalance.SIGMA > 0:
+                        module.router_replay = imbalance.replay(
+                            module.num_experts, layer.idx, imbalance.SIGMA
+                        )
+                    else:
+                        module.router_replay = force_balance(module.num_experts)
 
     training.model = DualPipeV(modules)
 

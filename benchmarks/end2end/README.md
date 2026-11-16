@@ -37,13 +37,17 @@ independently: EP may span CP, and either may be larger. The path is the contrac
 
 Every case shares the fixture in `common.py`:
 
-- **Synthetic data.** `cfg.dataset = None` selects `SyntheticDataset`: seeded token ids drawn on
+- **Synthetic data** (`training.benchmark = True`): `SyntheticDataset`, seeded token ids drawn on
   the GPU for each step, Zipf-distributed over the vocabulary. No corpus to tokenize, no file read
   on the step path, so disk load cannot move the step time. The samples depend only on the step,
   not on the mesh, so every mesh of one node count and sequence length trains on the same data.
-- **Force-balanced routing** (`training.benchmark = True`): every expert gets an equal load, which
-  removes the largest source of step-time variance and makes step time comparable across meshes
-  and builds. It also pins `load-balance-loss` at 1.0, which the summary checks.
+- **Realistic routing** (the same flag): the router's expert choice is replayed with the expert
+  load of a real training run. Per layer and step each expert's share is a log-normal draw with
+  spread `pithtrain.modules.imbalance.SIGMA = 0.2` (measured 0.212 on Qwen3-30B-A3B), seeded by
+  layer and step, so every run of a case routes alike. Experts sit on EP ranks in contiguous
+  blocks, so the per-rank imbalance follows from the EP degree: max/mean 1.04, 1.07, 1.13, 1.23
+  at EP 4, 8, 16, 32 for 128 experts (the run measured 1.037, 1.073, 1.130, 1.219). `SIGMA = 0`
+  routes force-balanced instead, every expert an equal load.
 - **Fixed work per GPU.** 262,144 tokens per GPU per step (`TOKENS_PER_GPU`: 64 sequences of 32K
   or 512 of 4K per node), so every rank runs at least 8 micro-batches a step and DualPipeV has
   micro-batches to overlap. Muon at a constant 3e-4, 12 steps from fresh weights. Nothing is
@@ -82,6 +86,6 @@ the same seed two correct builds follow the same curve, so it is a step-by-step 
 signal. In those 37 pairs the first-step loss agreed within 0.006, and the largest gap at any step
 was 0.023 in BF16 and 0.069 in FP8 (median 0.003 and 0.021). `compare.py` flags a first-step loss
 more than 0.01 apart (the first step precedes any update, so only a forward change moves it) or
-any step more than 0.1 apart. Each case also checks that its losses are finite, that
-the loss fell over the run, and that routing was force-balanced. For a precise loss-parity verdict
+any step more than 0.1 apart. Each case also checks that its losses are finite and that
+the loss fell over the run. For a precise loss-parity verdict
 on one mesh with real routing and real data, use the `validate-correctness` skill.
