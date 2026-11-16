@@ -2,7 +2,7 @@
 # one per model and node count, in BF16: 32768-token packed sequences, micro-batch 1, 64 sequences
 # per node. EP is as large as the deployment allows (ep8, ep16, ep32 on 1, 2, 4 nodes), PP only
 # where the model does not fit without it, and CP the smallest of 2, 4, 8 that runs with a peak
-# under 112 GB (80% of an H200), found by a fit search that tried cp2, then cp4, then cp8.
+# under 115 GB (82% of an H200), found by a fit search that tried cp2, then cp4, then cp8.
 # Configs whose search is still running are listed as comments. FP8 cases follow in a later pass.
 
 # 1 node
