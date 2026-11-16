@@ -10,7 +10,7 @@ in the code under test.
 
 from pathlib import Path
 
-__all__ = ["MODELS", "MAX_STEPS", "WARMUP_STEPS", "end2end_cfg"]
+__all__ = ["MODELS", "MAX_STEPS", "WARMUP_STEPS", "SAMPLES_PER_GPU", "end2end_cfg"]
 
 MODELS = {
     # name: (config directory, moe_load_balance_type, moe_load_balance_coef)
@@ -34,6 +34,13 @@ the torch.compile trace and the JIT warmup, and kernel tuning runs between steps
 
 WARMUP_STEPS = 6
 
+SAMPLES_PER_GPU = 8
+"""
+Sequences per GPU per step: 64 per 8-GPU node. Each attention DP rank then runs
+SAMPLES_PER_GPU * pp * cp micro-batches of one sequence a step, at least 16 at every case, so
+DualPipeV has micro-batches to overlap at pp1 as at pp2.
+"""
+
 
 def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
     """
@@ -45,9 +52,10 @@ def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
     comparable across meshes and builds. Nothing is checkpointed and nothing goes to wandb, so no
     step touches the disk.
 
-    The global batch is 4 samples per GPU, so tokens per GPU per step are the same at every mesh
-    and node count, and every mesh of one node count trains on the same samples. It satisfies the
-    DualPipeV bound global_batch / dp >= 2 * pp at every mesh, as global_batch / dp = 4 * pp * cp.
+    The global batch is SAMPLES_PER_GPU sequences per GPU, so tokens per GPU per step are the same
+    at every mesh and node count, and every mesh of one node count trains on the same samples. It
+    satisfies the DualPipeV bound global_batch / dp >= 2 * pp at every mesh, as global_batch / dp =
+    SAMPLES_PER_GPU * pp * cp.
     """
     # Imported here, not at the top: importing pithtrain reads the GPU, and summarize.py, compare.py
     # and collect.py read this module's tables on machines without one.
@@ -64,7 +72,7 @@ def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
     training.lr = 3.0e-4
     training.max_steps = MAX_STEPS
     training.micro_batch_size = 1
-    training.global_batch_size = 4 * world_size
+    training.global_batch_size = SAMPLES_PER_GPU * world_size
     training.sequence_length = sequence_length
     training.moe_load_balance_type = lb_type
     training.moe_load_balance_coef = lb_coef
