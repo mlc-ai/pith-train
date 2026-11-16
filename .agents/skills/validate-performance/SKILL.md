@@ -16,7 +16,9 @@ The wandb run is grouped as `performance/<model>`, so several meshes for one mod
 ## Prerequisites
 
 - Activate `.venv` in the repo root: `source .venv/bin/activate`.
-- No corpus and no checkpoint: `training.benchmark` trains on synthetic tokens.
+- No corpus and no checkpoint: `training.benchmark` trains on synthetic tokens. Their ids are drawn,
+  seeded, from a Zipf distribution over the vocabulary (`SyntheticDataset` in
+  `pithtrain/modules/dataset.py`).
 - `world_size % PP == 0` with `CP` and `EP` each dividing `world_size / PP`, `sequence_length % (2 * cp_size) == 0`, and `global_batch / dp >= 2 * pp` (where `dp = world_size / (pp * cp)`).
 - Keep sequence length, dtype and global batch identical across the two arms, and across meshes you intend to compare to each other.
 - **A clean tree.** The arms are switched with `git checkout`, so commit the feature work first.
