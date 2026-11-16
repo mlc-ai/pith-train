@@ -58,9 +58,9 @@ python3 -m benchmarks.operators.fp8.test_deepgemm
 # ring attention: multi-GPU launcher (torchrun), scenario = <model>-cp<N>-s<N>k
 bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
 
-# end-to-end training: every model x BF16/FP8 x H200 1/2/4 nodes x PP/DP/CP/EP layout, on
+# end-to-end training: each model's fastest fitting layout at 32K (CP) and 4K, H200 1/2/4 nodes, on
 # synthetic tokens with force-balanced routing; one result.json per case (benchmarks/end2end/README.md)
-srun -N 2 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end              # every 2-node case
+srun -N 2 -W 0 bash benchmarks/end2end/launch.sh                                 # every 2-node case
 python3 -m benchmarks.end2end.compare benchmarks/end2end/baseline.json workspace/benchmarks/end2end/<commit>
 ```
 

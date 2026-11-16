@@ -3,8 +3,7 @@
 #
 # Usage, from the repo root with .venv active, one srun step per node count:
 #   srun -N 1 -W 0 bash benchmarks/end2end/launch.sh                  # the default set (default.txt)
-#   srun -N 4 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end/qwen3-30b-a3b-seq4096-bf16
-#   srun -N 2 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end   # the full-grid sweep
+#   srun -N 4 -W 0 bash benchmarks/end2end/launch.sh benchmarks/end2end/qwen3-30b-a3b-seq32768-bf16
 #   bash benchmarks/end2end/launch.sh <case-dir>          # one node, no SLURM
 #
 # With no argument it runs the default set, the cases listed in benchmarks/end2end/default.txt.
