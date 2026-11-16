@@ -12,8 +12,8 @@ Checked against PyTorch (FLA is no longer a dependency, so its kernels no longer
 oracles; the references below evaluate FLA's chunk algorithm in float64 or run the fp32
 recurrence):
 
-- the capability query: True at Qwen3.5's geometry and its batch folds (H 16 b / HV 32 b), False
-  off it;
+- the capability query: True at Qwen3.5-35B-A3B's and Qwen3.5-122B-A10B's heads (16 / 32 and 16 /
+  64), at groups of 3, and at their batch folds (H b / HV b), False off it;
 - single GPU, synthetic inputs, model and mild gates, resets, aligned and ragged slices, HV 32 and
   96:
   - the forward map hm (he and the M chain) against its float64 evaluation from the rank's own w,
@@ -29,7 +29,8 @@ recurrence):
     such a rank yields exactly that rank's he;
 - the whole chain emulated in one process (W ranks run one after another, the all-gather a stack)
   against the fp32 recurrence over the whole sequence, output and the five gradients, documents
-  crossing rank boundaries, aligned and ragged slices, batch 1 and 3 folded;
+  crossing rank boundaries, aligned and ragged slices, batch 1 and 3 folded; and so at 122B-A10B's
+  16 key heads over 64 value heads (batch 1 and 2 folded) and groups of 3 and 5;
 - determinism (repeated calls bit-identical), only the CuTe kernels launching, and one compile
   per kernel variant over a sweep of lengths, ranks and group sizes.
 
@@ -43,8 +44,9 @@ The recurrence, per value head with state S of shape (K, V) and scale = K ** -0.
 
     S = S * exp(g_t);  u = beta_t * (v_t - k_t @ S);  S = S + outer(k_t, u);  o_t = scale * q_t @ S
 
-with S reset to zero at every packed-document start. q and k are L2-normalized per head on 16 key
-heads and repeated to the 32 value heads, as the operator hands them over under CP.
+with S reset to zero at every packed-document start. q and k are L2-normalized per head on H key
+heads and repeated to the HV value heads, as the operator hands them over under CP (16 / 32 for
+Qwen3.5-35B-A3B unless a case says otherwise).
 
 The CP group is emulated in one process, as in the harness the kernels were evolved in: the whole
 sequence is cut into world_size contiguous shards, each rank's CP context is derived from the
@@ -54,8 +56,9 @@ rank's stage after it runs on that stack.
 
 Checked:
 
-- the capability query: True at the Qwen3.5 geometry (batch 1, 32 heads per value head, dim 128,
-  bf16 q / k / v / beta, fp32 gate), False off it;
+- the capability query: True at the Qwen3.5 geometry (batch 1, dim 128, bf16 q / k / v / beta,
+  fp32 gate) at 16 to 128 value heads (35B-A3B's 32, 122B-A10B's 64, its batch of 2 folded),
+  False off it;
 - the reference: the recurrence in its chunked form (64-token chunks, the intra-chunk system solved
   as a unit lower-triangular one), in fp64 PyTorch, whose autograd stays small at long lengths;
   itself checked against the naive token-by-token recurrence on a short packed sequence;
@@ -65,7 +68,9 @@ Checked:
   largest magnitude, the bounds of the dense verifier. Cases cover every
   rank position, partial chunks, documents ending on, inside and across rank boundaries (on and
   off the 64-token chunk grid), gate resets, and lengths that take the backward's split and packed
-  h recompute and the forward's folded last-document pass;
+  h recompute and the forward's folded last-document pass; and so at other key / value head
+  groupings: 122B-A10B's 16 / 64 (aligned, ragged, packed, a batch of 2 folded to 32 / 128), groups
+  of 3 and 5, and one value head per key head;
 - the payloads' shapes and dtypes, and that the ones no rank reads are zero;
 - sensitivity: a perturbed gate, or the payloads stacked out of rank order, fails the comparison.
 """
@@ -101,15 +106,21 @@ RCP_LN2 = 1.4426950216
 
 
 def make_inputs(
-    T: int, b: int = 1, gate: str = "model", seed: int = 0, resets: tuple[int, ...] = ()
+    T: int,
+    b: int = 1,
+    gate: str = "model",
+    seed: int = 0,
+    resets: tuple[int, ...] = (),
+    heads: tuple[int, int] = (16, 32),
 ) -> tuple[torch.Tensor, ...]:
     """
-    One slice of b samples folded into the heads: q / k (1, T, 16 b, D) L2-normalized bf16, v (1,
-    T, 32 b, D) bf16, the raw gate g (1, T, 32 b) fp32, beta bf16 and do like v. gate="model" as
-    the model computes it, "mild" a long memory (the transition M of order 1). resets: g = -128.
+    One slice of b samples of heads = (H, HV) key / value heads (Qwen3.5-35B-A3B's 16 / 32 unless
+    given) folded into the heads: q / k (1, T, H b, D) L2-normalized bf16, v (1, T, HV b, D) bf16,
+    the raw gate g (1, T, HV b) fp32, beta bf16 and do like v. gate="model" as the model computes
+    it, "mild" a long memory (the transition M of order 1). resets: g = -128.
     """
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    H, HV = 16 * b, 32 * b
+    H, HV = heads[0] * b, heads[1] * b
 
     def randn(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, device="cuda", generator=gen)
@@ -262,9 +273,10 @@ def naive_gdr(q, k, v, g, beta, h0=None):
 
 @SM90
 def test_supported_at_qwen35_and_folded_geometries() -> None:
-    for b in (1, 2, 3):
-        for T in (1, 64, 4000):
-            assert gated_delta_rule_cp_supported(*make_inputs(T, b)[:5]), (b, T)
+    for heads in ((16, 32), (16, 64), (16, 48), (8, 40), (32, 32)):
+        for b in (1, 2, 3):
+            for T in (1, 64, 4000):
+                assert gated_delta_rule_cp_supported(*make_inputs(T, b, heads=heads)[:5]), (heads, b, T)  # fmt: skip
 
 
 @SM90
@@ -284,20 +296,8 @@ def test_not_supported_off_the_geometry() -> None:
             g,
             beta,
         ),  # fmt: skip
-        "value heads not twice the key heads": (
-            q[:, :, :8].contiguous(),
-            k[:, :, :8].contiguous(),
-            v,
-            g,
-            beta,
-        ),  # fmt: skip
-        "16 value heads": (
-            q[:, :, :8].contiguous(),
-            k[:, :, :8].contiguous(),
-            v[:, :, :16].contiguous(),
-            g[:, :, :16].contiguous(),
-            beta[:, :, :16].contiguous(),
-        ),  # fmt: skip
+        "more key heads than value heads": make_inputs(256, heads=(64, 32))[:5],
+        "no key heads": (q[:, :, :0], k[:, :, :0], v, g, beta),
         "batch 2 unfolded": tuple(torch.cat([x, x]) for x in (q, k, v, g, beta)),
         "rank-3 q / k": (q[0], k[0], v, g, beta),
         "on the host": (q.cpu(), k.cpu(), v.cpu(), g.cpu(), beta.cpu()),
@@ -476,26 +476,39 @@ def run_chain(slices: list, b: int) -> tuple[torch.Tensor, tuple]:
         dht = gdr_cp_merge(ag_back, r, W - 1 - r, True) if r < W - 1 else None
         dq, dk, dv, dg, dbeta = gdr_cp_bwd_output(q, k, v, w, v_new, do, dv_local, h, st[0], beta, st[1], u, dht)  # fmt: skip
         T, H = k.shape[1], k.shape[2]
-        grads.append((dq.view(1, T, H, 2, D).sum(3), dk.view(1, T, H, 2, D).sum(3), dv, dg, dbeta))
+        grads.append(
+            (dq.view(1, T, H, -1, D).sum(3), dk.view(1, T, H, -1, D).sum(3), dv, dg, dbeta)
+        )
     return torch.cat(outs, 1), tuple(torch.cat(parts, 1) for parts in zip(*grads))
 
 
-# (W, T per rank, b, gate, resets in the whole sequence)
+# (W, T per rank, b, gate, resets in the whole sequence, (H, HV) per sample)
 CHAIN_CASES = [
-    (2, 64, 3, "model", ()),
-    (2, 1000, 1, "mild", (1000,)),
-    (4, 256, 1, "mild", (300, 777)),
-    (4, 300, 1, "model", (0, 299, 600)),
-    (4, 500, 3, "mild", (250, 1500)),
+    (2, 64, 3, "model", (), (16, 32)),
+    (2, 1000, 1, "mild", (1000,), (16, 32)),
+    (4, 256, 1, "mild", (300, 777), (16, 32)),
+    (4, 300, 1, "model", (0, 299, 600), (16, 32)),
+    (4, 500, 3, "mild", (250, 1500), (16, 32)),
 ]
 
 
-@pytest.mark.parametrize("W,T,b,gate,resets", CHAIN_CASES)
+# (W, T per rank, b, gate, resets, (H, HV)): other key / value head groupings, Qwen3.5-122B-A10B's
+# 16 / 64 (batch 1 and 2 folded), a group of 3 and one of 5
+GROUPED_CHAIN_CASES = [
+    (2, 1000, 1, "model", (1000,), (16, 64)),
+    (4, 500, 1, "mild", (250, 1500), (16, 64)),
+    (2, 192, 2, "model", (0, 191), (16, 64)),
+    (4, 300, 1, "model", (0, 299, 600), (16, 48)),
+    (2, 1000, 1, "mild", (), (8, 40)),
+]
+
+
+@pytest.mark.parametrize("W,T,b,gate,resets,heads", CHAIN_CASES + GROUPED_CHAIN_CASES)
 @SM90
 def test_chain_against_recurrence(
-    W: int, T: int, b: int, gate: str, resets: tuple[int, ...]
+    W: int, T: int, b: int, gate: str, resets: tuple[int, ...], heads: tuple[int, int]
 ) -> None:
-    q, k, v, g, beta, do = make_inputs(W * T, b, gate, seed=W * T + b, resets=resets)
+    q, k, v, g, beta, do = make_inputs(W * T, b, gate, seed=W * T + b, resets=resets, heads=heads)
     cut = lambda x, r: x[:, r * T : (r + 1) * T].contiguous()
     slices = [tuple(cut(x, r) for x in (q, k, v, g, beta, do)) for r in range(W)]
     o, grads = run_chain(slices, b)
@@ -635,16 +648,22 @@ SM100 = pytest.mark.skipif(
 
 
 def tirx_make_inputs(
-    T: int, gate: str = "model", seed: int = 0, resets: tuple[int, ...] = ()
+    T: int,
+    gate: str = "model",
+    seed: int = 0,
+    resets: tuple[int, ...] = (),
+    heads: tuple[int, int] = (H, HV),
 ) -> tuple[torch.Tensor, ...]:
     """
-    The whole sequence: q / k (1, T, HV, D) L2-normalized bf16 on H key heads repeated to HV, v
+    The whole sequence at heads = (H, HV) key / value heads (35B-A3B's 16 / 32 unless given): q / k
+    (1, T, HV, D) L2-normalized bf16 on H key heads repeated to HV, v
     (1, T, HV, D) bf16, g (1, T, HV) fp32, beta (1, T, HV) bf16 and do like v. gate="model" draws
     the gate as the model computes it, -exp(A_log) * softplus(a + dt_bias) with A_log = log U(0,
     16); "mild" keeps a long memory. resets get g = -128, as the model sets it at document starts.
     """
     gen = torch.Generator(device="cuda").manual_seed(seed)
     device, bf16 = "cuda", torch.bfloat16
+    H, HV = heads
 
     def randn(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, device=device, generator=gen)
@@ -792,8 +811,9 @@ def tirx_assert_close_to(got: torch.Tensor, ref: torch.Tensor, name: str, diff: 
 
 @SM100
 def test_supported_at_the_qwen35_geometry() -> None:
-    for S in (1, 100, 1024, 8192):
-        assert chunk_gdr_cp_supported(*tirx_meta_inputs(S)), S
+    for heads in (HV, 16, 40, 48, 64, 128):
+        for S in (1, 100, 1024, 8192):
+            assert chunk_gdr_cp_supported(*tirx_meta_inputs(S, heads=heads)), (heads, S)
 
 
 @SM100
@@ -801,8 +821,7 @@ def test_tirx_not_supported_off_the_geometry() -> None:
     q, k, v, g, beta = tirx_meta_inputs()
     off = {
         "batch 2": tirx_meta_inputs(B=2),
-        "16 heads": tirx_meta_inputs(heads=16),
-        "64 value heads (folded batch)": tirx_meta_inputs(heads=64),
+        "no heads": tirx_meta_inputs(heads=0),
         "dim 64": tirx_meta_inputs(dim=64),
         "empty": tirx_meta_inputs(S=0),
         "unrepeated key heads": (q[:, :, :H], k[:, :, :H], v, g, beta),
@@ -829,13 +848,32 @@ CASES = [
     (2, 6144, None, "model", ()),
 ]
 
+# (world size, tokens per rank, global document boundaries or None, gate, resets, (H, HV)): other
+# key / value head groupings, q and k repeated to the value heads: Qwen3.5-122B-A10B's 16 / 64
+# aligned, ragged, packed and long, a batch of 2 of it folded (32 / 128), groups of 3 and 5, and
+# one value head per key head
+GROUPED_CASES = [
+    (2, 1024, None, "model", (), (16, 64)),
+    (2, 1000, None, "model", (0, 77, 1000, 1500), (16, 64)),
+    (4, 500, None, "mild", (250, 1500), (16, 64)),
+    (4, 256, [0, 100, 512, 600, 1024], "model", (), (16, 64)),
+    (2, 4096, None, "mild", (), (16, 64)),
+    (2, 192, None, "model", (0, 191), (32, 128)),
+    (4, 300, None, "model", (0, 299, 600), (16, 48)),
+    (2, 1000, None, "mild", (), (8, 40)),
+    (2, 300, [0, 64, 450, 600], "model", (), (16, 16)),
+]
 
-@pytest.mark.parametrize("world,S,cu,gate,resets", CASES)
+
+@pytest.mark.parametrize(
+    "world,S,cu,gate,resets,heads",
+    [case + ((H, HV),) for case in CASES] + GROUPED_CASES,
+)
 @SM100
-def test_against_naive_recurrence(world: int, S: int, cu, gate: str, resets) -> None:
-    T = world * S
+def test_against_naive_recurrence(world: int, S: int, cu, gate: str, resets, heads) -> None:
+    T, HV = world * S, heads[1]
     cu = cu or [0, T]
-    q, k, v, g, beta, do = tirx_make_inputs(T, gate=gate, seed=T + world, resets=resets)
+    q, k, v, g, beta, do = tirx_make_inputs(T, gate=gate, seed=T + world, resets=resets, heads=heads)  # fmt: skip
     assert chunk_gdr_cp_supported(*(t[:, :S] for t in (q, k, v, g, beta)))
     got = tirx_run_cp(q, k, v, g, beta, do, world, cu)
 

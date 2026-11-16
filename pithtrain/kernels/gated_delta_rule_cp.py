@@ -39,10 +39,10 @@ SM90_ONLY = "the context-parallel gated delta rule kernels run on SM90 only; gat
 def gated_delta_rule_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     Whether the gdr_cp_* entry points apply to a rank's slice (q, k (1, T, H, K), v (1, T, HV, V),
-    g, beta (1, T, HV)): on SM90, all contiguous on one CUDA device, T > 0, HV a multiple of 32 and
-    H == HV / 2 (Qwen3.5's 16 key / 32 value heads, or a batch of b folded into the heads, H 16 b /
-    HV 32 b), K == V == 128, bf16 q / k / v / beta and an fp32 gate. False on every other
-    architecture. Constant per geometry: torch.compile guards on the shape, device and dtype checks.
+    g, beta (1, T, HV)): on SM90, all contiguous on one CUDA device, T > 0, H >= 1 and HV a
+    multiple of H (Qwen3.5-35B-A3B's 16 key / 32 value heads, Qwen3.5-122B-A10B's 16 / 64, or
+    either with a batch of b folded into the heads, H b / HV b), K == V == 128, bf16 q / k / v /
+    beta and an fp32 gate. False on every other architecture. Constant per geometry: torch.compile guards on the shape, device and dtype checks.
     """
     if ARCH_MAJOR != 9:
         return False
@@ -160,18 +160,18 @@ SM100_ONLY = "the TIRx context-parallel gated delta rule kernels run on SM100 on
 
 def chunk_gdr_cp_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
-    Whether the chunk_gdr_cp_* entry points apply to this rank's call: on SM100, at the geometry the
-    kernels were verified at: q, k, v bf16 (1, T, 32, 128) with T >= 1 (q / k given per value head,
-    so already repeated to the 32 value heads where fewer key heads serve them), g fp32 (1, T, 32),
-    beta bf16 (1, T, 32); otherwise False. Depends only on shapes, dtypes and the device, so it
+    Whether the chunk_gdr_cp_* entry points apply to this rank's call: on SM100, q, k, v bf16 (1, T,
+    HV, 128) with T >= 1 and HV >= 1 (q / k given per value head, so already repeated to the value heads where fewer key heads serve them: Qwen3.5-35B-A3B's 32,
+    Qwen3.5-122B-A10B's 64, any other grouping, or a batch folded into the heads), g fp32 (1, T,
+    HV), beta bf16 (1, T, HV); otherwise False. Depends only on shapes, dtypes and the device, so it
     gives the same answer on every rank of a CP group and for a forward and its backward (whose g
     is the forward's g_cum).
     """
     if ARCH_MAJOR != 10:
         return False
-    T = v.shape[1] if v.dim() == 4 else 0
-    shape = (1, T, 32, 128)
-    return T >= 1 and tuple(q.shape) == tuple(k.shape) == tuple(v.shape) == shape and tuple(g.shape) == tuple(beta.shape) == shape[:3] and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
+    T, HV = (v.shape[1], v.shape[2]) if v.dim() == 4 else (0, 0)
+    shape = (1, T, HV, 128)
+    return T >= 1 and HV >= 1 and tuple(q.shape) == tuple(k.shape) == tuple(v.shape) == shape and tuple(g.shape) == tuple(beta.shape) == shape[:3] and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
 def gated_delta_rule_cp_plan(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor, rank: int, is_first_rank: bool, is_last_rank: bool, pre_num_ranks: int, post_num_ranks: int) -> dict:

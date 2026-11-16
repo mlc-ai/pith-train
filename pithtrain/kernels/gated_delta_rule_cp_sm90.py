@@ -275,8 +275,10 @@ COMPILED: dict[tuple, object] = {}
 def gated_delta_rule_cp_supported_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> bool:
     """
     The geometry the context-parallel kernels take: ranks 4 / 4 / 4 / 3 / 3, all contiguous on one
-    CUDA device, B == 1, T > 0, HV a multiple of 32 and H == HV / 2 (Qwen3.5's 16 / 32 heads, a
-    batch folded into the heads), K == V == 128, bf16 q / k / v / beta and an fp32 gate.
+    CUDA device, B == 1, T > 0, H >= 1 and HV a multiple of H (Qwen3.5-35B-A3B's 16 / 32 heads,
+    Qwen3.5-122B-A10B's 16 / 64, a batch folded into the heads; every kernel is compiled per (H,
+    HV) and reads key head j // (HV / H) for value head j), K == V == 128, bf16 q / k / v / beta
+    and an fp32 gate.
     """
     tensors = (q, k, v, g, beta)
     if tuple(tensor.dim() for tensor in tensors) != (4, 4, 4, 3, 3):
@@ -284,7 +286,7 @@ def gated_delta_rule_cp_supported_sm90(q: torch.Tensor, k: torch.Tensor, v: torc
     B, T, H, K = k.shape
     HV, V = v.shape[2:]
     consistent = T > 0 and tuple(v.shape[:2]) == (B, T) and tuple(g.shape) == (B, T, HV) and tuple(beta.shape) == (B, T, HV) and len({tensor.device for tensor in tensors}) == 1 and k.device.type == "cuda" and all(tensor.is_contiguous() for tensor in tensors)
-    return consistent and B == 1 and HV % 32 == 0 and HV == 2 * H and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
+    return consistent and B == 1 and H >= 1 and HV % H == 0 and K == 128 and V == 128 and q.shape == k.shape and q.dtype == k.dtype == v.dtype == beta.dtype == torch.bfloat16 and g.dtype == torch.float32
 
 
 def compile_transition_chain(H: int, HV: int, reverse: bool, device: int, ragged: bool) -> object:

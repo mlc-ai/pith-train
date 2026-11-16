@@ -364,7 +364,8 @@ def pick_layout(num_cols: int, element_bytes: int) -> tuple:
 
 
 def compile_kernel(dtype: torch.dtype, target_dtype: torch.dtype, num_cols: int, cluster_size: int, chunks: int, is_resident: bool, threads: int) -> Callable:
-    x = fake(TORCH2CUTE[dtype], (cute.sym_int(),), (1,), dtype.itemsize)
+    # The flat logits hold N * V elements, past 2^31 at long packs (N > 10.6k at V = 201088): a 64-bit length. The kernel reads only their base address and offsets rows in Int64 bytes (RowSlice).
+    x = fake(TORCH2CUTE[dtype], (cute.sym_int64(),), (1,), dtype.itemsize)
     target = fake(TARGET_TYPES[target_dtype], (cute.sym_int(),), (1,), target_dtype.itemsize)
     row_loss, count, mean_loss = fake(Float32, (cute.sym_int(),), (1,), 4), fake(Int64, (1,), (1,), 8), fake(Float32, (1,), (1,), 4)
     return cute.compile(CrossEntropy(TORCH2CUTE[dtype], num_cols, cluster_size, chunks, is_resident, threads), x, target, row_loss, count, mean_loss, Int64(0), fake_stream(), options="--enable-tvm-ffi")

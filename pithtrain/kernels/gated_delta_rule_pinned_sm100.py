@@ -12562,6 +12562,18 @@ def compile_kernel(kernel):
 FWD_SPLIT_MIN_CHUNKS = 48
 
 
+def span_path(n_ckpt, H, HV):
+    """
+    Whether a sequence of n_ckpt chunks takes the FlashInfer CP chain over head-spanning segments
+    (fwd_span, then bwd_span): from FWD_SPLIT_MIN_CHUNKS chunks at two value heads per key head
+    (Qwen3.5-35B-A3B's 16 / 32, or a fold of it), the grouping its T precompute (make_tpre3) is
+    built for. Every other grouping takes the N / M recurrence split there, whose kernels read key
+    head j // (HV / H) at any ratio; the chain's generic T precompute gives wrong or non-finite
+    outputs at three to five value heads per key head.
+    """
+    return n_ckpt >= FWD_SPLIT_MIN_CHUNKS and HV == 2 * H
+
+
 @functools.cache
 def fwd_split_executables(H, HV, K, V):
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -12668,7 +12680,7 @@ def chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta):
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     assert B == 1
-    if (T + BT - 1) // BT >= FWD_SPLIT_MIN_CHUNKS and H < HV:
+    if span_path((T + BT - 1) // BT, H, HV):
         return fwd_span(q, k, v, g, beta, B, T, H, K, HV, V)
     o = torch.empty((B, T, HV, V), dtype=q.dtype, device=q.device)
     g_cum = torch.empty((B, T, HV), dtype=torch.float32, device=q.device)
@@ -12680,53 +12692,23 @@ def chunk_gdr_fwd_pinned_sm100(q, k, v, g, beta):
         c_map = ckpt_map(A, max(1, (T - 1) // SEG), HV)
         fwd_fn(*list(maps), g.reshape(-1), beta.reshape(-1), g_cum.reshape(-1), float(K ** -0.5), T, c_map, A.reshape(-1))
         return o, g_cum, A
-    if H == HV:  # the CP prefill handles grouped value heads only; keep the N / M recurrence split here
-        maps = (headed_map(q, H, T), headed_map(k, H, T), headed_map(v, HV, T), headed_map(o, HV, T))
-        c_map = ckpt_map(A, max(1, (T - 1) // SEG), HV)
-        # Split path: super-segments (multiples of 256 tokens), one wave of (segment, head) items. A then
-        # holds the entering states X[j] in slots 0..n-1 and the segment transitions P[j] in slots n..2n-1
-        # (slot = (HV, V, K) bf16); the backward reuses both. The rest of A is zeroed by the forward kernel.
-        nrec, mrec, fscan, fwd = fwd_split_executables(H, HV, K, V)
-        seg_len, n_seg = super_split(T, HV, q.device)
-        slot = HV * V * K
-        exit0 = torch.empty((n_seg, HV, V, K), dtype=torch.bfloat16, device=q.device)
-        g_flat, beta_flat, a_flat = g.reshape(-1), beta.reshape(-1), A.reshape(-1)
-        enter, trans = a_flat[: n_seg * slot], a_flat[n_seg * slot : 2 * n_seg * slot]
-        k_map, v_map = maps[1], maps[2]
-        nrec(k_map, v_map, c_map, g_flat, beta_flat, T, seg_len, a_flat, exit0.reshape(-1))
-        mrec(k_map, v_map, c_map, g_flat, beta_flat, T, seg_len, a_flat, trans)
-        fscan(trans.view(torch.uint32), exit0.view(torch.uint32).reshape(-1), enter.view(torch.uint32), n_seg)
-        fwd(*list(maps), g_flat, beta_flat, g_cum.reshape(-1), float(K ** -0.5), T, c_map, a_flat, enter, seg_len, 2 * n_seg * slot // 8)
-        return o, g_cum, A
-    # FlashInfer CP chain over the head-spanning one-wave segments: T precompute, fused M/N, fixup, CP prefill.
-    # A's tail = [X_s (s < maxseg) | P_s] bf16 (V, K) slots indexed (s, head), written by the fixup.
-    t_precompute, mn_precompute, sfix, prefill = cp_executables(H, HV, K, V)
-    device = q.device
-    num_sms = sm_count(device.index)
-    maxseg = max(sp_host_nseg(T, HV, num_sms))
-    lp = sp_host_lp(T, HV, num_sms)
-    cu_seqlens = single_cu_seqlens(T, device)
-    n_tail = 2 * maxseg * HV * V * K
-    if T % BT == 0:
-        # one buffer [n_lo chunks | n_ckpt chunks]: T workspace = first n_ckpt chunks, A = the last n_ckpt chunks, so A's tail
-        # slots never alias a T tile the prefill still reads
-        n_lo = n_tail // (HV * BT * BT)
-        workspace = torch.empty((n_lo + n_ckpt, HV, BT, BT), dtype=torch.bfloat16, device=device)
-        t_workspace = workspace[:n_ckpt]
-        A = workspace[n_lo:].view(B, T, HV, BT)
-    else:
-        t_workspace = torch.empty((n_ckpt, HV, BT, BT), dtype=torch.bfloat16, device=device)
-        A = torch.zeros((B, T, HV, BT), dtype=torch.bfloat16, device=device)
-    a_tail = A.reshape(-1)[A.numel() - n_tail:]
-    transfer = torch.empty((maxseg, HV, V, K), dtype=torch.float32, device=device)
-    local, fixed = torch.empty_like(transfer), torch.empty_like(transfer)
-    descriptor = torch.empty((128,), dtype=torch.int8, device=device)
-    dummy = transfer.reshape(-1)
-    q_flat, k_flat, v_flat, g_flat = q.reshape(-1), k.reshape(-1), v.reshape(-1), g.reshape(-1)
-    t_precompute(k_flat, beta.reshape(-1), t_workspace.reshape(-1), cu_seqlens, T)
-    mn_precompute(k_flat, v_flat, t_workspace.reshape(-1), g_flat, transfer.reshape(-1), local.reshape(-1), cu_seqlens, T, lp, maxseg, a_tail)
-    sfix(transfer.reshape(-1), local.reshape(-1), fixed.reshape(-1), a_tail, T, maxseg, lp)
-    prefill(q_flat, k_flat, v_flat, g_flat, t_workspace.reshape(-1), fixed.reshape(-1), dummy, o.reshape(-1), cu_seqlens, float(K ** -0.5), descriptor, T, lp, maxseg, transfer.reshape(-1), g_cum.reshape(-1), a_tail, 0)
+    maps = (headed_map(q, H, T), headed_map(k, H, T), headed_map(v, HV, T), headed_map(o, HV, T))
+    c_map = ckpt_map(A, max(1, (T - 1) // SEG), HV)
+    # Long sequences off span_path, at any grouping. Split path: super-segments (multiples of 256 tokens), one
+    # wave of (segment, head) items. A then holds the entering states X[j] in slots 0..n-1 and the segment
+    # transitions P[j] in slots n..2n-1 (slot = (HV, V, K) bf16); the backward reuses both. The rest of A is
+    # zeroed by the forward kernel.
+    nrec, mrec, fscan, fwd = fwd_split_executables(H, HV, K, V)
+    seg_len, n_seg = super_split(T, HV, q.device)
+    slot = HV * V * K
+    exit0 = torch.empty((n_seg, HV, V, K), dtype=torch.bfloat16, device=q.device)
+    g_flat, beta_flat, a_flat = g.reshape(-1), beta.reshape(-1), A.reshape(-1)
+    enter, trans = a_flat[: n_seg * slot], a_flat[n_seg * slot : 2 * n_seg * slot]
+    k_map, v_map = maps[1], maps[2]
+    nrec(k_map, v_map, c_map, g_flat, beta_flat, T, seg_len, a_flat, exit0.reshape(-1))
+    mrec(k_map, v_map, c_map, g_flat, beta_flat, T, seg_len, a_flat, trans)
+    fscan(trans.view(torch.uint32), exit0.view(torch.uint32).reshape(-1), enter.view(torch.uint32), n_seg)
+    fwd(*list(maps), g_flat, beta_flat, g_cum.reshape(-1), float(K ** -0.5), T, c_map, a_flat, enter, seg_len, 2 * n_seg * slot // 8)
     return o, g_cum, A
 
 
@@ -12766,7 +12748,7 @@ def chunk_gdr_bwd_pinned_sm100(q, k, v, g_cum, beta, A, do):
     HV, V = v.shape[2], v.shape[3]
     assert B == 1
     n_ckpt = (T + BT - 1) // BT
-    if n_ckpt >= FWD_SPLIT_MIN_CHUNKS and H < HV:
+    if span_path(n_ckpt, H, HV):
         return bwd_span(q, k, v, g_cum, beta, A, do)
     rec, mrec, rpass, scan, fpass, xrec, dsr = bwd_executables(H, HV, K, V)
     # super-segments for the bprop: one wave of (segment, head) items, each a long sequential run
@@ -12796,9 +12778,9 @@ def chunk_gdr_bwd_pinned_sm100(q, k, v, g_cum, beta, A, do):
     bp_args = list(maps) + [g_cum_flat, beta_flat, dg.reshape(-1), dbeta.reshape(-1), float(K ** -0.5), T, seg_len]
     if fwd_split:
         slot = HV * V * K
-        a_off = 0 if H == HV else a_flat.numel() - 2 * n_seg * slot  # CP forward: X / P slots in A's tail
-        xrec(k_map, v_map, c_map, g_cum_flat, beta_flat, T, seg_len, a_flat[a_off:], a_flat, wy)
-        trans_words = a_flat[a_off + n_seg * slot : a_off + 2 * n_seg * slot].view(torch.uint32)
+        # the split forward's X / P slots open A
+        xrec(k_map, v_map, c_map, g_cum_flat, beta_flat, T, seg_len, a_flat, a_flat, wy)
+        trans_words = a_flat[n_seg * slot : 2 * n_seg * slot].view(torch.uint32)
         dsr(*dsr_args)
         scan(trans_words, dstate_r.reshape(-1), dstate_g.reshape(-1), n_seg)
         fpass(*bp_args, dstate_r.reshape(-1), dstate_g.reshape(-1), wy)
