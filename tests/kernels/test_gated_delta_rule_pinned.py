@@ -15,9 +15,9 @@ Checked, each test on its own (none skips on the H200):
 
 - the capability query: True at the Qwen3.5 geometry (batch 1, 32 value heads, 16 or
   32 key heads, dim 128, bf16 q / k / v / beta, fp32 gate), False off it;
-- on the H200, other key / value head groupings: Qwen3.5-122B-A10B's 16 key heads over 64 value
-  heads (and a batch of 2 of it folded), groups of 3 and 5, and one value head per key head, with
-  the same bounds; a key-head mapping other than j // (HV / H) fails them;
+- other key / value head groupings: Qwen3.5-122B-A10B's 16 key heads over 64 value heads (and a
+  batch of 2 of it folded), groups of 3 and 5, and one value head per key head, with the same
+  bounds; a key-head mapping other than j // (HV / H) fails them;
 - the forward and backward (dq, dk per value head, dv, dg for the raw gate, dbeta) against a naive
   token-by-token fp32 recurrence and its autograd, at aligned and ragged lengths (T = 1 .. 8191,
   last-chunk sizes around the 8- and 16-row copy blocks), H = 16 and 32, the model's gate and a
@@ -28,8 +28,9 @@ Checked, each test on its own (none skips on the H200):
   about 2.5 to 3 times the largest error measured on the H200 over every case here at the test's
   seed and three more: calc_diff 8.1e-6 (o), 8.1e-6 (dq), 1.1e-5 (dk), 6.1e-6 (dv),
   3.6e-5 (dg, at T = 2), 7.7e-6 (dbeta), and a largest absolute error of 9.3e-3 of the reference's
-  largest magnitude (dg at T = 2; 8.7e-3 elsewhere). On the B200 (the folded cases unsupported):
-  6.9e-6, 7.0e-6, 1.0e-5, 7.2e-6, 3.6e-5 (dg, at T = 2), 1.2e-5, and 9.3e-3;
+  largest magnitude (dg at T = 2; 8.7e-3 elsewhere). On the B200 (measured before the folded and
+  grouped cases ran there): 6.9e-6, 7.0e-6, 1.0e-5, 7.2e-6, 3.6e-5 (dg, at T = 2), 1.2e-5, and
+  9.3e-3;
 - at long and ragged T (4096 .. 8192, with resets), the forward and backward against the
   recurrence in fp64, in its chunked form (itself checked against the token-by-token one), with the
   same bounds;
@@ -304,12 +305,12 @@ def test_folded_batch_against_naive_recurrence(
     S: int, b: int, gate: str, resets: tuple[int, ...]
 ) -> None:
     """
-    The folded geometry (the SM90 widening of the capability query; skipped where it is False):
+    The folded geometry (skipped where the capability query is False for it):
     forward and backward against the fp32 recurrence, as test_against_naive_recurrence.
     """
     q, k, v, g, beta, do = make_inputs(S, H=16 * b, gate=gate, seed=S + b, resets=resets, hv=32 * b)
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("the folded geometry runs the pinned kernels on SM90 only")
+        pytest.skip("the folded geometry is past the pinned kernels' head bound here")
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     assert o.shape == v.shape and A.shape == (1, S, 32 * b, 64)
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
@@ -323,15 +324,18 @@ def test_folded_batch_against_naive_recurrence(
 @pytest.mark.parametrize("S", [64, 4000])
 def test_folded_batch_is_per_sample(S: int) -> None:
     """
-    Folding is exact: each sample's slice of the folded call's outputs and gradients equals the
-    pinned call on that sample alone, bit for bit (every head's recurrence is independent).
+    Folding is exact on the CuTe kernels: each sample's slice of the folded call's outputs and
+    gradients equals the pinned call on that sample alone, bit for bit (every head's recurrence is
+    independent). The TIRx kernels cut a long sequence into segments by the head count (one wave
+    of (segment, head) items), so there the fold's output and gradients match the sample's own call
+    within the dense bounds, bit for bit only where both take the same segments.
     """
     b = 3
     q, k, v, g, beta, do = make_inputs(
         S, H=16 * b, gate="model", seed=7, resets=(0, S // 2), hv=32 * b
     )
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("the folded geometry runs the pinned kernels on SM90 only")
+        pytest.skip("the folded geometry is past the pinned kernels' head bound here")
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     folded = (o, g_cum, A, *chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do))
     for i in range(b):
@@ -341,7 +345,10 @@ def test_folded_batch_is_per_sample(S: int) -> None:
         oi, gci, Ai = chunk_gdr_fwd_pinned(qi, ki, vi, gi, bi)
         single = (oi, gci, Ai, *chunk_gdr_bwd_pinned(qi, ki, vi, gci, bi, Ai, doi))
         for name, x, y in zip(("o", "g_cum", "A", *GRADS), folded, single):
-            assert torch.equal(x[:, :, values], y), (i, name)
+            if runs_cute_kernels():
+                assert torch.equal(x[:, :, values], y), (i, name)
+            elif name in ("o", *GRADS):  # A carries the segment states of the TIRx long path
+                assert_close_to(x[:, :, values], y.double(), name)
 
 
 # (S, H, HV, gate, resets): other key / value head groupings, aligned and ragged, with resets:
@@ -366,13 +373,13 @@ GROUPED_CASES = [
 @pytest.mark.parametrize("S,H,hv,gate,resets", GROUPED_CASES)
 def test_grouped_heads_against_recurrence(S: int, H: int, hv: int, gate: str, resets) -> None:
     """
-    Other key / value head groupings (the SM90 kernels take any H dividing HV; skipped where the
-    capability query is False): forward and backward against the recurrence, with the bounds of
-    test_against_naive_recurrence.
+    Other key / value head groupings (the kernels take any H dividing HV, on SM100 up to 128 value
+    heads; skipped where the capability query is False): forward and backward against the
+    recurrence, with the bounds of test_against_naive_recurrence.
     """
     q, k, v, g, beta, do = make_inputs(S, H=H, gate=gate, seed=S + hv, resets=resets, hv=hv)
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("this head grouping runs the pinned kernels on SM90 only")
+        pytest.skip("this head grouping is past the pinned kernels' head bound here")
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     assert o.shape == v.shape and A.shape == (1, S, hv, 64)
     grads = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
@@ -391,7 +398,7 @@ def test_grouped_heads_mapping_is_checked() -> None:
     """
     q, k, v, g, beta, do = make_inputs(256, H=16, gate="model", seed=4, hv=64)
     if not gated_delta_rule_pinned_supported(q, k, v, g, beta):
-        pytest.skip("this head grouping runs the pinned kernels on SM90 only")
+        pytest.skip("this head grouping is past the pinned kernels' head bound here")
     o, _, _ = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     tiled = naive_gdr(*(x.float().repeat(1, 1, 4, 1) for x in (q, k)), v.float(), g, beta.float())
     assert calc_diff(o, tiled) > BOUNDS["o"]

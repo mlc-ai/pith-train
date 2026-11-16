@@ -1,8 +1,8 @@
 """
 gated_delta_rule_cp_sm100: one rank's share of the chunked gated delta rule (chunk size 64, scale
 K ** -0.5) under context parallelism on SM100, in TIRx-lite kernels. The rank holds a
-contiguous shard of the sequence split over the CP group, at Qwen3.5's geometry (batch 1, 32
-heads, head dims 128).
+contiguous shard of the sequence split over the CP group, at Qwen3.5's geometry (batch 1, head
+dims 128, q / k per value head; every kernel is built per value-head count).
 
 Numerically it follows the chunked CP algorithm of FLA 0.5.2 (the same bf16 / TF32 rounding
 points): the sharded recurrence matches the fp64 PyTorch reference of the CP verifier, and its
