@@ -10,7 +10,7 @@ in the code under test.
 
 from pathlib import Path
 
-__all__ = ["MODELS", "MAX_STEPS", "WARMUP_STEPS", "SAMPLES_PER_GPU", "end2end_cfg"]
+__all__ = ["MODELS", "MAX_STEPS", "WARMUP_STEPS", "TOKENS_PER_GPU", "end2end_cfg"]
 
 MODELS = {
     # name: (config directory, moe_load_balance_type, moe_load_balance_coef)
@@ -34,15 +34,18 @@ the torch.compile trace and the JIT warmup, and kernel tuning runs between steps
 
 WARMUP_STEPS = 6
 
-SAMPLES_PER_GPU = 8
+TOKENS_PER_GPU = 8 * 32768
 """
-Sequences per GPU per step: 64 per 8-GPU node. Each attention DP rank then runs
-SAMPLES_PER_GPU * pp * cp micro-batches of one sequence a step, at least 16 at every case, so
-DualPipeV has micro-batches to overlap at pp1 as at pp2.
+Tokens per GPU per step: 64 sequences of 32K per 8-GPU node, or 512 of 4K. Each attention DP rank
+then runs (TOKENS_PER_GPU / sequence_length) * pp * cp / micro_batch_size micro-batches a step, at
+least 8 at every case (16 at 32K, cp >= 2; 8 at 4K, micro-batch 8), so DualPipeV has micro-batches
+to overlap at pp1 as at pp2.
 """
 
 
-def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
+def end2end_cfg(
+    model: str, sequence_length: int, fp8: bool, world_size: int, micro_batch_size: int = 1
+):
     """
     The PretrainLMCfg of one case before its mesh is set.
 
@@ -52,10 +55,10 @@ def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
     comparable across meshes and builds. Nothing is checkpointed and nothing goes to wandb, so no
     step touches the disk.
 
-    The global batch is SAMPLES_PER_GPU sequences per GPU, so tokens per GPU per step are the same
-    at every mesh and node count, and every mesh of one node count trains on the same samples. It
-    satisfies the DualPipeV bound global_batch / dp >= 2 * pp at every mesh, as global_batch / dp =
-    SAMPLES_PER_GPU * pp * cp.
+    The global batch is TOKENS_PER_GPU tokens per GPU, so tokens per GPU per step are the same at
+    every mesh, node count and sequence length, and every mesh of one node count and sequence length
+    trains on the same samples. It satisfies the DualPipeV bound global_batch / dp >= 2 * pp at every
+    case, as global_batch / dp = (TOKENS_PER_GPU / sequence_length) * pp * cp.
     """
     # Imported here, not at the top: importing pithtrain reads the GPU, and summarize.py, compare.py
     # and collect.py read this module's tables on machines without one.
@@ -71,8 +74,8 @@ def end2end_cfg(model: str, sequence_length: int, fp8: bool, world_size: int):
     training.scheduler = make_constant_scheduler
     training.lr = 3.0e-4
     training.max_steps = MAX_STEPS
-    training.micro_batch_size = 1
-    training.global_batch_size = SAMPLES_PER_GPU * world_size
+    training.micro_batch_size = micro_batch_size
+    training.global_batch_size = TOKENS_PER_GPU // sequence_length * world_size
     training.sequence_length = sequence_length
     training.moe_load_balance_type = lb_type
     training.moe_load_balance_coef = lb_coef

@@ -19,11 +19,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from benchmarks.end2end.common import MAX_STEPS, MODELS, SAMPLES_PER_GPU, WARMUP_STEPS
+from benchmarks.end2end.common import MAX_STEPS, MODELS, TOKENS_PER_GPU, WARMUP_STEPS
 
 CASE = re.compile(
     r"(?P<model>.+)-seq(?P<seq>\d+)-(?P<dtype>bf16|fp8)/(?P<gpu>[a-z0-9]+)-(?P<nodes>\d+)n(?P<gpn>\d+)g/"
-    r"pp(?P<pp>\d+)-dp(?P<dp>\d+)-cp(?P<cp>\d+)-ep(?P<ep>\d+)$"
+    r"pp(?P<pp>\d+)-dp(?P<dp>\d+)-cp(?P<cp>\d+)-ep(?P<ep>\d+)(?:-mbs(?P<mbs>\d+))?$"
 )
 
 STEP = re.compile(
@@ -64,7 +64,8 @@ def parse_case(case: str) -> dict:
         cp=cp,
         ep=ep,
         expert_dp=world // (pp * ep),
-        global_batch_size=SAMPLES_PER_GPU * world,
+        global_batch_size=TOKENS_PER_GPU // int(m["seq"]) * world,
+        micro_batch_size=int(m["mbs"] or 1),
     )
 
 

@@ -27,7 +27,7 @@ def test_cases_exist():
 
 def test_default_set():
     """
-    Every line of default.txt names a case of the grid, once, and each case times 6 steps after 6 of warmup.
+    Every line of default.txt names a case, once, and each case times 6 steps after 6 of warmup.
     """
     lines = (ROOT / "benchmarks/end2end/default.txt").read_text().splitlines()
     cases = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
@@ -53,6 +53,7 @@ def test_case_matches_path(script: Path, monkeypatch):
     assert training.sequence_length == case["sequence_length"]
     assert training.fp8 == (case["dtype"] == "fp8")
     assert training.global_batch_size == case["global_batch_size"]
+    assert training.micro_batch_size == case["micro_batch_size"]
     assert training.benchmark and cfg.dataset is None and training.max_steps == MAX_STEPS
     assert training.save_interval is None and cfg.logging.wandb is None
     assert (pp, cp, ep) == (case["pp"], case["cp"], case["ep"])
