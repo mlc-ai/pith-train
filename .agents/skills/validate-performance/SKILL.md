@@ -29,8 +29,8 @@ The two runs must be **strictly sequential**. One tree serves both arms, so a ch
 |---|---|
 | `qwen3-30b-a3b` | `global-batch` |
 | `qwen3.5-35b-a3b` | `global-batch` |
-| `deepseek-v2-lite` | `sequence` |
-| `gpt-oss-20b`, `gpt-oss-120b` | `global-batch` |
+| `deepseek-v2-lite` | `micro-batch` |
+| `gpt-oss-20b`, `gpt-oss-120b` | `micro-batch` |
 
 ## Step 1: Create the two run files
 
