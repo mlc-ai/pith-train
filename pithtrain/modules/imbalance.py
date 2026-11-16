@@ -15,7 +15,16 @@ import torch
 
 from pithtrain.contexts import training
 
-SIGMA = 0.2  # measured 0.212 on qwen3-30b-a3b, rounded
+SIGMA = 0.2
+"""
+The spread of the log-normal per-expert token shares drawn each layer and step; 0 routes
+force-balanced.
+
+Settled by training Qwen3-30B-A3B from scratch on DCLM with real routing (4K tokens, global-batch
+load-balancing loss at 1e-3) and recording each expert's token count. Once routing stabilized,
+from step 200 on with a load-balancing loss of about 1.02, the spread of expert loads was 0.212,
+rounded to 0.2, which reproduces the measured busiest-rank load at EP 4 to 32.
+"""
 
 
 def expert_shares(num_experts: int, sigma: float, layer: int, step: int) -> np.ndarray:

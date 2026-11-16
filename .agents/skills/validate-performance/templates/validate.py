@@ -1,6 +1,5 @@
 from pathlib import Path
 
-from pithtrain.modules import imbalance
 from pithtrain.modules.logging import LoggingWandbCfg
 from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
@@ -25,7 +24,6 @@ training.global_batch_size = <global-batch-size>
 training.fp8 = False
 training.max_steps = 8
 training.benchmark = True
-imbalance.SIGMA = 0  # force-balanced routing: comparable with earlier results, isolates the change
 
 wandb_cfg = LoggingWandbCfg()
 wandb_cfg.entity = "PithTrain"

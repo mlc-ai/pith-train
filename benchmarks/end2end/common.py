@@ -60,8 +60,8 @@ def end2end_cfg(
     trains on the same samples. It satisfies the DualPipeV bound global_batch / dp >= 2 * pp at every
     case, as global_batch / dp = (TOKENS_PER_GPU / sequence_length) * pp * cp.
     """
-    # Imported here, not at the top: importing pithtrain reads the GPU, and summarize.py, compare.py
-    # and collect.py read this module's tables on machines without one.
+    # Imported here, not at the top: importing pithtrain reads the GPU, and tools that read this
+    # module's tables may run on machines without one.
     from pithtrain.modules.training import make_constant_scheduler, make_muon_optimizer
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
