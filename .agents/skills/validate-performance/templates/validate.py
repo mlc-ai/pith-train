@@ -6,6 +6,8 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
+cfg.dataset = Path("/synthetic")
+
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = <pipeline-parallel-size>
 distributed.expert_parallel_size = <expert-parallel-size>

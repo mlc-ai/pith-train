@@ -2,7 +2,7 @@ import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.cuda
@@ -48,21 +48,16 @@ class PretrainLMCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
 
-    dataset: Optional[Path] = None
+    dataset: Path
     """
-    The root directory hosting the tokenized corpus, globbed for *.bin shards. Required unless
-    training.benchmark is set, which trains on SyntheticDataset instead (seeded token ids drawn on
-    the GPU, so no corpus is read and no step touches a file) and ignores this field.
+    The root directory hosting the tokenized corpus, globbed for *.bin shards.
     """
 
 
-def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset | SyntheticDataset:
+def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
     if cfg.training.benchmark:
         vocab_size = AutoConfig.from_pretrained(cfg.training.model).get_text_config().vocab_size
-        kwargs = dict(sequence_length=cfg.training.sequence_length)
-        kwargs.update(global_batch_size=cfg.training.global_batch_size, seed=cfg.training.seed)
-        return SyntheticDataset(vocab_size, **kwargs)
-    assert cfg.dataset is not None, "set cfg.dataset, or training.benchmark for synthetic data"
+        return SyntheticDataset(vocab_size, cfg.training.sequence_length, cfg.training.seed)
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)
@@ -72,10 +67,7 @@ def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset | SyntheticDataset:
 
 
 def get_global_batch(
-    cfg: PretrainLMCfg,
-    dataset: ConcatDataset | SyntheticDataset,
-    step: int,
-    device: torch.device,
+    cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
 ) -> List[Microbatch]:
     """
     The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP blocks.
@@ -97,33 +89,21 @@ def get_global_batch(
     block = len(front)
     local_seq_len = 2 * block
 
-    indices = []
+    local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+    local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+
     for row in range(local_batch_size):
         microbatch_idx, row_in_microbatch = divmod(row, micro_batch_size)
-        indices.append(start0 + microbatch_idx * effective_batch_size + row_in_microbatch)
+        index = start0 + microbatch_idx * effective_batch_size + row_in_microbatch
+        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
+        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
+        local_tokens[row, :block] = tokens_a
+        local_tokens[row, block:] = tokens_b
+        local_labels[row, :block] = labels_a
+        local_labels[row, block:] = labels_b
 
-    if isinstance(dataset, SyntheticDataset):
-        # Rows of this step's global batch, and this rank's zigzag columns of each row.
-        samples = dataset.get_step(step)
-        rows = torch.tensor(indices, device=samples.device) - step * global_batch_size
-        cols = torch.cat(
-            [torch.arange(front.start, front.stop), torch.arange(back.start, back.stop)]
-        )
-        cols = cols.to(samples.device)
-        local_tokens = samples[rows][:, cols].to(device)
-        local_labels = samples[rows][:, cols + 1].to(device)
-    else:
-        local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-        local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-        for row, index in enumerate(indices):
-            tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
-            tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
-            local_tokens[row, :block] = tokens_a
-            local_tokens[row, block:] = tokens_b
-            local_labels[row, :block] = labels_a
-            local_labels[row, block:] = labels_b
-        local_tokens = local_tokens.to(device, non_blocking=True)
-        local_labels = local_labels.to(device, non_blocking=True)
+    local_tokens = local_tokens.to(device, non_blocking=True)
+    local_labels = local_labels.to(device, non_blocking=True)
 
     return [
         Microbatch(
@@ -152,7 +132,7 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, step: int) -> None:
+def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
@@ -225,18 +205,9 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, st
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    # Peak memory, GiB: allocated by tensors, reserved by PyTorch's caching allocator (allocated
-    # plus what fragmentation holds), and used on the device. The allocator does not hand reserved
-    # memory back during a run, so the device's peak is the reserved peak plus what the process
-    # holds outside the allocator (CUDA context, NCCL buffers), measured now.
-    free, total = torch.cuda.mem_get_info()
-    outside = (total - free) - torch.cuda.memory_reserved()
-    peak_mem = torch.tensor(
-        [torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()], device=device
-    )
-    peak_mem = torch.cat([peak_mem, peak_mem[1:] + outside]) / 1024**3
-    torch.distributed.all_reduce(peak_mem, op=torch.distributed.ReduceOp.MAX)
-    peak_gpu_mem, peak_reserved, peak_device = peak_mem.tolist()
+    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
+    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -264,8 +235,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, st
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
-        statements.append("peak-reserved-memory %.2f GB" % peak_reserved)
-        statements.append("peak-device-memory %.2f GB" % peak_device)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
@@ -278,8 +247,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | SyntheticDataset, st
             metrics["train/gradient-norm"] = gradient_norm
             metrics["infra/tokens-per-second"] = tokens_per_second
             metrics["infra/peak-gpu-memory"] = peak_gpu_mem
-            metrics["infra/peak-reserved-memory"] = peak_reserved
-            metrics["infra/peak-device-memory"] = peak_device
             metrics["infra/step-time"] = elapsed
             wandb.log(metrics)
 

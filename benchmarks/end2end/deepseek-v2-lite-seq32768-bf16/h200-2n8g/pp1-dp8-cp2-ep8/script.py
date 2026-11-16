@@ -8,6 +8,7 @@ from pithtrain.modules.training import make_constant_scheduler, make_muon_optimi
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
+cfg.dataset = Path("/synthetic")
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = 1
