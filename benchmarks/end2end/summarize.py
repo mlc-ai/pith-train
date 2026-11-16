@@ -100,7 +100,14 @@ def summarize(text: str, case: str, exit_code: int, others: tuple[str, ...] = ()
     steps = parse_steps(text)
     max_steps = max((int(n) for n in re.findall(r"step \d+/(\d+)", text)), default=None)
     result = dict(case=case, config=parse_case(case), steps=steps)
-    if exit_code == 0 and max_steps is not None and len(steps) == max_steps:
+    # A run that exited cleanly is complete when every timed step is logged: a log can lose a few
+    # warmup lines (seen once on the shared filesystem as a run of NUL bytes), and they are listed.
+    logged = {s["step"] for s in steps}
+    timed = set(range(WARMUP_STEPS + 1, (max_steps or 0) + 1))
+    if exit_code == 0 and max_steps is not None and timed <= logged and 1 in logged:
+        missing = sorted(set(range(1, max_steps + 1)) - logged)
+        if missing:
+            result["steps_missing"] = missing
         return measure(result)
     # A model that raises NotImplementedError for this mesh does not support it on this build
     # (e.g. context parallelism for GPT-OSS on main): recorded, not retried, not a regression.
