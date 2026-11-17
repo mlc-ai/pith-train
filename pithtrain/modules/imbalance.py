@@ -11,9 +11,9 @@ from pithtrain.contexts import training
 
 SIGMA = 0.2
 """
-Spread of the log-normal per-expert token shares; 0 routes force-balanced. Measured as 0.212 on
-Qwen3-30B-A3B trained from scratch on DCLM at 4K sequence length, with real routing and a
-global-batch load-balancing loss of 1e-3, after routing stabilized (from step 200 on), rounded.
+Spread of the log-normal per-expert token shares, measured as 0.212 on Qwen3-30B-A3B trained from
+scratch on DCLM at 4K sequence length, with real routing and a global-batch load-balancing loss of
+1e-3, after routing stabilized (from step 200 on), rounded.
 """
 
 
@@ -26,7 +26,7 @@ def expert_shares(num_experts: int, sigma: float, layer: int, step: int) -> np.n
     return loads / loads.sum()
 
 
-def replay(num_experts: int, layer: int, sigma: float) -> Callable[[int, int], torch.Tensor]:
+def replay(num_experts: int, layer: int) -> Callable[[int, int], torch.Tensor]:
     """
     A router replay for one gate: maps (num_tokens, top_k) to expert indices whose counts follow
     this layer's expert_shares at the current step.
@@ -41,7 +41,7 @@ def replay(num_experts: int, layer: int, sigma: float) -> Callable[[int, int], t
         state["last"] = mb
         indices = state["cache"].get((num_tokens, top_k))
         if indices is None:
-            shares = expert_shares(num_experts, sigma, layer, state["step"])
+            shares = expert_shares(num_experts, SIGMA, layer, state["step"])
             slots = num_tokens * top_k
             # Largest-remainder rounding to exactly `slots`, each expert capped at one slot per
             # token, so that every token's top_k experts are distinct.

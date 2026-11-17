@@ -124,7 +124,7 @@ Keep sequence length and global batch identical across meshes, so meshes stay co
 
 Warmup is load-bearing rather than cosmetic. From fresh weights a constant LR spikes hard in the first steps — on qwen3-30b-a3b at pp=2 ep=8, 12.33 to 19.90 with a pre-clip gradient norm of 1388 at 1e-4 — and lowering the LR tenfold barely helps, because AdamW's second moment is near zero early so the effective step `lr/(sqrt(v)+eps)` saturates whatever `lr` is. With warmup the same run descends monotonically and peaks at a gradient norm of 49, which is what makes a ~0.01 envelope measurable at all.
 
-Correctness uses real routing, so the template leaves `training.benchmark = False`. Never turn it on here: force-balanced routing overwrites the router's top-k with a round-robin over token index, so the routing path goes untested and `load-balance-loss` pins at exactly 1.000000 — a gate that can never fail. Throughput measurement wants it on, which is why it lives in **validate-performance**.
+Correctness uses real routing, so the template leaves `training.benchmark = False`. Never turn it on here: benchmark mode trains on synthetic tokens and replays the router's top-k from drawn expert loads, so the routing path goes untested and the loss carries no signal. Throughput measurement wants it on, which is why it lives in **validate-performance**.
 
 ## Multi-node notes
 

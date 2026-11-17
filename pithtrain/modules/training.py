@@ -29,7 +29,7 @@ from pithtrain.modules.fp8_param_gather import (
     install_raw_fp8_param_gather,
 )
 from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
-from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
+from pithtrain.modules.load_balance import make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
@@ -423,17 +423,10 @@ def setup_model(
                     gate.load_balance_loss_fn = loss_fn
 
     if cfg.benchmark:
-        for i in range(2):
-            for layer in modules[i].layers.values():
-                for module in layer.modules():
-                    if not hasattr(module, "router_replay"):
-                        continue
-                    if imbalance.SIGMA > 0:
-                        module.router_replay = imbalance.replay(
-                            module.num_experts, layer.idx, imbalance.SIGMA
-                        )
-                    else:
-                        module.router_replay = force_balance(module.num_experts)
+        for name, module in modules.named_modules():
+            if hasattr(module, "router_replay"):
+                layer = int(name.split("layers.")[1].split(".")[0])
+                module.router_replay = imbalance.replay(module.num_experts, layer)
 
     training.model = DualPipeV(modules)
 
