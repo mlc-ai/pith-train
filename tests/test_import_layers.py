@@ -428,6 +428,8 @@ def find_violations() -> set[tuple[str, str, str]]:
             elif layer == "pipeline" and not (
                 tl in ("contexts", "pipeline")
                 or t == "pithtrain.models.interface"
+                # A data-only contract shared with CPU readers, without GPU pipeline imports.
+                or t == "pithtrain.modules.microbatch"
                 or (tl == "operators" and stem_of(t) in PIPELINE_OPERATORS)
             ):
                 found.add(("pipeline-imports", mod, t))

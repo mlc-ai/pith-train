@@ -83,6 +83,15 @@ class LayerProtocol(Protocol):
 
 
 class ModelProtocol(Protocol):
+    """
+    Protocol for a DualPipeV-compatible transformer language model.
+    """
+
+    # Text-only models may omit this. Media models declare their implemented inputs
+    # and forward the stage-selected media_context into model_forward(...).
+    # Only stage 0 receives encoder payloads; other stages get tokens/masks/layout.
+    input_modalities: frozenset[str]
+
     stage_index: int
     stage_count: int
     hidden_size: int
@@ -91,17 +100,26 @@ class ModelProtocol(Protocol):
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 
     def forward_posemb(
-        self, S: int, cu_seqlens: Optional[torch.Tensor] = None
+        self, S: int, cu_seqlens: Optional[torch.Tensor] = None, *, media_context=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         The (cos, sin) rotary embeddings for this rank's S tokens. When cu_seqlens is set the
         sequence is packed and positions restart at zero at each document boundary; cu_seqlens
         holds the boundaries of the whole packed sample, also under context parallelism.
+
+        Media models use media_context to build multimodal rotary positions from token IDs,
+        masks and image/video grids or audio lengths (see Microbatch.media_context). Every
+        decoder stage needs these inputs: S and hidden activations do not encode media layout.
+        Text-only models can omit this keyword; the pipeline passes it only for media batches.
         """
 
-    def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_prolog(self, hidden_states: torch.Tensor, *, media_context=None) -> torch.Tensor:
         """
         Prolog compute (first stage only): embed the input token ids.
+
+        For media models, media_context also contains stage-0-only pixel_values,
+        pixel_values_videos or input_features. Encode them and replace their token embeddings
+        here; subsequent stages receive only the shared position/layout context.
         """
 
     def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:

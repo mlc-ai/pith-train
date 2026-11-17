@@ -17,6 +17,15 @@ __all__ = ["MemmapDataset", "ConcatDataset"]
 
 
 class MemmapDataset:
+    """Fixed-length next-token samples from the token stream in a packed .bin file.
+
+    tokenize_corpus writes tokens followed by document offsets as two .npy arrays; this
+    reader uses only the tokens. Samples can cross document boundaries, including EOS.
+    Inputs and labels have equal length, with labels shifted one token ahead here, before
+    any context-parallel slicing. The loss must not shift them again. A trailing fragment
+    without enough tokens for a full input plus its last target is dropped, not padded.
+    """
+
     def __init__(self, path: Path, sequence_length: int):
         self.root = path.parent
         self.sequence_length = sequence_length

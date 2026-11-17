@@ -6,8 +6,10 @@ from typing import List, Tuple
 
 import torch
 import torch.cuda
+import torch.distributed as dist
 import wandb
 from torch.distributed.elastic.multiprocessing.errors import record
+from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
@@ -17,15 +19,19 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
+from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
 from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
-from pithtrain.modules.training import TrainingCfg, setup_training
-from pithtrain.operators.cp_sequence import zigzag_spans
+from pithtrain.modules.training import TrainingCfg, model_class_for_config, setup_training
+from pithtrain.modules.training_data import (
+    PreparedBundleData,
+    PretrainData,
+    TokenBinData,
+)
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
 
@@ -47,68 +53,40 @@ class PretrainLMCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
 
-    dataset: Path
-    """
-    The root directory hosting the tokenized corpus, globbed for *.bin shards.
-    """
+    data: DataCfg = field(default_factory=DataCfg)
+    """Dataset location, storage format, modalities and sampling configuration."""
 
 
-def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
-    files = sorted(cfg.dataset.rglob("*.bin"))
-    memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
-    dataset = ConcatDataset(memmaps, cfg.training.seed)
-    required = cfg.training.max_steps * cfg.training.global_batch_size
-    assert len(dataset) >= required, f"corpus has {len(dataset)} samples, run needs {required}"
-    return dataset
+def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
+    """Choose a data source once; the training loop uses the same interface for each."""
+    cfg.data.validate()
+    ranks = dict(
+        dp_rank=distributed.dp_rank,
+        dp_size=distributed.dp_size,
+        cp_rank=distributed.cp_rank,
+        cp_size=distributed.cp_size,
+    )
+    if cfg.data.format == "token_bin":
+        data = TokenBinData(cfg.data.dataset, cfg.training, **ranks)
+    else:
+        data = PreparedBundleData(
+            cfg.data,
+            cfg.training,
+            **ranks,
+            pp_rank=distributed.pp_rank,
+            pp_size=distributed.pp_size,
+            pp_group=distributed.pp_group,
+        )
+    config = AutoConfig.from_pretrained(cfg.training.model)
+    data.validate_model(model_class_for_config(config), config)
+    return data
 
 
 def get_global_batch(
-    cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
+    cfg: PretrainLMCfg, dataset: PretrainData, step: int, device: torch.device
 ) -> List[Microbatch]:
-    """
-    The samples depend only on step and dp_rank, and each sample holds this rank's zigzag CP blocks.
-    Every pipeline rank builds the same list, so DualPipeV needs no broadcast of shapes; only
-    pipeline rank 0 feeds the tensors to the model.
-    """
-    micro_batch_size = cfg.training.micro_batch_size
-    global_batch_size = cfg.training.global_batch_size
-    dp_size = distributed.dp_size
-    dp_rank = distributed.dp_rank
-    sequence_length = cfg.training.sequence_length
-
-    effective_batch_size = micro_batch_size * dp_size
-    local_batch_size = global_batch_size // dp_size
-    start0 = step * global_batch_size + dp_rank * micro_batch_size
-
-    # Two blocks per rank under zigzag CP; at cp_size 1 they are adjacent and cover the sequence.
-    front, back = zigzag_spans(distributed.cp_rank, distributed.cp_size, sequence_length)
-    block = len(front)
-    local_seq_len = 2 * block
-
-    local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-    local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-
-    for row in range(local_batch_size):
-        microbatch_idx, row_in_microbatch = divmod(row, micro_batch_size)
-        index = start0 + microbatch_idx * effective_batch_size + row_in_microbatch
-        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
-        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
-        local_tokens[row, :block] = tokens_a
-        local_tokens[row, block:] = tokens_b
-        local_labels[row, :block] = labels_a
-        local_labels[row, block:] = labels_b
-
-    local_tokens = local_tokens.to(device, non_blocking=True)
-    local_labels = local_labels.to(device, non_blocking=True)
-
-    return [
-        Microbatch(
-            model_inputs=(local_tokens[i : i + micro_batch_size],),
-            cu_seqlens=None,
-            objective_inputs=(local_labels[i : i + micro_batch_size],),
-        )
-        for i in range(0, local_batch_size, micro_batch_size)
-    ]
+    """Get this rank's microbatches; retained as the task's batch observation point."""
+    return dataset.get_batch(step, device)
 
 
 def objective(
@@ -116,8 +94,11 @@ def objective(
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    The loss is summed over the micro-batch's tokens, not averaged: train_step divides by the
-    global token count.
+    Sum cross-entropy over this microbatch's non-ignored next-token targets.
+
+    Token and media readers already shift the labels. Return the differentiable loss sum and
+    its detached copy for logging. The training step normalizes both summed gradients and
+    summed losses once by the global target count across DP x CP.
     """
     (logits,) = model_outputs
     (labels,) = objective_inputs
@@ -128,7 +109,34 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
+def global_target_count(microbatches, group=None):
+    """Sum non-ignored labels over the stage's DP x CP group, excluding PP replicas.
+
+    For equal local counts this is local_count * dp_size * cp_size, matching
+    dense training. Masked media batches can have unequal (or zero) local counts,
+    so multiplying one rank's count by the group size would be incorrect.
+    """
+    count = sum((mb.objective_inputs[0] != -100).sum() for mb in microbatches)
+    if dist.is_initialized():
+        dist.all_reduce(count, group=group)
+    if count.item() == 0:
+        raise ValueError("The global batch has no valid next-token targets")
+    return count.to(dtype=torch.float32)
+
+
+def global_loss_mean(local_loss_sum, global_target_count, group=None):
+    """Sum rank-local losses and divide once by the already-global target count."""
+    total = local_loss_sum.detach().float().clone()
+    if dist.is_initialized():
+        dist.all_reduce(total, group=group)
+    return total / global_target_count
+
+
+def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
+    """
+    Execute one step of training.
+    """
+    # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
@@ -161,27 +169,22 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     microbatches = get_global_batch(cfg, dataset, step, device)
 
-    # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
+    token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
+    global_num_targets = global_target_count(microbatches, token_group)
+
+    # Run the forward and backward pass. The objective hands back one detached loss per
+    # micro-batch on pipeline rank 0; every other rank gets an empty list.
     objective_outputs = model.step(microbatches, objective)
 
-    # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
-    counted = 0
-    for microbatch in microbatches:
-        (labels,) = microbatch.objective_inputs
-        counted = counted + (labels != -100).sum()
-    num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
-
-    cp_size = distributed.cp_size
+    # Reduce true loss sums/counts across this pipeline stage's DP x CP ranks.
+    # FSDP has already summed gradients over the parameter replica groups.
     if distributed.pp_rank == 0:
-        loss = torch.stack(objective_outputs).sum() / num_tokens
-        if cp_size > 1:
-            torch.distributed.all_reduce(loss, group=distributed.cp_group)
-            loss /= cp_size
-
-    # The one gradient normalization: FSDP reduces with a plain sum, so this gives the
-    # token-weighted mean. The global count is the local count times dp * cp only while every rank
-    # counts the same number of tokens: true for pretraining, not for packed data with -100 masks.
-    scale = 1.0 / (num_tokens * distributed.dp_size * distributed.cp_size)
+        loss = global_loss_mean(
+            torch.stack(objective_outputs).sum(), global_num_targets, token_group
+        )
+    # global_num_targets already sums DP x CP; multiplying those sizes again
+    # would divide gradients twice. For dense data it equals local_count * DP * CP.
+    scale = 1.0 / global_num_targets
     scale_grads_(local_grads(model), scale)
 
     gradient_norm = clip_grad_norm(
@@ -266,7 +269,9 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         should_save |= completed == cfg.training.max_steps
         if should_save:
             assert cfg.training.save_location is not None
-            save_checkpoint(cfg.training.save_location, completed)
+            save_checkpoint(
+                cfg.training.save_location, completed, data_fingerprint=dataset.data_fingerprint
+            )
 
     # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
@@ -282,7 +287,7 @@ def launch(cfg: PretrainLMCfg) -> None:
     logger.info("launch(cfg=%s)" % cfg)
     step = find_checkpoint(cfg.training.save_location)
     if step is not None:
-        load_checkpoint(cfg.training.save_location, step)
+        load_checkpoint(cfg.training.save_location, step, data_fingerprint=dataset.data_fingerprint)
         if training.fp8:
             precompute_fp8_param_scales()
     elif cfg.training.hf_import_path is not None:

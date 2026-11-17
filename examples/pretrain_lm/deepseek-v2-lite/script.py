@@ -9,7 +9,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
+cfg.data.dataset = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
 
 distributed = cfg.distributed
 distributed.context_parallel_size = 1

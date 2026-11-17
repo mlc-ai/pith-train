@@ -3,6 +3,7 @@ Compare DualPipeV loss, gradients and canonical weight export with a single-devi
 """
 
 import argparse
+import math
 import os
 from dataclasses import fields
 from pathlib import Path
@@ -53,9 +54,18 @@ def fill_weights(module: nn.Module):
 
 
 def calculate_difference(x: torch.Tensor, y: torch.Tensor) -> float:
-    x, y = x.double(), y.double()
-    cos_diff = 1 - 2 * (x * y).sum().item() / (x * x + y * y).sum().item()
-    return cos_diff
+    # Expert tensors contain hundreds of millions of elements in the original Qwen case.
+    # Keep the same FP64 normalized squared-error metric without several full-size copies.
+    assert x.shape == y.shape, f"Gradient shapes differ: {x.shape} != {y.shape}"
+    x, y = x.reshape(-1), y.reshape(-1)
+    dot, squared_norm = 0.0, 0.0
+    for start in range(0, x.numel(), 1 << 20):
+        x_chunk = x[start : start + (1 << 20)].double()
+        y_chunk = y[start : start + (1 << 20)].double()
+        dot += torch.dot(x_chunk, y_chunk).item()
+        squared_norm += torch.dot(x_chunk, x_chunk).item() + torch.dot(y_chunk, y_chunk).item()
+    assert math.isfinite(dot) and math.isfinite(squared_norm), "Non-finite gradient comparison"
+    return 0.0 if squared_norm == 0 else 1 - 2 * dot / squared_norm
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -90,7 +100,7 @@ def reference_step(chunks, model: DeepSeekV2Model):
         loss = criterion(micro_y, micro_labels)
         loss.backward()
         outputs.append(micro_y)
-        losses.append(loss)
+        losses.append(loss.detach())
     return torch.stack(losses), outputs
 
 
@@ -392,6 +402,10 @@ def main(model_name: str):
         for n, p in full_modules.named_parameters():
             if ".experts." in n:
                 assert not p.grad[-1].any(), f"{n}: a layer ignored the replayed routes"
+    # Reference gradients stay available on host for comparison. Keeping both
+    # full copies and their gradients on GPU makes the 8-layer Qwen case OOM.
+    full_modules.cpu()
+    torch.cuda.empty_cache()
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
     distributed.cp_size, distributed.cp_rank = cp_size, cp_rank
 
@@ -401,8 +415,9 @@ def main(model_name: str):
 
     local_full_modules = []
 
-    local_full_modules.append(ModelClass(config, phase=0))
-    local_full_modules.append(ModelClass(config, phase=1))
+    with torch.device("meta"):
+        local_full_modules.append(ModelClass(config, phase=0))
+        local_full_modules.append(ModelClass(config, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
     if pp_rank == 0:
@@ -412,8 +427,9 @@ def main(model_name: str):
     local_full_modules[0].layers = shard_layers(full_modules.layers, local_full_modules[0])
     local_full_modules[1].layers = shard_layers(full_modules.layers, local_full_modules[1])
     if ep_size > 1:
-        shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
-        shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
+        with torch.device("cpu"):
+            shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
+            shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
 
     local_modules = []
 
@@ -498,16 +514,18 @@ def main(model_name: str):
             print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
+    # Validate the gradients.
+    print(f"[INFO] rank-{distributed.rank}: comparing gradients on CPU.", flush=True)
     eps = 1e-2
     largest_diff = 0
     largest_diff_param = None
     failed = False
 
     for (param_name, param), param_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):  # fmt: skip
-        if param.grad is None:
-            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, param_name))
-            failed = True
-            continue
+        assert param_ref.grad is not None, f"Reference parameter {param_name} has no gradient"
+        assert param.grad is not None, (
+            f"rank-{distributed.rank}: pipeline lost gradient for {param_name}"
+        )
         # Both parameter classes reduce with a plain sum over their own replica group, and either
         # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
         # and the expt replica group covers all the data too, since every member receives the
@@ -516,6 +534,7 @@ def main(model_name: str):
         param_grad = param.grad
         if isinstance(param_grad, torch.distributed.tensor.DTensor):
             param_grad = param_grad.full_tensor()
+        param_grad = param_grad.cpu()
         if cp_size > 1:
             # Each CP rank takes a mean over S/cp tokens, which is cp times its share of the
             # full-sequence mean, so the summed gradient overshoots the reference by exactly cp.
@@ -604,7 +623,7 @@ def main(model_name: str):
             weight = reference.pop(name)
             if updated:
                 weight = weight.neg().masked_fill_(weight == 0, 1)
-            assert torch.equal(tensor, weight), (distributed.rank, name, updated)
+            assert torch.equal(tensor.cpu(), weight), (distributed.rank, name, updated)
         assert not reference, (distributed.rank, sorted(reference)[:5])
     torch.distributed.barrier()
     if distributed.rank == 0:

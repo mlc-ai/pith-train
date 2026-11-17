@@ -157,7 +157,15 @@ from pithtrain.contexts import distributed
 cp_group = distributed.cp_group
 ```
 
-Follow the same `*Cfg` + `setup_*` + `contexts` shape when adding a subsystem.
+Training data is task-owned rather than a global context. `PretrainLMCfg.data`
+is a `DataCfg` with `dataset`, `format`, `modalities` and sampling options.
+`setup_dataset` selects the token or prepared-bundle reader once; `launch` owns
+the resulting `PretrainData` and requests batches by training step. Both readers
+keep data position derived from that step; prefetch is only a cache. A static
+`data_fingerprint` records data identity and sampling configuration in the model
+checkpoint and is checked before restoring weights, without checkpointing a reader cursor.
+
+Follow the same `*Cfg` + `setup_*` + `contexts` shape for shared runtime subsystems.
 
 ## 9. Agent skills
 

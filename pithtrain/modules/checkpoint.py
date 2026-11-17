@@ -24,6 +24,7 @@ own run or filling a frozen slot such as an RL reference policy.
 import gc
 import re
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
@@ -499,7 +500,7 @@ class CheckpointState(Stateful):
                 scheduler.load_state_dict(st)
 
 
-def save_checkpoint(root: Path, step: int) -> None:
+def save_checkpoint(root: Path, step: int, *, data_fingerprint: str | None = None) -> None:
     """
     Save the runtime model, optimizers and schedulers as the step checkpoint under root. The step is
     a count of completed work, the same number find_checkpoint reports and load_checkpoint takes.
@@ -508,6 +509,7 @@ def save_checkpoint(root: Path, step: int) -> None:
     shards move to CPU without any GPU all-gather. Expert DTensors are split into per-expert
     entries locally by unwrap_dtensor_experts, so each rank writes only the
     expert keys it owns. Non-expert DTensors stay as CPU DTensors and DCP saves each rank's shard.
+    An optional data_fingerprint records static input configuration, not a reader cursor.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
     stdout = logging.stdout
@@ -521,6 +523,8 @@ def save_checkpoint(root: Path, step: int) -> None:
     state_dict["app"]["model"] = to_canonical_model(model_state, model)
     state_dict["app"]["optimizer"] = to_canonical_optim(optim_state, model)
     state_dict["app"]["scheduler"] = [s.state_dict() for s in schedulers]
+    if data_fingerprint is not None:
+        state_dict["app"]["data_fingerprint"] = data_fingerprint
 
     stdout.info("Save checkpoint: %s" % location)
     t0 = time.monotonic()
@@ -538,7 +542,44 @@ def save_checkpoint(root: Path, step: int) -> None:
     stdout.info("Save checkpoint: elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def load_checkpoint(root: Path, step: int) -> None:
+def validate_data_fingerprint(location, metadata, expected):
+    """Read only data identity before loading model/optimizer tensors.
+
+    Earlier PR checkpoints used app.data.{version,fingerprint,consumed_samples}.
+    Compare that same version-1 identity but never restore the obsolete cursor.
+    Older checkpoints with no identity remain loadable, with an explicit warning.
+    Model-only weight imports have no training data contract to validate.
+    """
+    keys = metadata.state_dict_metadata
+    if "app.data_fingerprint" in keys:
+        saved = {"app": {"data_fingerprint": ""}}
+        dcp.load(saved, checkpoint_id=location)
+        actual = saved["app"]["data_fingerprint"]
+    elif "app.data.fingerprint" in keys:
+        if "app.data.version" not in keys:
+            raise ValueError("Legacy checkpoint data fingerprint has no version")
+        saved = {"app": {"data": {"version": 1, "fingerprint": ""}}}
+        dcp.load(saved, checkpoint_id=location)
+        legacy = saved["app"]["data"]
+        if legacy["version"] != 1:
+            raise ValueError("Unsupported legacy checkpoint data fingerprint version")
+        actual = legacy["fingerprint"]
+    else:
+        if not all(key.startswith("app.model.") for key in keys):
+            warnings.warn(
+                "Checkpoint has no data fingerprint; resuming without data configuration "
+                "validation. Confirm the dataset and sampling configuration match the original run.",
+                stacklevel=2,
+            )
+        return
+    if actual != expected:
+        raise ValueError(
+            "Checkpoint data fingerprint differs: check the dataset, modalities, sampling, "
+            "seed, sequence length and batch sizes before resuming"
+        )
+
+
+def load_checkpoint(root: Path, step: int, *, data_fingerprint: str | None = None) -> None:
     """
     Load the step checkpoint under root into the runtime state: the model, plus the optimizers and
     schedulers when the checkpoint carries them. One converted from HuggingFace carries model keys
@@ -548,6 +589,7 @@ def load_checkpoint(root: Path, step: int) -> None:
     Run position is never written. The step names a checkpoint, not where the caller is, and only
     the caller knows whether loading these weights means resuming its own run or filling a frozen
     slot such as an RL reference policy.
+    When supplied, data_fingerprint must match before model or optimizer tensors are loaded.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
     stdout = logging.stdout
@@ -557,6 +599,8 @@ def load_checkpoint(root: Path, step: int) -> None:
     t0 = time.monotonic()
     torch.cuda.empty_cache()
     metadata = FileSystemReader(str(location)).read_metadata()
+    if data_fingerprint is not None:
+        validate_data_fingerprint(location, metadata, data_fingerprint)
     model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     state = CheckpointState(model, optimizers, schedulers, model_only=model_only)
