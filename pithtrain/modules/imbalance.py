@@ -1,11 +1,5 @@
 """
-Benchmark routing with a realistic expert-load imbalance, which TrainingCfg.benchmark turns on.
-
-Per layer and step each expert's token share is a log-normal draw with spread SIGMA, normalized and
-seeded by (layer, step) so every rank routes to the same loads; each token gets top_k distinct
-experts whose counts match those shares. The per-EP-rank imbalance follows from the contiguous
-expert-to-rank placement, so one SIGMA carries over to every EP degree. SIGMA = 0 routes
-force-balanced (load_balance.force_balance).
+Benchmark routing with a realistic expert-load imbalance, used by TrainingCfg.benchmark.
 """
 
 from typing import Callable
@@ -17,20 +11,15 @@ from pithtrain.contexts import training
 
 SIGMA = 0.2
 """
-The spread of the log-normal per-expert token shares drawn each layer and step; 0 routes
-force-balanced.
-
-Settled by training Qwen3-30B-A3B from scratch on DCLM with real routing (4K tokens, global-batch
-load-balancing loss at 1e-3) and recording each expert's token count. Once routing stabilized,
-from step 200 on with a load-balancing loss of about 1.02, the spread of expert loads was 0.212,
-rounded to 0.2, which reproduces the measured busiest-rank load at EP 4 to 32.
+Spread of the log-normal per-expert token shares; 0 routes force-balanced. Measured as 0.212 on
+Qwen3-30B-A3B trained from scratch with real routing, rounded.
 """
 
 
 def expert_shares(num_experts: int, sigma: float, layer: int, step: int) -> np.ndarray:
     """
-    One layer's per-expert load shares at one step: independent log-normal draws with spread sigma,
-    normalized to sum 1, seeded by (layer, step) so every rank draws the same shares.
+    One layer's per-expert token shares at one step: log-normal with spread sigma, normalized,
+    seeded by (layer, step).
     """
     loads = np.random.default_rng((layer, step)).lognormal(0.0, sigma, num_experts)
     return loads / loads.sum()
@@ -38,11 +27,8 @@ def expert_shares(num_experts: int, sigma: float, layer: int, step: int) -> np.n
 
 def replay(num_experts: int, layer: int, sigma: float) -> Callable[[int, int], torch.Tensor]:
     """
-    A router replay for one gate (see load_balance.replay_indices): maps (num_tokens, top_k) to the
-    (num_tokens, top_k) expert indices whose counts match this layer's expert_shares at the current
-    step. The step advances when the micro-batch index (training.current_microbatch) wraps around;
-    every micro-batch of a step routes the same way. Indices are built on the GPU without a host
-    sync from counts drawn on the host.
+    A router replay for one gate: maps (num_tokens, top_k) to expert indices whose counts follow
+    this layer's expert_shares at the current step.
     """
     state = {"step": -1, "last": None, "cache": {}}
 

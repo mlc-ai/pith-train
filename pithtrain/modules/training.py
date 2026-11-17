@@ -207,11 +207,8 @@ class TrainingCfg(SlottedDefault):
 
     benchmark: bool = False
     """
-    Benchmark mode, for throughput measurement only: training reads no corpus but seeded synthetic
-    tokens (SyntheticDataset, Zipf-distributed), ignoring cfg.dataset, and MoE routing is replayed
-    with the expert-load imbalance of a real training run (pithtrain.modules.imbalance,
-    SIGMA = 0.2), or force-balanced with imbalance.SIGMA = 0, as NeMo Megatron-Bridge does for its
-    MoE benchmarks.
+    Benchmark mode, for throughput measurement only: trains on SyntheticDataset (cfg.dataset is
+    ignored) and replays MoE routing with a realistic expert-load imbalance (imbalance.SIGMA).
     """
 
     fp8: bool = False

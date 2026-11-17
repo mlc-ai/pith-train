@@ -85,15 +85,8 @@ class ConcatDataset:
 
 class SyntheticDataset(ConcatDataset):
     """
-    Seeded synthetic token ids in place of a corpus, so a benchmark reads no file. It overrides
-    what the trainer calls, get_chunk, and maps nothing. Ids follow a Zipf law over the vocabulary
-    (id k has weight 1 / (k + 1)), so the loss falls from about ln(vocab_size) toward the
-    distribution's entropy as the model learns the unigram, and two builds can be compared step by
-    step. It is not a convergence signal.
-
-    Sample idx is a pure function of (seed, idx): its sequence_length + 1 ids come from a PCG64
-    stream seeded by both, and a chunk advances the stream to its offset, so it draws only the ids
-    it returns and any split of a sample into chunks yields the same ids.
+    Synthetic token ids for benchmarks, in place of a corpus. Ids follow a Zipf distribution over
+    the vocabulary, and sample idx is a pure function of (seed, idx).
     """
 
     def __init__(self, vocab_size: int, sequence_length: int, seed: int):
