@@ -12,7 +12,8 @@ from pithtrain.contexts import training
 SIGMA = 0.2
 """
 Spread of the log-normal per-expert token shares; 0 routes force-balanced. Measured as 0.212 on
-Qwen3-30B-A3B trained from scratch with real routing, rounded.
+Qwen3-30B-A3B trained from scratch on DCLM at 4K sequence length, with real routing and a
+global-batch load-balancing loss of 1e-3, after routing stabilized (from step 200 on), rounded.
 """
 
 
