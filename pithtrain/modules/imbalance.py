@@ -29,40 +29,36 @@ def expert_shares(num_experts: int, sigma: float, layer: int, step: int) -> np.n
 def replay(num_experts: int, layer: int) -> Callable[[int, int], torch.Tensor]:
     """
     A router replay for one gate: maps (num_tokens, top_k) to expert indices whose counts follow
-    this layer's expert_shares at the current step.
+    this layer's expert_shares at the current step. The step advances when the micro-batch index
+    wraps around.
     """
-    state = {"step": -1, "last": None, "cache": {}}
+    step, last_microbatch, cache = -1, None, {}
 
     def route(num_tokens: int, top_k: int) -> torch.Tensor:
-        mb = training.current_microbatch
-        if state["last"] is None or mb is None or mb <= state["last"]:
-            state["step"] += 1
-            state["cache"] = {}
-        state["last"] = mb
-        indices = state["cache"].get((num_tokens, top_k))
-        if indices is None:
-            shares = expert_shares(num_experts, SIGMA, layer, state["step"])
-            slots = num_tokens * top_k
-            # Largest-remainder rounding to exactly `slots`, each expert capped at one slot per
-            # token, so that every token's top_k experts are distinct.
-            want = np.minimum(shares * slots, num_tokens)
-            counts = np.floor(want).astype(np.int64)
-            short = slots - counts.sum()
-            for e in np.argsort(-(want - counts), kind="stable"):
-                if short <= 0:
-                    break
-                if counts[e] < num_tokens:
-                    counts[e] += 1
-                    short -= 1
-            device = torch.cuda.current_device()
-            counts_t = torch.from_numpy(counts).to(device, non_blocking=True)
-            ids = torch.repeat_interleave(
-                torch.arange(num_experts, device=device), counts_t, output_size=slots
-            )
-            # Token t takes slots t, t + N, t + 2N, ...: an expert's slots are contiguous and at
-            # most N long, so no token gets an expert twice.
-            indices = ids.view(top_k, num_tokens).t().contiguous()
-            state["cache"][(num_tokens, top_k)] = indices
-        return indices
+        nonlocal step, last_microbatch, cache
+        microbatch = training.current_microbatch
+        if last_microbatch is None or microbatch is None or microbatch <= last_microbatch:
+            step, cache = step + 1, {}
+        last_microbatch = microbatch
+        if (num_tokens, top_k) in cache:
+            return cache[(num_tokens, top_k)]
+
+        # Largest-remainder rounding to exactly num_tokens * top_k slots, each expert capped at one
+        # slot per token, so that every token's top_k experts are distinct.
+        slots = num_tokens * top_k
+        exact = np.minimum(expert_shares(num_experts, SIGMA, layer, step) * slots, num_tokens)
+        counts = np.floor(exact).astype(np.int64)
+        order = np.argsort(-(exact - counts), kind="stable")
+        has_room = order[counts[order] < num_tokens]
+        counts[has_room[: slots - counts.sum()]] += 1
+
+        # Token t takes slots t, t + N, t + 2N, ...: an expert's slots are contiguous and at most N
+        # long, so no token gets an expert twice.
+        device = torch.cuda.current_device()
+        counts = torch.from_numpy(counts).to(device, non_blocking=True)
+        experts = torch.arange(num_experts, device=device)
+        expert_of_slot = torch.repeat_interleave(experts, counts, output_size=slots)
+        cache[(num_tokens, top_k)] = expert_of_slot.view(top_k, num_tokens).t().contiguous()
+        return cache[(num_tokens, top_k)]
 
     return route
