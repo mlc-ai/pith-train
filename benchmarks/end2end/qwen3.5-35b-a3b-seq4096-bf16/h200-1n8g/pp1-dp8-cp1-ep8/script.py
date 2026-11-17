@@ -1,5 +1,5 @@
 """
-Benchmark Qwen3.5-35B-A3B at 4K tokens on one 8-GPU H200 node: pp 2, cp 1, ep 4.
+Benchmark Qwen3.5-35B-A3B at 4K tokens on one 8-GPU H200 node: pp 1, cp 1, ep 8.
 """
 
 from pathlib import Path
@@ -11,9 +11,9 @@ cfg = PretrainLMCfg()
 cfg.dataset = Path("/synthetic")
 
 distributed = cfg.distributed
-distributed.pipeline_parallel_size = 2
+distributed.pipeline_parallel_size = 1
 distributed.context_parallel_size = 1
-distributed.expert_parallel_size = 4
+distributed.expert_parallel_size = 8
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b")
