@@ -10,6 +10,7 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 
+from pithtrain.contexts import training
 from pithtrain.kernels import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_sync
@@ -145,7 +146,8 @@ def prepare_dispatch(
 ) -> tuple[torch.Tensor, RoutingInfo]:
     """
     With ep_size > 1 a token sent to several experts on one EP rank is sent once, and expand_idx
-    restores the copies on the receiver.
+    restores the copies on the receiver. Under training.defer_dispatch it returns the
+    PendingDispatch and None instead, without blocking the host.
     """
     k = topk_ids.shape[1]
     expert_idxs = topk_ids.view(-1)
@@ -160,4 +162,6 @@ def prepare_dispatch(
     pending = prepare_dispatch_issue(
         hidden_states, topk_ids, topk_weight, num_experts, ep_size, experts_per_rank, ep_group
     )
+    if training.defer_dispatch:
+        return pending, None
     return pending.finish()

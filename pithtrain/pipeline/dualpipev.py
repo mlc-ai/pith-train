@@ -35,7 +35,9 @@ from pithtrain.pipeline.execution import (
     ExecutionCtx,
     clear_layer_records,
     create_chunk_record,
+    deferred_dispatch,
     epilog_f,
+    finish_dispatch,
     layer_backward,
     layer_forward,
     model_backward,
@@ -735,9 +737,13 @@ def overlapped_forward_backward(
 
     rotary_posemb = module0.forward_posemb(hidden_states.shape[1], cu_seqlens)
 
-    record, dispatch_tokens, residual, routing = stage1_f(
-        ctx, module0_layers[0], hidden_states, rotary_posemb, cu_seqlens
-    )
+    # Stage 1 issues each dispatch without waiting for its routing metadata; the host finishes it
+    # only after enqueuing the other micro-batch's stage 3 backward, so the GPU computes that
+    # backward while the host waits for the metadata and launches the dispatch.
+    with deferred_dispatch():
+        record, dispatch_tokens, residual, routing = stage1_f(
+            ctx, module0_layers[0], hidden_states, rotary_posemb, cu_seqlens
+        )
     chunk_record0.layers[layer_idx0].stage1.args = record.args
     chunk_record0.layers[layer_idx0].stage1.outs = record.outs
 
@@ -786,16 +792,17 @@ def overlapped_forward_backward(
             # first and last boundaries when module0 has the extra layer.
             if len(module0_layers) <= len(module1.layers) or (layer_idx - 1 > 0 and layer_idx < num_layers - 1):  # fmt: skip
                 prev_layer, next_layer = module0_layers[layer_idx - 1], module0_layers[layer_idx]
-                stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_stage1_f(
-                    ctx,
-                    prev_layer,
-                    next_layer,
-                    moe_outs,
-                    routing,
-                    residual,
-                    rotary_posemb,
-                    cu_seqlens,
-                )
+                with deferred_dispatch():
+                    stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_stage1_f(
+                        ctx,
+                        prev_layer,
+                        next_layer,
+                        moe_outs,
+                        routing,
+                        residual,
+                        rotary_posemb,
+                        cu_seqlens,
+                    )
                 chunk_record0.layers[layer_idx0].stage5.args = stage5_args
                 layer_idx0 += 1
                 chunk_record0.layers[layer_idx0].stage1.outs = stage1_outs
@@ -810,14 +817,21 @@ def overlapped_forward_backward(
                 chunk_record0.layers[layer_idx0].stage5.args = record.args
                 chunk_record0.layers[layer_idx0].stage5.outs = record.outs
                 layer_idx0 += 1
-                record, dispatch_tokens, residual, routing = stage1_f(
-                    ctx, module0_layers[layer_idx], hidden_states, rotary_posemb, cu_seqlens
-                )
+                with deferred_dispatch():
+                    record, dispatch_tokens, residual, routing = stage1_f(
+                        ctx, module0_layers[layer_idx], hidden_states, rotary_posemb, cu_seqlens
+                    )
                 chunk_record0.layers[layer_idx0].stage1.args = record.args
                 chunk_record0.layers[layer_idx0].stage1.outs = record.outs
 
         record = chunk_record1.layers[-layer_idx - 1].stage3
         gathered_tokens_grad = stage3_b(ctx, module1_layers[-layer_idx - 1], record, (moe_outs_grad,))  # fmt: skip
+
+        if not isinstance(dispatch_tokens, torch.Tensor):  # issued under deferred_dispatch
+            stage1_record = chunk_record0.layers[layer_idx0].stage1
+            stage1_record.outs, dispatch_tokens, routing = finish_dispatch(
+                ctx, stage1_record.outs, dispatch_tokens
+            )
 
         record, gathered_tokens = stage2_f(
             ctx,

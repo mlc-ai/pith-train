@@ -238,7 +238,7 @@ Process-global runtime state, one module per concern (`distributed`, `training`,
 
 Two per-step stores are the exception to "constant after setup": `weight_grad_store.py` (`WeightGradStore`, the deferred weight-gradient closures of the zero-bubble W phase) and `fp8_weight_cache.py` (`FP8WeightCacheControl`, the version counter that lets FP8 layers reuse a quantized weight across the micro-batches of a step). `DualPipeV.step` drives both; import them by class name.
 
-Two fields in `training` also change during a run: `current_microbatch`, which `DualPipeV.step` sets before each forward, and `offloaded`, which `offload_training_state` sets and `reload_training_state` clears. Both start from a default, so a bare import of either succeeds but freezes the default.
+Three fields in `training` also change during a run: `current_microbatch`, which `DualPipeV.step` sets before each forward; `defer_dispatch`, which DualPipeV's overlapped forward/backward sets around a stage 1 whose expert-parallel dispatch it finishes only after enqueuing the other micro-batch's stage 3 backward (`prepare_dispatch` then returns the pending dispatch without blocking the host); and `offloaded`, which `offload_training_state` sets and `reload_training_state` clears. All start from a default, so a bare import of any of them succeeds but freezes the default.
 
 ## Agent Skills
 
