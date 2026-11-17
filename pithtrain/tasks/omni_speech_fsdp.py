@@ -40,8 +40,9 @@ def _children(sequence):
 def _thinker_layer_units(layer):
     # Keep residual joins outside FSDP's input identity hook. Wrapping the whole
     # decoder regroups the BF16 text and speech cotangents at a shared hidden
-    # state. These children still share one all-gather/reduce-scatter group.
-    return (layer.input_layernorm, layer.self_attn, layer.post_attention_layernorm, layer.mlp)
+    # state. These children still share one all-gather/reduce-scatter group; the
+    # MoE block is a unit of its own (see _shard_units).
+    return (layer.input_layernorm, layer.self_attn, layer.post_attention_layernorm)
 
 
 def _shard_units(model):
@@ -71,10 +72,13 @@ def _shard_units(model):
         if getattr(thinker, name, None) is not None:
             add(getattr(thinker, name))
     for layer in _children(thinker.layers):
-        norm, attention, post_norm, mlp = _thinker_layer_units(layer)
-        for child in (norm, attention, post_norm):
+        for child in _thinker_layer_units(layer):
             add(child)
-        add(mlp, ("reference_forward",))
+        # The MoE block runs only through reference_forward, never forward(). In a shared
+        # group that group's forward would never complete: FSDP would complete it at the
+        # root post-forward and hook its pre-backward on the root output, so every backward
+        # would gather the layer, even with a frozen Thinker.
+        add(layer.mlp, ("reference_forward",))
     add(thinker, ("forward_prolog", "forward_posemb", "forward_epilog"), container=True)
 
     for layer in _children(talker.model.layers):
@@ -194,7 +198,7 @@ def apply_speech_fsdp(model, mesh, *, mode, gradient_reduction="sum", param_dtyp
         reduce_dtype=torch.float32,
         require_backward=True,
         fixed_topology=True,
-        thinker_sharding="grouped_residual_children_v1",
+        thinker_sharding="grouped_attention_children_own_moe_v2",
         owned_modules=tuple(names[id(m)] for m, _, _ in units),
         registered_methods=tuple((names[id(m)], methods) for m, methods, _ in units if methods),
     )

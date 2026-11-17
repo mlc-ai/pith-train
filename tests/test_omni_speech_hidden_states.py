@@ -274,9 +274,12 @@ def test_bf16_speech_branches_share_hf_hidden_gradient_boundaries(sharded, tmp_p
                 timeout=timedelta(seconds=30),
             )
             mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
-            units = _thinker_layer_units(native.layers["2"])
+            layer = native.layers["2"]
+            units = _thinker_layer_units(layer)
             fully_shard(list(units), mesh=mesh, reshard_after_forward=True)
-            for unit in units:
+            # Production gives the MoE block its own unit; this HF block runs via forward.
+            fully_shard(layer.mlp, mesh=mesh, reshard_after_forward=True)
+            for unit in (*units, layer.mlp):
                 unit.set_gradient_divide_factor(1.0)
                 unit.set_force_sum_reduction_for_comms(True)
 

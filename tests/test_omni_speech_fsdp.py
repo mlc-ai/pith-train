@@ -294,3 +294,83 @@ def batch_validation_worker(rank, root):
 
 def test_native_batch_contract_rejects_one_rank_before_fsdp_forward(tmp_path):
     mp.spawn(batch_validation_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+class MethodOnlyMLP(nn.Module):
+    """Like the native MoE block: speech training reaches it only via reference_forward."""
+
+    def __init__(self, width):
+        super().__init__()
+        self.proj = nn.Linear(width, width)
+
+    def reference_forward(self, x):
+        return self.proj(x)
+
+
+class MethodOnlyLayer(DirectLayer):
+    def __init__(self, width):
+        super().__init__(width)
+        self.mlp = MethodOnlyMLP(width)
+
+
+class CodecRoot(nn.Module):
+    """A frozen Thinker feeding a trainable Talker through one root forward."""
+
+    def __init__(self):
+        super().__init__()
+        shaped = shaped_model()
+        self.thinker, self.talker, self.code2wav = shaped.thinker, shaped.talker, shaped.code2wav
+        self.thinker.layers = nn.ModuleDict({str(i): MethodOnlyLayer(4) for i in range(2)})
+
+    def forward(self, ids):
+        hidden = self.thinker.forward_prolog(ids)
+        for layer in self.thinker.layers.values():
+            hidden = layer.reference_forward(hidden)
+        return self.talker.text_projection(hidden)
+
+    def decode_training_codes(self, codes):
+        return self.code2wav(codes)
+
+
+def frozen_thinker_worker(rank, root):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    from pithtrain.tasks.omni_speech_fsdp import apply_speech_fsdp
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{Path(root) / 'frozen-rendezvous'}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    original, gathered = FSDPParamGroup.pre_backward, []
+
+    def pre_backward(group, *args, **kwargs):
+        gathered.append(group._module_fqn)
+        return original(group, *args, **kwargs)
+
+    try:
+        torch.manual_seed(0)
+        model = CodecRoot()
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("talker."))
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
+        apply_speech_fsdp(model, mesh, mode="codec_only")
+        output = model(torch.tensor([[1, 2, 3]]))
+        FSDPParamGroup.pre_backward = pre_backward
+        output.float().sum().backward()
+        assert gathered and not [f for f in gathered if f.startswith("thinker.")], gathered
+        assert all(p.grad is not None for p in model.talker.text_projection.parameters())
+        assert all(p.grad is None for p in model.thinker.parameters())
+    finally:
+        FSDPParamGroup.pre_backward = original
+        dist.destroy_process_group()
+
+
+def test_codec_backward_never_gathers_frozen_thinker_layers(tmp_path):
+    # A group whose MoE block runs only through reference_forward never completes its forward.
+    # FSDP then completes it at the root post-forward and hooks its pre-backward on the root
+    # output, so each backward gathered every frozen Thinker layer (an H200 OOM at full size).
+    mp.spawn(frozen_thinker_worker, args=(str(tmp_path),), nprocs=2, join=True)
