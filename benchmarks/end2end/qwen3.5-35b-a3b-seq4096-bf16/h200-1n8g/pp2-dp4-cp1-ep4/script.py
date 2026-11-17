@@ -1,5 +1,5 @@
 """
-Benchmark Qwen3.5-35B-A3B at 32K tokens on one 8-GPU H200 node: pp 2, cp 4, ep 4.
+Benchmark Qwen3.5-35B-A3B at 4K tokens on one 8-GPU H200 node: pp 2, cp 1, ep 4.
 """
 
 from pathlib import Path
@@ -12,7 +12,7 @@ cfg.dataset = Path("/synthetic")
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = 2
-distributed.context_parallel_size = 4
+distributed.context_parallel_size = 1
 distributed.expert_parallel_size = 4
 
 training = cfg.training
@@ -22,8 +22,8 @@ training.scheduler = make_constant_scheduler
 training.lr = 3.0e-4
 training.max_steps = 12
 training.micro_batch_size = 1
-training.global_batch_size = 64
-training.sequence_length = 32768
+training.global_batch_size = 512
+training.sequence_length = 4096
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
 training.fp8 = False
