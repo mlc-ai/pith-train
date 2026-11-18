@@ -61,7 +61,7 @@ The launch script auto-detects GPUs and supports both single-node and multi-node
 bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b
 ```
 
-Convert a training checkpoint to standard Hugging Face format for evaluation or inference. The same tool also supports importing Hugging Face checkpoints for continued pretraining.
+Convert a training checkpoint to standard Hugging Face format for evaluation or inference. The same script downloads the released Hugging Face weights; set `training.hf_import_path` to them for continued pretraining.
 
 For hardware requirements, supported models, scaling and multi-node runs, troubleshooting, etc., see the [User Guide](docs/user-guide.md).
 

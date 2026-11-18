@@ -1,5 +1,5 @@
 #!/bin/bash
-# Convert checkpoints between HuggingFace and DCP formats.
+# Download a HuggingFace checkpoint and export the newest DCP checkpoint to HuggingFace.
 #
 # Usage:
 #   bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b

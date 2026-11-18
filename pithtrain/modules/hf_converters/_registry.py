@@ -5,9 +5,10 @@ insufficient (quantized weights, stacked experts with HF-side
 transposes). Converters are tried in order; the first whose detect_*
 returns True wins.
 
-``pithtrain.modules.hf_loader`` also dispatches over CONVERTERS, using two
-optional hooks: ``plan_param`` (default ``_streaming.generic_plan_param``) and
+``pithtrain.modules.hf_loader`` imports through two optional hooks:
+``plan_param`` (default ``_streaming.generic_plan_param``) and
 ``expected_unmapped``, the HF keys that are fine to leave unloaded.
+``convert_checkpoint`` exports through ``detect_dcp`` and ``postprocess_canonical``.
 """
 
 from logging import Logger
@@ -21,7 +22,7 @@ from .qwen35_moe import Qwen35MoeConverter
 
 
 class ModelConverter(Protocol):
-    """Per-model HF<->DCP conversion hooks."""
+    """Per-model HF import and export hooks."""
 
     name: str
 
@@ -30,9 +31,6 @@ class ModelConverter(Protocol):
 
     def detect_dcp(self, metadata) -> bool:
         """True if this converter should postprocess the given DCP metadata."""
-
-    def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
-        """Full HF->DCP conversion (replaces the generic path)."""
 
     def postprocess_canonical(
         self, canonical: Dict[str, torch.Tensor], stdout: Logger

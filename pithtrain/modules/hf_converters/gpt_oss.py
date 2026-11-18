@@ -8,9 +8,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import torch
-import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from safetensors import safe_open
 from torch.distributed.tensor import DTensor
 
 from pithtrain.modules.checkpoint import find_moe
@@ -92,71 +90,12 @@ class GptOssConverter:
         # fused-expert models (Qwen3.5-MoE also has gate_up_proj but no bias).
         return any("gate_up_proj_bias" in k for k in metadata.state_dict_metadata.keys())
 
-    def hf2dcp(self, load_path: Path, save_path: Path, stdout: Logger) -> None:
-        with open(Path(load_path, "model.safetensors.index.json")) as f:
-            weight_map = json.load(f)["weight_map"]
-
-        shard_files = set(weight_map.values())
-        stdout.info(
-            "Converting GPT-OSS HF checkpoint from %s (%d shards)" % (load_path, len(shard_files))
-        )
-
-        raw: Dict[str, torch.Tensor] = dict()
-        for i, shard_file in enumerate(sorted(shard_files), start=1):
-            stdout.info("Reading shard %d/%d: %s" % (i, len(shard_files), shard_file))
-            with safe_open(str(Path(load_path, shard_file)), framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    raw[key] = f.get_tensor(key)
-
-        # MXFP4 on-disk is [E, out, in] with quant axis along in (32 FP4/block).
-        # Dequant drops the last two dims:
-        #   gate_up_proj_blocks [E, 2*inter, G, 16] -> [E, 2*inter, hidden]
-        #   down_proj_blocks    [E, hidden,  G, 16] -> [E, hidden, inter]
-        dequantized: Dict[str, torch.Tensor] = dict()
-        seen_blocks = set()
-        for key in sorted(raw.keys()):
-            if key.endswith("_blocks"):
-                base = key.removesuffix("_blocks")
-                scales_key = base + "_scales"
-                if scales_key in raw:
-                    stdout.info("Dequantizing MXFP4: %s" % base)
-                    flat = _dequantize_mxfp4(raw[key], raw[scales_key])
-                    dequantized[base] = flat.contiguous()
-                    seen_blocks.add(key)
-                    seen_blocks.add(scales_key)
-
-        for key, tensor in raw.items():
-            if key not in seen_blocks and key not in dequantized:
-                dequantized[key] = tensor
-
-        model_state_dict: Dict[str, torch.Tensor] = dict()
-        for key, tensor in dequantized.items():
-            canon = key.removeprefix("model.")
-
-            if canon.endswith(
-                (
-                    ".mlp.experts.gate_up_proj",
-                    ".mlp.experts.gate_up_proj_bias",
-                    ".mlp.experts.down_proj",
-                    ".mlp.experts.down_proj_bias",
-                )
-            ):
-                for idx in range(tensor.shape[0]):
-                    expert_key = canon.replace(".experts.", ".experts.%d." % idx)
-                    model_state_dict[expert_key] = tensor[idx].contiguous()
-            else:
-                model_state_dict[canon] = tensor
-
-        save_path.mkdir(parents=True, exist_ok=True)
-        dcp.save({"app": {"model": model_state_dict}}, checkpoint_id=save_path, no_dist=True)
-        stdout.info("Saved DCP checkpoint to %s (%d weights)" % (save_path, len(model_state_dict)))
-
     def postprocess_canonical(
         self, canonical: Dict[str, torch.Tensor], stdout: Logger
     ) -> Dict[str, torch.Tensor]:
         # DCP stores per-expert [out, in]; HF's live stacked Parameter wants
-        # [E, in, out]. The transpose lives here so the model and hf2dcp
-        # never see it. 1-D biases pass through unchanged.
+        # [E, in, out]. The transpose lives here so the model never sees it.
+        # 1-D biases pass through unchanged.
         _WEIGHT_KEYS = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
 
         indexed = re.compile(r"(.*\.mlp\.experts)\.(\d+)\.(.*)")
