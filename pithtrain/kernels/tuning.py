@@ -16,10 +16,12 @@ and adds it to the cache. Nothing is timed after that. Every exchange happens in
 which all ranks reach; none happens while a launch picks its config.
 """
 
+import fcntl
 import hashlib
 import inspect
 import json
 import os
+import tempfile
 from importlib import metadata
 from pathlib import Path
 from typing import Callable
@@ -137,16 +139,35 @@ def as_tuple(value):
 
 
 def read_cache() -> list:
+    """
+    The cache entries, or none when the file is missing or unreadable (tuning then starts over).
+    """
     try:
         return [(name, fingerprint, as_tuple(key), bucket, idx) for name, fingerprint, key, bucket, idx in json.loads(cache_file().read_text())]
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return []
 
 
 def write_cache(entries: list) -> None:
+    """
+    Adds entries to the cache file, replacing those of the same family, key and bucket. Jobs sharing
+    the file may write at once: under a lock each merges with what is on disk just before writing,
+    so none drops another's entries, and the file is replaced whole, so no reader sees it partial.
+    """
     path = cache_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(sorted(entries, key=repr)))
+    with open(path.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        merged = {tuple(entry[:4]): entry[4] for entry in read_cache()}
+        merged.update((tuple(entry[:4]), entry[4]) for entry in entries)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as file:
+                json.dump(sorted(((*entry, idx) for entry, idx in merged.items()), key=repr), file)
+            os.replace(tmp, path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
 
 def time_launch(launch: Callable, config) -> float:
