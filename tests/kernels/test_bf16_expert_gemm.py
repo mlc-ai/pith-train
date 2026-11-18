@@ -19,13 +19,17 @@ Backward:
 Every bf16 output is the fp32 accumulation rounded once: it must lie within half a bf16 ulp of the
 float64 reference plus 1e-5 of the sum of absolute products. A main grad accumulation from a
 nonzero start must lie within 1e-5 of the sum of absolute products plus 2 fp32 ulps of the result.
-Gate and up are tested as two weights in both address orders, as the two halves of one fused
-[gate; up] weight, and (gpt-oss) as the interleaved rows of one weight; their main grads likewise.
+Gate and up are tested as two weights in both address orders, also 2^40 bytes apart (further than
+one TMA stride reaches), as the two halves of one fused [gate; up] weight, and (gpt-oss) as the
+interleaved rows of one weight; their main grads likewise.
 Shapes are those of qwen3-30b-a3b (2048 / 768; 16, 32, 64 local experts), deepseek-v2-lite
 (2048 / 1408), qwen3.5 (2048 / 512) and gpt-oss-20b (2880 / 2880, 32 experts), with ragged and
 empty groups, more than 65536 rows, and 0 rows.
 """
 
+import weakref
+
+import cuda.bindings.driver as cuda
 import pytest
 import torch
 import torch.nn.functional as F
@@ -131,12 +135,81 @@ def ragged(G, total, seed, empty=0.0):
     return [int(size) for size in (weights / weights.sum() * total).round().long()]
 
 
+FAR_GAP = 1 << 40  # the smallest address gap no TMA stride reaches
+
+
+def checked(result):
+    err, *values = result
+    assert err == cuda.CUresult.CUDA_SUCCESS, err
+    return values[0] if values else None
+
+
+class DeviceBytes:
+    """
+    nbytes of device memory at ptr for torch.as_tensor, keeping owner alive while a tensor is.
+    """
+
+    def __init__(self, ptr, nbytes, owner):
+        self.owner = owner
+        self.__cuda_array_interface__ = dict(
+            shape=(nbytes,), typestr="|u1", data=(ptr, False), version=2
+        )
+
+
+class Mapping:
+    pass
+
+
+def far_buffers(nbytes):
+    """
+    Two uint8 tensors of nbytes FAR_GAP bytes apart: one reserved address range with physical memory
+    mapped at its two ends only, unmapped once both tensors are freed.
+    """
+    prop = cuda.CUmemAllocationProp()
+    prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = torch.cuda.current_device()
+    flag = cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+    granularity = checked(cuda.cuMemGetAllocationGranularity(prop, flag))
+    size = -(-nbytes // granularity) * granularity
+    base = int(checked(cuda.cuMemAddressReserve(FAR_GAP + size, 0, 0, 0)))
+    access = cuda.CUmemAccessDesc()
+    access.location = prop.location
+    access.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+    ptrs, handles = (base, base + FAR_GAP), []
+    for ptr in ptrs:
+        handles.append(checked(cuda.cuMemCreate(size, prop, 0)))
+        checked(cuda.cuMemMap(ptr, size, 0, handles[-1], 0))
+        checked(cuda.cuMemSetAccess(ptr, size, [access], 1))
+
+    def release():
+        torch.cuda.synchronize()
+        for ptr, handle in zip(ptrs, handles):
+            checked(cuda.cuMemUnmap(ptr, size))
+            checked(cuda.cuMemRelease(handle))
+        checked(cuda.cuMemAddressFree(base, FAR_GAP + size))
+
+    owner = Mapping()
+    weakref.finalize(owner, release)
+    return [torch.as_tensor(DeviceBytes(ptr, nbytes, owner), device="cuda") for ptr in ptrs]
+
+
 def pair(G, n, k, layout, dtype=torch.bfloat16, scale=1.0):
     """
     (gate, up), each (G, n, k), laid out as layout: separate (two weights, gate lower), swapped
-    (two weights, up lower), halves (one fused (G, 2n, k) weight [gate; up]) or interleaved (one
-    (G, 2n, k) weight with gate / up rows alternating, gpt-oss).
+    (two weights, up lower), far / far_swapped (as separate / swapped, FAR_GAP bytes apart), halves
+    (one fused (G, 2n, k) weight [gate; up]) or interleaved (one (G, 2n, k) weight with gate / up
+    rows alternating, gpt-oss).
     """
+    if layout in ("far", "far_swapped"):
+        lower, higher = (
+            buf.view(dtype).view(G, n, k) for buf in far_buffers(G * n * k * dtype.itemsize)
+        )
+        gate, up = (lower, higher) if layout == "far" else (higher, lower)
+        values = (torch.randn(2, G, n, k, device="cuda") * scale).to(dtype)
+        gate.copy_(values[0])
+        up.copy_(values[1])
+        return gate, up
     if layout in ("separate", "swapped"):
         buf = (torch.randn(2, G, n, k, device="cuda") * scale).to(dtype)
         return (buf[0], buf[1]) if layout == "separate" else (buf[1], buf[0])
@@ -180,7 +253,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("case", list(CASES))
-@pytest.mark.parametrize("layout", ["separate", "swapped", "halves"])
+@pytest.mark.parametrize("layout", ["separate", "swapped", "far", "far_swapped", "halves"])
 def test_swiglu_forward_backward(case, layout):
     H, inter, counts = CASES[case]
     G, M = len(counts), sum(counts)
@@ -209,7 +282,7 @@ def test_swiglu_forward_backward(case, layout):
     # dy read by slot_of, dpre in the weights' address order
     dy = torch.randn(M, H, **BF16)
     dpre, h2, swapped = bf16_expert_down_dgrad(dy, wd, pre, cu, slot_of, wg, wu)
-    assert swapped == (wu.data_ptr() < wg.data_ptr()) == (layout == "swapped")
+    assert swapped == (wu.data_ptr() < wg.data_ptr()) == layout.endswith("swapped")
     assert torch.equal(h, h2), "the backward must re-emit the forward's h bit for bit"
     dh, dh_abs = gmm(dy[slot_of.long()], wd, counts, trans=False)
     dg_ref, du_ref = dswiglu_ref(g16, u16, dh)
@@ -250,6 +323,8 @@ WGRAD_CASES = [
         ("swapped", "separate"),
         ("swapped", "swapped"),
         ("halves", "halves"),
+        ("separate", "far_swapped"),
+        ("far_swapped", "far"),
     ],
 )
 def test_swiglu_wgrads(case, w_layout, mg_layout):

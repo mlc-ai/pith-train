@@ -5,9 +5,11 @@ Every launch runs DEFAULT_CONFIG until tune_kernels() picks, per kind, shape and
 expert, one of CANDIDATES; QuACK's own autotuner is not used.
 
 Gate and up are two tensors read as one operand: a tensor over the lower address whose size-2 pair
-mode strides to the higher one, so they act as one (G, 2I, H) weight with gate and up interleaved
-(TMA takes any positive 16-byte-multiple stride). Lane 0 is the lower address, gate or up; the
-epilogue variant is picked per call from the pointer order.
+mode strides to the higher one, so they act as one (G, 2I, H) weight with gate and up interleaved.
+TMA takes a global stride that is a multiple of 16 bytes and below 2^40 bytes, so a pair further
+apart (independent allocations can be) is copied into one adjacent buffer first, in address order.
+Lane 0 is the lower address, gate or up; the epilogue variant is picked per call from the pointer
+order.
 """
 
 from functools import lru_cache
@@ -464,15 +466,29 @@ def prepare_launch(key: tuple, rows_per_expert: int) -> Callable | None:
 TUNING = Tunable("bf16_expert_gemm", CANDIDATES, default_config, prepare_launch)
 
 
+TMA_STRIDE_LIMIT = 1 << 40  # cuTensorMapEncodeTiled: every global stride below 2^40 bytes
+
+
+def pairable(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """
+    Whether the address gap of first and second is a valid TMA stride for the pair mode: nonzero, a
+    multiple of 16 bytes and below 2^40 bytes.
+    """
+    byte_gap = abs(second.data_ptr() - first.data_ptr())
+    return 0 < byte_gap < TMA_STRIDE_LIMIT and byte_gap % 16 == 0
+
+
 def order_by_address(first: torch.Tensor, second: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """
-    Returns (lower, higher, whether first is the higher) by address.
+    Returns (lower, higher, whether first is the higher) by address. A pair that is not pairable
+    comes back as the two halves of a copy of (lower, higher) in one adjacent buffer.
     """
     assert first.dtype == second.dtype and first.shape == second.shape and first.stride() == second.stride()
     assert first.data_ptr() % 16 == 0 and second.data_ptr() % 16 == 0
-    byte_gap = second.data_ptr() - first.data_ptr()
-    assert byte_gap != 0 and byte_gap % 16 == 0, "paired operands must be distinct and 16-byte apart"
-    return (first, second, False) if byte_gap > 0 else (second, first, True)
+    lower, higher, swapped = (second, first, True) if second.data_ptr() < first.data_ptr() else (first, second, False)
+    if not pairable(first, second):
+        lower, higher = torch.stack((lower, higher))
+    return lower, higher, swapped
 
 
 def bf16_expert_gate_up_fwd_sm90(x, w_gate, w_up, cu, a_idx, bias=None, act=()):
@@ -529,6 +545,13 @@ def bf16_expert_gate_up_dgrad_sm90(dpre, w_gate, w_up, cu, dpre_swapped):
 
 def bf16_expert_gate_up_wgrad_sm90(x, dpre, dpre_swapped, mg_gate, mg_up, cu, a_idx):
     if a_idx.shape[0] == 0:
+        return
+    if not pairable(mg_gate, mg_up):
+        # accumulate into an adjacent copy, then write it back
+        pair = torch.stack((mg_gate, mg_up))
+        bf16_expert_gate_up_wgrad_sm90(x, dpre, dpre_swapped, pair[0], pair[1], cu, a_idx)
+        mg_gate.copy_(pair[0])
+        mg_up.copy_(pair[1])
         return
     mg_lower, mg_higher, mg_swapped = order_by_address(mg_gate, mg_up)
     swapped = mg_swapped != dpre_swapped
