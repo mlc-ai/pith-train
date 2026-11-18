@@ -1,5 +1,5 @@
 """
-Benchmark GPT-OSS-20B at 4K tokens on one 8-GPU H200 node: pp 1, cp 1, ep 8, micro-batch 2.
+Benchmark GPT-OSS-20B at 4K tokens on one 8-GPU H200 node: pp 1, cp 1, ep 2, micro-batch 2.
 """
 
 from pathlib import Path
@@ -13,7 +13,7 @@ cfg.dataset = Path("/synthetic")
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = 1
 distributed.context_parallel_size = 1
-distributed.expert_parallel_size = 8
+distributed.expert_parallel_size = 2
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/gpt-oss-20b")
