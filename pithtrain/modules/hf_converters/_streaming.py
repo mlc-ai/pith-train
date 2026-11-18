@@ -41,8 +41,9 @@ def generic_plan_param(
     local = param._local_tensor
     canon_keys = _expand_localized_fqn(local_fqn, named_modules)
     moe = find_moe(local_fqn, named_modules)
-    dp_rank = param.device_mesh.get_local_rank()
-    dp_size = param.device_mesh.size()
+    shard_dim = param.device_mesh.ndim - 1
+    dp_rank = param.device_mesh.get_local_rank(shard_dim)
+    dp_size = param.device_mesh.size(shard_dim)
 
     if moe is None:
         (canon,) = canon_keys
@@ -96,8 +97,9 @@ def fused_expert_ops(
     local = param._local_tensor
     moe = find_moe(local_fqn, named_modules)
     keys = hf_keys(strip_prefix(local_fqn).removesuffix(".weight"))
-    dp_rank = param.device_mesh.get_local_rank()
-    dp_size = param.device_mesh.size()
+    shard_dim = param.device_mesh.ndim - 1
+    dp_rank = param.device_mesh.get_local_rank(shard_dim)
+    dp_size = param.device_mesh.size(shard_dim)
     chunk = -(-moe.experts_per_rank // dp_size)
     dp_offset = min(dp_rank * chunk, moe.experts_per_rank)
     dp_len = max(0, min(chunk, moe.experts_per_rank - dp_offset))
