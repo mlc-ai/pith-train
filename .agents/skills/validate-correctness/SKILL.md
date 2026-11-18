@@ -17,6 +17,8 @@ Two runs of identical code do not agree past step 1. FlashAttention's backward i
 
 So a base-vs-feature delta means nothing on its own. `base0` and `base1` are identical code, so their difference is the run-to-run floor, and the feature difference is read as a ratio against it. A fixed tolerance cannot substitute: measured drift spans 3.6x across meshes, and `--tolerance 5e-3` both rejected a change that four meshes later showed to be indistinguishable and rejected identical code on two of four meshes.
 
+**The logged losses are rank 0's samples, not the global batch.** `train_step` reduces the cross-entropy over CP but not over DP, so the log prints the mean over the samples of DP rank 0. Both arms must therefore hand rank 0 the same samples: keep the mesh (PP, CP, EP, hence DP), `micro_batch_size` and `global_batch_size` identical. A change that alters any of them, e.g. `micro_batch_size` 1 against 2, moves rank 0 to a different subset of the same global batch, and the cross-entropy rows fail by construction (a measured 362x ratio, with a step-1 forward signal 35x its floor, from a change whose outputs are bit-identical per sample). The global `gradient-norm` row, reduced over every rank, is the comparison to read in that case. `load-balance-loss` also moves with `micro_batch_size` under `global-batch` balancing, whose statistics are gathered per micro-batch slot.
+
 ## Prerequisites
 
 - Activate `.venv` in the repo root: `source .venv/bin/activate`.
