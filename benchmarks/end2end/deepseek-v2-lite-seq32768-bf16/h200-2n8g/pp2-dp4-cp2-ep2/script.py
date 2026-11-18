@@ -1,5 +1,5 @@
 """
-Benchmark DeepSeek-V2-Lite at 32K tokens on two 8-GPU H200 nodes: pp 1, cp 2, ep 8.
+Benchmark DeepSeek-V2-Lite at 32K tokens on two 8-GPU H200 nodes: pp 2, cp 2, ep 2.
 """
 
 from pathlib import Path
@@ -11,9 +11,9 @@ cfg = PretrainLMCfg()
 cfg.dataset = Path("/synthetic")
 
 distributed = cfg.distributed
-distributed.pipeline_parallel_size = 1
+distributed.pipeline_parallel_size = 2
 distributed.context_parallel_size = 2
-distributed.expert_parallel_size = 8
+distributed.expert_parallel_size = 2
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/deepseek-v2-lite")
