@@ -22,6 +22,8 @@ bash examples/pretrain_lm/launch.sh deepseek-v2-lite
 
 The launch script auto-detects available GPUs and works with both single-node and multi-node (SLURM) setups.
 
+Training starts from random weights. To start from released weights instead, download them with [convert_checkpoint](../convert_checkpoint/) and set `training.hf_import_path` to `workspace/checkpoints/<model>/hf-import` in `script.py`.
+
 ## Available Models
 
 | Model | Default Parallelism |

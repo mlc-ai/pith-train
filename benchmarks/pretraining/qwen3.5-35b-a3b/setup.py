@@ -3,17 +3,16 @@
 Prepare the model checkpoint and the pretraining dataset.
 
 Qwen3.5-35B-A3B is released as a vision-language checkpoint; only the text
-tower is converted (the vision tower and the MTP head are skipped). Loading
-these real weights and observing a low first-step LM loss (well below the ~12
-of random init) is the correctness signal for the model + converter.
+tower is loaded (the vision tower and the MTP head are skipped). Setting
+training.hf_import_path to it and observing a low first-step LM loss (well
+below the ~12 of random init) is the correctness signal for the model + loader.
 """
 
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-from pithtrain.tasks import convert_checkpoint, tokenize_corpus
-from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
+from pithtrain.tasks import tokenize_corpus
 from pithtrain.tasks.tokenize_corpus import TokenizeCorpusCfg
 
 if __name__ == "__main__":
@@ -24,14 +23,6 @@ if __name__ == "__main__":
     kwargs["repo_id"] = "Qwen/Qwen3.5-35B-A3B"
     kwargs["local_dir"] = "workspace/checkpoints/qwen3.5-35b-a3b/hf-import"
     snapshot_download(**kwargs, repo_type="model")
-
-if __name__ == "__main__":
-    cfg = ConvertCheckpointCfg()
-    cfg.operation = "hf2dcp"
-    cfg.load_path = Path("workspace/checkpoints/qwen3.5-35b-a3b/hf-import")
-    cfg.save_path = Path("workspace/checkpoints/qwen3.5-35b-a3b/torch-dcp/00000000")
-    if not Path(cfg.save_path, ".metadata").exists():
-        convert_checkpoint.launch(cfg)
 
 if __name__ == "__main__":
     kwargs = dict()

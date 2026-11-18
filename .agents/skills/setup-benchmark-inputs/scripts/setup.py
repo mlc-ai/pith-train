@@ -1,4 +1,4 @@
-"""Setup minimal benchmark inputs: corpus shard, tokenize, HF checkpoint, HF->DCP."""
+"""Setup minimal benchmark inputs: corpus shard, tokenize, HF checkpoint."""
 
 import argparse
 import os
@@ -6,8 +6,7 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from pithtrain.tasks import convert_checkpoint, tokenize_corpus
-from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
+from pithtrain.tasks import tokenize_corpus
 from pithtrain.tasks.tokenize_corpus import TokenizeCorpusCfg
 
 CORPUS_RAWTXT = "workspace/datasets/dclm-baseline/rawtxt"
@@ -17,13 +16,11 @@ MODELS = {
         "model_id": "deepseek-ai/DeepSeek-V2-Lite",
         "corpus_toktxt": "workspace/datasets/dclm-baseline/toktxt/deepseek-v2",
         "hf_import": "workspace/checkpoints/deepseek-v2-lite/hf-import",
-        "torch_dcp": "workspace/checkpoints/deepseek-v2-lite/torch-dcp/00000000",
     },
     "qwen3-30b-a3b": {
         "model_id": "Qwen/Qwen3-30B-A3B",
         "corpus_toktxt": "workspace/datasets/dclm-baseline/toktxt/qwen3",
         "hf_import": "workspace/checkpoints/qwen3-30b-a3b/hf-import",
-        "torch_dcp": "workspace/checkpoints/qwen3-30b-a3b/torch-dcp/00000000",
     },
 }
 
@@ -59,18 +56,6 @@ def fetch_checkpoint(specs):
     snapshot_download(specs["model_id"], local_dir=hf_import)
 
 
-def import_checkpoint(specs):
-    torch_dcp = Path(specs["torch_dcp"])
-    if Path(torch_dcp, ".metadata").exists():
-        print(f"[skip] DCP checkpoint already at {torch_dcp}")
-        return
-    cfg = ConvertCheckpointCfg()
-    cfg.operation = "hf2dcp"
-    cfg.load_path = Path(specs["hf_import"])
-    cfg.save_path = torch_dcp
-    convert_checkpoint.launch(cfg)
-
-
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", required=True, choices=list(MODELS))
 parsed = parser.parse_args()
@@ -80,4 +65,3 @@ if __name__ == "__main__":
     fetch_corpus()
     build_toktxt(specs)
     fetch_checkpoint(specs)
-    import_checkpoint(specs)

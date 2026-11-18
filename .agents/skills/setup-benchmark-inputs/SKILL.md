@@ -1,11 +1,11 @@
 ---
 name: setup-benchmark-inputs
-description: Set up the minimal set of artifacts (tokenized DCLM corpus shard + released HuggingFace checkpoint converted to DCP) required to benchmark, profile, or regression-test a MoE model in PithTrain. Use when the user asks to "prepare benchmark inputs", "set up the benchmark workspace", "download the DCLM shard", "fetch and convert the released checkpoint", "tokenize DCLM for DeepSeek/Qwen3", or when a downstream skill (capture-nsys-profile, validate-correctness, or any short canonical run) needs its workspace pre-populated. Produce `workspace/datasets/dclm-baseline/toktxt/<model>` and `workspace/checkpoints/<model>/torch-dcp/00000000`. Idempotent and safe to re-run.
+description: Set up the minimal set of artifacts (tokenized DCLM corpus shard + released HuggingFace checkpoint) required to benchmark, profile, or regression-test a MoE model in PithTrain. Use when the user asks to "prepare benchmark inputs", "set up the benchmark workspace", "download the DCLM shard", "fetch the released checkpoint", "tokenize DCLM for DeepSeek/Qwen3", or when a downstream skill (capture-nsys-profile, validate-correctness, or any short canonical run) needs its workspace pre-populated. Produce `workspace/datasets/dclm-baseline/toktxt/<model>` and `workspace/checkpoints/<model>/hf-import` (loaded through `training.hf_import_path`). Idempotent and safe to re-run.
 ---
 
 # Setup Benchmark Inputs
 
-Setup the minimal artifacts needed to benchmark, profile, or regression-test a MoE model in PithTrain: a single DCLM corpus shard tokenized for the target model, and the released HuggingFace checkpoint converted to DCP format. Each step is idempotent (skips if its output already exists).
+Setup the minimal artifacts needed to benchmark, profile, or regression-test a MoE model in PithTrain: a single DCLM corpus shard tokenized for the target model, and the released HuggingFace checkpoint, which training streams in through `training.hf_import_path`. Each step is idempotent (skips if its output already exists).
 
 ## Prerequisites
 

@@ -12,7 +12,7 @@ Capture a single-step Nsight Systems (`.nsys-rep`) trace of PithTrain training, 
 - **Python environment**: activate `.venv` in the repo root (`source .venv/bin/activate`).
 - **Nsight Systems CLI**: `nsys --version` must work on every compute node.
 - **Hardware**: enough GPUs to satisfy `world_size >= PP * CP * EP` (with at least `DP >= 1`). See Step 2.
-- **Benchmark inputs set up**: the **setup-benchmark-inputs** skill has run for the target model (produces the tokenized corpus and DCP checkpoint capture loads).
+- **Benchmark inputs set up**: the **setup-benchmark-inputs** skill has run for the target model (produces the tokenized corpus and the HuggingFace checkpoint capture loads).
 
 ## Step 1: Choose parallelism
 
