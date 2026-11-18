@@ -32,7 +32,7 @@ Typical mapping:
 | `<Prefix>RotaryEmbedding` | `<Prefix>RotaryEmbedding` (even if YaRN internally) |
 | `<Prefix>DecoderLayer` | `<Prefix>DecoderLayer` |
 
-**Counter-example (do not do this):** GPT-OSS originally named the class `GptOssGate` and the attribute `self.mlp.gate`. HF calls them `GptOssTopKRouter` and `self.mlp.router`. That mismatch required an asymmetric `hf2dcp` (rename `router -> gate`) and broke `dcp2hf` round-trip. Fix landed later - but only because the original choice ignored HF.
+**Counter-example (do not do this):** GPT-OSS originally named the class `GptOssGate` and the attribute `self.mlp.gate`. HF calls them `GptOssTopKRouter` and `self.mlp.router`. That mismatch required an asymmetric import (rename `router -> gate`) and broke the `dcp2hf` round-trip. Fix landed later - but only because the original choice ignored HF.
 
 ### Attribute names
 
@@ -60,7 +60,7 @@ All of these must be copied verbatim. A single wrong constant in the activation 
 
 ### Fused vs split tensors
 
-If HF stores gate and up as **one fused** tensor `gate_up_proj`, our model must also have a single `gate_up_proj` parameter. Don't split into `gate_proj` + `up_proj` - that forces a split+deinterleave in `hf2dcp` and a re-interleave+merge in `dcp2hf` with high bug risk.
+If HF stores gate and up as **one fused** tensor `gate_up_proj`, our model must also have a single `gate_up_proj` parameter. Don't split into `gate_proj` + `up_proj` - that forces a split+deinterleave on import and a re-interleave+merge in `dcp2hf` with high bug risk.
 
 Split the output *at forward time* if you need different post-ops:
 
@@ -132,7 +132,7 @@ return not training.fp8 and bf16_experts_supported(num_local_experts)  # BF16 Cu
 Norms are invariant under transposition. A norm match does NOT prove the layout is right. The real check is element-wise:
 
 ```python
-# After hf2dcp -> dcp2hf -> transformers.AutoModelForCausalLM.from_pretrained:
+# After HF import -> save -> dcp2hf -> transformers.AutoModelForCausalLM.from_pretrained:
 rt_state = round_tripped_model.state_dict()
 hf_state = hf_model.state_dict()           # load the original HF model fresh
 
@@ -164,12 +164,12 @@ The DCP checkpoint format is our internal standard. It differs from HF in exactl
 
 Nothing else should differ. In particular:
 
-- **No renaming.** If HF uses `router`, our canonical key uses `router`. Do not rename to `gate` in `hf2dcp` and back in `dcp2hf` - the asymmetry is bug-prone and our *model code* should already use `router` (see Rule 1).
+- **No renaming.** If HF uses `router`, our canonical key uses `router`. Do not rename to `gate` on import and back in `dcp2hf` - the asymmetry is bug-prone and our *model code* should already use `router` (see Rule 1).
 - **No shape transforms beyond the layout transpose at dcp2hf.**
 
 ### Converter responsibilities
 
-- `hf2dcp`: `model.layers.0.mlp.experts.gate_up_proj [E, out, in]` -> split along dim 0 into E per-expert tensors (each `[out, in]`) -> write under `layers.0.mlp.experts.IDX.gate_up_proj`. (Dequant if needed - see `checkpoint.md`.)
+- Import (`plan_param`): each runtime param reads its rows of the HF tensor, e.g. this rank's experts of `model.layers.0.mlp.experts.gate_up_proj [E, out, in]`. (Dequant if needed - see `checkpoint.md`.) Training checkpoints then save them under `layers.0.mlp.experts.IDX.gate_up_proj`.
 - `dcp2hf`: a model-specific converter's `postprocess_canonical` stacks per-expert tensors back into `[E, out, in]`, transposes to `[E, in, out]` for HF live layout. The generic `dcp2hf` then adds `model.` prefix and writes safetensors.
 
 ### Round-trip test (non-negotiable)
@@ -177,7 +177,7 @@ Nothing else should differ. In particular:
 Do this immediately after writing both directions:
 
 ```bash
-hf2dcp <hf_snapshot> <dcp_dir>
+# one-step pretrain_lm run: hf_import_path=<hf_snapshot>, lr=0, save_interval=1 -> <dcp_dir>
 dcp2hf <dcp_dir> <bf16_snapshot>
 # strip quantization_config from bf16_snapshot/config.json first
 python -c "

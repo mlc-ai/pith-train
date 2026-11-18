@@ -57,11 +57,10 @@ from pithtrain.models.hf_prefix import HFPrefixModel
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.grouped_linear import GroupedLinear
 from pithtrain.operators.linear import BF16Linear
-from pithtrain.tasks.convert_checkpoint import ConvertCheckpointCfg
-from pithtrain.tasks.convert_checkpoint import launch as convert_launch
 
-# TODO_MODEL: default HF id and local root.  The root holds hf/ and dcp/
-# subdirs; both are created lazily on rank 0 when missing.
+# TODO_MODEL: default HF id and local root. The root holds hf/, downloaded lazily on rank 0, and
+# dcp/, one training checkpoint step (torch-dcp/XXXXXXXX) saved by a short run started from
+# training.hf_import_path = <root>/hf.
 DEFAULT_HF_ID = "TODO_MODEL"  # e.g. "mistralai/Mixtral-8x7B-v0.1"
 DEFAULT_ROOT = Path("/tmp/pithtrain-<model>")  # TODO_MODEL
 
@@ -69,28 +68,20 @@ DEFAULT_ROOT = Path("/tmp/pithtrain-<model>")  # TODO_MODEL
 # --- checkpoint prep (rank 0 only) ---
 
 
-def _ensure_dcp_checkpoint(hf_id: str, root: Path):
+def _ensure_hf_snapshot(hf_id: str, root: Path):
     hf_dir = root / "hf"
-    dcp_dir = root / "dcp"
-    if not dcp_dir.exists():
-        if not hf_dir.exists() or not (hf_dir / "config.json").exists():
-            print(f"[INFO] Downloading {hf_id} into {hf_dir}", flush=True)
-            snapshot_download(
-                repo_id=hf_id,
-                local_dir=hf_dir,
-                # TODO_MODEL: tighten the allow_patterns if the repo has
-                # extra files you don't need (e.g. original PyTorch weights
-                # when you're loading safetensors).
-                allow_patterns=["*.json", "model*.safetensors", "*.txt", "tokenizer*"],
-                ignore_patterns=["original/*", "metal/*"],
-            )
-        print(f"[INFO] Converting HF -> DCP into {dcp_dir}", flush=True)
-        cfg = ConvertCheckpointCfg()
-        cfg.operation = "hf2dcp"
-        cfg.load_path = hf_dir
-        cfg.save_path = dcp_dir
-        convert_launch(cfg)
-    return dcp_dir, hf_dir
+    if not hf_dir.exists() or not (hf_dir / "config.json").exists():
+        print(f"[INFO] Downloading {hf_id} into {hf_dir}", flush=True)
+        snapshot_download(
+            repo_id=hf_id,
+            local_dir=hf_dir,
+            # TODO_MODEL: tighten the allow_patterns if the repo has
+            # extra files you don't need (e.g. original PyTorch weights
+            # when you're loading safetensors).
+            allow_patterns=["*.json", "model*.safetensors", "*.txt", "tokenizer*"],
+            ignore_patterns=["original/*", "metal/*"],
+        )
+    return root / "dcp", hf_dir
 
 
 # --- DCP -> localized state_dict ---
@@ -265,7 +256,7 @@ def main(args):
     torch.set_default_device(distributed.device)
 
     if distributed.rank == 0:
-        dcp_path, hf_path = _ensure_dcp_checkpoint(args.hf_id, args.root)
+        dcp_path, hf_path = _ensure_hf_snapshot(args.hf_id, args.root)
     else:
         dcp_path = args.root / "dcp"
         hf_path = args.root / "hf"
@@ -275,7 +266,7 @@ def main(args):
     dualpipev = build_dualpipev(config, dtype)
 
     if distributed.rank == 0:
-        print(f"[INFO] Loading canonical DCP from {dcp_path}", flush=True)
+        print(f"[INFO] Loading training checkpoint from {dcp_path}", flush=True)
     canonical = _load_dcp_canonical(dcp_path)
     local_sd = _load_localized_from_canonical(canonical, dualpipev)
     missing, unexpected = dualpipev.load_state_dict(local_sd, strict=False)
