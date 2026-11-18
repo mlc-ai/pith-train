@@ -1,0 +1,50 @@
+{
+  "base_sha": "a0b14f7abbf4f84c7a9fbb76eb5a759a63f65010",
+  "feature_sha": "d237e4c3d5ce9e38cf80e16a38dbd8f2210d0e53",
+  "changed_production_files": [
+    "examples/convert_checkpoint/qwen3-omni-text/script.py",
+    "pithtrain/modules/checkpoint.py",
+    "pithtrain/modules/distributed_checkpoint.py",
+    "pithtrain/modules/training.py",
+    "pithtrain/tasks/convert_checkpoint/_core.py",
+    "pithtrain/tasks/convert_checkpoint/strict_omni.py",
+    "pithtrain/tasks/pretrain_lm.py"
+  ],
+  "unchanged_model_data_and_ordinary_converter_files": {
+    "pithtrain/models/qwen3_omni_moe.py": "e3d04719f5def7adde68cda510aae409c6c6e938bf25153f7fa737f0aab6c21e",
+    "pithtrain/modules/training_data.py": "6f048b0d8bc78850184728451562e08d5c7b563123f4869d897ed84274369b64",
+    "pithtrain/modules/dataset.py": "1e48edaf3cfb96260df6c5981a79e24a0c66e7a1141ddf936270b80c6c537f68",
+    "pithtrain/modules/data_config.py": "607d6c0ea87f06a3d0413ef9ab58174611152a09e60a49530043e64aff5e8de6",
+    "pithtrain/modules/model_config.py": "4306776be8c2f5b7410d686653f16a9bf9f6f46309077c5b622af1fe8f1cefc3",
+    "pithtrain/tasks/prepare_omni_data.py": "13c58d1cce5b569c5f4ed105892e19bcb5bfdeb0073e3ccf4ca07d6c922d09b2",
+    "pithtrain/tasks/convert_checkpoint/qwen3_omni_moe.py": "26c36716a3923176bbf836625e531f8745917b5e780be79947c6e6de85755393",
+    "tests/configs/qwen3_omni_text/tiny.json": "d03f488586dcb3053b10f24338dbe95d2bf4b8f499230adb980cfec98e86c702"
+  },
+  "identical_numerical_functions": [
+    "pithtrain/tasks/pretrain_lm.py:setup_dataset",
+    "pithtrain/tasks/pretrain_lm.py:objective",
+    "pithtrain/tasks/pretrain_lm.py:get_global_batch",
+    "pithtrain/tasks/pretrain_lm.py:train_step (checkpoint block excluded)",
+    "pithtrain/modules/training.py:make_adamw_optimizer",
+    "pithtrain/modules/training.py:make_wsd_scheduler",
+    "pithtrain/modules/training.py:init_weights",
+    "pithtrain/modules/training.py:apply_fsdp",
+    "pithtrain/modules/training.py:setup_model",
+    "pithtrain/modules/training.py:setup_training"
+  ],
+  "old_harness_gap": "save_interval=None, strict_resume=False and no converter invocation; only normal-training regression",
+  "revised_intervention": "feat0: native 1..16 -> strict checkpoint -> thinker. fused HF -> original strict container -> fresh exact boundary restore -> native17..32",
+  "configuration": "Same model, data, seed, optimizer, scheduler, loss/routing, global/microbatch and mesh. Only feat0 checkpoint/restart controls intentionally differ.",
+  "covers": "Post-PR100/Omni integration Week3 fixed-topology strict/HF bridge increment",
+  "does_not_cover": [
+    "Whole PR101",
+    "Whole PR100",
+    "Initial ordinary converter already present at baseline",
+    "Automatic pretrain_lm.launch resume glue (driver uses native setup/train_step and checkpoint APIs directly)",
+    "Malformed/edited HF companions and one-rank failures (separate CPU/155302 gates)",
+    "Uneven/empty expert shards (separate CPU tests, not four-expert GPU fixture)",
+    "Full-30B numeric, audio/video, CP>1, HSDP>1, Muon or topology-changing resume"
+  ],
+  "numerical_execution": "NOT_RUN",
+  "ready_for_user_review": false
+}

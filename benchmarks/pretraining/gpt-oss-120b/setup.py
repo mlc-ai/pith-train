@@ -41,7 +41,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
+cfg.data.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
 
 training = cfg.training
 training.model = Path("benchmarks/pretraining/gpt-oss-120b")

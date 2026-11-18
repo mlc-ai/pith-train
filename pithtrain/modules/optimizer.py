@@ -17,12 +17,33 @@ from torch.distributed.tensor import DTensor, Replicate
 __all__ = [
     "Muon",
     "clip_grad_norm",
+    "is_muon_param",
     "local_grads",
     "muon_scale_factor",
     "orthogonalized_updates",
     "scale_grads_",
     "zeropower_via_newtonschulz5",
 ]
+
+
+def is_muon_param(name: str, param: torch.Tensor) -> bool:
+    # Encoders (vision/audio towers), codec embeddings/heads and the shared-expert gate of the
+    # language model stay with AdamW, like the embeddings, LM head, routers and biases.
+    if param.ndim < 2 or "visual." in name or "audio_tower." in name:
+        return False
+    if name.endswith(".bias") or name.endswith("_bias"):
+        return False
+    if name.endswith(
+        ("embed_tokens.weight", "lm_head.weight", "codec_embedding.weight", "codec_head.weight")
+    ):
+        return False
+    if (
+        ".gate.weight" in name
+        or ".router.weight" in name
+        or (".model.layers." in "." + name and name.endswith("shared_expert_gate.weight"))
+    ):
+        return False
+    return True
 
 
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int) -> torch.Tensor:

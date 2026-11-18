@@ -6,8 +6,12 @@ import torch.nn as nn
 from torch.optim import AdamW
 
 from pithtrain.modules.checkpoint import to_canonical_optim, to_localized_optim
-from pithtrain.modules.optimizer import Muon, muon_scale_factor, zeropower_via_newtonschulz5
-from pithtrain.modules.training import is_muon_param
+from pithtrain.modules.optimizer import (
+    Muon,
+    is_muon_param,
+    muon_scale_factor,
+    zeropower_via_newtonschulz5,
+)
 
 # ---------------------------------------------------------------------------
 # Newton-Schulz orthogonalization

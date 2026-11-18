@@ -51,13 +51,22 @@ class GroupedLinearFunc(torch.autograd.Function):
         dgrad = F.grouped_mm(dy, weight, offs=offs)
         main_grad, ks, ks_tensor = ctx.main_grad, ctx.ks, ctx.ks_tensor
 
+        if main_grad is None and (not WeightGradStore.enabled or not weight.is_leaf):
+            # Return through autograd so casts/views reach their master leaves and hooks.
+            wgrad = F.grouped_mm(dy.transpose(0, 1), input, offs=offs)
+            return dgrad, wgrad, None, None, None, None
+
         def wgrad_fn(dy: torch.Tensor, x: torch.Tensor, offs: torch.Tensor) -> None:
             if main_grad is not None:
                 dy, x = dy.contiguous(), x.contiguous()
                 deep_gemm.k_grouped_bf16_gemm_tn_contiguous(dy, x, main_grad, ks, ks_tensor, c=main_grad)  # fmt: skip
                 return
             wgrad = F.grouped_mm(dy.transpose(0, 1), x, offs=offs)
-            weight.grad = wgrad if weight.grad is None else weight.grad.add_(wgrad)
+            # W-phase callbacks execute after the original backward has returned.
+            # Preserve the BF16 GEMM result, but let autograd run leaf accumulation
+            # hooks so FSDP can promote each contribution before the next W.
+            if weight.requires_grad:
+                torch.autograd.backward(weight, wgrad)
 
         if WeightGradStore.enabled:
             WeightGradStore.put(partial(wgrad_fn, dy.detach(), input.detach(), offs.detach()))

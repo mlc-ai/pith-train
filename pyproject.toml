@@ -19,6 +19,9 @@ dependencies = [
     "ruff",
 ]
 
+[project.optional-dependencies]
+omni-data = ["av", "fsspec", "librosa", "pillow", "pyarrow", "soundfile", "torchvision", "transformers>=5.17,<5.18"]
+
 [build-system]
 build-backend = "setuptools.build_meta"
 requires = ["setuptools>=61"]

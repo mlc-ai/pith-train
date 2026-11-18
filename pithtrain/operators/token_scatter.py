@@ -1,3 +1,10 @@
+"""
+Expert-grouped token scatter for the grouped GEMMs, and an index gather that does not save its
+input. The fused scatter places rows within a group in atomic order; deterministic=True (or the
+Talker's canonical=True) instead keeps every group's rows in input order, so bf16 grouped-wgrad
+sums do not depend on scheduling. That ordered placement is computed with stable integer sorts.
+"""
+
 from typing import Optional
 
 import torch
@@ -14,12 +21,59 @@ __all__ = [
 ]
 
 
+def ordered_scatter(
+    input_tokens: torch.Tensor,
+    expert_idxs: torch.Tensor,
+    num_groups: int,
+    padding_alignment: int,
+    group_counts: Optional[list[int]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    """
+    scatter_by_expert's contract with every group's rows in input order: a stable sort by expert
+    gives each row its ordinal in its group. Rows are copied exactly; padding and the allocation
+    tail up to a multiple of 1024 rows are zero.
+    """
+    num_tokens, hidden_size = input_tokens.shape[0], input_tokens.shape[1]
+    device = input_tokens.device
+    if expert_idxs.shape[0] != num_tokens:
+        raise ValueError(f"{expert_idxs.shape[0]=} must equal the input row count {num_tokens=}")
+    if num_tokens == 0:
+        empty = torch.empty((0,), device=device, dtype=torch.int32)
+        output_tokens = torch.empty((0, hidden_size), device=device, dtype=input_tokens.dtype)
+        return output_tokens, torch.empty((0,), device=device, dtype=torch.int64), empty, empty, []
+    counts = torch.bincount(expert_idxs, minlength=num_groups)
+    padded = (counts + padding_alignment - 1) // padding_alignment * padding_alignment
+    ks_tensor = padded.to(torch.int32)
+    grouped_mm_offs = padded.cumsum(0).to(torch.int32)
+    if group_counts is not None:
+        ks = [(c + padding_alignment - 1) // padding_alignment * padding_alignment for c in group_counts]  # fmt: skip
+    else:
+        ks = ks_tensor.tolist()
+    total = sum(ks)
+    order = torch.argsort(expert_idxs, stable=True)
+    sorted_ids = expert_idxs[order]
+    ordinal = torch.arange(num_tokens, device=device) - (counts.cumsum(0) - counts)[sorted_ids]
+    positions = (padded.cumsum(0) - padded)[sorted_ids] + ordinal
+    reverse_shuffle_idxs = torch.empty_like(order)
+    reverse_shuffle_idxs[order] = positions
+    buffer = input_tokens.new_zeros(((total + 1023) // 1024 * 1024, hidden_size))
+    buffer.index_copy_(0, reverse_shuffle_idxs, input_tokens)
+    return buffer[:total], reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks
+
+
 class ScatterForGroupedGemm(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, input_tokens, expert_idxs, num_groups, padding_alignment=128, group_counts=None
+        ctx,
+        input_tokens,
+        expert_idxs,
+        num_groups,
+        padding_alignment=128,
+        group_counts=None,
+        ordered=False,
     ):
-        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter_by_expert(
+        scatter = ordered_scatter if ordered else scatter_by_expert
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = scatter(
             input_tokens, expert_idxs, num_groups, padding_alignment, group_counts
         )
         ctx.save_for_backward(reverse_shuffle_idxs)
@@ -36,7 +90,7 @@ class ScatterForGroupedGemm(torch.autograd.Function):
     ):
         (reverse_shuffle_idxs,) = ctx.saved_tensors
         grad_input_tokens = grad_output_tokens[reverse_shuffle_idxs]
-        return grad_input_tokens, None, None, None, None
+        return (grad_input_tokens,) + (None,) * (len(ctx.needs_input_grad) - 1)
 
 
 class PaddedIndexGather(torch.autograd.Function):
@@ -82,6 +136,9 @@ def scatter_for_grouped_gemm(
     num_groups: int,
     padding_alignment: int = 128,
     group_counts: Optional[list[int]] = None,
+    *,
+    deterministic: bool = False,
+    canonical: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
     """
     Scatter input_tokens (m, hidden) into expert groups by expert_idxs (m,) int64, each group's
@@ -94,11 +151,18 @@ def scatter_for_grouped_gemm(
     - ks, ks_tensor: the padded group sizes, as a host list and a (num_groups,) int32 tensor.
 
     group_counts, the rows per group on the host if the caller has them, saves the blocking
-    device-to-host copy of the group sizes.
+    device-to-host copy of the group sizes. deterministic=True keeps each group's rows in input
+    order (it does not make an upstream EP dispatch or the GEMMs deterministic); canonical=True is
+    the same placement, used by the Talker's independent expert slots.
     """
     output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks_tensor, ks = (
         ScatterForGroupedGemm.apply(
-            input_tokens, expert_idxs, num_groups, padding_alignment, group_counts
+            input_tokens,
+            expert_idxs,
+            num_groups,
+            padding_alignment,
+            group_counts,
+            deterministic or canonical,
         )
     )
     return output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor

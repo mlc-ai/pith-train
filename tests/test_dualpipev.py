@@ -3,6 +3,7 @@ Compare DualPipeV loss, gradients and canonical weight export with a single-devi
 """
 
 import argparse
+import math
 import os
 from dataclasses import fields
 from pathlib import Path
@@ -21,6 +22,12 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerTextExperts,
+    Qwen3OmniMoeThinkerTextModel,
+    Qwen3OmniMoeThinkerTextTopKRouter,
+)
+from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
@@ -38,12 +45,19 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, (GroupedLinear, FP8GroupedLinear)):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, GptOssExperts):
+    elif isinstance(module, (GptOssExperts, Qwen3OmniMoeThinkerTextExperts)):
         # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
     elif isinstance(
-        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
+        module,
+        (
+            DeepSeekV2MoEGate,
+            Qwen3MoeGate,
+            GptOssTopKRouter,
+            Qwen35MoeTopKRouter,
+            Qwen3OmniMoeThinkerTextTopKRouter,
+        ),
     ):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
@@ -53,9 +67,18 @@ def fill_weights(module: nn.Module):
 
 
 def calculate_difference(x: torch.Tensor, y: torch.Tensor) -> float:
-    x, y = x.double(), y.double()
-    cos_diff = 1 - 2 * (x * y).sum().item() / (x * x + y * y).sum().item()
-    return cos_diff
+    # Expert tensors contain hundreds of millions of elements in the original Qwen case.
+    # Keep the same FP64 normalized squared-error metric without several full-size copies.
+    assert x.shape == y.shape, f"Gradient shapes differ: {x.shape} != {y.shape}"
+    x, y = x.reshape(-1), y.reshape(-1)
+    dot, squared_norm = 0.0, 0.0
+    for start in range(0, x.numel(), 1 << 20):
+        x_chunk = x[start : start + (1 << 20)].double()
+        y_chunk = y[start : start + (1 << 20)].double()
+        dot += torch.dot(x_chunk, y_chunk).item()
+        squared_norm += torch.dot(x_chunk, x_chunk).item() + torch.dot(y_chunk, y_chunk).item()
+    assert math.isfinite(dot) and math.isfinite(squared_norm), "Non-finite gradient comparison"
+    return 0.0 if squared_norm == 0 else 1 - 2 * dot / squared_norm
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -83,15 +106,14 @@ def records_empty(model: DualPipeV) -> bool:
 
 
 def reference_step(chunks, model: DeepSeekV2Model):
-    outputs, losses = [], []
+    losses = []
     for i, (micro_x, micro_labels, cu_seqlens) in enumerate(chunks):
         training.current_microbatch = i
         micro_y = model.reference_forward(micro_x, cu_seqlens)
         loss = criterion(micro_y, micro_labels)
         loss.backward()
-        outputs.append(micro_y)
-        losses.append(loss)
-    return torch.stack(losses), outputs
+        losses.append(loss.detach())
+    return torch.stack(losses)
 
 
 def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
@@ -301,6 +323,12 @@ def main(model_name: str):
     elif config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
+    elif config.model_type == "qwen3_omni_moe_talker_text":
+        ModelClass = Qwen3OmniMoeTalkerTextModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
+    elif config.model_type == "qwen3_omni_moe_text":
+        ModelClass = Qwen3OmniMoeThinkerTextModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
         ModelClass = GptOssModel
         keep = min(config.num_hidden_layers, 8)
@@ -386,12 +414,16 @@ def main(model_name: str):
             install_router_replay(
                 full_modules, micro_batch_size, step_index * num_global_chunks, chunks
             )
-        loss_refs.append(reference_step(chunks, full_modules)[0])
+        loss_refs.append(reference_step(chunks, full_modules))
     if replay:
         # Catch replay ignored by both paths: the unused expert must have zero gradient.
         for n, p in full_modules.named_parameters():
             if ".experts." in n:
                 assert not p.grad[-1].any(), f"{n}: a layer ignored the replayed routes"
+    # Reference gradients stay available on host for comparison. Keeping both
+    # full copies and their gradients on GPU makes the 8-layer Qwen case OOM.
+    full_modules.cpu()
+    torch.cuda.empty_cache()
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
     distributed.cp_size, distributed.cp_rank = cp_size, cp_rank
 
@@ -401,19 +433,29 @@ def main(model_name: str):
 
     local_full_modules = []
 
-    local_full_modules.append(ModelClass(config, phase=0))
-    local_full_modules.append(ModelClass(config, phase=1))
+    with torch.device("meta"):
+        local_full_modules.append(ModelClass(config, phase=0))
+        local_full_modules.append(ModelClass(config, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
-    if pp_rank == 0:
-        local_full_modules[0].embed_tokens = full_modules.embed_tokens
-        local_full_modules[1].norm = full_modules.norm
-        local_full_modules[1].lm_head = full_modules.lm_head
-    local_full_modules[0].layers = shard_layers(full_modules.layers, local_full_modules[0])
-    local_full_modules[1].layers = shard_layers(full_modules.layers, local_full_modules[1])
+    if isinstance(full_modules, Qwen3OmniMoeTalkerTextModel):
+        if pp_rank == 0:
+            local_full_modules[0].model.codec_embedding = full_modules.model.codec_embedding
+            local_full_modules[1].model.norm = full_modules.model.norm
+            local_full_modules[1].codec_head = full_modules.codec_head
+        for local in local_full_modules:
+            local.model.layers = shard_layers(full_modules.layers, local)
+    else:
+        if pp_rank == 0:
+            local_full_modules[0].embed_tokens = full_modules.embed_tokens
+            local_full_modules[1].norm = full_modules.norm
+            local_full_modules[1].lm_head = full_modules.lm_head
+        local_full_modules[0].layers = shard_layers(full_modules.layers, local_full_modules[0])
+        local_full_modules[1].layers = shard_layers(full_modules.layers, local_full_modules[1])
     if ep_size > 1:
-        shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
-        shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
+        with torch.device("cpu"):
+            shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
+            shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
 
     local_modules = []
 
@@ -498,12 +540,14 @@ def main(model_name: str):
             print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
+    print(f"[INFO] rank-{distributed.rank}: comparing gradients on CPU.", flush=True)
     eps = 1e-2
     largest_diff = 0
     largest_diff_param = None
     failed = False
 
     for (param_name, param), param_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):  # fmt: skip
+        assert param_ref.grad is not None, f"Reference parameter {param_name} has no gradient"
         if param.grad is None:
             print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, param_name))
             failed = True
@@ -516,6 +560,7 @@ def main(model_name: str):
         param_grad = param.grad
         if isinstance(param_grad, torch.distributed.tensor.DTensor):
             param_grad = param_grad.full_tensor()
+        param_grad = param_grad.cpu()
         if cp_size > 1:
             # Each CP rank takes a mean over S/cp tokens, which is cp times its share of the
             # full-sequence mean, so the summed gradient overshoots the reference by exactly cp.
@@ -529,9 +574,13 @@ def main(model_name: str):
         # The reference accumulates in bf16 and DualPipeV in fp32, so the diff of gradients at the
         # noise floor (gpt-oss router.bias, about 1e-8) is meaningless. Routed expert weights are
         # exempt: their gradients scale as 1/num_experts, so a fixed floor would skip them all on
-        # a many-expert config.
+        # a many-expert config. The Talker is checked at every scale.
         ref_max = param_ref.grad.abs().max().item()
-        if ref_max < 1e-5 and ".experts." not in param_name:
+        if (
+            ref_max < 1e-5
+            and ".experts." not in param_name
+            and config.model_type != "qwen3_omni_moe_talker_text"
+        ):
             print(
                 "[warn] rank-%d, Parameter %s grad max=%.2e at bf16 noise floor, skipping."
                 % (distributed.rank, param_name, ref_max)
@@ -604,7 +653,7 @@ def main(model_name: str):
             weight = reference.pop(name)
             if updated:
                 weight = weight.neg().masked_fill_(weight == 0, 1)
-            assert torch.equal(tensor, weight), (distributed.rank, name, updated)
+            assert torch.equal(tensor.cpu(), weight), (distributed.rank, name, updated)
         assert not reference, (distributed.rank, sorted(reference)[:5])
     torch.distributed.barrier()
     if distributed.rank == 0:
@@ -619,6 +668,15 @@ def entry() -> None:
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
+
+    models.extend(
+        [
+            "tests/configs/qwen3_omni_text/tiny.json",
+            "tests/configs/qwen3_omni_talker_text/tiny.json",
+            "examples/pretrain_lm/qwen3-omni-talker-text/config.json",
+            "examples/pretrain_lm/qwen3-omni-thinker-text/config.json",
+        ]
+    )
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
