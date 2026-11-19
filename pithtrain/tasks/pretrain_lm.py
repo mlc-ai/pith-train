@@ -200,6 +200,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
 
+    torch.cuda.synchronize()
     step_end_time = time.time()
     elapsed_tensor = torch.tensor(step_end_time - step_start_time, device=device)
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
