@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch._functorch.utils import unwrap_dead_wrappers
+from torch.distributed import _spmd_no_typecheck
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp import (
     register_fsdp_forward_method as upstream_register_fsdp_forward_method,  # fmt: skip
@@ -131,11 +131,6 @@ def cast_call_inputs(state: Any, args: tuple, kwargs: dict, flags: int) -> tuple
     return args, kwargs
 
 
-# RegisterPostBackwardFunction.apply without Function.apply's bind_default_args, an
-# inspect.signature per call that is a no-op here: forward(param_group, *inputs) has no defaults.
-register_post_backward_apply = super(torch.autograd.Function, RegisterPostBackwardFunction).apply
-
-
 def repeat_call_ok(state: Any) -> bool:
     """
     Whether a call may take the lean path: FSDP's full pre- and post-forward would reduce to the
@@ -207,7 +202,7 @@ def register_fsdp_forward_method(module: nn.Module, method_name: str) -> None:
                 scan_call(args, kwargs, None, tensors)
             recollect = True  # this group replaces them for the next one
             if tensors:
-                applied = register_post_backward_apply(*unwrap_dead_wrappers((group, *tensors)))
+                applied = RegisterPostBackwardFunction.apply(group, *tensors)
                 replacements = iter(applied)
                 args = replace_grad_tensors(args, replacements)
                 kwargs = {name: replace_grad_tensors(value, replacements) for name, value in kwargs.items()}  # fmt: skip
@@ -250,13 +245,12 @@ def lean_post_backward(post_backward):
     def lean(param_group, *unused):
         if param_group.reduce_grads:
             return post_backward(param_group, *unused)
-        param_group._training_state = TrainingState.POST_BACKWARD
-        for fsdp_param in param_group.fsdp_params:
-            fsdp_param.accumulate_unsharded_grad_if_needed()
-        if param_group.reshard_after_backward:
-            param_group.reshard()
-        for fsdp_param in param_group.fsdp_params:
-            fsdp_param.to_accumulated_grad_if_needed()
+        with _spmd_no_typecheck():
+            param_group._training_state = TrainingState.POST_BACKWARD
+            param_group._post_backward_pending = True
+            param_group._set_unsharded_grad_dtypes(defer_upcast=False)
+            if param_group.reshard_after_backward:
+                param_group.reshard()
 
     return lean
 

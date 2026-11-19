@@ -2,15 +2,15 @@
 Weight-gradient accumulation into a layer-owned fp32 buffer.
 
 BF16Linear, GroupedLinear and FP8GroupedLinear add their weight gradient straight into the fp32
-main_grad buffer instead of writing a bf16 .grad that FSDP2 then adds into its own fp32 buffer. It
-also keeps the sum across micro-batches in fp32 under DualPipeV, where FSDP2 would otherwise add
-most micro-batches together in bf16. setup_model enables it for every run, BF16 or FP8.
+main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into
+FSDP2's fp32 .grad: the GEMM accumulates in fp32, so no micro-batch's gradient is rounded to bf16
+and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
 - pre_backward allocates and zeroes main_grad at the first backward of the step.
-- post_backward, when the group reduces, hands main_grad to FSDP2 as the accumulated gradient of the
-  parameter and releases its memory once FSDP2 has copied it into the reduce-scatter input.
+- post_backward, when the group reduces, hands main_grad to FSDP2 as the gradient of the parameter
+  and releases its memory once FSDP2 has copied it into the reduce-scatter input.
 
 main_grad keeps the same tensor object across steps, so compiled graphs that take it as an input
 stay valid. Without install, main_grad is None and the layer behaves like its torch.nn version.
@@ -21,9 +21,17 @@ BF16 CuTe experts) add their fp32 result straight into ``main_grad`` (``operator
 instead of a bf16 ``.grad`` per micro-batch next to FSDP2's fp32 sum: 2 B/param less (4.5 GiB for
 gpt-oss-20b at EP8 on one node), and the per-micro-batch gradients are no longer rounded to bf16
 before they are summed.
+
+install_side_grads keeps every other gradient off the unsharded parameter during the step. Torch
+2.15's FSDP2 accumulates .grad in the reduce dtype (fp32) on the bf16 unsharded parameter, and the
+pipeline defers the reduce to the end of the step, so a parameter would carry an fp32 .grad into
+the next micro-batch's compiled forward, which Dynamo rejects ("dtype mismatch between tensor and
+its gradient"). A post-accumulate-grad hook moves such a .grad into an fp32 sum and clears it; the
+group's post_backward hands the sum back as .grad when the group reduces, before the main_grad hook
+above (which adds it into main_grad) and FSDP2's reduce-scatter.
 """
 
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,7 +49,7 @@ from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.main_grad import MAIN_GRADS
 
-__all__ = ["install_raw_main_grad", "install_wgrad_accumulation"]
+__all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumulation"]
 
 
 def install_wgrad_accumulation(model: nn.Module) -> None:
@@ -92,18 +100,15 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
         if not group.reduce_grads:
             orig_post_backward(*args)
             return
-        # FSDP2 reduces a group in one dtype, so move the bf16 gradients into fp32 first.
-        for fsdp_param in group.fsdp_params:
-            if hasattr(fsdp_param, "_unsharded_param"):
-                fsdp_param.accumulate_unsharded_grad_if_needed()
-                fsdp_param.to_accumulated_grad_if_needed()
         # Keep any gradient the weight got outside its layer, e.g. kv_b_proj in MLA ring attention.
         for fsdp_param, main_grad in pairs:
             if main_grad.untyped_storage().size() > 0:
-                if fsdp_param.unsharded_accumulated_grad is not None:
-                    main_grad.add_(fsdp_param.unsharded_accumulated_grad)
+                param = fsdp_param.unsharded_param
+                if param.grad is not None:
+                    main_grad.add_(param.grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
-                fsdp_param.unsharded_accumulated_grad = main_grad.contiguous()
+                # The parameter's grad_dtype is fp32 (the reduce dtype) or None, so it takes fp32.
+                param.grad = main_grad.contiguous()
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.
         for _, main_grad in pairs:
@@ -136,3 +141,59 @@ def install_raw_main_grad(model: nn.Module) -> None:
                 pairs.append((fsdp_param, mg))
             if pairs:
                 _attach_main_grads(group, pairs)
+
+
+def install_side_grads(model: nn.Module) -> None:
+    """
+    Keep each FSDP2 parameter's .grad empty while the step accumulates, after the main_grad
+    installs (its post_backward has to run before theirs).
+    """
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            for group in fully_shard.state(module)._fsdp_param_groups:
+                _attach_side_grads(group)
+
+
+def _attach_side_grads(group: FSDPParamGroup) -> None:
+    """
+    Move a .grad whose dtype differs from its parameter's into a per-parameter sum during the step,
+    and hand the sums back as .grad when the group reduces.
+    """
+    orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
+    sums: Dict[int, torch.Tensor] = {}
+    hooked: Dict[int, torch.Tensor] = {}
+
+    def make_hook(index: int):
+        def hook(param: torch.Tensor) -> None:
+            grad = param.grad
+            if grad is None or grad.dtype == param.dtype:
+                return
+            if index in sums:
+                sums[index].add_(grad)
+            else:
+                sums[index] = grad
+            param.grad = None
+
+        return hook
+
+    def pre_backward(*args: Any) -> None:
+        # The unsharded parameters exist once the group has been all-gathered; FSDP2 keeps the
+        # same objects across steps, so each is hooked once (again if FSDP2 ever replaces it).
+        for index, fsdp_param in enumerate(group.fsdp_params):
+            param = fsdp_param.unsharded_param
+            if hooked.get(index) is not param:
+                param.register_post_accumulate_grad_hook(make_hook(index))
+                hooked[index] = param
+        orig_pre_backward(*args)
+
+    def post_backward(*args: Any) -> None:
+        if group.reduce_grads:
+            for index, fsdp_param in enumerate(group.fsdp_params):
+                grad = sums.pop(index, None)
+                if grad is not None:
+                    param = fsdp_param.unsharded_param
+                    param.grad = grad if param.grad is None else grad.add_(param.grad)
+        orig_post_backward(*args)
+
+    group.pre_backward = pre_backward
+    group.post_backward = post_backward

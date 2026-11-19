@@ -39,7 +39,7 @@ def clamped_swiglu_bwd(grad_output: torch.Tensor, gate_up: torch.Tensor, alpha: 
 
     grad_output is contiguous (M, N) in gate_up's dtype; gate_up is the saved contiguous (M, 2N)
     forward input. The gate gradient is zero where gate > limit, the up gradient zero where
-    |up| > limit (the boundary itself passes the gradient, as torch.clamp does). fp32 arithmetic,
+    |up| > limit (the boundary itself passes the gradient, as torch.clamp did before torch 2.15). fp32 arithmetic,
     rounded once to the dtype. Deterministic.
     """
     match ARCH_MAJOR:

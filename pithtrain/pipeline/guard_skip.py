@@ -29,7 +29,7 @@ from pithtrain.contexts import distributed, training
 
 __all__ = ["GuardSkip"]
 
-VALIDATED_TORCH = "2.13."
+VALIDATED_TORCH = "2.15."
 
 
 def torch_validated() -> bool:

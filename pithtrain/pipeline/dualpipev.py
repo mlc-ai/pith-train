@@ -652,8 +652,8 @@ class DualPipeV(nn.Module):
         # Release FP8 weight caches so the memory is available for optimizer.step().
         FP8WeightCacheControl.clear(*self.module)
 
-        # End of the ZeRO-1 step: fold the bf16 gradients into the fp32 buffers, reduce-scatter
-        # each group once, reshard its weights, and run the root callback skipped above.
+        # End of the ZeRO-1 step: reduce-scatter each group's fp32 gradients once, reshard its
+        # weights, and run the root callback skipped above.
         for module in self.module:
             if not isinstance(module, FSDPModule):
                 continue
@@ -669,11 +669,10 @@ class DualPipeV(nn.Module):
             fsdp_state = fully_shard.state(module)
             for state in fsdp_state._state_ctx.all_states:
                 if state._fsdp_param_group:
-                    for fsdp_param in state._fsdp_param_group.fsdp_params:
-                        if hasattr(fsdp_param, "_unsharded_param"):
-                            fsdp_param.accumulate_unsharded_grad_if_needed()
-                            fsdp_param.to_accumulated_grad_if_needed()
                     state._fsdp_param_group.post_backward()
+            # The callback reads the finalization mode FSDP records when it queues the callback
+            # itself, which the skip above bypasses: automatic, as without the skip.
+            fsdp_state._state_ctx.manual_backward_finalization_active = False
             fsdp_state._root_post_backward_final_callback()
 
         return objective_outputs
