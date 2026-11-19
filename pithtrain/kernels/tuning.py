@@ -10,10 +10,14 @@ tune_kernels() is called on every rank before the first training step and after 
 installs the choices cached for this setup (a file every node of the cluster sees, named by the GPU
 and a fingerprint of the library versions, the candidates and the kernel source), so a repeated
 setup runs tuned from its first step. The second pools the keys every rank used that the cache
-lacked, splits the timing of their candidates across the ranks on synthetic inputs (dropping any
-whose results differ from the default's), pools the timings, installs the same choice on every rank
-and adds it to the cache. Nothing is timed after that. Every exchange happens inside tune_kernels(),
-which all ranks reach; none happens while a launch picks its config.
+lacked and splits their buckets across the ranks in runs of about equal rows. Each rank times every
+candidate of a key and bucket it was given on its own GPU, on the same synthetic inputs, in
+interleaved passes (dropping any whose results differ from the default's), since GPUs differ in
+speed by about as much as MARGIN. The ranks pool the timings and install the same choice everywhere:
+of the candidates within MARGIN of the fastest, the default if it is one, else the lowest index, so
+near-ties resolve the same way on every run. Rank 0 adds it to the cache. Nothing is timed after
+that. Every exchange happens inside tune_kernels(), which all ranks reach; none happens while a
+launch picks its config.
 """
 
 import fcntl
@@ -44,10 +48,22 @@ Buckets tuned on each side of every bucket the first step used, so later steps w
 
 MARGIN = 0.03
 """
-A candidate replaces the default only if it is this much faster, so near-ties keep the default.
+Candidates within this much of the fastest count as tied: of those the default is chosen if it is
+among them, else the lowest candidate index, so near-ties resolve the same way on every run.
 """
 
-WARMUP, ITERS = 3, 10
+WARMUP, ROUNDS, ITERS = 3, 5, 4
+"""
+Each candidate of a key and bucket runs WARMUP times, then ROUNDS passes over all of them time ITERS
+launches of each, every pass starting one candidate later; a candidate's time is the median of its
+ROUNDS * ITERS launches.
+"""
+
+UNIT_ROWS = 1 << 12
+"""
+Rows per group whose timing costs about as much as setting up a key and bucket, the weight every
+bucket carries on top of its rows when the buckets are split across the ranks.
+"""
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache/pithtrain/tuning"
 """
@@ -170,18 +186,6 @@ def write_cache(entries: list) -> None:
             raise
 
 
-def time_launch(launch: Callable, config) -> float:
-    for _ in range(WARMUP):
-        launch(config)
-    events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(ITERS)]
-    for start, end in events:
-        start.record()
-        launch(config)
-        end.record()
-    torch.cuda.synchronize()
-    return sorted(start.elapsed_time(end) * 1e3 for start, end in events)[ITERS // 2]
-
-
 def same_results(outputs: tuple, reference: tuple) -> bool:
     """
     The tolerance, 2^-6 of the reference's largest magnitude, allows
@@ -190,31 +194,73 @@ def same_results(outputs: tuple, reference: tuple) -> bool:
     return all(torch.allclose(out.float(), ref.float(), rtol=0, atol=2**-6 * max(ref.float().abs().max().item(), 1e-30)) for out, ref in zip(outputs, reference))
 
 
-def time_candidate(tunable: Tunable, key: tuple, bucket: int, config) -> float | None:
+def time_candidates(tunable: Tunable, key: tuple, bucket: int) -> dict:
     """
-    Times config at 1.5x the bucket's lower bound. None when the inputs would not fit, the config
-    fails, or its results differ from the default's.
+    Times every candidate of the key at 1.5x the bucket's lower bound, all on the same inputs and
+    GPU, in ROUNDS interleaved passes, so a drift in clock speed reaches all of them alike. Returns
+    {candidate index: microseconds}, leaving out a candidate that fails (a config this kernel kind
+    cannot take) or whose results differ from the default's; empty when the inputs would not fit.
     """
     launch = tunable.prepare(key, 3 << (bucket - 1))
     if launch is None:
-        return None
+        return {}
     try:
         reference = tuple(out.clone() for out in launch(tunable.default(key)))
-        if not same_results(launch(config), reference):
-            return None
-        return time_launch(launch, config)
+    except Exception:
+        return {}
+    valid = [idx for idx, config in enumerate(tunable.candidates) if runs_like(launch, config, reference)]
+    for idx in valid:
+        for _ in range(WARMUP):
+            launch(tunable.candidates[idx])
+    events = {idx: [] for idx in valid}
+    for shift in range(ROUNDS if valid else 0):
+        for idx in valid[shift % len(valid):] + valid[:shift % len(valid)]:
+            for _ in range(ITERS):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                launch(tunable.candidates[idx])
+                end.record()
+                events[idx].append((start, end))
+    torch.cuda.synchronize()
+    return {idx: sorted(start.elapsed_time(end) * 1e3 for start, end in pairs)[len(pairs) // 2] for idx, pairs in events.items()}
+
+
+def runs_like(launch: Callable, config, reference: tuple) -> bool:
+    """
+    Whether config runs (compiling on first use) and gives the reference's results.
+    """
+    try:
+        return same_results(launch(config), reference)
     except Exception:  # a config this kernel kind cannot take
-        return None
+        return False
+
+
+def split_units(units: list, world_size: int) -> list:
+    """
+    Splits the (name, key, bucket) units across the ranks as contiguous runs of the units in key
+    order, cut so each run holds about the same rows (UNIT_ROWS added per unit for its setup). A
+    run spans few keys, so each rank compiles the candidates of few kernel kinds. Every rank
+    computes the same split.
+    """
+    units = sorted(units, key=lambda unit: (repr(unit[:2]), unit[2]))
+    weights = [(3 << (bucket - 1)) + UNIT_ROWS for name, key, bucket in units]
+    shares, total, done = [[] for _ in range(world_size)], sum(weights), 0
+    for unit, weight in zip(units, weights):
+        shares[min((done + weight // 2) * world_size // total, world_size - 1)].append(unit)
+        done += weight
+    return shares
 
 
 def tune_kernels() -> dict:
     """
     Install this setup's cached choices, then tune every key any rank has used that they lack. Call
-    on every rank before the first training step and after it. Per key and bucket the fastest
-    candidate is installed unless the default is within MARGIN, and rank 0 adds it to the cache;
-    every rank then compiles the configs it will launch and checks that all ranks installed the same
-    choices, which also lines them up so the next step starts together. Returns {(name, key,
-    bucket): (config, default)} of this call.
+    on every rank before the first training step and after it. The buckets to tune are split across
+    the ranks (split_units), and the rank given a key and bucket times all its candidates
+    (time_candidates). Per key and bucket the candidates within MARGIN of the fastest tie, and the
+    default is installed if it is one of them, else the lowest candidate index of them; rank 0 adds
+    the choice to the cache. Every rank then compiles the configs it will launch and checks that all
+    ranks installed the same choices, which also lines them up so the next step starts together.
+    Returns {(name, key, bucket): (config, default)} of this call.
     """
     rank, world_size = (dist.get_rank(), dist.get_world_size()) if dist.is_available() and dist.is_initialized() else (0, 1)
     if not CACHED:  # the first call reads the cache: rank 0's read, the same on every rank
@@ -227,23 +273,20 @@ def tune_kernels() -> dict:
     for name, key, buckets in (entry for entries in gather(pending) for entry in entries):
         for bucket in buckets:
             buckets_of.setdefault((name, key), set()).update(range(max(bucket - BUCKET_SPREAD, MIN_BUCKET), min(bucket + BUCKET_SPREAD, MAX_BUCKET) + 1))
-    tasks = [(name, key, idx) for (name, key) in sorted(buckets_of, key=repr) for idx in range(len(TUNABLES[name].candidates))]
+    units = [(name, key, bucket) for (name, key), buckets in buckets_of.items() for bucket in buckets]
 
-    timings = []
-    for name, key, idx in tasks[rank::world_size]:
-        tunable = TUNABLES[name]
-        timings += [(name, key, bucket, idx, time_candidate(tunable, key, bucket, tunable.candidates[idx])) for bucket in sorted(buckets_of[(name, key)])]
+    timings = [(name, key, bucket, time_candidates(TUNABLES[name], key, bucket)) for name, key, bucket in split_units(units, world_size)[rank]]
     torch.cuda.empty_cache()
 
     times_of: dict[tuple, dict] = {}
-    for name, key, bucket, idx, us in (timing for rank_timings in gather(timings) for timing in rank_timings):
-        if us is not None:
-            times_of.setdefault((name, key, bucket), {})[idx] = us
+    for name, key, bucket, times in (timing for rank_timings in gather(timings) for timing in rank_timings):
+        if times:
+            times_of[(name, key, bucket)] = times
     for (name, key, bucket), times in sorted(times_of.items(), key=repr):
         tunable = TUNABLES[name]
-        default, fastest = tunable.default(key), min(times, key=lambda idx: (times[idx], idx))
-        default_idx = tunable.candidates.index(default) if default in tunable.candidates else None
-        config = default if default_idx in times and times[default_idx] <= times[fastest] * (1 + MARGIN) else tunable.candidates[fastest]
+        default, fastest = tunable.default(key), min(times.values())
+        tied = [idx for idx in sorted(times) if times[idx] <= fastest * (1 + MARGIN)]
+        config = default if default in (tunable.candidates[idx] for idx in tied) else tunable.candidates[tied[0]]
         tunable.installed.setdefault(key, {})[bucket] = config
         chosen[(name, key, bucket)] = (config, default)
 
