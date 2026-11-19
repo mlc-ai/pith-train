@@ -1,10 +1,9 @@
-"""Checkpoint conversion between HuggingFace safetensors and DCP."""
+"""Checkpoint export from DCP to HuggingFace safetensors."""
 
-from ._core import ConvertCheckpointCfg, dcp2hf, hf2dcp, launch
+from ._core import ConvertCheckpointCfg, dcp2hf, launch
 
 __all__ = [
     "ConvertCheckpointCfg",
     "dcp2hf",
-    "hf2dcp",
     "launch",
 ]

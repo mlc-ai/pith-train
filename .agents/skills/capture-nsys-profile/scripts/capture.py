@@ -11,14 +11,14 @@ MODELS = {
     "deepseek-v2-lite": {
         "model": "examples/pretrain_lm/deepseek-v2-lite",
         "dataset": "workspace/datasets/dclm-baseline/toktxt/deepseek-v2",
-        "save_location": "workspace/checkpoints/deepseek-v2-lite",
+        "hf_import": "workspace/checkpoints/deepseek-v2-lite/hf-import",
         "moe_load_balance_type": "sequence",
         "moe_load_balance_coef": 1e-3,
     },
     "qwen3-30b-a3b": {
         "model": "examples/pretrain_lm/qwen3-30b-a3b",
         "dataset": "workspace/datasets/dclm-baseline/toktxt/qwen3",
-        "save_location": "workspace/checkpoints/qwen3-30b-a3b",
+        "hf_import": "workspace/checkpoints/qwen3-30b-a3b/hf-import",
         "moe_load_balance_type": "global-batch",
         "moe_load_balance_coef": 1e-3,
     },
@@ -64,7 +64,7 @@ training.sequence_length = parsed.sequence_length
 training.moe_load_balance_type = specs["moe_load_balance_type"]
 training.moe_load_balance_coef = specs["moe_load_balance_coef"]
 training.fp8 = False
-training.save_location = Path(specs["save_location"])
+training.hf_import_path = Path(specs["hf_import"])
 training.nsys_start = 5
 training.nsys_stop = 6
 

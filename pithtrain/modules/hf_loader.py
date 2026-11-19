@@ -1,5 +1,5 @@
 """
-Stream a HuggingFace safetensors checkpoint into a live FSDP-sharded model, skipping hf2dcp.
+Stream a HuggingFace safetensors checkpoint into a live FSDP-sharded model.
 
 Each rank reads only the rows of its own shards from the safetensors files. Per-model quirks live
 in optional hooks on the matching converter in ``hf_converters._registry``.

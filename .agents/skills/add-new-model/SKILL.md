@@ -42,7 +42,7 @@ Phases 1-4 are modeling + training correctness. Phases 5-6 are real-weight infer
 | 2 | Wire into `pithtrain/modules/training.py` + `tests/test_dualpipev.py` + example config | Example config mirrors upstream; imports clean |
 | 3 | Single-GPU sanity test | pp=1/ep=1 `test_dualpipev.py` passes (loss `allclose` 1e-3, grad `calc_diff` < 1e-2, weight sync `torch.equal`) |
 | 4 | FSDP scaling (pp=1/ep=1 -> 2/2) | All 4 configs pass |
-| 5 | *(If needed)* Checkpoint converter + round-trip | `hf -> dcp -> hf -> transformers.load` succeeds |
+| 5 | *(If needed)* Checkpoint converter + round-trip | `hf import -> save -> dcp2hf -> transformers.load` succeeds |
 | 6 | *(If needed)* Ad-hoc inference test | Coherent text from real weights |
 
 Do not skip ahead. Each phase is a gate: if phase N fails, do not move to phase N+1. If you're tempted to, stop and read `reference/pitfalls.md`.
@@ -156,7 +156,7 @@ Run the ladder in that order. After each step, stop and diagnose before continui
 
 ## Phase 5 - Checkpoint converter (only if needed)
 
-**Skip this phase entirely** if the user only wants training from scratch (no real released weights involved). The generic path in `pithtrain/tasks/convert_checkpoint/_core.py` already handles un-quantized, un-transposed HF checkpoints - Qwen3 and DeepSeek-V2 work with no model-specific converter.
+**Skip this phase entirely** if the user only wants training from scratch (no real released weights involved). The generic import (`training.hf_import_path`) and export (`dcp2hf`) already handle un-quantized, un-transposed HF checkpoints - Qwen3 and DeepSeek-V2 work with no model-specific converter.
 
 **Add a converter only if one of the following applies:**
 
@@ -166,10 +166,10 @@ Run the ladder in that order. After each step, stop and diagnose before continui
 
 **Load `reference/checkpoint.md` before starting this phase.**
 
-1. Create `pithtrain/modules/hf_converters/<model>.py` with a `<Model>Converter` class (see `gpt_oss.py` for the pattern). Implement `detect_hf` / `detect_dcp` probes, `hf2dcp`, and `postprocess_canonical`.
+1. Create `pithtrain/modules/hf_converters/<model>.py` with a `<Model>Converter` class (see `gpt_oss.py` for the pattern). Implement `detect_hf` / `detect_dcp` probes, `plan_param` (and `expected_unmapped` if some HF keys have no counterpart), and `postprocess_canonical`.
 2. Register the converter instance in `pithtrain/modules/hf_converters/_registry.py` (append to `CONVERTERS`).
-3. Write an `examples/convert_checkpoint/<model>/script.py` that downloads + converts. Mirror `examples/convert_checkpoint/gpt-oss-20b/script.py`.
-4. Run the round-trip: hf -> dcp -> hf -> `transformers.AutoModelForCausalLM.from_pretrained`. Compare `state_dict()` element-wise against HF's own BF16 dequant. Expected `max_abs_diff == 0`.
+3. Write an `examples/convert_checkpoint/<model>/script.py` that downloads + exports. Mirror `examples/convert_checkpoint/gpt-oss-20b/script.py`.
+4. Run the round-trip: HF import (one-step run at `lr = 0` that saves) -> `dcp2hf` -> `transformers.AutoModelForCausalLM.from_pretrained`. Compare `state_dict()` element-wise against HF's own BF16 dequant. Expected `max_abs_diff == 0`.
 
 **Gate:** round-trip succeeds, one expert weight compares element-wise equal (not just norms!) against HF's live tensor.
 
@@ -179,7 +179,7 @@ Run the ladder in that order. After each step, stop and diagnose before continui
 
 Only needed if the user wants to verify that real weights produce coherent text. **This test is not committed** - it's model-specific and lives as a scratch file.
 
-1. Start from `templates/inference_test.py` - the DualPipeV autoregressive harness, parameterized for any `<Model>Model`. Fill in the model-class import and HF ID default.
+1. Start from `templates/inference_test.py` - the DualPipeV autoregressive harness, parameterized for any `<Model>Model`. Fill in the model-class import and HF ID default. It loads `<root>/dcp`, a training checkpoint step: save one first with the phase-5 round-trip run (HF import at `lr = 0`, one step).
 2. Run the same pp/ep scaling ladder as phase 4 (same torchrun form, replace `tests/test_dualpipev.py` with `tests/test_<model>_inference.py` and drop `--model <cfg>`). Each config should print coherent continuations.
 3. Compare outputs across configurations - they should produce identical tokens (within bf16 noise). If a specific config produces gibberish, diagnose by layer/stage - do not loosen expectations.
 
@@ -214,7 +214,7 @@ Three sweeps on the new files before opening the PR - low-noise, high-signal sel
 - `reference/protocol.md` - 5-stage protocol, `Model.forward`/`backward`, stage-record copy
 - `reference/conventions.md` - naming, tensor layout, canonical keys
 - `reference/compile.md` - three `@torch.compile(fullgraph=True)` hot regions, unwrap patterns
-- `reference/checkpoint.md` - hf2dcp/dcp2hf recipes, when to add, round-trip validation
+- `reference/checkpoint.md` - HF import / dcp2hf recipes, when to add, round-trip validation
 - `reference/testing.md` - pp/ep scaling ladder, test_dualpipev wiring, label scaling
 - `reference/pitfalls.md` - NaN padding, `.view()` vs `.transpose()`, silent-zero experts, etc.
 

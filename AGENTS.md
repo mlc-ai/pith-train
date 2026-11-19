@@ -73,7 +73,7 @@ bash examples/tokenize_corpus/launch.sh dclm-qwen3
 # Pretrain (qwen3-30b-a3b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
 bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 
-# Convert a training checkpoint to / from HuggingFace
+# Download released HuggingFace weights (for training.hf_import_path) and export the newest checkpoint
 bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b
 ```
 

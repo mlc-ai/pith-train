@@ -1,20 +1,18 @@
-"""Generic HF<->DCP conversion, dispatcher, and launch entry-point.
+"""Generic DCP->HF export and launch entry-point.
 
-Model-specific converters (quantized weights, stacked experts, layout
-transposes) live in sibling modules and are registered in
-``_registry.CONVERTERS``. The generic path here handles un-quantized,
-un-transposed HF checkpoints (Qwen3, DeepSeek-V2).
+Model-specific postprocessing (stacked experts, layout transposes) lives in
+``hf_converters._registry.CONVERTERS``. The generic path here handles
+un-quantized, un-transposed HF checkpoints (Qwen3, DeepSeek-V2).
 """
 
 import json
 from dataclasses import dataclass, field
 from logging import Logger
 from pathlib import Path
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed.checkpoint as dcp
-from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed.checkpoint import FileSystemReader
 
@@ -28,9 +26,6 @@ from pithtrain.modules.logging import LoggingCfg, setup_logging
 class ConvertCheckpointCfg(SlottedDefault):
     """Configuration for checkpoint conversion."""
 
-    operation: Literal["hf2dcp", "dcp2hf"]
-    """Conversion operation."""
-
     load_path: Path
     """Source checkpoint directory."""
 
@@ -42,34 +37,6 @@ class ConvertCheckpointCfg(SlottedDefault):
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
-
-
-def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
-    """Convert HuggingFace checkpoint to DCP format."""
-    load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
-
-    for converter in CONVERTERS:
-        if converter.detect_hf(load_path):
-            stdout.info("Dispatching hf2dcp to %s converter" % converter.name)
-            converter.hf2dcp(load_path, save_path, stdout)
-            return
-
-    with open(Path(load_path, "model.safetensors.index.json")) as f:
-        weight_map = json.load(f)["weight_map"]
-
-    shard_files = set(weight_map.values())
-    stdout.info("Converting HF checkpoint from %s (%d shards)" % (load_path, len(shard_files)))
-
-    model_state_dict: Dict[str, torch.Tensor] = dict()
-    for i, shard_file in enumerate(sorted(shard_files), start=1):
-        stdout.info("Reading shard %d/%d: %s" % (i, len(shard_files), shard_file))
-        with safe_open(str(Path(load_path, shard_file)), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                model_state_dict[key.removeprefix("model.")] = f.get_tensor(key)
-
-    save_path.mkdir(parents=True, exist_ok=True)
-    dcp.save({"app": {"model": model_state_dict}}, checkpoint_id=save_path, no_dist=True)
-    stdout.info("Saved DCP checkpoint to %s (%d weights)" % (save_path, len(model_state_dict)))
 
 
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
@@ -135,8 +102,4 @@ def launch(cfg: ConvertCheckpointCfg) -> None:
     """Launch checkpoint conversion."""
     setup_logging(cfg)
     logging.stdout.info("launch(cfg=%s)" % cfg)
-    match cfg.operation:
-        case "hf2dcp":
-            hf2dcp(cfg, logging.stdout)
-        case "dcp2hf":
-            dcp2hf(cfg, logging.stdout)
+    dcp2hf(cfg, logging.stdout)

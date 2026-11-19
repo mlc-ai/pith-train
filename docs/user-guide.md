@@ -60,7 +60,7 @@ The launch script auto-detects GPUs and supports both single-node and multi-node
 bash examples/convert_checkpoint/launch.sh <model>
 ```
 
-Convert a training checkpoint to standard Hugging Face format for evaluation or inference. The same tool also supports importing Hugging Face checkpoints for continued pretraining.
+Convert a training checkpoint to standard Hugging Face format for evaluation or inference. The same script downloads the released Hugging Face weights; set `training.hf_import_path` to them for continued pretraining.
 
 ## Configuring a run
 
@@ -130,7 +130,7 @@ If `logging.wandb` is configured, the same metrics are logged to Weights & Biase
 - **Resuming** is automatic: a run loads the latest `<save_location>/torch-dcp/XXXXXXXX` on startup.
 - **Reshardable:** checkpoints are stored in a parallelism-independent format, so you can resume the same run under a *different* PP/EP/DP layout (e.g. start on one node, continue on two).
 - **Export to HuggingFace** with `convert_checkpoint` for downstream evaluation/inference with standard tooling.
-- **Import from HuggingFace** with the same tool to start from released weights (continued pretraining). Imported checkpoints carry no optimizer state, which the loader handles.
+- **Import from HuggingFace** by setting `training.hf_import_path` to a HuggingFace snapshot to start from released weights (continued pretraining). Each rank streams only its own shard of the weights; it is used only when `save_location` holds no checkpoint yet.
 
 ## FP8 training
 
