@@ -168,8 +168,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
     def split_qkv(self, mixed_qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
         B, S, _ = mixed_qkv.shape
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)  # fmt: skip
-        query = F.normalize(query.reshape(B, S, -1, self.head_k_dim), dim=-1)
-        key = F.normalize(key.reshape(B, S, -1, self.head_k_dim), dim=-1)
+        # Match HF/FLA's l2norm: epsilon is inside rsqrt, not a clamp on the norm.
+        query, key = (t.reshape(B, S, -1, self.head_k_dim) for t in (query, key))
+        query, key = ((t.float() * torch.rsqrt(t.float().square().sum(-1, keepdim=True) + 1e-6)).to(t.dtype) for t in (query, key))  # fmt: skip
         # Contiguous here, where Inductor writes it straight from the fused SiLU; the delta-rule op
         # would otherwise make the same copy eagerly in forward and again in backward.
         value = value.reshape(B, S, -1, self.head_v_dim).contiguous()
@@ -618,6 +619,9 @@ class Qwen35MoeModel(nn.Module):
             cos, sin = self.rotary_emb(S)
             return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
         cp_size = distributed.cp_size
+        if cp_size == 1:
+            cos, sin = self.rotary_emb(S)
+            return cos.unsqueeze(0), sin.unsqueeze(0)
         spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
         position_ids = torch.cat([torch.arange(span.start, span.stop, device=device) for span in spans])  # fmt: skip
         cos, sin = self.rotary_emb(S * cp_size)
