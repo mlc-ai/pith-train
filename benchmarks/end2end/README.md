@@ -1,10 +1,5 @@
 # End-to-end benchmarks
 
-Short training runs of the supported models on H200 at 1, 2 and 4 nodes, as people would run and
-tune them: 32K tokens with context parallelism, and 4K without. Each case is the fastest layout
-found that fits, in one self-contained script; its log reports step time, tokens per second and
-peak memory, so a later build can be run on the same cases and compared.
-
 ```
 benchmarks/end2end/<model>-seq<N>-<dtype>/h200-<nodes>n<gpus>g/pp<P>-dp<D>-cp<C>-ep<E>/script.py
 ```
