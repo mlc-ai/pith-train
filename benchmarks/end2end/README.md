@@ -37,7 +37,7 @@ per token from Megatron's `num_floating_point_operations`.
 | gpt-oss-20b | 1 | `pp1-dp8-cp1-ep2` | 2 | 18,924 | 43.9% | 109.3 |
 | gpt-oss-20b | 2 | `pp1-dp16-cp1-ep8` | 4 | 18,640 | 43.2% | 102.6 |
 | gpt-oss-20b | 4 | `pp1-dp32-cp1-ep8` | 4 | 18,947 | 43.9% | 97.6 |
-| gpt-oss-120b | 4 | `pp2-dp16-cp1-ep16` | 2 | 10,347 | 34.2% | 98.6 |
+| gpt-oss-120b | 4 | `pp4-dp8-cp1-ep8` | 2 | 10,957 | 36.2% | 98.6 |
 | qwen3-30b-a3b | 1 | `pp2-dp4-cp1-ep4` | 2 | 15,339 | 35.8% | 99.8 |
 | qwen3-30b-a3b | 2 | `pp2-dp8-cp1-ep4` | 2 | 14,928 | 34.8% | 85.0 |
 | qwen3-30b-a3b | 4 | `pp1-dp32-cp1-ep8` | 2 | 14,322 | 33.4% | 90.7 |
