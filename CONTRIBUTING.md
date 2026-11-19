@@ -31,7 +31,7 @@ When in doubt, optimize for the next reader (human or agent) being able to under
 
 ## Development setup
 
-Requires an NVIDIA Hopper (SM90) or Blackwell (SM100) GPU, CUDA >= 13.0, and Python >= 3.12. We use [uv](https://docs.astral.sh/uv/).
+Requires an NVIDIA Hopper (SM90) or Blackwell (SM100) GPU, CUDA >= 13.2, and Python >= 3.12. We use [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/mlc-ai/pith-train.git && cd pith-train

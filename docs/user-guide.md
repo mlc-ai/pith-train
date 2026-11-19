@@ -7,7 +7,7 @@ If you want to understand *how the framework works internally* (to modify it), s
 ## Requirements
 
 - **GPU:** NVIDIA Hopper (SM90, e.g. H100) or Blackwell (SM100, e.g. B200). Other architectures are not supported.
-- **CUDA:** >= 13.0.
+- **CUDA:** >= 13.2.
 - **Python:** >= 3.12, managed with [uv](https://docs.astral.sh/uv/).
 - **Multiple GPUs:** the example configs assume one 8-GPU node, and the framework is designed for multi-GPU training. You can lower the parallelism degrees for fewer GPUs, but the smaller meshes are not the tested defaults.
 
