@@ -6,7 +6,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 cfg = PretrainLMCfg()
 
-cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/<tokenizer>")
+cfg.dataset = Path("/synthetic")
 
 distributed = cfg.distributed
 distributed.pipeline_parallel_size = <pipeline-parallel-size>

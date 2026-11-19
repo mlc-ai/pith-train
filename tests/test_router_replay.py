@@ -14,7 +14,7 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate
 from pithtrain.models.qwen35_moe import Qwen35MoeTopKRouter
-from pithtrain.modules.load_balance import force_balance, replay_indices
+from pithtrain.modules.load_balance import replay_indices
 
 HIDDEN, EXPERTS, GROUPS = 256, 16, 4
 GATES = ["deepseek-v2-lite", "deepseek-v2", "qwen3", "qwen3.5", "gpt-oss"]
@@ -98,16 +98,3 @@ def test_replay_overrides_choice(name, dtype):
     expected = live_weights(name, gate, hidden, routes)
     torch.testing.assert_close(weight, expected)
     torch.testing.assert_close(router_grad(gate, weight), router_grad(gate, expected))
-
-
-@pytest.mark.parametrize("num_experts,top_k", [(128, 8), (64, 6), (32, 4), (128, 4), (256, 8)])
-def test_force_balance(num_experts, top_k):
-    """
-    Check equal load and distinct ids per token for each shipped expert count and top-k.
-    """
-    num_tokens = 24 * num_experts
-    idx = force_balance(num_experts)(num_tokens, top_k)
-    assert idx.shape == (num_tokens, top_k)
-    counts = torch.bincount(idx.flatten(), minlength=num_experts)
-    assert (counts == num_tokens * top_k // num_experts).all()
-    assert (idx.sort(dim=-1).values.diff(dim=-1) > 0).all()

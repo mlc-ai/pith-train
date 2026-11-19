@@ -1,4 +1,4 @@
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -10,7 +10,6 @@ __all__ = [
     "MoELoadBalanceLossInjector",
     "MoELoadBalanceLossTracker",
     "SequenceLevelLoadBalanceLoss",
-    "force_balance",
     "make_load_balance_loss_fn",
     "replay_indices",
 ]
@@ -245,26 +244,6 @@ def make_load_balance_loss_fn(
             raise ValueError(f"Unknown moe_load_balance_type: {lb_type!r}")
     MoELoadBalanceLossTracker.register(loss)
     return loss
-
-
-def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
-    """
-    A benchmark-only router replay that gives every expert an equal load. The returned function maps
-    (num_tokens, top_k) to the (num_tokens, top_k) expert indices a gate should use.
-    """
-    cache: dict[tuple[int, int], torch.Tensor] = {}
-
-    def replay(num_tokens: int, top_k: int) -> torch.Tensor:
-        indices = cache.get((num_tokens, top_k))
-        if indices is None:
-            stride = num_experts // top_k
-            device = torch.cuda.current_device()
-            token = torch.arange(num_tokens, device=device).unsqueeze(1)
-            slot = torch.arange(top_k, device=device).unsqueeze(0)
-            indices = cache[(num_tokens, top_k)] = (token + slot * stride) % num_experts
-        return indices
-
-    return replay
 
 
 def replay_indices(
