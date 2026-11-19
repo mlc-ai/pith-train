@@ -469,3 +469,30 @@ def test_waveform_produce_and_fresh_restore_on_two_gloo_ranks(tmp_path, monkeypa
     failure = continuation.read_json(tmp_path / "changed/rank-0/failure.json")
     assert failure["status"] == "FAIL" and "input batch 3 differs" in failure["error"]
     assert (tmp_path / "changed/rank-0/state-2/index.json").exists()
+
+
+def test_seed_process_seeds_every_generator_like_the_launcher(monkeypatch):
+    """Each rank sees every DP device; the checkpoint restores only its own CUDA generator."""
+    import random
+
+    import numpy as np
+
+    saved = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    seeded = []
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", seeded.append)
+    states = []
+    try:
+        for _ in range(2):
+            random.random()
+            np.random.rand()
+            torch.rand(1)
+            speech.seed_process()
+            states.append(
+                (random.getstate(), np.random.get_state()[1].tolist(), torch.get_rng_state())
+            )
+    finally:
+        random.setstate(saved[0])
+        np.random.set_state(saved[1])
+        torch.set_rng_state(saved[2])
+    assert seeded and set(seeded) == {chain.SEED}
+    assert states[0][:2] == states[1][:2] and torch.equal(states[0][2], states[1][2])

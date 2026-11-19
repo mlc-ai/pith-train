@@ -1112,6 +1112,24 @@ def gpu_runtime(args, world, rank):
     )
 
 
+def seed_process():
+    """Seed every generator at process start, as the launcher's setup_training does.
+
+    PyTorch seeds each CUDA default generator from OS entropy, every rank sees all
+    DP devices, and the native strict checkpoint holds only the rank's own CUDA
+    generator. Unseeded, the fresh restore's other-device generators differ from
+    the producer's and the exact state comparison fails on them.
+    """
+    import random
+
+    import numpy as np
+
+    random.seed(chain.SEED)
+    np.random.seed(chain.SEED)
+    torch.manual_seed(chain.SEED)
+    torch.cuda.manual_seed_all(chain.SEED)
+
+
 def train(args):
     import torch.distributed as dist
 
@@ -1122,6 +1140,7 @@ def train(args):
     runtime = gpu_runtime(args, world, rank)
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
+    seed_process()
     source = chain.source_identity(args.expected_commit)
     report, samples = load_fixture(args.fixture, args.fixture_sha256, args.expected_commit)
     stage_report = load_stage(
