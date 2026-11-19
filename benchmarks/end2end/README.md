@@ -1,11 +1,13 @@
 # End-to-end benchmarks
 
+## Layout
+
 ```
 benchmarks/end2end/<model>-seq<N>-<dtype>/h200-<nodes>n<gpus>g/pp<P>-dp<D>-cp<C>-ep<E>/script.py
 ```
 
-`training.benchmark = True` trains on synthetic tokens and replays a realistic expert load (see
-`pithtrain/modules/imbalance.py`). A case fits if at least 5 GiB of the device stays free.
+`P`, `C` and `E` are the pipeline, context and expert parallel sizes, and `D` is the attention data
+parallel size, the GPU count divided by P × C.
 
 ## Results
 
