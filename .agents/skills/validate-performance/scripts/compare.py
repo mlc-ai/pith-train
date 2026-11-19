@@ -1,8 +1,8 @@
 """
 Compare two PithTrain benchmark logs and report the throughput difference.
 
-Both runs use force-balanced routing, so the loss is meaningless and only the timing and
-memory rows carry information. Step 1 is dropped: it carries the JIT warmup and the
+Both runs use benchmark mode (synthetic tokens, replayed routing), so the loss is meaningless and
+only the timing and memory rows carry information. Step 1 is dropped: it carries the JIT warmup and the
 torch.compile trace, which dwarf the steady-state step time.
 
 Usage:  python3 compare.py <base.log> <feat.log>

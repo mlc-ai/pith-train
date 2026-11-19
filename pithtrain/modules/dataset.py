@@ -4,6 +4,8 @@ Memory-mapped token datasets for distributed training.
 Only the pages a sample touches are read. Global rank 0 writes the sequence offsets and the
 shuffled indices to offsets.npy and indices.npy in the corpus directory at startup, and every rank
 maps them after a barrier. The shuffle runs on the GPU, so the index array must fit in GPU memory.
+
+SyntheticDataset reads nothing: it draws seeded token ids, for benchmarks.
 """
 
 import os
@@ -13,7 +15,7 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-__all__ = ["MemmapDataset", "ConcatDataset"]
+__all__ = ["MemmapDataset", "ConcatDataset", "SyntheticDataset"]
 
 
 class MemmapDataset:
@@ -79,3 +81,24 @@ class ConcatDataset:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         ds, local_idx = self.resolve_index(idx)
         return ds.get_chunk(local_idx, seq_offset, seq_length)
+
+
+class SyntheticDataset(ConcatDataset):
+    """
+    Synthetic token ids for benchmarks, in place of a corpus. Ids follow a Zipf distribution over
+    the vocabulary, and sample idx is a pure function of (seed, idx).
+    """
+
+    def __init__(self, vocab_size: int, sequence_length: int, seed: int):
+        self.sequence_length = sequence_length
+        self.seed = seed
+        cdf = torch.cumsum(1.0 / torch.arange(1, vocab_size + 1, dtype=torch.float64), 0)
+        self.cdf = cdf / cdf[-1]
+
+    def get_chunk(
+        self, idx: int, seq_offset: int, seq_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stream = np.random.PCG64([self.seed, idx]).advance(seq_offset)
+        uniform = torch.from_numpy(np.random.Generator(stream).random(seq_length + 1))
+        ids = torch.searchsorted(self.cdf, uniform, right=True).clamp_(max=len(self.cdf) - 1)
+        return ids[:-1], ids[1:]

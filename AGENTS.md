@@ -57,6 +57,9 @@ bash tests/test_dualpipev.sh
 python3 -m benchmarks.operators.fp8.test_deepgemm
 # ring attention: multi-GPU launcher (torchrun), scenario = <model>-cp<N>-s<N>k
 bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
+
+# end-to-end training benchmark: one case per script
+torchrun --nproc-per-node=8 benchmarks/end2end/<case>/script.py
 ```
 
 ### Training & Data Prep

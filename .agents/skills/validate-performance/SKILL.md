@@ -1,11 +1,11 @@
 ---
 name: validate-performance
-description: Measures the throughput difference between two branches with force-balanced routing. Use when the user asks to "benchmark the performance", "measure throughput", "check for a slowdown", "check throughput did not regress", or "compare step time". The user specifies the model and the mesh; sequence length defaults to 2048 and dtype to bf16 — do not infer any of it from git diff.
+description: Measures the throughput difference between two branches in benchmark mode (synthetic data, measured routing imbalance). Use when the user asks to "benchmark the performance", "measure throughput", "check for a slowdown", "check throughput did not regress", or "compare step time". The user specifies the model and the mesh; sequence length defaults to 2048 and dtype to bf16 — do not infer any of it from git diff.
 ---
 
 # Validate Performance
 
-Runs the same short training on the base branch and on the feature branch with force-balanced routing, then reports the step-time difference. It measures; it does not gate. For loss correctness see **validate-correctness**.
+Runs the same short training on the base branch and on the feature branch in benchmark mode, then reports the step-time difference. It measures; it does not gate. For loss correctness see **validate-correctness**.
 
 The user picks the **model** and the **mesh**, e.g. "benchmark qwen3-30b-a3b at pp=2 ep=8". Sequence length defaults to 2048 and dtype to bf16; take either from the user when given. If the model or the mesh is vague, ask.
 
@@ -16,21 +16,23 @@ The wandb run is grouped as `performance/<model>`, so several meshes for one mod
 ## Prerequisites
 
 - Activate `.venv` in the repo root: `source .venv/bin/activate`.
-- A tokenized corpus for the model — run **setup-benchmark-inputs** if `workspace/datasets/dclm-baseline/toktxt/<tokenizer>` is missing. No checkpoint is needed.
+- No corpus and no checkpoint: `training.benchmark` trains on synthetic tokens. Their ids are drawn,
+  seeded, from a Zipf distribution over the vocabulary (`SyntheticDataset` in
+  `pithtrain/modules/dataset.py`).
 - `world_size % PP == 0` with `CP` and `EP` each dividing `world_size / PP`, `sequence_length % (2 * cp_size) == 0`, and `global_batch / dp >= 2 * pp` (where `dp = world_size / (pp * cp)`).
 - Keep sequence length, dtype and global batch identical across the two arms, and across meshes you intend to compare to each other.
 - **A clean tree.** The arms are switched with `git checkout`, so commit the feature work first.
 
 The two runs must be **strictly sequential**. One tree serves both arms, so a checkout landing while a run is pending or in flight silently benchmarks the wrong branch.
 
-`<tokenizer>` is not `<model>`, and `<moe-load-balance-type>` differs per model:
+`<moe-load-balance-type>` differs per model:
 
-| `<model>` | `<tokenizer>` | `<moe-load-balance-type>` |
-|---|---|---|
-| `qwen3-30b-a3b` | `qwen3` | `global-batch` |
-| `qwen3.5-35b-a3b` | `qwen3.5` | `global-batch` |
-| `deepseek-v2-lite` | `deepseek-v2` | `sequence` |
-| `gpt-oss-20b`, `gpt-oss-120b` | `gpt-oss` | `global-batch` |
+| `<model>` | `<moe-load-balance-type>` |
+|---|---|
+| `qwen3-30b-a3b` | `global-batch` |
+| `qwen3.5-35b-a3b` | `global-batch` |
+| `deepseek-v2-lite` | `micro-batch` |
+| `gpt-oss-20b`, `gpt-oss-120b` | `micro-batch` |
 
 ## Step 1: Create the two run files
 
@@ -88,9 +90,9 @@ It prints median step time, tokens per second and peak memory for each arm, plus
 
 ## Why the fixture looks like this
 
-`templates/validate.py` sets `training.benchmark = True`, which force-balances routing by overwriting the router's top-k with a round-robin over token index. Expert imbalance is the largest source of step-time variance, and removing it is what makes a short run readable. It also makes the loss meaningless, which is why correctness lives in a separate skill.
+`templates/validate.py` sets `training.benchmark = True`: synthetic tokens instead of a corpus, and the router's top-k replaced by the routing imbalance measured in a real training run (`pithtrain.modules.imbalance`), seeded by layer and step so both branches route alike. It also makes the loss meaningless, which is why correctness lives in a separate skill.
 
-`training.max_steps = 8`, because step time settles within a few steps once routing is balanced.
+`training.max_steps = 8`, because step time settles within a few steps once compilation and kernel tuning are done; the routing draws vary a little from step to step, the same on both branches.
 
 `compare.py` drops step 1: it carries the JIT warmup and the `torch.compile` trace, which dwarf the steady-state step time.
 

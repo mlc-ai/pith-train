@@ -8,6 +8,7 @@ import torch
 import torch.cuda
 import wandb
 from torch.distributed.elastic.multiprocessing.errors import record
+from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
@@ -17,7 +18,7 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
+from pithtrain.modules.dataset import ConcatDataset, MemmapDataset, SyntheticDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.fp8_param_gather import precompute_fp8_param_scales
 from pithtrain.modules.hf_loader import load_hf_into_model
@@ -54,6 +55,9 @@ class PretrainLMCfg(SlottedDefault):
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
+    if cfg.training.benchmark:
+        vocab_size = AutoConfig.from_pretrained(cfg.training.model).get_text_config().vocab_size
+        return SyntheticDataset(vocab_size, cfg.training.sequence_length, cfg.training.seed)
     files = sorted(cfg.dataset.rglob("*.bin"))
     memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
     dataset = ConcatDataset(memmaps, cfg.training.seed)
