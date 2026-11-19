@@ -12,15 +12,6 @@ benchmarks/end2end/<model>-seq<N>-<dtype>/h200-<nodes>n<gpus>g/pp<P>-dp<D>-cp<C>
 `training.benchmark = True` trains on synthetic tokens and replays a realistic expert load (see
 `pithtrain/modules/imbalance.py`). A case fits if at least 5 GiB of the device stays free.
 
-## Run
-
-```bash
-torchrun --nproc-per-node=8 benchmarks/end2end/<case>/script.py
-```
-
-Multi-node through the `launch-with-slurm` skill. Steps 1 to 6 are warmup; time a case by the median
-step time of steps 7 to 12. To add a case, copy the nearest case directory and change its layout.
-
 ## Results
 
 Measured in November 2026, BF16 on H200. Throughput is the median of steps 7 to 12; memory is peak
