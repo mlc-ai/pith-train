@@ -22,6 +22,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
+from pithtrain.models.qwen35 import Qwen35Model
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules import imbalance
 from pithtrain.modules.fp8_param_gather import (
@@ -53,7 +54,7 @@ __all__ = [
     "setup_training",
 ]
 
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel)
+PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -175,7 +176,7 @@ class TrainingCfg(SlottedDefault):
     """
     A HuggingFace safetensors directory to stream the initial weights from. Used only when
     save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS (MXFP4) and
-    Qwen3.5-MoE.
+    Qwen3.5 dense/MoE.
     """
 
     save_interval: Optional[int] = None
@@ -366,6 +367,8 @@ def setup_model(
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
+    if module_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+        module_config = module_config.text_config
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")
@@ -385,6 +388,8 @@ def setup_model(
         ModelClass = GptOssModel
     elif module_config.model_type == "qwen3_5_moe_text":
         ModelClass = Qwen35MoeModel
+    elif module_config.model_type == "qwen3_5_text":
+        ModelClass = Qwen35Model
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
