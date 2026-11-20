@@ -146,10 +146,10 @@ def install_side_grads(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, FSDPModule):
             for group in fully_shard.state(module)._fsdp_param_groups:
-                _attach_side_grads(group)
+                attach_side_grads(group)
 
 
-def _attach_side_grads(group: FSDPParamGroup) -> None:
+def attach_side_grads(group: FSDPParamGroup) -> None:
     """
     Move a .grad whose dtype differs from its parameter's into a per-parameter sum during the step,
     and hand the sums back as .grad when the group reduces.
