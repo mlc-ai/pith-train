@@ -21,6 +21,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.qwen35 import Qwen35Model
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
@@ -298,6 +299,8 @@ def main(model_name: str):
 
     config_path = Path(__file__).resolve().parent.parent / model_name
     config = AutoConfig.from_pretrained(config_path)
+    if config.model_type in ("qwen3_5", "qwen3_5_moe"):
+        config = config.text_config
 
     if config.model_type == "deepseek_v2":
         ModelClass = DeepSeekV2Model
@@ -312,13 +315,14 @@ def main(model_name: str):
             config.layer_types = config.layer_types[:keep]
         config.num_hidden_layers = keep
         config.vocab_size = 8192
-    elif config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen35MoeModel
+    elif config.model_type in ("qwen3_5_moe_text", "qwen3_5_text"):
+        ModelClass = Qwen35MoeModel if config.model_type == "qwen3_5_moe_text" else Qwen35Model
         keep = min(config.num_hidden_layers, 8)
         if getattr(config, "layer_types", None) is not None:
             config.layer_types = config.layer_types[:keep]
         config.num_hidden_layers = keep
-        config.num_experts = 32
+        if config.model_type == "qwen3_5_moe_text":
+            config.num_experts = 32
         config.vocab_size = 8192
     else:
         raise ValueError(f"Unsupported model: {model_name}")
@@ -624,6 +628,7 @@ def entry() -> None:
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
+    models.append("examples/pretrain_lm/qwen3.5-27b/config.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
