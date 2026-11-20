@@ -10,12 +10,8 @@ tune_kernels() is called on every rank before the first training step and after 
 installs the choices cached for this setup (a file every node of the cluster sees, named by the GPU
 and a fingerprint of the library versions, the candidates and the kernel source), so a repeated
 setup runs tuned from its first step. The second pools the keys every rank used that the cache
-lacked and splits their buckets across the ranks in runs of about equal rows. Each rank times every
-candidate of a key and bucket it was given on its own GPU, on the same synthetic inputs, in
-interleaved passes (dropping any whose results differ from the default's), since GPUs differ in
-speed by about as much as MARGIN. The ranks pool the timings and install the same choice everywhere:
-of the candidates within MARGIN of the fastest, the default if it is one, else the lowest index, so
-near-ties resolve the same way on every run. Rank 0 adds it to the cache. Nothing is timed after
+lacked, splits their buckets across the ranks, times all candidates of a bucket on one GPU, pools
+the timings, installs the same choice on every rank and adds it to the cache. Nothing is timed after
 that. Every exchange happens inside tune_kernels(), which all ranks reach; none happens while a
 launch picks its config.
 """
@@ -48,21 +44,18 @@ Buckets tuned on each side of every bucket the first step used, so later steps w
 
 MARGIN = 0.03
 """
-Candidates within this much of the fastest count as tied: of those the default is chosen if it is
-among them, else the lowest candidate index, so near-ties resolve the same way on every run.
+Candidates within this much of the fastest tie; a tie picks the default if present, else the lowest
+index.
 """
 
 WARMUP, ROUNDS, ITERS = 3, 5, 4
 """
-Each candidate of a key and bucket runs WARMUP times, then ROUNDS passes over all of them time ITERS
-launches of each, every pass starting one candidate later; a candidate's time is the median of its
-ROUNDS * ITERS launches.
+A time is the median of ROUNDS passes of ITERS launches, each pass rotating the candidate order.
 """
 
 UNIT_ROWS = 1 << 12
 """
-Rows per group whose timing costs about as much as setting up a key and bucket, the weight every
-bucket carries on top of its rows when the buckets are split across the ranks.
+Setup cost of a bucket in rows, added to its rows when the buckets are split across the ranks.
 """
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache/pithtrain/tuning"
@@ -196,10 +189,8 @@ def same_results(outputs: tuple, reference: tuple) -> bool:
 
 def time_candidates(tunable: Tunable, key: tuple, bucket: int) -> dict:
     """
-    Times every candidate of the key at 1.5x the bucket's lower bound, all on the same inputs and
-    GPU, in ROUNDS interleaved passes, so a drift in clock speed reaches all of them alike. Returns
-    {candidate index: microseconds}, leaving out a candidate that fails (a config this kernel kind
-    cannot take) or whose results differ from the default's; empty when the inputs would not fit.
+    {candidate index: microseconds} at 1.5x the lower bound of the bucket, all on one GPU, without
+    candidates that fail or differ from the default; empty when the inputs would not fit.
     """
     launch = tunable.prepare(key, 3 << (bucket - 1))
     if launch is None:
@@ -227,7 +218,7 @@ def time_candidates(tunable: Tunable, key: tuple, bucket: int) -> dict:
 
 def runs_like(launch: Callable, config, reference: tuple) -> bool:
     """
-    Whether config runs (compiling on first use) and gives the reference's results.
+    Whether config runs and matches the reference.
     """
     try:
         return same_results(launch(config), reference)
@@ -237,10 +228,8 @@ def runs_like(launch: Callable, config, reference: tuple) -> bool:
 
 def split_units(units: list, world_size: int) -> list:
     """
-    Splits the (name, key, bucket) units across the ranks as contiguous runs of the units in key
-    order, cut so each run holds about the same rows (UNIT_ROWS added per unit for its setup). A
-    run spans few keys, so each rank compiles the candidates of few kernel kinds. Every rank
-    computes the same split.
+    The (name, key, bucket) units of each rank: contiguous runs in key order of about equal rows, so
+    each rank compiles few kernel kinds.
     """
     units = sorted(units, key=lambda unit: (repr(unit[:2]), unit[2]))
     weights = [(3 << (bucket - 1)) + UNIT_ROWS for name, key, bucket in units]
@@ -254,13 +243,10 @@ def split_units(units: list, world_size: int) -> list:
 def tune_kernels() -> dict:
     """
     Install this setup's cached choices, then tune every key any rank has used that they lack. Call
-    on every rank before the first training step and after it. The buckets to tune are split across
-    the ranks (split_units), and the rank given a key and bucket times all its candidates
-    (time_candidates). Per key and bucket the candidates within MARGIN of the fastest tie, and the
-    default is installed if it is one of them, else the lowest candidate index of them; rank 0 adds
-    the choice to the cache. Every rank then compiles the configs it will launch and checks that all
-    ranks installed the same choices, which also lines them up so the next step starts together.
-    Returns {(name, key, bucket): (config, default)} of this call.
+    on every rank before the first training step and after it. Per key and bucket the MARGIN tie
+    rule picks the config, and rank 0 adds it to the cache; every rank then compiles the configs it
+    will launch and checks that all ranks installed the same choices, which also lines them up so
+    the next step starts together. Returns {(name, key, bucket): (config, default)} of this call.
     """
     rank, world_size = (dist.get_rank(), dist.get_world_size()) if dist.is_available() and dist.is_initialized() else (0, 1)
     if not CACHED:  # the first call reads the cache: rank 0's read, the same on every rank
