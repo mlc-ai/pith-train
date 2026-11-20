@@ -74,8 +74,8 @@ def test_matches_autograd(dtype):
     grad_out = torch.randn(256, 2880, generator=gen, device="cuda").to(dtype)
     x = gate_up.double().requires_grad_()
     gate, up = x[:, ::2], x[:, 1::2]
-    # Clamps whose gradient passes at the boundary, the kernel's contract. torch.clamp's own
-    # backward zeroes it there from torch 2.15 on, and bf16 inputs land on +/-LIMIT often.
+    # Clamps whose gradient passes at the boundary, as the kernel does. The backward of torch.clamp
+    # zeroes it there from torch 2.15 on, and bf16 inputs land on +/-LIMIT often.
     gc = torch.where(gate <= LIMIT, gate, gate.detach().clamp(max=LIMIT))
     uc = torch.where(up.abs() <= LIMIT, up, up.detach().clamp(min=-LIMIT, max=LIMIT))
     ((uc + 1) * gc * torch.sigmoid(ALPHA * gc)).backward(grad_out.double())

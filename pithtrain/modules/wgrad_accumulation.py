@@ -2,9 +2,9 @@
 Weight-gradient accumulation into a layer-owned fp32 buffer.
 
 BF16Linear, GroupedLinear and FP8GroupedLinear add their weight gradient straight into the fp32
-main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into
-FSDP2's fp32 .grad: the GEMM accumulates in fp32, so no micro-batch's gradient is rounded to bf16
-and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
+main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into the
+fp32 .grad of FSDP2: the GEMM accumulates in fp32, so no gradient of a micro-batch is rounded to
+bf16 and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
@@ -102,7 +102,7 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
                 if param.grad is not None:
                     main_grad.add_(param.grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
-                # The parameter's grad_dtype is fp32 (the reduce dtype) or None, so it takes fp32.
+                # grad_dtype of the parameter is fp32 (the reduce dtype) or None, so it takes fp32.
                 param.grad = main_grad.contiguous()
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.
@@ -140,7 +140,7 @@ def install_raw_main_grad(model: nn.Module) -> None:
 
 def install_side_grads(model: nn.Module) -> None:
     """
-    Keep each FSDP2 parameter's .grad empty while the step accumulates, after the main_grad
+    Keep .grad of each FSDP2 parameter empty while the step accumulates, after the main_grad
     installs (its post_backward has to run before theirs).
     """
     for module in model.modules():
@@ -151,8 +151,8 @@ def install_side_grads(model: nn.Module) -> None:
 
 def attach_side_grads(group: FSDPParamGroup) -> None:
     """
-    Move a .grad whose dtype differs from its parameter's into a per-parameter sum during the step,
-    and hand the sums back as .grad when the group reduces.
+    Move a .grad whose dtype differs from that of its parameter into a per-parameter sum during the
+    step, and hand the sums back as .grad when the group reduces.
     """
     orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
     sums: Dict[int, torch.Tensor] = {}

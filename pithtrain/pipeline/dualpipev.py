@@ -652,7 +652,7 @@ class DualPipeV(nn.Module):
         # Release FP8 weight caches so the memory is available for optimizer.step().
         FP8WeightCacheControl.clear(*self.module)
 
-        # End of the ZeRO-1 step: reduce-scatter each group's fp32 gradients once, reshard its
+        # End of the ZeRO-1 step: reduce-scatter the fp32 gradients of each group once, reshard the
         # weights, and run the root callback skipped above.
         for module in self.module:
             if not isinstance(module, FSDPModule):
