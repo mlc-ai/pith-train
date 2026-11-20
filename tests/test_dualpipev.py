@@ -19,6 +19,7 @@ from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
+from pithtrain.models.glm4_moe_lite import Glm4MoeLiteModel, Glm4MoeLiteTopkRouter
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35 import Qwen35Model
@@ -53,6 +54,10 @@ def fill_weights(module: nn.Module):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
+    elif isinstance(module, Glm4MoeLiteTopkRouter):
+        nn.init.xavier_uniform_(module.weight, gain=1.0)
+        # Non-zero, so the choice of experts departs from the plain top-k of the scores.
+        nn.init.normal_(module.e_score_correction_bias, std=0.1)
     elif isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -324,6 +329,10 @@ def main(model_name: str):
         if config.model_type == "qwen3_5_moe_text":
             config.num_experts = 32
         config.vocab_size = 8192
+    elif config.model_type == "glm4_moe_lite":
+        ModelClass = Glm4MoeLiteModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
+        config.vocab_size = 8192
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
@@ -513,6 +522,9 @@ def main(model_name: str):
     failed = False
 
     for (param_name, param), param_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):  # fmt: skip
+        if not param.requires_grad:
+            # GLM-4.7's e_score_correction_bias is frozen on both sides.
+            continue
         if param.grad is None:
             print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, param_name))
             failed = True
@@ -572,6 +584,14 @@ def main(model_name: str):
         # accumulation reads about 1.
         if training.fp8 and config.model_type == "deepseek_v2":
             param_eps = max(param_eps, 0.6 if ".experts." in param_name else 0.05)
+        # GLM-4.7: the eager reference and the staged copy round differently and send a few percent
+        # of the tokens to another expert set, as in every model here; the diff weighs a flipped
+        # token by its routing weight squared, and the sigmoid router's top-k normalization gives
+        # the expert that flips the weight of any other (softmax: half), so the flips read about
+        # 0.02 on the routed experts (behind DeepSeek-V2's softmax gate 0.005, with replayed routes
+        # 7e-4, the noise floor). A broken expert path reads about 1.
+        if config.model_type == "glm4_moe_lite" and ".experts." in param_name:
+            param_eps = max(param_eps, 3e-2)
         if diff > param_eps:
             failed = True
             print(
@@ -629,6 +649,7 @@ def entry() -> None:
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-27b/config.json")
+    models.append("examples/pretrain_lm/glm-4.7-flash/config.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)

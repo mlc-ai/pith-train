@@ -32,6 +32,7 @@ Every example pretrains at 4K context (`sequence_length = 4096`, global batch 10
 |---|---|---|---|
 | [GPT-OSS-20B](https://huggingface.co/openai/gpt-oss-20b) | 1 | 1-way pipeline x 2-way expert | 2 |
 | [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | 1 | 2-way pipeline x 4-way expert | 2 |
+| [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) | 1 | 2-way pipeline x 4-way expert | 2 |
 | [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | 1 | 1-way pipeline x 8-way expert | 1 |
 | [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) (dense) | 2 | 8-way pipeline | 1 |
 | [GPT-OSS-120B](https://huggingface.co/openai/gpt-oss-120b) | 4 | 4-way pipeline x 8-way expert | 2 |

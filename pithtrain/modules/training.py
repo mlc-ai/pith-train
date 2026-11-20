@@ -20,6 +20,7 @@ from transformers import AutoConfig
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
+from pithtrain.models.glm4_moe_lite import Glm4MoeLiteModel
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35 import Qwen35Model
@@ -298,11 +299,21 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
+def frozen_param_dtype(param: nn.Parameter) -> torch.dtype | None:
+    """
+    The forward dtype of a parameter under FSDP2's mixed precision: the default for a trained one,
+    its stored dtype for a frozen one. GLM-4.7's fp32 router bias (e_score_correction_bias) only
+    chooses the experts, and rounded to bf16 it chooses differently for a fifth of the tokens.
+    """
+    return None if param.requires_grad else param.dtype
+
+
 def apply_fsdp(model, hsdp_replica: int = 1):
     """
     Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
-    gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
+    gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8. A frozen
+    parameter keeps its stored dtype in the forward (frozen_param_dtype).
     """
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     if hsdp_replica > 1:
@@ -318,6 +329,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
+        param_dtype_override_fn=frozen_param_dtype,
     )
     install_lean_hooks()
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
@@ -394,6 +406,8 @@ def setup_model(
         ModelClass = Qwen35MoeModel
     elif module_config.model_type == "qwen3_5_text":
         ModelClass = Qwen35Model
+    elif module_config.model_type == "glm4_moe_lite":
+        ModelClass = Glm4MoeLiteModel
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 

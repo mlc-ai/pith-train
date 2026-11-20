@@ -228,13 +228,16 @@ class DeepSeekV2MoEGate(nn.Module):
 
 
 class DeepSeekV2MoE(nn.Module):
+    # GLM-4.7-Flash keeps the experts and the shared experts and swaps in a sigmoid router.
+    gate_class = DeepSeekV2MoEGate
+
     def __init__(self, config: DeepseekV2Config):
         super().__init__()
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
         self.experts = DeepSeekV2Experts(config, self.experts_per_rank)
-        self.gate = DeepSeekV2MoEGate(config)
+        self.gate = self.gate_class(config)
         intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
 
@@ -340,12 +343,15 @@ class DeepSeekV2Attention(nn.Module):
 
 
 class DeepSeekV2DecoderLayer(nn.Module):
+    # The isinstance checks below accept the subclasses a derived model installs here.
+    moe_class = DeepSeekV2MoE
+
     def __init__(self, config: DeepseekV2Config, layer_id: int):
         super().__init__()
         self.idx = layer_id
         self.self_attn = DeepSeekV2Attention(config=config)
         has_experts = layer_id >= config.first_k_dense_replace
-        self.mlp = DeepSeekV2MoE(config) if has_experts else DeepSeekV2MLP(config)
+        self.mlp = self.moe_class(config) if has_experts else DeepSeekV2MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -459,6 +465,9 @@ class DeepSeekV2DecoderLayer(nn.Module):
 
 
 class DeepSeekV2Model(nn.Module):
+    # GLM-4.7-Flash shares the rotary embedding, the V-pipeline partition and the prolog / epilog.
+    decoder_layer_class = DeepSeekV2DecoderLayer
+
     def __init__(self, config: DeepseekV2Config, phase: int):
         super().__init__()
         match phase:
@@ -486,7 +495,7 @@ class DeepSeekV2Model(nn.Module):
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(i): DeepSeekV2DecoderLayer(config, i)
+                str(i): self.decoder_layer_class(config, i)
                 for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
             }
         )
