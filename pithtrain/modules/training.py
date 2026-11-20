@@ -353,6 +353,10 @@ def apply_fsdp(model, hsdp_replica: int = 1):
             register_fsdp_forward_method(layer, "forward_stage1")
             register_fsdp_forward_method(layer, "forward_stage3")
             register_fsdp_forward_method(layer, "forward_stage5")
+        if model[i].mtp_layer is not None:
+            register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_input")
+            register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_norm")
+            register_fsdp_forward_method(model[i].lm_head, "forward_shared")
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
 
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
@@ -421,6 +425,9 @@ def setup_model(
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
         modules[1].rotary_emb = modules[0].rotary_emb
+        # The MTP layer of the last stage embeds the next tokens with the first stage's embedding.
+        if modules[1].mtp_layer is not None:
+            modules[1].mtp_embed = modules[0].forward_prolog
 
     local_seq_len = cfg.sequence_length // cp_size
 

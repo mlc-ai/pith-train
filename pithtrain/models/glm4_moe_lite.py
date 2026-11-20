@@ -6,8 +6,12 @@ first layer, shared experts next to the routed ones, and DeepSeek-V3's aux-loss-
 ("noaux_tc"): sigmoid scores, a per-expert correction bias that steers the choice but not the
 weights, top-k weights renormalized then scaled.
 
-The checkpoint also holds one multi-token-prediction layer, model.layers.47, which this model does
-not instantiate; its keys are expected unmapped on import.
+The checkpoint also holds one multi-token-prediction layer, model.layers.47 (DeepSeek-V3's MTP):
+one more decoder layer whose input is a projection of the normalized trunk output and the
+embedding of the next token, and whose output goes through its own norm and the shared head to
+predict the token two positions ahead. The last stage holds it under that key, and the epilog runs
+it after the decoder layers. As in Megatron (mtp_detach_heads), its loss trains only its own
+weights: the trunk output, the embedding and the head are detached on its path.
 """
 
 import math
@@ -47,7 +51,13 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["Glm4MoeLiteDecoderLayer", "Glm4MoeLiteMoE", "Glm4MoeLiteModel", "Glm4MoeLiteTopkRouter"]
+__all__ = [
+    "Glm4MoeLiteDecoderLayer",
+    "Glm4MoeLiteMTPLayer",
+    "Glm4MoeLiteMoE",
+    "Glm4MoeLiteModel",
+    "Glm4MoeLiteTopkRouter",
+]
 
 
 class Glm4MoeLiteRotaryEmbedding(nn.Module):
@@ -479,6 +489,29 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Glm4MoeLiteMTPLayer(Glm4MoeLiteDecoderLayer):
+    """
+    The multi-token-prediction layer: a decoder layer between the input projection of the
+    normalized next-token embeddings and trunk hidden states and its own final norm. The
+    checkpoint's copies of the embedding and of the head under this layer are not loaded: the
+    layer shares the trunk's.
+    """
+
+    def __init__(self, config: Glm4MoeLiteConfig, layer_id: int):
+        super().__init__(config, layer_id)
+        self.enorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = training.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.shared_head = nn.Module()
+        self.shared_head.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward_mtp_input(self, embeds: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.eh_proj(torch.cat([self.enorm(embeds), self.hnorm(hidden_states)], dim=-1))
+
+    def forward_mtp_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.shared_head.norm(hidden_states)
+
+
 class Glm4MoeLiteModel(nn.Module):
     def __init__(self, config: Glm4MoeLiteConfig, phase: int):
         super().__init__()
@@ -514,6 +547,21 @@ class Glm4MoeLiteModel(nn.Module):
                 for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
             }
         )
+        num_mtp_layers = getattr(config, "num_nextn_predict_layers", 0)
+        if num_mtp_layers > 1:
+            raise NotImplementedError(f"{num_mtp_layers} MTP layers; at most one is supported")
+        self.mtp_key = None
+        if num_mtp_layers == 1 and self.stage_index == self.stage_count - 1:
+            self.mtp_key = str(config.num_hidden_layers)
+            self.layers[self.mtp_key] = Glm4MoeLiteMTPLayer(config, config.num_hidden_layers)
+        # The MTP layer embeds the next tokens with the trunk's embedding, which the first stage
+        # holds: the single-device model has it here, and setup_model links the last stage of the
+        # pipeline to the first (a bound method, so the state dict holds the embedding once).
+        self.mtp_embed = self.forward_prolog if self.embed_tokens is not None else None
+
+    @property
+    def mtp_layer(self) -> Glm4MoeLiteMTPLayer | None:
+        return None if self.mtp_key is None else self.layers[self.mtp_key]
 
     def forward_posemb(
         self, S: int, cu_seqlens: torch.Tensor | None = None
@@ -539,19 +587,49 @@ class Glm4MoeLiteModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
+    def forward_mtp_input(
+        self, hidden_states: torch.Tensor, next_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.norm(hidden_states)
+        embeds = self.mtp_embed(next_tokens).detach()
+        mtp_input = self.mtp_layer.forward_mtp_input(embeds, hidden_states.detach())
+        return hidden_states, mtp_input
+
+    def forward_mtp_heads(
+        self, hidden_states: torch.Tensor, mtp_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mtp_hidden_states = self.mtp_layer.forward_mtp_norm(mtp_hidden_states)
+        return self.lm_head.forward_shared(hidden_states, mtp_hidden_states)
+
     def forward(
-        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens)
+        self,
+        hidden_states: torch.Tensor,
+        next_tokens: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+    ):
+        """
+        next_tokens, the ids of the tokens after each input token, feed the MTP layer of the last
+        stage; the other stages take none.
+        """
+        epilog_inputs = () if next_tokens is None else (next_tokens,)
+        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens, epilog_inputs)
 
     def reference_forward(
-        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        next_tokens: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+    ):
         if self.stage_index == 0:
             hidden_states = self.forward_prolog(hidden_states)
         rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
-        for _, layer in self.layers.items():
-            hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
+        for layer in self.layers.values():
+            if layer is not self.mtp_layer:
+                hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
         if self.stage_index == self.stage_count - 1:
-            hidden_states = self.forward_epilog(hidden_states)
+            if self.mtp_layer is None:
+                return self.forward_epilog(hidden_states)
+            hidden_states, mtp_hidden_states = self.forward_mtp_input(hidden_states, next_tokens)
+            mtp_hidden_states = self.mtp_layer.reference_forward(mtp_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+            return self.forward_mtp_heads(hidden_states, mtp_hidden_states)
         return hidden_states

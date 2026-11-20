@@ -480,19 +480,72 @@ class EpilogArgs(NamedTuple):
 @dataclass(slots=True)
 class EpilogRecord:
     args: Optional[EpilogArgs] = None
+    mtp: Optional["LayerRecord"] = None
+    """
+    The records of the MTP layer's stages, with the layer's detached input and output around them.
+    """
+    mtp_input: Optional[torch.Tensor] = None
+    mtp_output: Optional[torch.Tensor] = None
 
 
-def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogRecord) -> torch.Tensor:  # fmt: skip
+def decoder_layers(module: ModelProtocol) -> List[LayerProtocol]:
+    """
+    The layers the pipeline runs in order: every entry of module.layers but the MTP layer, which
+    the epilog runs.
+    """
+    return [layer for layer in module.layers.values() if layer is not module.mtp_layer]
+
+
+def epilog_f(
+    module: ModelProtocol,
+    hidden_states: torch.Tensor,
+    record: EpilogRecord,
+    epilog_inputs: Tuple[torch.Tensor, ...] = (),
+    rotary_posemb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+):
     """
     The loss backward fills the grad of the detached input saved in record, the gradient handed to
-    the decoder layers.
+    the decoder layers. With an MTP layer the epilog returns (logits, mtp_logits); the layer runs
+    through the stages of layer_forward, between its detached input and output, so epilog_b can
+    run its backward the same way.
     """
     nvtx.range_push("epilog_f")
     hidden_states = hidden_states.detach().requires_grad_()
     record.args = EpilogArgs(hidden_states)
-    logits = module.forward_epilog(hidden_states)
+    mtp_layer = module.mtp_layer
+    if mtp_layer is None:
+        logits = module.forward_epilog(hidden_states)
+        nvtx.range_pop()
+        return logits
+    (next_tokens,) = epilog_inputs
+    hidden_states, mtp_input = module.forward_mtp_input(hidden_states, next_tokens)
+    record.mtp_input = mtp_input
+    mtp_output = layer_forward(mtp_layer, mtp_input, rotary_posemb, record.mtp, cu_seqlens)
+    mtp_output = mtp_output.detach().requires_grad_()
+    record.mtp_output = mtp_output
+    logits = module.forward_mtp_heads(hidden_states, mtp_output)
     nvtx.range_pop()
     return logits
+
+
+def epilog_b(module: ModelProtocol, loss: torch.Tensor, record: EpilogRecord) -> torch.Tensor:
+    """
+    Backward of the loss through the epilog; returns the gradient of the decoder layers' output.
+    """
+    nvtx.range_push("epilog_b")
+    loss.backward()
+    loss.detach_()
+    hidden_states_grad = record.args.hidden_states.grad
+    record.args = None
+    if module.mtp_layer is not None:
+        output_grads = (record.mtp_output.grad,)
+        record.mtp_output = None
+        input_grads = layer_backward(module.mtp_layer, output_grads, record.mtp)
+        run_backward([record.mtp_input], [input_grads])
+        record.mtp_input = None
+    nvtx.range_pop()
+    return hidden_states_grad
 
 
 @dataclass(init=False, slots=True)
@@ -521,11 +574,15 @@ def create_layer_record() -> LayerRecord:
     return layer
 
 
-def create_chunk_record(num_layers: int, has_prolog: bool, has_epilog: bool) -> ChunkRecord:
+def create_chunk_record(module: ModelProtocol) -> ChunkRecord:
     record = ChunkRecord()
-    record.prolog = PrologRecord() if has_prolog else None
-    record.epilog = EpilogRecord() if has_epilog else None
-    record.layers = [create_layer_record() for _ in range(num_layers)]
+    record.prolog = PrologRecord() if module.stage_index == 0 else None
+    record.epilog = None
+    if module.stage_index == module.stage_count - 1:
+        record.epilog = EpilogRecord()
+        if module.mtp_layer is not None:
+            record.epilog.mtp = create_layer_record()
+    record.layers = [create_layer_record() for _ in decoder_layers(module)]
     return record
 
 
@@ -702,12 +759,20 @@ def layer_backward(
     return input_grads
 
 
+def clear_epilog_records(record: EpilogRecord) -> None:
+    record.args = None
+    record.mtp_input = record.mtp_output = None
+    if record.mtp is not None:
+        clear_layer_records(record.mtp)
+
+
 def model_forward(
     module: ModelProtocol,
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    epilog_inputs: Tuple[torch.Tensor, ...] = (),
+):
     """
     Without grad the records are cleared after each layer, bounding activation memory and leaving
     them empty for the next step.
@@ -719,15 +784,15 @@ def model_forward(
             chunk_record.prolog.outs = None
 
     rotary_posemb = module.forward_posemb(hidden_states.shape[1], cu_seqlens)
-    for layer, layer_record in zip(module.layers.values(), chunk_record.layers):
+    for layer, layer_record in zip(decoder_layers(module), chunk_record.layers):
         hidden_states = layer_forward(layer, hidden_states, rotary_posemb, layer_record, cu_seqlens)
         if forward_only:
             clear_layer_records(layer_record)
 
     if module.stage_index == module.stage_count - 1:
-        hidden_states = epilog_f(module, hidden_states, chunk_record.epilog)
+        hidden_states = epilog_f(module, hidden_states, chunk_record.epilog, epilog_inputs, rotary_posemb, cu_seqlens)  # fmt: skip
         if forward_only:
-            chunk_record.epilog.args = None
+            clear_epilog_records(chunk_record.epilog)
 
     return hidden_states
 
@@ -739,15 +804,10 @@ def model_backward(
     chunk_record: ChunkRecord,
 ):
     if loss is not None:
-        loss.backward()
-        loss.detach_()
-        output_grads = (chunk_record.epilog.args.hidden_states.grad,)
-        chunk_record.epilog.args = None
+        output_grads = (epilog_b(module, loss, chunk_record.epilog),)
 
     input_grads = output_grads
-    for layer, layer_record in zip(
-        reversed(list(module.layers.values())), reversed(chunk_record.layers)
-    ):
+    for layer, layer_record in zip(reversed(decoder_layers(module)), reversed(chunk_record.layers)):
         input_grads = (layer_backward(layer, input_grads, layer_record),)
 
     final_grads = input_grads

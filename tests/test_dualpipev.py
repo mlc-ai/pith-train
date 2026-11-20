@@ -66,19 +66,22 @@ def calculate_difference(x: torch.Tensor, y: torch.Tensor) -> float:
     return cos_diff
 
 
-def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    output = output.to(torch.float32)
-    target = target.to(torch.float32)
-    return F.mse_loss(output, target).clone()
+def criterion(outputs, targets) -> torch.Tensor:
+    """
+    The MSE of each output against its target, summed: one pair, or two with an MTP layer.
+    """
+    if isinstance(outputs, torch.Tensor):
+        outputs, targets = (outputs,), (targets,)
+    assert len(outputs) == len(targets)
+    losses = [F.mse_loss(output.float(), target.float()) for output, target in zip(outputs, targets)]  # fmt: skip
+    return sum(losses).clone()
 
 
 def objective(
     model_outputs: Tuple[torch.Tensor, ...],
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    (output,) = model_outputs
-    (target,) = objective_inputs
-    loss = criterion(output, target)
+    loss = criterion(model_outputs, objective_inputs)
     return loss, loss.detach()
 
 
@@ -86,15 +89,19 @@ def records_empty(model: DualPipeV) -> bool:
     records = []
     for chunk in model.chunk_records[0] + model.chunk_records[1]:
         records += [chunk.prolog, chunk.epilog]
-        records += [getattr(layer, field.name) for layer in chunk.layers for field in fields(layer)]
-    return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record))  # fmt: skip
+        layers = list(chunk.layers)
+        if chunk.epilog is not None and chunk.epilog.mtp is not None:
+            layers.append(chunk.epilog.mtp)
+        records += [getattr(layer, field.name) for layer in layers for field in fields(layer)]
+    # The MTP layer's records are checked through the stage records above.
+    return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record) if field.name != "mtp")  # fmt: skip
 
 
 def reference_step(chunks, model: nn.Module):
     outputs, losses = [], []
     for i, (micro_x, micro_labels, cu_seqlens) in enumerate(chunks):
         training.current_microbatch = i
-        micro_y = model.reference_forward(micro_x, cu_seqlens)
+        micro_y = model.reference_forward(*micro_x, cu_seqlens=cu_seqlens)
         loss = criterion(micro_y, micro_labels)
         loss.backward()
         outputs.append(micro_y)
@@ -262,6 +269,10 @@ def apply_fsdp(model, dtype):
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
+        if model[i].mtp_layer is not None:
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_input")  # fmt: skip
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_norm")  # fmt: skip
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].lm_head, "forward_shared")  # fmt: skip
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
     # Plain-sum reduction, as in modules.training.apply_fsdp.
     for module in model.modules():
@@ -339,6 +350,8 @@ def main(model_name: str):
         config.vocab_size = 8192
     else:
         raise ValueError(f"Unsupported model: {model_name}")
+    # GLM-4.7's MTP layer takes the next tokens as a second input and adds a second output.
+    mtp = getattr(config, "num_nextn_predict_layers", 0) == 1
 
     torch.distributed.barrier()
     torch.manual_seed(1234)
@@ -370,8 +383,9 @@ def main(model_name: str):
 
         chunks = []
         for j, seqlen in enumerate(seqlens):
-            chunk_x = torch.randint(0, vocab_size, (micro_batch_size, seqlen))
-            chunk_l = label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype)
+            num_inputs = 2 if mtp else 1
+            chunk_x = tuple(torch.randint(0, vocab_size, (micro_batch_size, seqlen)) for _ in range(num_inputs))  # fmt: skip
+            chunk_l = tuple(label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype) for _ in range(num_inputs))  # fmt: skip
             chunk_cu = None
             if packed:
                 # Ragged batches vary the document count as well as the token count. CP documents
@@ -447,6 +461,9 @@ def main(model_name: str):
     keep_frozen_fp32(local_modules)
     local_modules[0].load_state_dict(local_full_modules[0].state_dict())
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
+    if local_modules[1].mtp_layer is not None:
+        # As setup_model: the MTP layer embeds the next tokens with the first stage's embedding.
+        local_modules[1].mtp_embed = local_modules[0].forward_prolog
     local_modules.zero_grad()
     apply_fsdp(local_modules, dtype)
     install_wgrad_accumulation(local_modules)
@@ -464,8 +481,7 @@ def main(model_name: str):
     def collect(model_outputs, objective_inputs):
         # Check before step cleanup can hide retained activations.
         assert records_empty(dualpipev_model), "a forward-only step kept activations mid-step"
-        (output,), (target,) = model_outputs, objective_inputs
-        return None, criterion(output, target)
+        return None, criterion(model_outputs, objective_inputs)
 
     for step_index, chunks in enumerate(chunk_steps):
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P shapes;
@@ -474,9 +490,10 @@ def main(model_name: str):
         local_chunks = chunks[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
         microbatches = [
             Microbatch(
-                model_inputs=(shard(x, cu_seqlens),),
+                model_inputs=(shard(x[0], cu_seqlens),),
                 cu_seqlens=cu_seqlens,
-                objective_inputs=(shard(labels, cu_seqlens),),
+                objective_inputs=tuple(shard(label, cu_seqlens) for label in labels),
+                epilog_inputs=tuple(shard(tokens, cu_seqlens) for tokens in x[1:]),
             )
             for x, labels, cu_seqlens in local_chunks
         ]

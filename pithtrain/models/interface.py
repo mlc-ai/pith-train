@@ -2,7 +2,7 @@ from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
-__all__ = ["AllToAllSplits", "LayerProtocol", "MLPProtocol", "ModelProtocol", "RoutingInfo"]
+__all__ = ["AllToAllSplits", "LayerProtocol", "MLPProtocol", "MTPLayerProtocol", "ModelProtocol", "RoutingInfo"]  # fmt: skip
 
 
 class AllToAllSplits(NamedTuple):
@@ -86,11 +86,34 @@ class LayerProtocol(Protocol):
         """
 
 
+class MTPLayerProtocol(LayerProtocol, Protocol):
+    """
+    A multi-token-prediction layer (DeepSeek-V3 style): a decoder layer that reads the trunk's
+    final hidden states together with the embeddings of the next tokens and predicts the tokens one
+    position further. Its stages are the decoder layer's; the two methods below wrap them.
+    """
+
+    def forward_mtp_input(self, embeds: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Project the normalized next-token embeddings and trunk hidden states to the layer's input.
+        """
+
+    def forward_mtp_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        The layer's own final norm, before the shared head.
+        """
+
+
 class ModelProtocol(Protocol):
     stage_index: int
     stage_count: int
     hidden_size: int
     layers: Dict[str, LayerProtocol]
+    mtp_layer: Optional[MTPLayerProtocol]
+    """
+    The multi-token-prediction layer of the last stage, or None. It is an entry of layers, under
+    its checkpoint key, but the epilog runs it, after the decoder layers.
+    """
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 
@@ -111,4 +134,21 @@ class ModelProtocol(Protocol):
     def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Epilog compute (last stage only): final norm and lm_head projection to logits.
+        """
+
+    def forward_mtp_input(
+        self, hidden_states: torch.Tensor, next_tokens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        With an mtp_layer: the final norm of the trunk hidden states, and the input of the MTP
+        layer built from them and the next tokens. The MTP layer gets no gradient path into the
+        trunk, the embedding or the head (DeepSeek-V3's detached heads).
+        """
+
+    def forward_mtp_heads(
+        self, hidden_states: torch.Tensor, mtp_hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        With an mtp_layer: the logits of the normalized trunk hidden states and of the MTP layer's
+        output, through the shared head.
         """

@@ -1,10 +1,10 @@
 """GLM-4.7-Flash checkpoint converter.
 
-The decoder keys are per-expert and untransposed, so the generic import and export handle them.
-The checkpoint also holds a multi-token-prediction layer under
-``model.layers.<num_hidden_layers>`` (its ``eh_proj``, ``enorm``, ``hnorm``, ``shared_head``, a
-copy of the embedding and of the head, and one more decoder layer), which the model does not
-instantiate: those keys are expected to stay unmapped on import.
+The decoder keys are per-expert and untransposed, so the generic import and export handle them,
+the multi-token-prediction layer's too (``model.layers.<num_hidden_layers>``). That layer's copies
+of the embedding and of the head (``embed_tokens.weight``, ``shared_head.head.weight``) are not
+loaded, as the layer shares the trunk's: they are expected to stay unmapped on import, and an
+export does not write them.
 """
 
 import json
@@ -16,7 +16,7 @@ from typing import Dict
 import torch
 
 # hf_loader strips the ``model.`` prefix from every HF key.
-_LAYER_KEY = re.compile(r"^layers\.(\d+)\.")
+_SHARED_COPY = re.compile(r"^layers\.\d+\.(embed_tokens|shared_head\.head)\.weight$")
 
 
 class Glm4MoeLiteConverter:
@@ -31,18 +31,7 @@ class Glm4MoeLiteConverter:
         return config.get("model_type") == "glm4_moe_lite"
 
     def expected_unmapped(self, unmapped: set) -> set:
-        # The MTP layers are the ones with an eh_proj; every key of such a layer is expected.
-        mtp_layers = set()
-        for hf_key in unmapped:
-            match = _LAYER_KEY.match(hf_key)
-            if match and hf_key.endswith(".eh_proj.weight"):
-                mtp_layers.add(match.group(1))
-        expected = set()
-        for hf_key in unmapped:
-            match = _LAYER_KEY.match(hf_key)
-            if match and match.group(1) in mtp_layers:
-                expected.add(hf_key)
-        return expected
+        return {hf_key for hf_key in unmapped if _SHARED_COPY.match(hf_key)}
 
     def detect_dcp(self, metadata) -> bool:
         # Nothing to postprocess: the canonical keys are the HF keys of the decoder.
