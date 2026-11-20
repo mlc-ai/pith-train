@@ -11,9 +11,9 @@ parallel size, the GPU count divided by P × C.
 
 ## Results
 
-Measured in November 2026 on torch 2.15, BF16 on H200. Throughput is the median of steps 7 to 12;
-memory is peak allocated. MFU is throughput × model FLOPs per token / 989.4 TFLOP/s (H200 dense
-BF16), with FLOPs per token from `num_floating_point_operations` in Megatron.
+Measured in November 2026, BF16 on H200. Throughput is the median of steps 7 to 12; memory is peak
+allocated. MFU is throughput × model FLOPs per token / 989.4 TFLOP/s (H200 dense BF16), with FLOPs
+per token from Megatron's `num_floating_point_operations`.
 
 ### 4K
 
