@@ -19,7 +19,7 @@ def ragged_dispatch_worker(rank, world_size, tokens_per_rank, out):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29517")
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group("nccl-legacy", rank=rank, world_size=world_size)
 
     ep_size, experts_per_rank, top_k, hidden = world_size, 4, 4, 64
     num_experts = ep_size * experts_per_rank

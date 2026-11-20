@@ -4,7 +4,7 @@ version = "0.1.4"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.13.0,<2.14",
+    "torch>=2.15.0,<2.16",
     "apache-tvm-ffi==0.1.16",
     "apache-tvm-tirx==0.1.0",
     "deep-gemm",
@@ -30,16 +30,16 @@ include = ["pithtrain*"]
 environments = ["sys_platform == 'linux'"]
 
 [[tool.uv.index]]
-name = "torch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "torch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
-deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "559d79fb6994a58b8a15b4b93bf13ccc16edf247" }
-torch = { index = "torch-cu130" }
+deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "5081f8513af57e61696de4f4f04b0e707ffb503e" }
+torch = { index = "torch-cu132" }
 
 [tool.uv.extra-build-dependencies]
-deep-gemm = ["torch>=2.13.0,<2.14", "packaging", "setuptools", "wheel"]
+deep-gemm = ["torch>=2.15.0,<2.16", "packaging", "setuptools", "wheel"]
 
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_FORCE_BUILD = "1", DG_USE_LOCAL_VERSION = "0" }

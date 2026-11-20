@@ -733,7 +733,7 @@ def build_ops() -> str:
                 source_file.write(OPS_SOURCE)
             includes = cpp_extension.include_paths(device_type="cuda") + [sysconfig.get_paths()["include"], tvm_ffi.libinfo.find_include_path(), tvm_ffi.libinfo.find_dlpack_include_path()]
             tvm_ffi_dir = os.path.dirname(tvm_ffi.libinfo.find_libtvm_ffi())
-            command = ["c++", "-O2", "-std=c++17", "-shared", "-fPIC", f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}", source, "-o", partial]
+            command = ["c++", "-O2", "-std=c++20", "-shared", "-fPIC", f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}", source, "-o", partial]
             command += [f"-I{path}" for path in includes] + [f"-L{path}" for path in cpp_extension.library_paths(device_type="cuda")] + [f"-L{tvm_ffi_dir}", f"-Wl,-rpath,{tvm_ffi_dir}", "-lc10", "-lc10_cuda", "-ltorch_cpu", "-ltorch_cuda", "-ltorch", "-ltvm_ffi"]
             subprocess.run(command, check=True)
             os.replace(partial, library)

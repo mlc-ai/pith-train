@@ -99,7 +99,8 @@ def setup_default_process_group(cfg: DistributedCfg, device_id: int) -> None:
     The excepthook hard-exits on an uncaught exception, since a collective teardown would wait on
     peers that already died.
     """
-    kwargs = dict(backend="nccl", device_id=device_id, timeout=cfg.timeout)
+    # torch 2.15 maps "nccl" to nccl2, still API Unstable; use the legacy ProcessGroupNCCL.
+    kwargs = dict(backend="nccl-legacy", device_id=device_id, timeout=cfg.timeout)
     torch.distributed.init_process_group(**kwargs)
     atexit.register(torch.distributed.destroy_process_group)
 

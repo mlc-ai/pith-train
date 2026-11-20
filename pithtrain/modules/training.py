@@ -31,7 +31,11 @@ from pithtrain.modules.fp8_param_gather import (
 from pithtrain.modules.fsdp_forward import install_lean_hooks, register_fsdp_forward_method
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
-from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_wgrad_accumulation
+from pithtrain.modules.wgrad_accumulation import (
+    install_raw_main_grad,
+    install_side_grads,
+    install_wgrad_accumulation,
+)
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
@@ -396,6 +400,7 @@ def setup_model(
     apply_fsdp(modules, distributed_cfg.hsdp_replica)
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
+    install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
 
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
