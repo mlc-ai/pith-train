@@ -22,13 +22,8 @@ instead of a bf16 ``.grad`` per micro-batch next to FSDP2's fp32 sum: 2 B/param 
 gpt-oss-20b at EP8 on one node), and the per-micro-batch gradients are no longer rounded to bf16
 before they are summed.
 
-install_side_grads keeps every other gradient off the unsharded parameter during the step. Torch
-2.15's FSDP2 accumulates .grad in the reduce dtype (fp32) on the bf16 unsharded parameter, and the
-pipeline defers the reduce to the end of the step, so a parameter would carry an fp32 .grad into
-the next micro-batch's compiled forward, which Dynamo rejects ("dtype mismatch between tensor and
-its gradient"). A post-accumulate-grad hook moves such a .grad into an fp32 sum and clears it; the
-group's post_backward hands the sum back as .grad when the group reduces, before the main_grad hook
-above (which adds it into main_grad) and FSDP2's reduce-scatter.
+install_side_grads sums every other gradient in fp32 off the parameter during the step and hands
+the sum back as .grad when the group reduces.
 """
 
 from typing import Any, Dict, List, Tuple
