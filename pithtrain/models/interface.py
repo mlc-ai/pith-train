@@ -55,6 +55,10 @@ class LayerProtocol(Protocol):
         """
         Stage 1, before the dispatch: run the attention sublayer and shared experts, then route the
         tokens to experts and prepare the dispatch (MoE layers).
+
+        While training.defer_dispatch is set, an expert-parallel layer returns, in place of the
+        dispatch tokens, a pending dispatch whose finish() gives (dispatch_tokens, routing), with
+        routing None until then.
         """
 
     def forward_stage3(

@@ -20,6 +20,7 @@ __all__ = [
     "optimizers",
     "schedulers",
     "current_microbatch",
+    "defer_dispatch",
 ]
 
 PARAM_DTYPE = torch.bfloat16
@@ -61,6 +62,13 @@ Index into the micro-batch list of the step in flight, or None outside a step, f
 tell the micro-batch from the layer alone: DualPipeV interleaves a rank's two chunks across
 micro-batches. It is set before each forward only, which suffices because the backward replays the
 saved graph without re-entering module code.
+"""
+
+defer_dispatch: bool = False
+"""
+Set by DualPipeV around a stage 1 whose dispatch it finishes later: an expert-parallel
+prepare_dispatch then returns (PendingDispatch, None) without waiting for the routing metadata,
+and the caller calls finish() once it has enqueued independent GPU work.
 """
 
 offloaded: bool = False

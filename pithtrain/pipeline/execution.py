@@ -19,6 +19,7 @@ run_backward is derived from dualpipe/utils.py in DeepSeek's DualPipe project
 DeepSeek. See pithtrain/pipeline/LICENSE for the full license text.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -27,7 +28,7 @@ import torch.cuda.nvtx as nvtx
 import torch.distributed
 from torch.autograd import Variable
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
@@ -37,7 +38,9 @@ __all__ = [
     "ExecutionCtx",
     "clear_layer_records",
     "create_chunk_record",
+    "deferred_dispatch",
     "epilog_f",
+    "finish_dispatch",
     "layer_backward",
     "layer_forward",
     "model_backward",
@@ -399,6 +402,34 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
 
     nvtx.range_pop()
     return stage5_args, stage1_outs, dispatch_tokens, next_residual, next_routing
+
+
+@contextmanager
+def deferred_dispatch():
+    """
+    Stage 1 calls inside this scope return a pending dispatch in place of the dispatch tokens and
+    None for the routing (see LayerProtocol.forward_stage1); finish it with finish_dispatch.
+    """
+    training.defer_dispatch = True
+    try:
+        yield
+    finally:
+        training.defer_dispatch = False
+
+
+def finish_dispatch(ctx: ExecutionCtx, outs: Stage1Outs, pending):
+    """
+    Finish a dispatch that stage 1 issued under deferred_dispatch, once the caller has enqueued
+    independent GPU work behind it. Returns the stage 1 outs with the dispatched tokens, the tokens
+    and the routing.
+    """
+    nvtx.range_push("dispatch_finish")
+    dispatch_tokens, routing = pending.finish()
+    # The token gather runs after the event stage 1 recorded; stage 2 waits on this one.
+    ctx.comp_stream.record_event(ctx.fwd_event)
+    nvtx.range_pop()
+    outs = outs._replace(dispatch_tokens=dispatch_tokens, topk_weight=routing.topk_weight)
+    return outs, dispatch_tokens, routing
 
 
 def stage1_stage5_b(ctx: ExecutionCtx, next_layer: LayerProtocol, prev_layer: LayerProtocol, stage1_outs: Stage1Outs, stage5_args: Stage5Args, grad_tensors: tuple):  # fmt: skip
