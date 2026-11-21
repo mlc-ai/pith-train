@@ -60,6 +60,16 @@ class Experts:
     layers: int
     act: str
     bias: bool
+    gate_up_layout: str
+    """
+    separate (two (E, I, H) weights), halves (one (E, 2I, H) weight [gate; up]) or interleaved (one
+    weight, gate / up rows alternating, gpt-oss): it decides the gate_up GEMM width and kernels.
+    """
+    swiglu_alpha: float | None = None
+    swiglu_limit: float | None = None
+    """
+    The clamped SwiGLU's alpha (1.702 in pithtrain/models/gpt_oss.py) and limit (config).
+    """
 
 
 @dataclass(frozen=True)
@@ -140,6 +150,7 @@ def deepseek_v2(cfg: dict) -> dict:
         L - dense,
         "swiglu",
         False,
+        "separate",
     )
     swiglu = (("dense_mlp", cfg["intermediate_size"], dense), ("shared_experts", shared, L - dense))
     return dict(
@@ -175,6 +186,7 @@ def qwen3_moe(cfg: dict) -> dict:
         L,
         "swiglu",
         False,
+        "separate",
     )
     return dict(
         projections=projections, attention=attention, experts=experts, linear_attention=None
@@ -208,6 +220,9 @@ def gpt_oss(cfg: dict) -> dict:
         L,
         "clamped_swiglu",
         True,
+        "interleaved",
+        1.702,
+        float(cfg["swiglu_limit"]),
     )
     return dict(
         projections=projections, attention=attention, experts=experts, linear_attention=None
@@ -256,6 +271,7 @@ def qwen3_5(cfg: dict, moe: bool) -> dict:
             L,
             "swiglu",
             False,
+            "halves",
         )
         swiglu = (("shared_expert", shared, L),)
     else:
