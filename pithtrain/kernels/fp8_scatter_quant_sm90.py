@@ -343,7 +343,7 @@ def compile_prep(G: int, has_expand: bool) -> Callable:
 def compile_scatter_quant(N: int, G: int, pdl: bool) -> Callable:
     M = cute.sym_int()
     num_col_tiles = (N + TILE - 1) // TILE
-    return cute.compile(ScatterQuant(N, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), N), (N, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(cutlass.Float8E4M3FN, (M, N), (N, 1)), fake(cutlass.Float32, (cute.sym_int(), num_col_tiles), (1, cute.sym_int64())), fake(cutlass.Float8E4M3FN, (cute.sym_int(),), (1,)), fake(cutlass.Float32, (N, cute.sym_int()), (1, mn_pad(N))), fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(ScatterQuant(N, G, pdl), fake(cutlass.BFloat16, (cute.sym_int(), N), (N, 1)), fake(Int64, (cute.sym_int(),), (1,), 8), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (cute.sym_int(),), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int32, (G,), (1,), 4), fake(Int64, (cute.sym_int(),), (1,), 8), fake(cutlass.Float8E4M3FN, (M, N), (N, 1)), fake(cutlass.Float32, (cute.sym_int(), num_col_tiles), (1, cute.sym_int64())), fake(cutlass.Float8E4M3FN, (cute.sym_int64(),), (1,)), fake(cutlass.Float32, (N, cute.sym_int()), (1, mn_pad(N))), fake_stream(), options="--enable-tvm-ffi")
 
 
 def run_unfused(gathered: torch.Tensor, expert_idxs: torch.Tensor, num_groups: int, expand_idx: Optional[torch.Tensor], group_counts: Optional[list[int]]) -> tuple:

@@ -149,8 +149,14 @@ Findings the spec tests exposed (xfail until fixed; each fix removes its marker)
   in the forward and `log_prob_bwd` with `grad_logp = -grad_output / n` (fp32) in the backward, so
   the logits gradient is rounded once; one pass over the logits fewer, 2.4x faster forward +
   backward on the H200 at 8k x 152k .. 32k x 248k;
-- SM90 `fp8_quant_grouped` and the fused activation quantizations raise once rows x channels
-  reaches 2^31 (int32 indexing; 11 `stress` cases, e.g. gpt-oss-20b at T = 16k, EP 32);
+- fixed: SM90 `fp8_quant_grouped` and the fused activation quantizations (and `fp8_scatter_quant`,
+  which shares the store) raised once rows x channels reached 2^31 (11 `stress` cases, e.g.
+  gpt-oss-20b at T = 16k, EP 32): the kernels offset in 64 bits, but their compiled signatures
+  declared the flat K-major output's length as int32, which tvm-ffi enforces. The length is now
+  64-bit; the generated code is unchanged (benchmarks within noise). The SM100 silu-mul backward's
+  four "signed" tile modes computed the FP8 store offsets `row * K` in int32 (overflow from 762k
+  rows at `gu_bwd_pair`, N = 1408); their row is now 64-bit, checked in the generated sm_100a
+  source only (not run on a B200);
 - SM90 `fp8_pack_transpose` raises for outputs of 2^31 bytes or more, so gpt-oss-120b `gate_up` at
   EP 1 cannot be FP8 param-gathered (`weight_quant/gpt-oss-120b/004`).
 

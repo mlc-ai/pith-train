@@ -44,9 +44,9 @@ calc_diff 1.38e-6, bound 5e-6), and for the fp32 main grads 2 fp32 ulps + 2.5e-4
 (measured 8.0e-5 at 1.1M rows of one expert, 3.6e-5 below 300k: fp32 accumulation error grows with
 the rows summed; calc_diff 7.5e-7, bound 3e-6).
 
-Known kernel limit, xfail where reached (KMAJOR_INT32_BUG): on SM90 fp8_quant_grouped and the
-fused activation-quant kernels raise ValueError once a per-channel output has 2^31 elements or more
-(only the stress tier, e.g. gpt-oss-20b at T = 16k and EP 32 with every token on one expert).
+The stress tier passes 2^31 elements in one per-channel output (e.g. gpt-oss-20b at T = 16k and
+EP 32 with every token on one expert): SM90 fp8_quant_grouped and the fused activation-quant kernels
+used to reject it (int32 length of their flat K-major output) and are checked there.
 
 SM100 routes the cases reach (computed from the axes, asserted by test_spec_crosses_sm100_routes):
 fp8_grouped_gemm_sm100 switches from its small-group kernels to the large-group ones (w320r for
@@ -56,7 +56,6 @@ above 512, and the gpt-oss gate_up fwd materializes at M >= 1024 G. The H200 run
 through DeepGEMM / QuACK.
 """
 
-import functools
 import json
 import os
 
@@ -100,12 +99,6 @@ FP8_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-8}
 BF16_REL = {"bf16": 2.0**-8, "fp32": 2.0**-22}
 BF16_COEF = {"bf16": 1e-5, "fp32": 2.5e-4}
 BF16_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-6}
-INT32_LIMIT = 2**31
-KMAJOR_INT32_BUG = (
-    "KNOWN KERNEL LIMIT (SM90): fp8_quant_grouped and the fused activation-quant kernels index "
-    "their flat K-major per-channel output with int32 and raise ValueError (Out of bound "
-    "mKmajor.shape) once rows * channels >= 2^31; only stress routing reaches it"
-)
 ALPHA = 1.702  # gpt-oss clamped SwiGLU; the tests assert the spec's swiglu_alpha / swiglu_limit
 LIMIT = 7.0
 
@@ -274,25 +267,8 @@ def grouped_input(rows: int, width: int, counts: list[int], padded: list[int], g
     return x
 
 
-@functools.cache
-def kmajor_layout() -> bool:
-    """
-    Whether fp8_quant_grouped lays the per-channel FP8 out flat, K-major per group (as on SM90).
-    """
-    x = torch.zeros(BLOCK, BLOCK, **BF16)
-    return fp8_quant_grouped(x, torch.tensor([BLOCK], dtype=torch.int32, device="cuda"))[2].ndim == 1  # fmt: skip
-
-
-def expect_int32_limit(request, rows: int, channels: int) -> None:
-    """
-    Mark the test an expected failure where the flat K-major per-channel output passes int32.
-    """
-    if kmajor_layout() and rows * channels >= INT32_LIMIT:
-        request.applymarker(pytest.mark.xfail(raises=ValueError, strict=False, reason=KMAJOR_INT32_BUG))  # fmt: skip
-
-
 @pytest.mark.parametrize("case", spec_params("moe_experts"))
-def test_fp8_expert_gemms(case: dict, request) -> None:
+def test_fp8_expert_gemms(case: dict) -> None:
     axes = case["axes"]
     G, H, inter = axes["G"], axes["hidden"], axes["inter"]
     counts = axes["group_sizes"]
@@ -304,7 +280,6 @@ def test_fp8_expert_gemms(case: dict, request) -> None:
     # gate_up projections as the model launches them: one 2I GEMM, or gate and up of I each
     gu_widths = [2 * inter] if gate_up_layout(case) != "separate" else [inter]
     M = sum(ks)
-    expect_int32_limit(request, M, max(H, *gu_widths))
 
     # forward: x -> gate_up, h -> down
     x = grouped_input(M, H, counts, ks, gen)
@@ -603,7 +578,7 @@ def dsilu_ref(g, u, dh):
 
 
 @pytest.mark.parametrize("case", spec_params("moe_experts"))
-def test_fp8_expert_activation(case: dict, request) -> None:
+def test_fp8_expert_activation(case: dict) -> None:
     """
     The fused activation + FP8 quantization between the expert GEMMs, as the model runs it:
     fp8_silu_mul_fwd / _bwd on separate gate and up (DeepSeek-V2-Lite, Qwen3),
@@ -620,7 +595,6 @@ def test_fp8_expert_activation(case: dict, request) -> None:
     offs = torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).cuda()
     gen = torch.Generator(device="cuda").manual_seed(M + 7 * G)
     layout = gate_up_layout(case)
-    expect_int32_limit(request, M, inter if layout == "separate" else 2 * inter)
     gu = grouped_input(M, 2 * inter, counts, ks, gen)
     dh = grouped_input(M, inter, counts, ks, gen)
     checks = []
