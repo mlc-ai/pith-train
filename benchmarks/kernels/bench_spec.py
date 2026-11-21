@@ -1,7 +1,7 @@
 """
 Times the kernels at the cases of tools/kernel_cases/kernel_cases.json, the same cases the spec
 tests verify, and writes machine-readable results; --compare checks them against a stored baseline
-with the docs/kernel-styles.md section 9 rule (median within 5% + 3 us).
+with the docs/kernel-styles.md section 9 rule (median within 5% + 3 us; benchmarks/kernels/compare.py).
 
     python -m benchmarks.kernels.bench_spec --tier smoke --out results.json
     python -m benchmarks.kernels.bench_spec --tier smoke --compare benchmarks/kernels/baselines/h200.json
@@ -26,6 +26,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from benchmarks.kernels.compare import gate
 from pithtrain.kernels import (
     bf16_expert_down_fwd,
     bf16_expert_gate_up_fwd,
@@ -355,24 +356,6 @@ def run(args) -> dict:
     )
 
 
-def compare(new: dict, base: dict, rel: float = 0.05, abs_us: float = 3.0) -> list[str]:
-    """
-    Ops slower than the baseline by more than rel of its median plus abs_us.
-    """
-    old = {(r["case"], r["op"]): r for r in base["results"] if "median_us" in r}
-    regressions = []
-    for r in new["results"]:
-        prev = old.get((r["case"], r["op"]))
-        if prev is None or "median_us" not in r:
-            continue
-        limit = prev["median_us"] * (1 + rel) + abs_us
-        if r["median_us"] > limit:
-            regressions.append(
-                f"{r['case']} {r['op']}: {r['median_us']:.1f} us > {limit:.1f} us (baseline {prev['median_us']:.1f})"
-            )
-    return regressions
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -389,16 +372,7 @@ def main() -> int:
     if args.out:
         args.out.write_text(json.dumps(result, indent=1) + "\n")
     if args.compare:
-        base = json.loads(args.compare.read_text())
-        if base["meta"]["gpu"] != result["meta"]["gpu"]:
-            print(f"baseline is from {base['meta']['gpu']}, this is {result['meta']['gpu']}")
-            return 1
-        regressions = compare(result, base)
-        for line in regressions:
-            print("REGRESSION", line)
-        matched = sum(1 for r in result["results"] if "median_us" in r)
-        print(f"{len(regressions)} regressions over {matched} ops")
-        return 1 if regressions else 0
+        return gate(result, json.loads(args.compare.read_text()))
     return 0 if all(math.isfinite(r.get("median_us", 0.0)) for r in result["results"]) else 1
 
 
