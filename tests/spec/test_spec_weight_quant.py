@@ -107,17 +107,8 @@ def shard_tile_amax(shard: torch.Tensor, row_offset: int, group_offset: int, gri
     return grid, touched
 
 
-PACK_LIMIT = 2**31
-"""
-Known bug: SM90 fp8_pack_transpose indexes its output with int32 (tvm-ffi rejects an out of 2^31
-or more elements), although its contract takes any size. The packed buffer is 2 x the gathered
-weight's elements, so gpt-oss-120b's gate_up experts at EP 1 (128 x 5760 x 2880, 4.2e9 bytes)
-cannot be gathered in FP8.
-"""
-
-
 @pytest.mark.parametrize("case", spec_params("weight_quant"))
-def test_param_gather(case: dict, request: pytest.FixtureRequest) -> None:
+def test_param_gather(case: dict) -> None:
     dense = case["axes"]["G"] == 0
     w = master_weight(case)
     G, N, K = w.shape
@@ -172,9 +163,7 @@ def test_param_gather(case: dict, request: pytest.FixtureRequest) -> None:
     assert_fp8_equal(gathered, ref, "gathered fp8_shard_cast")
 
     # pack: the gathered bytes and their per-expert transpose, back to back
-    if 2 * gathered.numel() >= PACK_LIMIT:
-        reason = "fp8_pack_transpose (SM90) fails with an output of 2^31 or more bytes (int32 index; see PACK_LIMIT)"  # fmt: skip
-        request.applymarker(pytest.mark.xfail(raises=ValueError, strict=False, reason=reason))
+    # gpt-oss-120b's gate_up experts at EP 1 (128 x 5760 x 2880) pack into 4.2e9 bytes, past 2^31
     packed = torch.empty(2 * gathered.numel(), dtype=torch.uint8, device=DEV)
     fp8_pack_transpose(gathered, packed)
     numel = gathered.numel()

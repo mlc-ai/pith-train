@@ -157,8 +157,9 @@ Findings the spec tests exposed (xfail until fixed; each fix removes its marker)
   four "signed" tile modes computed the FP8 store offsets `row * K` in int32 (overflow from 762k
   rows at `gu_bwd_pair`, N = 1408); their row is now 64-bit, checked in the generated sm_100a
   source only (not run on a B200);
-- SM90 `fp8_pack_transpose` raises for outputs of 2^31 bytes or more, so gpt-oss-120b `gate_up` at
-  EP 1 cannot be FP8 param-gathered (`weight_quant/gpt-oss-120b/004`).
+- fixed: SM90 `fp8_pack_transpose` raised for outputs of 2^31 bytes or more, so gpt-oss-120b
+  `gate_up` at EP 1 could not be FP8 param-gathered (`weight_quant/gpt-oss-120b/004`): the same
+  int32 length in the compiled signature, now 64-bit. SM100 was already 64-bit.
 
 Not a bug but measured: `FP8Linear` has no fp32 `main_grad`, so each micro-batch's dense FP8 weight
 gradient is rounded to bf16 before it is summed (relative L2 1.7e-3 per term;
