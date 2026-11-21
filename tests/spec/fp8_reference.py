@@ -68,7 +68,9 @@ def dequant_blockwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def assert_fp8_equal(got: torch.Tensor, want: torch.Tensor, name: str) -> None:
     assert got.dtype == torch.float8_e4m3fn and got.shape == want.shape, (name, got.dtype, got.shape, want.shape)  # fmt: skip
-    differ = (got.contiguous().view(torch.uint8) != want.contiguous().view(torch.uint8)).sum().item()
+    differ = (
+        (got.contiguous().view(torch.uint8) != want.contiguous().view(torch.uint8)).sum().item()
+    )
     assert differ == 0, f"{name}: {differ} of {got.numel()} fp8 bytes differ"
 
 
