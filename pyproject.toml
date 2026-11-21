@@ -44,6 +44,19 @@ deep-gemm = ["torch>=2.15.0,<2.16", "packaging", "setuptools", "wheel"]
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_FORCE_BUILD = "1", DG_USE_LOCAL_VERSION = "0" }
 
+[tool.pytest.ini_options]
+# Tiers of the spec-driven tests (tests/spec, cases from tools/kernel_cases/kernel_cases.json):
+# smoke runs by default, the full spec and stress tiers and the multi-GPU tests only when selected
+# (pytest -m spec, -m stress, -m multigpu). Unmarked tests are unaffected. See docs/kernel-validation.md.
+addopts = "-m 'not spec and not stress and not multigpu' --strict-markers"
+markers = [
+    "smoke: smallest spec cases, one or two per (family, model); run by default",
+    "spec: every training shape of tools/kernel_cases/kernel_cases.json (pytest -m spec)",
+    "stress: shapes past balanced training, e.g. all EP-group tokens on one expert (pytest -m stress)",
+    "multigpu: needs several GPUs on one node; a skip for missing GPUs fails the test (pytest -m multigpu)",
+    "sm100: exercises a kernel route only Blackwell (SM100) runs; skips elsewhere",
+]
+
 [tool.mypy]
 follow_imports = "skip"
 ignore_errors = false
