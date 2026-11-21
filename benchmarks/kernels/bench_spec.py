@@ -36,13 +36,21 @@ from pithtrain.kernels import (
     chunk_gdr_bwd_pinned,
     chunk_gdr_fwd_pinned,
     cross_entropy_fwd_bwd,
+    fp8_clamped_swiglu_bwd,
+    fp8_clamped_swiglu_kmajor,
+    fp8_clamped_swiglu_rowwise,
     fp8_gemm_bwd,
     fp8_gemm_fwd,
     fp8_grouped_gemm,
     fp8_grouped_wgrad_empty,
+    fp8_pack_transpose,
     fp8_quant_grouped,
     fp8_quant_weight,
     fp8_quant_weight_grouped,
+    fp8_silu_mul_bwd,
+    fp8_silu_mul_fwd,
+    fp8_silu_mul_gu_bwd,
+    fp8_silu_mul_gu_fwd,
     gated_delta_rule_pinned_supported,
     k_grouped_fp8_gemm,
 )
@@ -53,6 +61,7 @@ BF16 = dict(device=DEV, dtype=torch.bfloat16)
 FAMILIES = [
     "moe_experts",
     "dense_gemm",
+    "weight_quant",
     "attention",
     "gated_delta_rule",
     "causal_conv1d",
@@ -131,6 +140,7 @@ def moe_ops(axes: dict, gen: torch.Generator) -> dict:
             gemm,
         ),
     }
+    ops.update(activation_quant_ops(axes, M, offs, gen))
     if axes["bf16_fused"] and bf16_experts_supported(G):
         raw = axes["group_sizes"]
         M_raw = sum(raw)
@@ -154,6 +164,58 @@ def moe_ops(axes: dict, gen: torch.Generator) -> dict:
             2 * M_raw * H * inter,
         )
     return ops
+
+
+def activation_quant_ops(axes: dict, M: int, offs: torch.Tensor, gen: torch.Generator) -> dict:
+    """
+    The fused activation + FP8 quantization between the expert GEMMs, forward and backward, in the
+    model's gate / up layout (separate, the halves of one weight, or gpt-oss's interleaved rows).
+    """
+    G, inter, layout = axes["G"], axes["inter"], axes["gate_up_layout"]
+    gu, dh = randn(M, 2 * inter, gen=gen), randn(M, inter, gen=gen)
+    if layout == "interleaved":
+        bias = randn(G, 2 * inter, gen=gen)
+        alpha, limit = axes["swiglu_alpha"], axes["swiglu_limit"]
+        return {
+            "fp8_clamped_swiglu_rowwise": (
+                lambda: fp8_clamped_swiglu_rowwise(gu, bias, offs, alpha, limit),
+                0,
+            ),
+            "fp8_clamped_swiglu_kmajor": (
+                lambda: fp8_clamped_swiglu_kmajor(gu, bias, offs, alpha, limit),
+                0,
+            ),
+            "fp8_clamped_swiglu_bwd": (
+                lambda: fp8_clamped_swiglu_bwd(dh, gu, bias, offs, alpha, limit),
+                0,
+            ),
+        }
+    if layout == "halves":
+        return {
+            "fp8_silu_mul_gu_fwd": (lambda: fp8_silu_mul_gu_fwd(gu, offs), 0),
+            "fp8_silu_mul_gu_bwd": (lambda: fp8_silu_mul_gu_bwd(dh, gu, offs), 0),
+        }
+    g, u = gu[:, :inter].contiguous(), gu[:, inter:].contiguous()
+    return {
+        "fp8_silu_mul_fwd": (lambda: fp8_silu_mul_fwd(g, u, offs), 0),
+        "fp8_silu_mul_bwd": (lambda: fp8_silu_mul_bwd(dh, g, u, offs), 0),
+    }
+
+
+def weight_quant_ops(axes: dict, gen: torch.Generator) -> dict:
+    """
+    The per-step FP8 weight quantization of one weight (dense, or the (G, N, K) experts of a
+    rank) and the packing of its FP8 bytes with their transpose for the parameter all-gather.
+    """
+    G, N, K = axes["G"], axes["N"], axes["K"]
+    w = randn(max(G, 1), N, K, scale=0.02, gen=gen)
+    quant = (lambda: fp8_quant_weight_grouped(w)) if G else (lambda: fp8_quant_weight(w[0]))
+    w_fp8 = fp8_quant_weight_grouped(w)[0]
+    packed = torch.empty(2 * w_fp8.numel(), dtype=torch.uint8, device=DEV)
+    return {
+        "fp8_quant_weight" + ("_grouped" if G else ""): (quant, 0),
+        "fp8_pack_transpose": (lambda: fp8_pack_transpose(w_fp8, packed), 0),
+    }
 
 
 def dense_ops(axes: dict, gen: torch.Generator) -> dict:
@@ -288,6 +350,7 @@ def ce_ops(axes: dict, gen: torch.Generator) -> dict:
 OPS = dict(
     moe_experts=moe_ops,
     dense_gemm=dense_ops,
+    weight_quant=weight_quant_ops,
     attention=attention_ops,
     gated_delta_rule=gdn_ops,
     causal_conv1d=conv_ops,
