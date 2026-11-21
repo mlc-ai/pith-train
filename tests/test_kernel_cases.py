@@ -28,9 +28,7 @@ from tools.kernel_cases.models import CONFIG_ROOT, REPO_ROOT, load_models
 SPEC = load_spec()
 MODELS = {model.name: model for model in load_models()}
 
-UNTESTED = {
-    "pointwise_layers": "no pithtrain kernel: RMSNorm, RoPE and the router are plain PyTorch inside torch.compile stages; tests/test_dualpipev.py runs them end to end",
-}
+UNTESTED: dict[str, str] = {}
 """
 Families whose cases no spec-driven test consumes yet, with the reason.
 """

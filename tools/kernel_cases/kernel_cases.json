@@ -539,11 +539,11 @@
    "tolerance": "one bf16 rounding; fp8_swiglu_mlp exact against the unfused path, calc_diff against float64"
   },
   "pointwise_layers": {
-   "doc": "The torch-compiled per-token layers around attention and the experts (no pithtrain kernel; Inductor-generated): RMSNorm, q/k norm, RoPE (partial for Qwen3.5), router top-k.",
+   "doc": "The torch-compiled per-token layers around attention and the experts (no pithtrain kernel; Inductor-generated from each model's own modules): RMSNorm, q/k norm, RoPE (partial for Qwen3.5), router top-k.",
    "kernels": [],
-   "axes": "T, hidden, heads x head_dim, rotary_dim, E, top_k",
-   "reference": "float64 eager PyTorch",
-   "tolerance": "per output, see the test"
+   "axes": "T, B, S_local, hidden, Hq, Hkv, D, E, top_k",
+   "reference": "float64 formulas of the same modules",
+   "tolerance": "pointwise outputs within one bf16 rounding; reduced outputs and router weights per tests/spec/test_spec_pointwise_layers.py"
   }
  },
  "shape_independent": [
