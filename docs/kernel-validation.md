@@ -56,11 +56,18 @@ few axes, and the ~1.5k cases are the deduplicated set over all mesh points:
 | `gated_delta_rule` | pinned GDN kernels (CP 1), CP pieces (CP > 1) | `cp, mbs, T_local, H = 16 mbs, HV = (32 or 48) mbs` | Qwen3.5 meshes (batch folded into heads) |
 | `causal_conv1d` | `causal_conv1d_*` | `cp, B, T_local, C, width` | Qwen3.5 meshes |
 | `cross_entropy` | `cross_entropy_fwd_bwd`, `log_prob_*` | `rows = T, vocab` | each T (last pipeline stage) |
-| `swiglu_dense` | `silu_mul_*` | `M = T, inter` | dense / shared-expert MLPs |
-| `pointwise_layers` | none (Inductor) | `T, hidden, heads, E, top_k` | listed for completeness; no spec test yet |
+| `swiglu_dense` | `silu_mul_*`; for DeepSeek-V2 the fused FP8 MLP `operators.fp8_swiglu_mlp` | `M = T, inter, hidden, fp8_swiglu_mlp` | dense / shared-expert MLPs |
+| `pointwise_layers` | none (Inductor-generated from each model's own modules) | `T, B, S_local, hidden, Hq, Hkv, D, E, top_k` | each (T, mbs): RMSNorm (decoder, q / k, kv_a), RoPE, the router, compiled as the stages compile them |
 
 Expert routing is materialized in the spec (`group_sizes`), not re-drawn by consumers, so a test, a
-benchmark and an agent run the same per-expert row counts. The FP8 path pads each group to a
+benchmark and an agent run the same per-expert row counts. The counts stay explicit rather than a
+seed plus a deterministic expansion: a reviewer sees in the diff exactly which rows each expert
+gets, which is worth the spec's ~0.9 MB.
+
+Varlen attention under CP (`ring_attention_varlen_func`) is not in the spec: pretraining does not
+pack sequences (`pretrain_lm` passes `cu_seqlens=None`), so no shipped mesh launches it. Add its
+cases (per-document zigzag `cu_seqlens` at each CP) when a packed run ships; varlen FA4 at CP 1
+stays covered by the `attention` family. The FP8 path pads each group to a
 multiple of 128 rows; `fp8_rows` is that total.
 
 Each case is one line of JSON:
@@ -194,15 +201,20 @@ python -m tools.kernel_cases --export /tmp/cases --family moe_experts --tier spe
 ```
 
 writes `moe_experts.jsonl`, one case per line with the family's kernels, reference, tolerance and
-the config sha256 it came from. The intended TIRx-harness integration (not part of this repo):
+the config sha256 it came from. The TIRx-harness integration (implemented there, not in this repo)
+follows two decided rules:
 
-- an importer turns a family's JSONL into a pinned task (`definition.json` + `workload.jsonl`),
-  using `weight` for the aggregate score instead of an unweighted mean;
-- Quick-Start skills (`tirx-debug-kernel`, `tirx-profile-kernel`) load these cases instead of
-  "a representative input";
-- an agent may add edge cases of its own but may not remove or replace spec cases, and a kernel
-  is accepted only if every `spec` case of its family passes the PithTrain test and does not
-  regress in `bench_spec --compare`.
+- **Score by `weight`.** An importer turns a family's JSONL into a pinned task (`definition.json` +
+  `workload.jsonl`) whose aggregate score weights each case by its `weight` (FLOPs per launch x
+  layers launching it, i.e. its share of step time), never an unweighted mean over cases, so a
+  win on a rare shape cannot hide a loss on the dominant one.
+- **Add-only cases.** An agent may add edge cases of its own but may not remove, replace or
+  re-weight spec cases; the imported spec cases stay pinned to the spec's content. A kernel is
+  accepted only if every `spec` case of its family passes the PithTrain test and does not regress
+  in `bench_spec --compare`.
+
+Quick-Start skills (`tirx-debug-kernel`, `tirx-profile-kernel`) load these cases instead of "a
+representative input".
 
 Shape specialization stays allowed, but only to shapes in the spec, so a specialized route is
 always a verified one.
@@ -211,7 +223,8 @@ always a verified one.
 
 - **New model**: add `examples/pretrain_lm/<model>/config.json`; if its `model_type` is new, add an
   extractor in `tools/kernel_cases/models.py`. Run `python -m tools.kernel_cases --write`, review
-  the new cases, run `pytest tests/spec -m "smoke or spec"`.
+  the new cases, run `pytest tests/spec -m "smoke or spec"`. The `add-new-model` skill makes this
+  part of its Phase 2 gate (spec current, smoke tier passing for the model).
 - **New mesh or benchmark**: add the script; regenerate.
 - **New kernel**: list it in a family in `tools/kernel_cases/cases.py` (or in
   `SHAPE_INDEPENDENT`), and make that family's `tests/spec/test_spec_<family>.py` drive it.
