@@ -9,12 +9,11 @@ float64 log-softmax computed here in row blocks:
 - the CrossEntropy autograd op (pithtrain.operators.cross_entropy) as training uses it, with a
   grad_output of 1/3 (not representable in bf16; pretrain_lm scales the loss by num_tokens and the
   step divides by the global count, so grad_output is rarely a power of two): the gradient
-  g (softmax - onehot) / n should also be within one bf16 rounding. CrossEntropy.backward computes
-  inp.mul_(grad_output.to(inp.dtype)), rounding g to bf16 (relative error up to 2^-9) and then the
-  product a second time, so it exceeds that bound: a known bug, marked xfail. Measured on the H200
-  at every spec shape: errors up to 2.65x the one-rounding bound (the kernel alone: 0.996x), and the
-  off-target gradient scaled by 1.0017 .. 1.0019 (bf16(1/3) = 0.333984 is 1/3 + 0.2%), a systematic
-  bias of every logits gradient whenever grad_output is not a short binary fraction;
+  g (softmax - onehot) / n within one bf16 rounding too. The op used to multiply the fused
+  kernel's bf16 gradient by grad_output rounded to bf16, rounding twice: measured on the H200 up to
+  2.65x the one-rounding bound and the off-target gradient scaled by 1.0017 .. 1.0019 (bf16(1/3)
+  = 0.333984 is 1/3 + 0.2%). It now runs log_prob_fwd / log_prob_bwd with grad_logp = -g / n in
+  fp32, one rounding;
 - log_prob_fwd / log_prob_bwd at the same shapes (temperature 1): logp and entropy to fp32
   accuracy, the gradient within one bf16 rounding (measured 0.996x).
 
@@ -127,7 +126,7 @@ GRAD_OUTPUT = 1.0 / 3.0
 
 
 @pytest.mark.parametrize("case", spec_params("cross_entropy"))
-def test_cross_entropy_op_grad_output(case: dict, request: pytest.FixtureRequest) -> None:
+def test_cross_entropy_op_grad_output(case: dict) -> None:
     logits, target = make_case(case)
     want, count = exact_ce(logits, target)
     leaf = logits.clone().requires_grad_(True)
@@ -137,13 +136,6 @@ def test_cross_entropy_op_grad_output(case: dict, request: pytest.FixtureRequest
     assert loss_rel <= LOSS_REL, f"loss {float(loss)} vs {want}: rel {loss_rel:.3g}"
     ratio, bias = grad_ratio(leaf.grad, logits, target, GRAD_OUTPUT / count)
     record(case["id"], "op_grad_output", loss_rel=loss_rel, grad_ratio=ratio, grad_bias=bias)
-    if ratio > 1.0:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=False,
-                reason="CrossEntropy.backward rounds grad_output to bf16 before multiplying (operators/cross_entropy.py: inp.mul_(grad_output.to(inp.dtype))), so the logits gradient is rounded twice",  # fmt: skip
-            )
-        )
     assert ratio <= 1.0, f"gradient error {ratio:.3g}x one bf16 rounding (scale bias {bias:.3g})"
 
 

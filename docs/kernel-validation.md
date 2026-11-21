@@ -141,11 +141,14 @@ Bounds as calibrated on the H200 (worst measured over smoke + spec + stress, the
 Set `PITHTRAIN_SPEC_ERRORS` / `PITHTRAIN_SPEC_MEASURE` / `PITHTRAIN_SPEC_ERROR_LOG` (named in each
 module) to record the errors again before changing a bound, e.g. on SM100.
 
-Findings the spec tests exposed (xfail until fixed):
+Findings the spec tests exposed (xfail until fixed; each fix removes its marker):
 
-- `CrossEntropy.backward` rounds `grad_output` to bf16 before scaling (`inp.mul_(grad_output.to(inp.dtype))`),
-  2.65x the one-rounding bound at `grad_output = 1/3` and a systematic 0.2% scale error
-  (all `cross_entropy` operator cases);
+- fixed: `CrossEntropy.backward` rounded `grad_output` to bf16 before scaling
+  (`inp.mul_(grad_output.to(inp.dtype))`), 2.65x the one-rounding bound at `grad_output = 1/3` and a
+  systematic 0.2% scale error (all `cross_entropy` operator cases). The op now runs `log_prob_fwd`
+  in the forward and `log_prob_bwd` with `grad_logp = -grad_output / n` (fp32) in the backward, so
+  the logits gradient is rounded once; one pass over the logits fewer, 2.4x faster forward +
+  backward on the H200 at 8k x 152k .. 32k x 248k;
 - SM90 `fp8_quant_grouped` and the fused activation quantizations raise once rows x channels
   reaches 2^31 (int32 indexing; 11 `stress` cases, e.g. gpt-oss-20b at T = 16k, EP 32);
 - SM90 `fp8_pack_transpose` raises for outputs of 2^31 bytes or more, so gpt-oss-120b `gate_up` at
