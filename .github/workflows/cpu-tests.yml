@@ -1,0 +1,23 @@
+name: CPU Tests
+
+# The checks that need neither a GPU nor the training dependencies: the kernel-shape spec is current
+# and complete (tests/test_kernel_cases.py), the kernel benchmark gate (tests/test_bench_compare.py),
+# the import layering and kernel naming rules (tests/test_import_layers.py, AST only) and the memory
+# estimator (tools/tests).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m tools.kernel_cases
+      - run: python -m pytest -p no:cacheprovider tests/test_kernel_cases.py tests/test_bench_compare.py tests/test_import_layers.py tools/tests -q

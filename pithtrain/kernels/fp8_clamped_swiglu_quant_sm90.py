@@ -447,7 +447,7 @@ def get_kernel(N: int, backward: bool, alpha: float, limit: float, device: torch
         gate_up = fake(bf16_type, (M, 2 * N), (2 * N, 1))
         dh = fake(bf16_type, (M, N), (N, 1)) if backward else None
         bias = fake(bf16_type, (cute.sym_int(), 2 * N), (2 * N, 1))
-        outputs = (fake(fp8_type, (M, num_out_cols), (num_out_cols, 1)), fake(Float32, (M, num_col_blocks), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int(),), (1,)), fake(Float32, (KP, cute.sym_int()), (1, mn_pad(KP)), 16))
+        outputs = (fake(fp8_type, (M, num_out_cols), (num_out_cols, 1)), fake(Float32, (M, num_col_blocks), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int64(),), (1,)), fake(Float32, (KP, cute.sym_int()), (1, mn_pad(KP)), 16))
         if not rowwise:
             outputs = (None, None) + outputs[2:]
         if not kmajor:

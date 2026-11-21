@@ -425,7 +425,8 @@ def build_kernel(mode, N):
             # registers better for these pipelines.
             row_block, col_block = tile // NUM_COL_TILES, tile % NUM_COL_TILES
             out_col = col_block * BLOCK + col_group * 8
-            return row_block, col_block, out_col, row_block * BLOCK + row0
+            # the row in 64 bits all the same: quant_store offsets row * K in its type
+            return row_block, col_block, out_col, txl.cast(row_block * BLOCK, "int64") + txl.cast(row0, "int64")
         # tile indices are non-negative: unsigned division, 64-bit row so per-row offsets fold into addresses
         tile_u32 = txl.cast(tile, "uint32")
         row_block = txl.cast(tile_u32 // txl.uint32(NUM_COL_TILES), "int32")
