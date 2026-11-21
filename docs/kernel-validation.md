@@ -87,7 +87,7 @@ Cases carry a tier; the spec-driven tests (`tests/spec/`) mark each param with i
 | `smoke` | one or two cases per (family, model), at T = 4k | default: `pytest tests/spec` |
 | `spec` | every case the meshes produce, plus the route-boundary cases | `pytest tests/spec -m "smoke or spec"` |
 | `stress` | past balanced training: all EP-group tokens on one expert | `pytest tests/spec -m stress` |
-| `multigpu` | ring attention and GDN under CP, on `cp` GPUs of one node (CP 8 cases in `*_cp8` tests / `cp8` ids, so `-k "not cp8"` fits 4 GPUs) | `pytest tests/spec -m multigpu` |
+| `multigpu` | ring attention and GDN under CP, on `cp` GPUs of one node (ring attention keeps its CP 8 cases in `test_ring_attention_cp8`, so `-k "not cp8"` fits 4 GPUs there) | `pytest tests/spec -m multigpu` |
 
 `pyproject.toml` deselects `spec`, `stress` and `multigpu` by default (unmarked tests are
 unaffected). A `multigpu` test that skips for lack of GPUs fails instead (`tests/conftest.py`;
