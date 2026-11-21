@@ -172,11 +172,11 @@ FAMILIES = OrderedDict(
         tolerance="loss rel 1e-6; gradient within one bf16 rounding of the exact value",
     ),
     swiglu_dense=dict(
-        doc="SiLU-mul of the dense and shared-expert MLPs at M = tokens per GPU (eager silu_mul kernels; FP8 runs the fused fp8_silu_mul with one group).",
+        doc="SiLU-mul of the dense and shared-expert MLPs at M = tokens per GPU (eager silu_mul kernels; FP8 runs the fused fp8_silu_mul with one group), and for DeepSeek-V2 (fp8_swiglu_mlp set) the whole fused FP8 MLP, pithtrain.operators.fp8_swiglu_mlp.",
         kernels=["silu_mul_fwd", "silu_mul_bwd"],
-        axes="M, inter",
-        reference="float64 silu(g) * u",
-        tolerance="one bf16 rounding",
+        axes="M, inter, hidden, fp8_swiglu_mlp",
+        reference="float64 silu(g) * u; fp8_swiglu_mlp bit-identical to FP8Linear -> silu_mul -> FP8Linear, and against the float64 MLP",
+        tolerance="one bf16 rounding; fp8_swiglu_mlp exact against the unfused path, calc_diff against float64",
     ),
     pointwise_layers=dict(
         doc="The torch-compiled per-token layers around attention and the experts (no pithtrain kernel; Inductor-generated): RMSNorm, q/k norm, RoPE (partial for Qwen3.5), router top-k.",
@@ -638,6 +638,9 @@ def swiglu_cases(model: Model, meshes: list[Mesh]) -> list[dict]:
                 mlp=name,
                 M=T,
                 inter=inter,
+                hidden=model.hidden,
+                # DeepSeekV2MLP runs the fused FP8 operator (pithtrain/models/deepseek_v2.py)
+                fp8_swiglu_mlp=model.model_type == "deepseek_v2",
                 tier="smoke" if T == 4096 else "spec",
                 weight=dict(layers=layers),
             )
