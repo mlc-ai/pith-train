@@ -87,7 +87,7 @@ Cases carry a tier; the spec-driven tests (`tests/spec/`) mark each param with i
 | `smoke` | one or two cases per (family, model), at T = 4k | default: `pytest tests/spec` |
 | `spec` | every case the meshes produce, plus the route-boundary cases | `pytest tests/spec -m "smoke or spec"` |
 | `stress` | past balanced training: all EP-group tokens on one expert | `pytest tests/spec -m stress` |
-| `multigpu` | ring attention and GDN under CP, on `cp` GPUs of one node | `pytest tests/spec -m multigpu` |
+| `multigpu` | ring attention and GDN under CP, on `cp` GPUs of one node (CP 8 cases in `*_cp8` tests / `cp8` ids, so `-k "not cp8"` fits 4 GPUs) | `pytest tests/spec -m multigpu` |
 
 `pyproject.toml` deselects `spec`, `stress` and `multigpu` by default (unmarked tests are
 unaffected). A `multigpu` test that skips for lack of GPUs fails instead (`tests/conftest.py`;
@@ -120,6 +120,44 @@ case is a finding, not a fix.
 
 A test that exposes a kernel bug keeps the case and marks it `xfail(strict=False)` with a reason
 naming the bug; the kernel is fixed in its own change.
+
+Bounds as calibrated on the H200 (worst measured over smoke + spec + stress, then the bound):
+
+| family | output | worst measured | bound |
+|---|---|---|---|
+| moe_experts (FP8) | GEMM bf16 out, per element: coef of sum \|ab\| / calc_diff | 1.4e-4 / 1.39e-6 | 2^-11 / 5e-6 |
+| | k-grouped wgrad fp32: coef / calc_diff | 5.3e-4 / 7.8e-9 | 2^-9 / 3e-8 |
+| | fused activation quant | 0.94 of e4m3 + bf16 rounding | 1.0 |
+| moe_experts (BF16) | outputs / main grads coef | 2.3e-6 / 8.0e-5 | 1e-5 / 2.5e-4 |
+| dense_gemm | y, dx, dw coef / calc_diff vs exact dequant / vs bf16 truth | 9.9e-5 / 1.39e-6 / 7.15e-4 | 3e-4 / 3e-6 / 2e-3 |
+| weight_quant | bytes and scales | exact | exact |
+| attention | out / dq, dk, dv / dsink (rel L2); lse (abs) | 2.3e-3 / 2.5e-3 / 3.1e-3; 3.8e-6 | 7e-3 / 7.5e-3 / 1e-2; 2e-5 |
+| ring_attention | out / grads / MLA latent grads (rel L2) | 3.1e-3 / 3.0e-3 / 4.1e-3 | 1e-2 / 9e-3 / 1.25e-2 |
+| gated_delta_rule | calc_diff o .. dbeta; max-abs / ref max | <= 1.1e-5; 8.2e-3 | 2e-5 .. 1e-4; 2e-2 |
+| causal_conv1d | y, dx, dw (fraction of one bf16 rounding + fp32 slack) | 0.996 | 1.0 |
+| cross_entropy | loss rel; grad (fraction of one rounding); log_prob abs | 1.9e-7; 0.996; 1.9e-6 | 1e-6; 1.0; 1e-5 |
+| swiglu_dense | out, dg, du (fraction of one rounding) | 0.9998 | 1.0 |
+
+Set `PITHTRAIN_SPEC_ERRORS` / `PITHTRAIN_SPEC_MEASURE` / `PITHTRAIN_SPEC_ERROR_LOG` (named in each
+module) to record the errors again before changing a bound, e.g. on SM100.
+
+Findings the spec tests exposed (xfail until fixed):
+
+- `CrossEntropy.backward` rounds `grad_output` to bf16 before scaling (`inp.mul_(grad_output.to(inp.dtype))`),
+  2.65x the one-rounding bound at `grad_output = 1/3` and a systematic 0.2% scale error
+  (all `cross_entropy` operator cases);
+- SM90 `fp8_quant_grouped` and the fused activation quantizations raise once rows x channels
+  reaches 2^31 (int32 indexing; 11 `stress` cases, e.g. gpt-oss-20b at T = 16k, EP 32);
+- SM90 `fp8_pack_transpose` raises for outputs of 2^31 bytes or more, so gpt-oss-120b `gate_up` at
+  EP 1 cannot be FP8 param-gathered (`weight_quant/gpt-oss-120b/004`).
+
+Not a bug but measured: `FP8Linear` has no fp32 `main_grad`, so each micro-batch's dense FP8 weight
+gradient is rounded to bf16 before it is summed (relative L2 1.7e-3 per term;
+`test_spec_dense_gemm.py::test_wgrad_bf16_rounding` pins it).
+
+Running the multi-GPU tiers: each case spawns its ranks through `tests/utilities.launch`, which uses
+`MASTER_PORT` 15213 unless set, so give concurrent runs on one node distinct ports. Under `srun -n N`,
+`-c` is per task.
 
 ## 5. Benchmarks
 
