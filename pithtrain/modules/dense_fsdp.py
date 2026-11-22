@@ -191,7 +191,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
     if cfg.compile_blocks:
         from torch._inductor import list_mode_options
 
-        compile_options = list_mode_options(cfg.compile_mode) | stage_compile_options()
+        compile_options = list_mode_options(cfg.compile_mode)
+        if cfg.compile_mode in ("default", "reduce-overhead"):
+            compile_options |= stage_compile_options()
     for layer in model.layers:
         if cfg.activation_checkpoint in ("selective", "full"):
             ctx = (
