@@ -36,6 +36,22 @@ BAR_READY, BAR_FREE_P, BAR_FREE = 3, 5, 7  # READY, FREE_P: ids +0 / +1 by P buf
 GRAD_THREADS = 256  # ChunkGradients: 8 warps, 4 along the rows and 2 along the columns of each tile
 
 
+@cute.jit
+def load_tma_tile(atom: cute.CopyAtom, source: cute.Tensor, target: cute.Tensor, barrier):
+    dst, src = cpasync.tma_partition(
+        atom, 0, cute.make_layout(1), cute.group_modes(target, 0, 2), cute.group_modes(source, 0, 2)
+    )
+    cute.copy(atom, src, dst, tma_bar_ptr=barrier)
+
+
+@cute.jit
+def store_tma_tile(atom: cute.CopyAtom, source: cute.Tensor, target: cute.Tensor):
+    src, dst = cpasync.tma_partition(
+        atom, 0, cute.make_layout(1), cute.group_modes(source, 0, 2), cute.group_modes(target, 0, 2)
+    )
+    cute.copy(atom, src, dst)
+
+
 class BwdPrologue:
     """
     One CTA per (chunk, value head), four warps, everything in shared memory, no cross-chunk state:
@@ -50,29 +66,67 @@ class BwdPrologue:
     T are stored.
     """
 
-    def __init__(self, H: int, HV: int, ragged: bool = False):
+    def __init__(self, H: int, HV: int, ragged: bool = False, tma: bool = False):
         self.H, self.HV, self.ragged = H, HV, ragged
+        self.tma = tma
         self.scale = HEAD_DIM ** -0.5
 
     @cute.jit
     def __call__(self, mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mDo: cute.Tensor, mGcum: cute.Tensor, mBeta: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mDvLocal: cute.Tensor, stream):
         mma = cute.make_tiled_mma(cute.nvgpu.warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16))
-        chunk_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM), (0, 1))
-        a_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT), (0, 1))
+        if const_expr(self.tma):
+            chunk_layout = sm90_utils.make_smem_layout(
+                BFloat16, LayoutEnum.ROW_MAJOR, (BT, HEAD_DIM), major_mode_size=64
+            )
+            a_layout = sm90_utils.make_smem_layout(
+                BFloat16, LayoutEnum.ROW_MAJOR, (BT, BT), major_mode_size=32
+            )
+        else:
+            chunk_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM), (0, 1))
+            a_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT), (0, 1))
         num_chunks = (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT
-        self.kernel(mQ, mK, mV, mDo, mGcum, mBeta, mA, mW, mU, mDvLocal, mma, chunk_layout, a_layout).launch(grid=[num_chunks, self.HV, 1], block=[PROLOGUE_THREADS, 1, 1], stream=stream)
+        tma_inputs, tma_outputs = None, None
+        if const_expr(self.tma):
+            tma_inputs = tuple(
+                cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileG2SOp(),
+                    cute.make_tensor(tensor.iterator, cute.select(tensor.layout, mode=[0, 2, 1])),
+                    layout, (BT, width),
+                )
+                for tensor, layout, width in (
+                    (mK, chunk_layout, HEAD_DIM), (mQ, chunk_layout, HEAD_DIM),
+                    (mDo, chunk_layout, HEAD_DIM), (mV, chunk_layout, HEAD_DIM),
+                    (mA, a_layout, BT),
+                )
+            )
+            tma_outputs = tuple(
+                cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileS2GOp(),
+                    cute.make_tensor(tensor.iterator, cute.select(tensor.layout, mode=[0, 2, 1])),
+                    chunk_layout, (BT, HEAD_DIM),
+                )
+                for tensor in (mDvLocal, mU, mW)
+            )
+        self.kernel(mQ, mK, mV, mDo, mGcum, mBeta, mA, mW, mU, mDvLocal, mma, chunk_layout, a_layout, tma_inputs, tma_outputs).launch(grid=[num_chunks, self.HV, 1], block=[PROLOGUE_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mDo: cute.Tensor, mGcum: cute.Tensor, mBeta: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mDvLocal: cute.Tensor, mma: cute.TiledMma, chunk_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout):
+    def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mDo: cute.Tensor, mGcum: cute.Tensor, mBeta: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mDvLocal: cute.Tensor, mma: cute.TiledMma, chunk_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout, tma_inputs, tma_outputs):
         tidx, _, _ = cute.arch.thread_idx()
         chunk_idx, head_idx, _ = cute.arch.block_idx()
         key_head_idx = head_idx // (self.HV // self.H)
         smem = cutlass.utils.SmemAllocator()
-        s_k = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
-        s_q = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
-        s_v = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
-        s_do = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
-        s_a = smem.allocate_tensor(BFloat16, a_layout, 1024)
+        if const_expr(self.tma):
+            s_k = smem.allocate_tensor(BFloat16, chunk_layout.outer, 1024, swizzle=chunk_layout.inner)
+            s_q = smem.allocate_tensor(BFloat16, chunk_layout.outer, 1024, swizzle=chunk_layout.inner)
+            s_v = smem.allocate_tensor(BFloat16, chunk_layout.outer, 1024, swizzle=chunk_layout.inner)
+            s_do = smem.allocate_tensor(BFloat16, chunk_layout.outer, 1024, swizzle=chunk_layout.inner)
+            s_a = smem.allocate_tensor(BFloat16, a_layout.outer, 1024, swizzle=a_layout.inner)
+        else:
+            s_k = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
+            s_q = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
+            s_v = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
+            s_do = smem.allocate_tensor(BFloat16, chunk_layout, 1024)
+            s_a = smem.allocate_tensor(BFloat16, a_layout, 1024)
         s_gcum = smem.allocate_tensor(Float32, cute.make_layout(BT), 16)
         s_beta = smem.allocate_tensor(Float32, cute.make_layout(BT), 16)
         load, store_128, _ = chunk_copies(PROLOGUE_THREADS, tidx)
@@ -80,7 +134,28 @@ class BwdPrologue:
         ld_A, ld_B, _, ldt_B, st_C, _, _ = operand_copies(mma, tidx)
         thr = mma.get_slice(tidx)
         tile = lambda m, head: cute.local_tile(m[None, head, None], (BT, HEAD_DIM), (chunk_idx, 0))
-        if const_expr(self.ragged):
+        if const_expr(self.tma):
+            ready = smem.allocate_array(cutlass.Int64, 2)
+            if tidx == 0:
+                cute.arch.mbarrier_init(ready, 1)
+                cute.arch.mbarrier_init(ready + 1, 1)
+                cute.arch.mbarrier_init_fence()
+                cute.arch.fence_view_async_shared()
+                cute.arch.mbarrier_arrive_and_expect_tx(ready, 4 * BT * HEAD_DIM)
+                cute.arch.mbarrier_arrive_and_expect_tx(ready + 1, 2 * BT * (2 * HEAD_DIM + BT))
+            if tidx < 32:
+                # Bulk copies elect their issuer from this warp.
+                cute.arch.sync_warp()
+                for i in cutlass.range_constexpr(5):
+                    atom, coords = tma_inputs[i]
+                    head = key_head_idx if const_expr(i < 2) else head_idx
+                    width = BT if const_expr(i == 4) else HEAD_DIM
+                    source = cute.local_tile(coords[None, None, head], (BT, width), (chunk_idx, 0))
+                    load_tma_tile(atom, source, (s_k, s_q, s_do, s_v, s_a)[i], ready + (0 if const_expr(i < 2) else 1))
+            if tidx < BT:
+                row = chunk_idx * BT + tidx
+                s_gcum[tidx], s_beta[tidx] = mGcum[row, head_idx], Float32(mBeta[row, head_idx])
+        elif const_expr(self.ragged):
             T = mGcum.shape[0]
             valid = T - chunk_idx * BT
             rows_128 = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM)))
@@ -112,8 +187,12 @@ class BwdPrologue:
             if tidx < BT:
                 row = chunk_idx * BT + tidx
                 s_gcum[tidx], s_beta[tidx] = mGcum[row, head_idx], Float32(mBeta[row, head_idx])
-        cute.arch.cp_async_wait_group(1)
-        cute.arch.barrier()
+        if const_expr(self.tma):
+            cute.arch.barrier()
+            cute.arch.mbarrier_wait(ready, 0)
+        else:
+            cute.arch.cp_async_wait_group(1)
+            cute.arch.barrier()
         # S = k q^T, then the upper-triangular (key i <= query j) decayed and scaled block
         acc_s = cute.make_rmem_tensor(thr.partition_shape_C((BT, BT)), Float32)
         acc_s.fill(0.0)
@@ -127,8 +206,12 @@ class BwdPrologue:
             acc_s[elem] = value
         r_p = cute.make_fragment_like(acc_s, BFloat16)
         r_p.store(acc_s.load().to(BFloat16))
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+        if const_expr(self.tma):
+            cute.arch.mbarrier_wait(ready + 1, 0)
+            cute.arch.barrier()
+        else:
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
         s_do_t = cute.composition(s_do, cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0)))
         acc_dv = cute.make_rmem_tensor(thr.partition_shape_C((BT, HEAD_DIM)), Float32)
         acc_dv.fill(0.0)
@@ -136,8 +219,16 @@ class BwdPrologue:
         r_dv = cute.make_fragment_like(acc_dv, BFloat16)
         r_dv.store(acc_dv.load().to(BFloat16))
         cute.copy(st_C, st_C.retile(r_dv), st_C.partition_D(s_q))  # q is no longer read
+        if const_expr(self.tma):
+            cute.arch.fence_view_async_shared()
         cute.arch.barrier()
-        if const_expr(self.ragged):
+        if const_expr(self.tma):
+            if tidx < 32:
+                atom, coords = tma_outputs[0]
+                target = cute.local_tile(coords[None, None, head_idx], (BT, HEAD_DIM), (chunk_idx, 0))
+                store_tma_tile(atom, s_q, target)
+                cute.arch.cp_async_bulk_commit_group()
+        elif const_expr(self.ragged):
             copy_rows(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDvLocal, head_idx)), rows_128, valid, False)
         else:
             cute.copy(store_128, store_128.partition_S(s_q), store_128.partition_D(tile(mDvLocal, head_idx)))
@@ -146,10 +237,21 @@ class BwdPrologue:
             s_x = s_v if const_expr(which == 0) else s_k
             mOut = mU if const_expr(which == 0) else mW
             multiply_a(mma, thr, ld_A, ldt_B, s_a, s_x)
-            if const_expr(self.ragged):
+            if const_expr(self.tma):
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier()
+                if tidx < 32:
+                    atom, coords = tma_outputs[1 + which]
+                    target = cute.local_tile(coords[None, None, head_idx], (BT, HEAD_DIM), (chunk_idx, 0))
+                    store_tma_tile(atom, s_x, target)
+            elif const_expr(self.ragged):
                 copy_rows(store_128, store_128.partition_S(s_x), store_128.partition_D(tile(mOut, head_idx)), rows_128, valid, False)
             else:
                 cute.copy(store_128, store_128.partition_S(s_x), store_128.partition_D(tile(mOut, head_idx)))
+        if const_expr(self.tma):
+            if tidx < 32:
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
 
 
 class StateRecompute:
@@ -314,6 +416,179 @@ class StateRecompute:
                 s_gcum[tidx, stage] = mGcum[T - 1, head_idx]
 
 
+class StateRecomputeTma:
+    """Dense state recurrence with a dedicated producer and two TMA slots."""
+
+    stages = 2
+    gate_tile = 4
+
+    def __init__(self, H: int, HV: int):
+        self.H, self.HV = H, HV
+
+    @cute.jit
+    def __call__(self, mK, mW, mU, mGcum, mH, mVnew, stream):
+        mmas = (
+            sm90_utils.make_tiled_mma(BFloat16, "K", "K", STATE_BV),
+            sm90_utils.make_tiled_mma(BFloat16, "MN", "K", STATE_BV),
+        )
+        wide = sm90_utils.make_smem_layout(
+            BFloat16, LayoutEnum.ROW_MAJOR, (BT, HEAD_DIM), self.stages, major_mode_size=64
+        )
+        narrow = sm90_utils.make_smem_layout(
+            BFloat16, LayoutEnum.ROW_MAJOR, (BT, STATE_BV), self.stages, major_mode_size=STATE_BV
+        )
+        gate = cute.make_ordered_layout((BT, self.gate_tile, self.stages), order=(1, 0, 2))
+        states = sm90_utils.make_smem_layout(
+            BFloat16, LayoutEnum.ROW_MAJOR, (STATE_BV, HEAD_DIM), major_mode_size=64
+        )
+        scaled = sm90_utils.make_smem_layout(
+            BFloat16, LayoutEnum.ROW_MAJOR, (STATE_BV, BT), major_mode_size=64
+        )
+        output = cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV), (0, 1))
+        operands = tuple(
+            cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                cute.make_tensor(tensor.iterator, cute.select(tensor.layout, mode=[0, 2, 1])),
+                cute.slice_(layout, (None, None, 0)), (BT, width),
+            )
+            for tensor, layout, width in (
+                (mK, wide, HEAD_DIM), (mW, wide, HEAD_DIM), (mU, narrow, STATE_BV)
+            )
+        )
+        gates = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), mGcum,
+            cute.slice_(gate, (None, None, 0)), (BT, self.gate_tile),
+        )
+        self.kernel(
+            operands, gates, mH, mVnew, mmas, (wide, narrow, gate, states, scaled, output),
+            mGcum.shape[0] // BT,
+        ).launch(
+            grid=[HEAD_DIM // STATE_BV, self.HV, 1],
+            block=[STATE_THREADS + 32, 1, 1], stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, operands, gates, mH, mVnew, mmas, layouts, chunks):
+        tidx, _, _ = cute.arch.thread_idx()
+        col, head, _ = cute.arch.block_idx()
+        wide, narrow, gate, states, scaled, output = layouts
+        smem = cutlass.utils.SmemAllocator()
+        s_k = smem.allocate_tensor(BFloat16, wide.outer, 1024, swizzle=wide.inner)
+        s_w = smem.allocate_tensor(BFloat16, wide.outer, 1024, swizzle=wide.inner)
+        s_u = smem.allocate_tensor(BFloat16, narrow.outer, 1024, swizzle=narrow.inner)
+        s_g = smem.allocate_tensor(Float32, gate, 128)
+        s_h = smem.allocate_tensor(BFloat16, states.outer, 1024, swizzle=states.inner)
+        s_scaled = smem.allocate_tensor(BFloat16, scaled.outer, 1024, swizzle=scaled.inner)
+        s_out = smem.allocate_tensor(BFloat16, output, 1024)
+        full = smem.allocate_array(cutlass.Int64, self.stages)
+        free = smem.allocate_array(cutlass.Int64, self.stages)
+        if tidx == 0:
+            for slot in cutlass.range_constexpr(self.stages):
+                cute.arch.mbarrier_init(full + slot, 1)
+                cute.arch.mbarrier_init(free + slot, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.fence_view_async_shared()
+        cute.arch.barrier()
+        if tidx < STATE_THREADS:
+            self.consume(mH, mVnew, mmas, (s_k, s_w, s_u, s_g, s_h, s_scaled, s_out),
+                         full, free, chunks, tidx, col, head)
+        else:
+            self.produce(operands, gates, (s_k, s_w, s_u, s_g), full, free, chunks, tidx, col, head)
+
+    @cute.jit
+    def produce(self, operands, gates, buffers, full, free, chunks, tidx, col, head):
+        s_k, s_w, s_u, s_g = buffers
+        (atom_k, coords_k), (atom_w, coords_w), (atom_u, coords_u) = operands
+        atom_g, coords_g = gates
+        key_head = head // (self.HV // self.H)
+        for chunk in cutlass.range(chunks, unroll=1):
+            slot = chunk % self.stages
+            if chunk >= self.stages:
+                cute.arch.mbarrier_wait(free + slot, (chunk // self.stages - 1) % 2)
+            barrier = full + slot
+            if tidx == STATE_THREADS:
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    barrier, 2 * BT * (2 * HEAD_DIM + STATE_BV) + 4 * BT * self.gate_tile
+                )
+            # CuTe elects the issuer from the whole producer warp.
+            cute.arch.sync_warp()
+            k = cute.local_tile(coords_k[None, None, key_head], (BT, HEAD_DIM), (chunk, 0))
+            w = cute.local_tile(coords_w[None, None, head], (BT, HEAD_DIM), (chunk, 0))
+            u = cute.local_tile(coords_u[None, None, head], (BT, STATE_BV), (chunk, col))
+            g = cute.local_tile(coords_g, (BT, self.gate_tile), (chunk, head // self.gate_tile))
+            load_tma_tile(atom_k, k, s_k[None, None, slot], barrier)
+            load_tma_tile(atom_w, w, s_w[None, None, slot], barrier)
+            load_tma_tile(atom_u, u, s_u[None, None, slot], barrier)
+            load_tma_tile(atom_g, g, s_g[None, None, slot], barrier)
+
+    @cute.jit
+    def consume(self, mH, mVnew, mmas, buffers, full, free, chunks, tidx, col, head):
+        s_k, s_w, s_u, s_g, s_h, s_vscaled, s_vnew = buffers
+        mma_v, mma_h = mmas
+        thr_v, thr_h = mma_v.get_slice(tidx), mma_h.get_slice(tidx)
+        wg_v, wg_h = mma_v.get_slice(0), mma_h.get_slice(0)
+        _, store_128, _ = chunk_copies(STATE_THREADS, tidx)
+        atom_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
+        narrow = cute.make_ordered_layout((STATE_THREADS // (STATE_BV // 8), STATE_BV // 8), order=(1, 0))
+        store_v = cute.make_tiled_copy_tv(atom_store, narrow, cute.make_layout((1, 8))).get_slice(tidx)
+        acc_h = cute.make_rmem_tensor(thr_h.partition_shape_C((HEAD_DIM, STATE_BV)), Float32)
+        acc_h.fill(0.0)
+        v_coords = thr_v.partition_C(cute.make_identity_tensor((BT, STATE_BV)))
+        s_h_kv = cute.composition(s_h, cute.make_ordered_layout((HEAD_DIM, STATE_BV), order=(1, 0)))
+        s_vscaled_t = cute.composition(s_vscaled, cute.make_ordered_layout((BT, STATE_BV), order=(1, 0)))
+        t_h_store = store_128.partition_S(s_h)
+        t_vnew_store = store_v.partition_S(s_vnew)
+        gVnew = cute.local_tile(mVnew[None, head, None], (BT, STATE_BV), (None, col))
+        for chunk in cutlass.range(chunks, unroll=1):
+            slot = chunk % self.stages
+            r_h = cute.make_fragment_like(acc_h, BFloat16)
+            r_h.store(acc_h.load().to(BFloat16))
+            cute.autovec_copy(r_h, thr_h.partition_C(s_h_kv))
+            cute.arch.fence_view_async_shared()
+            cute.arch.mbarrier_wait(full + slot, (chunk // self.stages) % 2)
+            cute.arch.barrier(barrier_id=BAR_CHAIN, number_of_threads=STATE_THREADS)
+            h_tile = cute.local_tile(mH[chunk, head, None, None], (STATE_BV, HEAD_DIM), (col, 0))
+            cute.copy(store_128, t_h_store, store_128.partition_D(h_tile))
+            s_w_n, s_u_n = s_w[None, None, slot], s_u[None, None, slot]
+            acc_v = cute.make_rmem_tensor(thr_v.partition_shape_C((BT, STATE_BV)), Float32)
+            acc_v.fill(0.0)
+            sm90_utils.gemm(
+                mma_v, acc_v, wg_v.make_fragment_A(wg_v.partition_A(s_w_n)),
+                wg_v.make_fragment_B(wg_v.partition_B(s_h)), wg_wait=0,
+            )
+            gate_head = head % self.gate_tile
+            gate_last = s_g[BT - 1, gate_head, slot]
+            r_u = cute.make_fragment_like(acc_v, BFloat16)
+            cute.autovec_copy(thr_v.partition_C(s_u_n), r_u)
+            v_value = r_u.load().to(Float32) - acc_v.load()
+            r_vnew = cute.make_fragment_like(acc_v, BFloat16)
+            r_vnew.store(v_value.to(BFloat16))
+            acc_v.store(v_value)
+            for elem in cutlass.range_constexpr(cute.size(acc_v)):
+                gate_row = s_g[v_coords[elem][0], gate_head, slot]
+                acc_v[elem] = acc_v[elem] * cute.math.exp2(gate_last - gate_row, fastmath=True)
+            r_vscaled = cute.make_fragment_like(acc_v, BFloat16)
+            r_vscaled.store(acc_v.load().to(BFloat16))
+            cute.autovec_copy(r_vnew, thr_v.partition_C(s_vnew))
+            cute.autovec_copy(r_vscaled, thr_v.partition_C(s_vscaled_t))
+            cute.arch.fence_view_async_shared()
+            decay = cute.math.exp2(gate_last, fastmath=True)
+            for elem in cutlass.range_constexpr(cute.size(acc_h)):
+                acc_h[elem] = acc_h[elem] * decay
+            cute.arch.barrier(barrier_id=BAR_CHAIN, number_of_threads=STATE_THREADS)
+            cute.copy(store_v, t_vnew_store, store_v.partition_D(gVnew[None, None, chunk]))
+            s_k_n_t = cute.composition(
+                s_k[None, None, slot], cute.make_ordered_layout((HEAD_DIM, BT), order=(1, 0))
+            )
+            sm90_utils.gemm(
+                mma_h, acc_h, wg_h.make_fragment_A(wg_h.partition_A(s_k_n_t)),
+                wg_h.make_fragment_B(wg_h.partition_B(s_vscaled)), wg_wait=0,
+            )
+            cute.arch.barrier(barrier_id=BAR_CHAIN, number_of_threads=STATE_THREADS)
+            if tidx == 0:
+                cute.arch.mbarrier_arrive(free + slot)
+
+
 class StateGradient:
     """
     The reverse state-gradient recurrence, one CTA per (GRAD_BV columns, value head), two
@@ -339,26 +614,55 @@ class StateGradient:
     None): the context-parallel transition's state half (FLA's pre-process dh).
     """
 
-    def __init__(self, H: int, HV: int, ragged: bool = False, has_dht: bool = False, has_dh0: bool = False, store_states: bool = True):
+    def __init__(self, H: int, HV: int, ragged: bool = False, has_dht: bool = False, has_dh0: bool = False, store_states: bool = True, tma: bool = False):
         self.H, self.HV, self.ragged = H, HV, ragged
         self.has_dht, self.has_dh0, self.store_states = has_dht, has_dh0, store_states
+        self.tma = tma
         self.scale = HEAD_DIM ** -0.5
 
     @cute.jit
     def __call__(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mDo: cute.Tensor, mDvLocal: cute.Tensor, mGcum: cute.Tensor, mDh: cute.Tensor, mDu: cute.Tensor, mDht: cute.Tensor, mDh0: cute.Tensor, stream):
         mma = cute.make_tiled_mma(cute.nvgpu.warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16))
         mma_tf32 = cute.make_tiled_mma(cute.nvgpu.warp.MmaTF32Op((16, 8, 8)), (4, 1, 1), permutation_mnk=(64, 8, 8))
-        layouts = (cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, GRAD_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, GRAD_BV), (BT, GRAD_BV, GRAD_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (GRAD_BV, HEAD_DIM), (0, 1)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (GRAD_BV, BT), (0, 1)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, GRAD_BV), (BT, GRAD_BV), (0, 1)))
-        self.kernel(mQ, mK, mW, mDo, mDvLocal, mGcum, mDh, mDu, mDht, mDh0, mma, mma_tf32, *layouts).launch(grid=[HEAD_DIM // GRAD_BV, self.HV, 1], block=[2 * STATE_THREADS, 1, 1], stream=stream)
+        if const_expr(self.tma):
+            wide_ring = sm90_utils.make_smem_layout(
+                BFloat16, LayoutEnum.ROW_MAJOR, (BT, HEAD_DIM), stage=GRAD_STAGES,
+                major_mode_size=HEAD_DIM // 2,
+            )
+        else:
+            wide_ring = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, GRAD_STAGES), (0, 1, 2))
+        layouts = (wide_ring, cute.tile_to_shape(get_smem_layout_atom(BFloat16, GRAD_BV), (BT, GRAD_BV, GRAD_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (GRAD_BV, HEAD_DIM), (0, 1)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (GRAD_BV, BT), (0, 1)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, GRAD_BV), (BT, GRAD_BV), (0, 1)))
+        tma_inputs = None
+        if const_expr(self.tma):
+            wide_layout = sm90_utils.make_smem_layout(
+                BFloat16, LayoutEnum.ROW_MAJOR, (BT, HEAD_DIM), major_mode_size=HEAD_DIM // 2,
+            )
+            tma_inputs = tuple(
+                cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileG2SOp(),
+                    cute.make_tensor(tensor.iterator, cute.select(tensor.layout, mode=[0, 2, 1])),
+                    wide_layout, (BT, HEAD_DIM),
+                )
+                for tensor in (mK, mW, mQ)
+            )
+            tma_inputs = tuple((atom, coords) for atom, coords in tma_inputs)
+        self.kernel(mQ, mK, mW, mDo, mDvLocal, mGcum, mDh, mDu, mDht, mDh0, mma, mma_tf32, tma_inputs, *layouts).launch(grid=[HEAD_DIM // GRAD_BV, self.HV, 1], block=[2 * STATE_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mDo: cute.Tensor, mDvLocal: cute.Tensor, mGcum: cute.Tensor, mDh: cute.Tensor, mDu: cute.Tensor, mDht: cute.Tensor, mDh0: cute.Tensor, mma: cute.TiledMma, mma_tf32: cute.TiledMma, ring_layout: cute.ComposedLayout, cols_layout: cute.ComposedLayout, dh_layout: cute.ComposedLayout, du_t_layout: cute.ComposedLayout, du_layout: cute.ComposedLayout):
+    def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mDo: cute.Tensor, mDvLocal: cute.Tensor, mGcum: cute.Tensor, mDh: cute.Tensor, mDu: cute.Tensor, mDht: cute.Tensor, mDh0: cute.Tensor, mma: cute.TiledMma, mma_tf32: cute.TiledMma, tma_inputs, ring_layout: cute.ComposedLayout, cols_layout: cute.ComposedLayout, dh_layout: cute.ComposedLayout, du_t_layout: cute.ComposedLayout, du_layout: cute.ComposedLayout):
         tidx, _, _ = cute.arch.thread_idx()
         col_tile, head_idx, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
-        s_k = smem.allocate_tensor(BFloat16, ring_layout, 1024)
-        s_w = smem.allocate_tensor(BFloat16, ring_layout, 1024)
-        s_q = smem.allocate_tensor(BFloat16, ring_layout, 1024)
+        if const_expr(self.tma):
+            # Keep the ring's swizzle in the pointer so TMA can vectorize each stage.
+            s_k, s_w, s_q = (
+                smem.allocate_tensor(BFloat16, ring_layout.outer, 1024, swizzle=ring_layout.inner)
+                for _ in range(3)
+            )
+        else:
+            s_k = smem.allocate_tensor(BFloat16, ring_layout, 1024)
+            s_w = smem.allocate_tensor(BFloat16, ring_layout, 1024)
+            s_q = smem.allocate_tensor(BFloat16, ring_layout, 1024)
         s_dv_local = smem.allocate_tensor(BFloat16, cols_layout, 1024)
         s_do = smem.allocate_tensor(BFloat16, cols_layout, 1024)
         s_dh = smem.allocate_tensor(BFloat16, dh_layout, 1024)
@@ -368,13 +672,21 @@ class StateGradient:
         s_p = smem.allocate_tensor(Float32, cute.make_layout((HEAD_DIM, GRAD_BV, 2), stride=(GRAD_BV + F32_PAD, 1, HEAD_DIM * (GRAD_BV + F32_PAD))), 16)
         s_decay = smem.allocate_tensor(Float32, cute.make_layout(BT), 16)  # 2^g of the producer's chunk
         buffers = (s_k, s_w, s_q, s_dv_local, s_do, s_dh, s_du_t, s_du, s_gcum, s_p, s_decay)
+        tma_barriers = None
+        if const_expr(self.tma):
+            tma_barriers = smem.allocate_array(cutlass.Int64, GRAD_STAGES)
+            if tidx == STATE_THREADS:
+                for i in cutlass.range_constexpr(GRAD_STAGES):
+                    cute.arch.mbarrier_init(tma_barriers + i, 1)
+                cute.arch.mbarrier_init_fence()
+            cute.arch.barrier()
         if tidx < STATE_THREADS:
             self.chain_loop(mDh, mDu, mDht, mDh0, mma, buffers, tidx, col_tile, head_idx, (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT)
         else:
-            self.producer_loop(mQ, mK, mW, mDo, mDvLocal, mGcum, mma_tf32, buffers, tidx - STATE_THREADS, col_tile, head_idx)
+            self.producer_loop(mQ, mK, mW, mDo, mDvLocal, mGcum, mma_tf32, buffers, tidx - STATE_THREADS, col_tile, head_idx, tma_inputs, tma_barriers)
 
     @cute.jit
-    def issue_chunk(self, copies: tuple, sources: tuple, targets: tuple, chunk, buffer, tidx, tail: tuple):
+    def issue_chunk(self, copies: tuple, sources: tuple, targets: tuple, chunk, buffer, tidx, tail: tuple, tma_ring):
         """
         cp.async of chunk's k, w, q, dv_local and do columns and g into ring stage buffer, one
         commit group. With ragged, tail is (rows of load's vectors, rows of load_cols's, g_cum, its
@@ -395,8 +707,21 @@ class StateGradient:
                 else:
                     s_gcum[tidx, buffer] = mGcum[T - 1, head_idx]
         else:
-            for i in cutlass.range_constexpr(3):
-                cute.copy(load, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer])
+            if const_expr(self.tma):
+                tma_inputs, shared_wide, tma_barriers = tma_ring
+                if tidx < 32:
+                    barrier = tma_barriers + buffer
+                    if tidx == 0:
+                        cute.arch.mbarrier_arrive_and_expect_tx(barrier, 2 * 3 * BT * HEAD_DIM)
+                    # The full producer warp reaches CuTe's lane election.
+                    cute.arch.sync_warp()
+                    for i in cutlass.range_constexpr(3):
+                        atom, head_coords = tma_inputs[i]
+                        source = cute.local_tile(head_coords, (BT, HEAD_DIM), (chunk, 0))
+                        load_tma_tile(atom, source, shared_wide[i][None, None, buffer], barrier)
+            else:
+                for i in cutlass.range_constexpr(3):
+                    cute.copy(load, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer])
             for i in cutlass.range_constexpr(3, 5):
                 cute.copy(load_cols, sources[i][None, None, None, chunk], targets[i][None, None, None, buffer])
             if tidx < BT:
@@ -404,10 +729,17 @@ class StateGradient:
         cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def producer_loop(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mDo: cute.Tensor, mDvLocal: cute.Tensor, mGcum: cute.Tensor, mma_tf32: cute.TiledMma, buffers: tuple, tidx, col_tile, head_idx):
+    def producer_loop(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mDo: cute.Tensor, mDvLocal: cute.Tensor, mGcum: cute.Tensor, mma_tf32: cute.TiledMma, buffers: tuple, tidx, col_tile, head_idx, tma_inputs, tma_barriers):
         s_k, s_w, s_q, s_dv_local, s_do, _, _, _, s_gcum, s_p, s_decay = buffers
         num_chunks = (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT
         key_head_idx = head_idx // (self.HV // self.H)
+        tma_ring = None
+        if const_expr(self.tma):
+            head_tiles = tuple(
+                (tma_inputs[i][0], tma_inputs[i][1][None, None, h])
+                for i, h in enumerate((key_head_idx, head_idx, key_head_idx))
+            )
+            tma_ring = (head_tiles, (s_k, s_w, s_q), tma_barriers)
         threads = STATE_THREADS
         load, _, _ = chunk_copies(threads, tidx)
         atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
@@ -434,12 +766,14 @@ class StateGradient:
         # an empty commit group stands in for a missing chunk, so the group count stays fixed
         for step in cutlass.range_constexpr(GRAD_STAGES - 1):
             if step < num_chunks:
-                self.issue_chunk(copies, sources, targets, num_chunks - 1 - step, step, tidx, tail)
+                self.issue_chunk(copies, sources, targets, num_chunks - 1 - step, step, tidx, tail, tma_ring)
             else:
                 cute.arch.cp_async_commit_group()
         for step in cutlass.range(num_chunks, unroll=1):
             buffer, parity = step % GRAD_STAGES, step % 2
             cute.arch.cp_async_wait_group(GRAD_STAGES - 2)
+            if const_expr(self.tma):
+                cute.arch.mbarrier_wait(tma_barriers + buffer, (step // GRAD_STAGES) % 2)
             cute.arch.barrier(barrier_id=BAR_PRODUCER, number_of_threads=threads)
             if tidx < BT:
                 s_decay[tidx] = cute.math.exp2(s_gcum[tidx, buffer], fastmath=True)
@@ -466,7 +800,7 @@ class StateGradient:
             if upcoming < num_chunks:
                 if step >= 1:
                     cute.arch.barrier(barrier_id=BAR_FREE + upcoming % GRAD_STAGES, number_of_threads=2 * threads)
-                self.issue_chunk(copies, sources, targets, num_chunks - 1 - upcoming, upcoming % GRAD_STAGES, tidx, tail)
+                self.issue_chunk(copies, sources, targets, num_chunks - 1 - upcoming, upcoming % GRAD_STAGES, tidx, tail, tma_ring)
             else:
                 cute.arch.cp_async_commit_group()
 
@@ -968,14 +1302,17 @@ def backward_kernel(name: str, H: int, HV: int, device: int, ragged: bool, flags
         state_out = fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (2 * HEAD_DIM * HEAD_DIM, 2 * HEAD_DIM, 1))
         has_state_in, has_state_out, store_states = flags if flags else (False, False, True)
         match name:
-            case "bwd_prologue":
+            case "bwd_prologue" | "bwd_prologue_tma":
                 A, beta = fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1)), fake(BFloat16, (T, HV), (HV, 1), 2)
-                COMPILED[key] = cute.compile(BwdPrologue(H, HV, ragged), keys, keys, values, values, gate, beta, A, values, values, values, fake_stream(), options="--enable-tvm-ffi")
-            case "state_gradient":
-                COMPILED[key] = cute.compile(StateGradient(H, HV, ragged, has_state_in, has_state_out, store_states), keys, keys, values, values, values, gate, states if store_states else None, values if store_states else None, state_in if has_state_in else None, state_out if has_state_out else None, fake_stream(), options="--enable-tvm-ffi")
+                COMPILED[key] = cute.compile(BwdPrologue(H, HV, ragged, tma=name == "bwd_prologue_tma"), keys, keys, values, values, gate, beta, A, values, values, values, fake_stream(), options="--enable-tvm-ffi")
+            case "state_gradient" | "state_gradient_tma":
+                COMPILED[key] = cute.compile(StateGradient(H, HV, ragged, has_state_in, has_state_out, store_states, tma=name == "state_gradient_tma"), keys, keys, values, values, values, gate, states if store_states else None, values if store_states else None, state_in if has_state_in else None, state_out if has_state_out else None, fake_stream(), options="--enable-tvm-ffi")
             case "chunk_gradients":
                 A, beta = fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1)), fake(BFloat16, (T, HV), (HV, 1), 2)
                 COMPILED[key] = cute.compile(ChunkGradients(H, HV, ragged), keys, keys, values, values, values, values, states, states, gate, beta, A, values, values, values, gate, beta, fake_stream(), options="--enable-tvm-ffi")
+            case "state_recompute_tma":
+                aligned_gate = fake(Float32, (T, HV), (HV, 1), 16)
+                COMPILED[key] = cute.compile(StateRecomputeTma(H, HV), keys, values, values, aligned_gate, states, values, fake_stream(), options="--enable-tvm-ffi")
             case "state_recompute":
                 COMPILED[key] = cute.compile(StateRecompute(H, HV, ragged, has_state_in, has_state_out, store_states), keys, values, values, gate, states if store_states else None, values if store_states else None, state_in if has_state_in else None, state_out if has_state_out else None, fake_stream(), options="--enable-tvm-ffi")
     return COMPILED[key]
@@ -1018,11 +1355,15 @@ def state_gradient(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, do: torch.
     do, into the given buffer when one is passed. From dht, fp32 (HV, K, V), the gradient of the
     final state, when one is passed, else from zero.
     """
+    return _state_gradient("state_gradient", q, k, w, do, dv_local, g_cum, du, dht)
+
+
+def _state_gradient(name, q, k, w, do, dv_local, g_cum, du, dht):
     T, H, HV = k.shape[1], k.shape[2], do.shape[2]
     dh = k.new_empty(1, (T + BT - 1) // BT, HV, HEAD_DIM, HEAD_DIM)
     du = torch.empty_like(do) if du is None else du
     flags = () if dht is None else (True, False, True)
-    backward_kernel("state_gradient", H, HV, k.device.index, T % BT != 0, flags)(q[0], k[0], w[0], do[0], dv_local[0], g_cum[0], dh[0], du[0], dht, None)
+    backward_kernel(name, H, HV, k.device.index, T % BT != 0, flags)(q[0], k[0], w[0], do[0], dv_local[0], g_cum[0], dh[0], du[0], dht, None)
     return dh, du
 
 
@@ -1063,8 +1404,28 @@ def chunk_gdr_bwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     the reference's largest magnitude. Deterministic. Only where
     gated_delta_rule_pinned_supported is True.
     """
-    w, u, dv_local = bwd_prologue(q, k, v, do, g_cum, beta, A)
-    h, v_new = state_recompute(k, w, u, g_cum)
-    # du reuses u's buffer (read only by StateRecompute), dv dv_local's (read only by StateGradient)
-    dh, du = state_gradient(q, k, w, do, dv_local, g_cum, du=u)
+    T, H, HV = k.shape[1], k.shape[2], v.shape[2]
+    dense_b2 = (T, H, HV) == (4096, 32, 96)
+
+    if dense_b2 and all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (q, k, v, do, A)):
+        w = k.new_empty(1, T, HV, HEAD_DIM)
+        u, dv_local = torch.empty_like(v), torch.empty_like(v)
+        launch = backward_kernel("bwd_prologue_tma", H, HV, k.device.index, False)
+        launch(q[0], k[0], v[0], do[0], g_cum[0], beta[0], A[0], w[0], u[0], dv_local[0])
+    else:
+        w, u, dv_local = bwd_prologue(q, k, v, do, g_cum, beta, A)
+
+    if dense_b2 and all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (k, w, u, g_cum)):
+        h = k.new_empty(1, T // BT, HV, HEAD_DIM, HEAD_DIM)
+        v_new = torch.empty_like(u)
+        launch = backward_kernel("state_recompute_tma", H, HV, k.device.index, False)
+        launch(k[0], w[0], u[0], g_cum[0], h[0], v_new[0])
+    else:
+        h, v_new = state_recompute(k, w, u, g_cum)
+
+    # The reverse recurrence reuses U for dU, then ChunkGradients reuses dV-local.
+    if dense_b2 and all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (q, k, w)):
+        dh, du = _state_gradient("state_gradient_tma", q, k, w, do, dv_local, g_cum, u, None)
+    else:
+        dh, du = state_gradient(q, k, w, do, dv_local, g_cum, du=u)
     return chunk_gradients(q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv=dv_local)
