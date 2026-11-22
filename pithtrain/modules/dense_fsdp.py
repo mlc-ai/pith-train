@@ -88,6 +88,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     activation_checkpoint: Literal["none", "selective", "full", "offload"] = "none"
 
+    recompute_mlp_blocks: int = 0
+    """Recompute the stock MLP in this many leading decoder blocks."""
+
     compile_blocks: bool = False
 
     compile_mode: Literal[
@@ -273,6 +276,12 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError(
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
         )
+    if not 0 <= cfg.recompute_mlp_blocks <= len(model.layers):
+        raise ValueError("dense_fsdp.recompute_mlp_blocks must be within the decoder depth")
+    if cfg.recompute_mlp_blocks and (cfg.compile_blocks or cfg.activation_checkpoint != "none"):
+        raise ValueError(
+            "Partial MLP recompute requires the stock stages without block checkpointing"
+        )
 
     if cfg.collective_buffers not in ("default", "native-pool", "process-group", "symmetric"):
         raise ValueError(
@@ -294,9 +303,13 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         compile_options = list_mode_options(cfg.compile_mode)
         if cfg.compile_mode in ("default", "reduce-overhead"):
             compile_options |= stage_compile_options()
-    for layer in model.layers:
+    for index, layer in enumerate(model.layers):
         if not cfg.compile_blocks:
             layer.forward = layer.forward_stock_stages
+        if index < cfg.recompute_mlp_blocks:
+            layer.forward_stage3 = partial(
+                checkpoint, layer.forward_stage3, use_reentrant=False, preserve_rng_state=False
+            )
         if cfg.activation_checkpoint in ("selective", "full"):
             ctx = (
                 {"context_fn": selective_checkpoint_contexts}
