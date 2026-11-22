@@ -35,6 +35,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--prefetch-forward-copy-out", action="store_true")
+    parser.add_argument("--fuse-gather-copy-in", action="store_true")
+    parser.add_argument("--reuse-single-weight-gather-buffers", action="store_true")
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument(
         "--bf16-sharded-gradients", action=argparse.BooleanOptionalAction, default=False
@@ -70,6 +72,10 @@ if __name__ == "__main__":
 
     # PithTrain's kernel imports query the current GPU.
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if args.fuse_gather_copy_in:
+        from fused_gather import enable
+
+        enable()
     from pithtrain.modules.dense_fsdp import DenseFSDPCfg
     from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
@@ -99,6 +105,7 @@ if __name__ == "__main__":
     train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.prefetch_forward_copy_out = args.prefetch_forward_copy_out
+    train.dense_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
     train.dense_fsdp.bf16_sharded_gradients = args.bf16_sharded_gradients
     train.dense_fsdp.reduce_at_step_end = args.reduce_at_step_end
