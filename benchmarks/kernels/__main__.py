@@ -3,12 +3,12 @@ Times the kernels at the cases of tests/kernels/cases.py, the same cases the ker
 one tree alone, or a change against a base git ref (--base), which is how a kernel change is judged
 (no baseline is stored).
 
-    python -m benchmarks.kernels.bench_spec --base upstream/main --family cross_entropy --out ab.json
-    python -m benchmarks.kernels.bench_spec --base upstream/main --family moe_experts --op 'quant|silu'
-    python -m benchmarks.kernels.bench_spec --base-dir . --family weight_quant      (the noise floor)
-    python -m benchmarks.kernels.bench_spec --tier spec --out results.json           (this tree alone)
-    python -m benchmarks.kernels.bench_spec --tier spec --shard 3/8 --out shard3.json   (one per GPU)
-    python -m benchmarks.kernels.bench_spec --merge shard*.json --out results.json
+    python -m benchmarks.kernels --base upstream/main --family cross_entropy --out ab.json
+    python -m benchmarks.kernels --base upstream/main --family moe_experts --op 'quant|silu'
+    python -m benchmarks.kernels --base-dir . --family weight_quant      (the noise floor)
+    python -m benchmarks.kernels --tier spec --out results.json           (this tree alone)
+    python -m benchmarks.kernels --tier spec --shard 3/8 --out shard3.json   (one per GPU)
+    python -m benchmarks.kernels --merge shard*.json --out results.json
 
 The default tier is spec (smoke and spec cases; stress with --tier stress). One case runs several
 ops (e.g. the FP8 gate_up forward, its dgrad and wgrad); each op is timed with CUDA events around
@@ -482,7 +482,7 @@ def serve(tree: str) -> None:
 
 class Worker:
     def __init__(self, tree: Path):
-        cmd = [sys.executable, "-m", "benchmarks.kernels.bench_spec", "--serve", str(tree)]
+        cmd = [sys.executable, "-m", "benchmarks.kernels", "--serve", str(tree)]
         env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
         self.proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)  # fmt: skip
         self.pithtrain = self.read()["ready"]

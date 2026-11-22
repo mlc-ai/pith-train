@@ -23,8 +23,7 @@ term), else about 3x the worst error measured over the smoke, spec and stress ti
 in each test module; a bound that must grow to pass a new case is a finding, not a fix.
 
 Kernel changes and agents take their shapes from here, never pick their own, and post a GPU run of
-the tiers (multigpu when CP code changes) and of benchmarks/kernels/bench_spec.py --base
-upstream/main. They may add cases (a rule or edge case here or in a test), never remove spec cases.
+the tiers (multigpu when CP code changes) and of python -m benchmarks.kernels --base upstream/main. They may add cases (a rule or edge case here or in a test), never remove spec cases.
 """
 
 from __future__ import annotations
