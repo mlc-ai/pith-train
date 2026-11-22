@@ -12,7 +12,6 @@ repos:
       - id: check-yaml
       - id: check-ast            # pycompile / syntax check — extremely fast
       - id: check-added-large-files
-        exclude: ^tools/kernel_cases/kernel_cases\.json$   # generated spec, checked by tests/test_kernel_cases.py
       - id: check-merge-conflict
 
   # Ruff: linting + formatting (replaces black + pylint + isort)
