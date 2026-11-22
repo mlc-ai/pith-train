@@ -18,7 +18,7 @@ def reshard(value: str) -> bool | int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model", type=Path, default=Path("examples/pretrain_lm/qwen3.5-27b"))
     parser.add_argument("--weights", type=Path)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--seq", type=int, default=4096)
@@ -39,6 +39,7 @@ if __name__ == "__main__":
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
     cfg = PretrainLMCfg()
+    cfg.dataset = Path(".")
     train = cfg.training
     train.model = args.model
     train.hf_import_path = args.weights
