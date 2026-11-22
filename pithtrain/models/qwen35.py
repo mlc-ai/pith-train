@@ -11,11 +11,13 @@ from pithtrain.models.qwen35_moe import (
     Qwen35MoeGatedDeltaNet,
     Qwen35MoeModel,
     Qwen35MoeRMSNorm,
+    Qwen35MoeRotaryEmbedding,
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.silu_mul import silu_mul
 
-__all__ = ["Qwen35Model"]
+__all__ = ["Qwen35Model", "Qwen35TextModel"]
 
 
 class Qwen35MLP(nn.Module):
@@ -84,12 +86,16 @@ class Qwen35DecoderLayer(nn.Module):
         return hidden_states
 
     def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        return self.forward(hidden_states, rotary_posemb, cu_seqlens, checkpoint_delta=True)
+
+    def forward(self, hidden_states, rotary_posemb, cu_seqlens=None, *, checkpoint_delta=False):
         if self.to_contiguous:
             hidden_states = zigzag_to_contiguous(hidden_states, distributed.cp_group)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear:
-            hidden_states = self.linear_attn(hidden_states, cu_seqlens)
+            delta = self.linear_attn if checkpoint_delta else self.linear_attn.block
+            hidden_states = delta(hidden_states, cu_seqlens)
         else:
             hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = residual + hidden_states
@@ -103,3 +109,24 @@ class Qwen35Model(Qwen35MoeModel):
     """Reuse hybrid attention and pipeline plumbing; no routed or shared experts are created."""
 
     decoder_layer_class = Qwen35DecoderLayer
+
+
+class Qwen35TextModel(nn.Module):
+    """The complete dense text tower with a standard autograd forward."""
+
+    def __init__(self, config: Qwen3_5TextConfig):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.rotary_emb = Qwen35MoeRotaryEmbedding(config)
+        self.layers = nn.ModuleList(
+            Qwen35DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+        )
+        self.norm = Qwen35MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.embed_tokens(tokens)
+        rotary_posemb = tuple(t.unsqueeze(0) for t in self.rotary_emb(tokens.size(1)))
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, rotary_posemb)
+        return self.lm_head(self.norm(hidden_states))

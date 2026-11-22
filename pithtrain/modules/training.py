@@ -22,9 +22,10 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
-from pithtrain.models.qwen35 import Qwen35Model
+from pithtrain.models.qwen35 import Qwen35Model, Qwen35TextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules import imbalance
+from pithtrain.modules.dense_fsdp import DenseFSDPCfg, shard_dense_model
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
     install_raw_fp8_param_gather,
@@ -90,9 +91,11 @@ def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple
     return Muon(muon_params, **kwargs), AdamW(adamw_params, **kwargs)
 
 
-def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
+def make_adamw_optimizer(
+    cfg: TrainingCfg, *, weight_decay: float = 0.1, fused: bool = True
+) -> tuple[Optimizer, ...]:
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
-    return (AdamW(training.model.parameters(), fused=True, **kwargs),)
+    return (AdamW(training.model.parameters(), fused=fused, **kwargs),)
 
 
 def make_wsd_scheduler(
@@ -221,6 +224,9 @@ class TrainingCfg(SlottedDefault):
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
     """
 
+    dense_fsdp: DenseFSDPCfg | None = None
+    """Enable the direct FSDP2/autograd path for dense Qwen3.5 with PP, CP and EP all 1."""
+
     init_std: float = 0.02
 
     nsys_start: Optional[int] = None
@@ -253,7 +259,14 @@ class TrainingCfg(SlottedDefault):
     """
 
 
-def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed: int = 0) -> None:
+def init_weights(
+    model: nn.Module,
+    num_layers: int,
+    init_std: float = 0.02,
+    seed: int = 0,
+    *,
+    pipeline_chunks: bool = True,
+) -> None:
     """
     Initialize this rank's V-chunks (an nn.Sequential of two models) in place, before FSDP shards
     them. Every parameter of 2 or more dims draws from N(0, init_std), except o_proj and down_proj,
@@ -269,7 +282,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed
     for chunk_name, param in model.named_parameters():
         if param.dim() < 2:
             continue
-        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
+        name = chunk_name.split(".", 1)[1] if pipeline_chunks else chunk_name
         std = output_std if "o_proj" in name or "down_proj" in name else init_std
         # Routed experts are stacked (local experts, ...), the local ones of this EP rank.
         if ".experts." in name and param.dim() == 3:
@@ -383,6 +396,22 @@ def setup_model(
             f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
             f"splits the sequence into 2*cp_size equal chunks"
         )
+
+    if cfg.dense_fsdp is not None:
+        if module_config.model_type != "qwen3_5_text" or cfg.fp8 or cfg.moe_load_balance_coef:
+            raise ValueError("dense_fsdp requires BF16 dense Qwen3.5")
+        if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
+            raise ValueError("dense_fsdp requires PP, CP and EP all 1")
+        mesh = distributed.attn_mesh["dp"]
+        if distributed_cfg.hsdp_replica > 1:
+            mesh = split_replicas(mesh, distributed_cfg.hsdp_replica)
+        model = Qwen35TextModel(module_config)
+        init_weights(
+            model, module_config.num_hidden_layers, cfg.init_std, cfg.seed, pipeline_chunks=False
+        )
+        shard_dense_model(model, mesh, cfg.dense_fsdp)
+        training.model = model
+        return
 
     if module_config.model_type == "deepseek_v2":
         ModelClass = DeepSeekV2Model

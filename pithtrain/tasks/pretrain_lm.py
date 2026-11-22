@@ -74,6 +74,15 @@ def get_global_batch(
     Every pipeline rank builds the same list, so DualPipeV needs no broadcast of shapes; only
     pipeline rank 0 feeds the tensors to the model.
     """
+    return [
+        Microbatch(model_inputs=(tokens,), cu_seqlens=None, objective_inputs=(labels,))
+        for tokens, labels in get_batch_tensors(cfg, dataset, step, device)
+    ]
+
+
+def get_batch_tensors(
+    cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
     dp_size = distributed.dp_size
@@ -106,11 +115,7 @@ def get_global_batch(
     local_labels = local_labels.to(device, non_blocking=True)
 
     return [
-        Microbatch(
-            model_inputs=(local_tokens[i : i + micro_batch_size],),
-            cu_seqlens=None,
-            objective_inputs=(local_labels[i : i + micro_batch_size],),
-        )
+        (local_tokens[i : i + micro_batch_size], local_labels[i : i + micro_batch_size])
         for i in range(0, local_batch_size, micro_batch_size)
     ]
 
@@ -163,30 +168,40 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     global_batch_size = cfg.training.global_batch_size
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
-    microbatches = get_global_batch(cfg, dataset, step, device)
-
-    # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
-    objective_outputs = model.step(microbatches, objective)
-
-    # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
-    counted = 0
-    for microbatch in microbatches:
-        (labels,) = microbatch.objective_inputs
-        counted = counted + (labels != -100).sum()
-    num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
-
     cp_size = distributed.cp_size
-    if distributed.pp_rank == 0:
-        loss = torch.stack(objective_outputs).sum() / num_tokens
-        if cp_size > 1:
-            torch.distributed.all_reduce(loss, group=distributed.cp_group)
-            loss /= cp_size
+    if cfg.training.dense_fsdp is not None:
+        batches = get_batch_tensors(cfg, dataset, step, device)
+        losses, counts = [], []
+        for tokens, labels in batches:
+            loss, detached = objective((model(tokens),), (labels,))
+            loss.backward()
+            losses.append(detached)
+            counts.append((labels != -100).sum())
 
-    # The one gradient normalization: FSDP reduces with a plain sum, so this gives the
-    # token-weighted mean. The global count is the local count times dp * cp only while every rank
-    # counts the same number of tokens: true for pretraining, not for packed data with -100 masks.
-    scale = 1.0 / (num_tokens * distributed.dp_size * distributed.cp_size)
-    scale_grads_(local_grads(model), scale)
+        totals = torch.stack((torch.stack(losses).sum(), torch.stack(counts).sum()))
+        torch.distributed.all_reduce(totals)
+        loss_sum, num_tokens = totals.unbind()
+        num_tokens = num_tokens.clamp_min(1)
+        loss = loss_sum / num_tokens
+    else:
+        microbatches = get_global_batch(cfg, dataset, step, device)
+        # One detached loss per micro-batch on pipeline rank 0, an empty list elsewhere.
+        objective_outputs = model.step(microbatches, objective)
+        counted = 0
+        for microbatch in microbatches:
+            (labels,) = microbatch.objective_inputs
+            counted = counted + (labels != -100).sum()
+        local_count = counted.clamp_min(1).to(device=device, dtype=torch.float32)
+        if distributed.pp_rank == 0:
+            loss = torch.stack(objective_outputs).sum() / local_count
+            if cp_size > 1:
+                torch.distributed.all_reduce(loss, group=distributed.cp_group)
+                loss /= cp_size
+        # Pretraining gives each DP/CP rank the same number of valid tokens.
+        num_tokens = local_count * dp_size * cp_size
+
+    # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
+    scale_grads_(local_grads(model), 1.0 / num_tokens)
 
     gradient_norm = clip_grad_norm(
         model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
