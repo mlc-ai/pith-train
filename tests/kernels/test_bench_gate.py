@@ -2,8 +2,8 @@
 The kernel benchmark gate (benchmarks/kernels/compare.py) against the stored H200 baseline, in the
 smoke tier (no GPU work): an unchanged run passes; inflating a few ops past 5% + 3 us flags exactly
 those and exits 1, through the function and through the command line; noise within the bound, ops of
-cases a run did not select, and timings below the absolute slack pass; an op that errored or vanished
-fails.
+cases a run did not select, and timings below the absolute slack pass; every op slower within its
+own slack but the work-weighted total past 5% fails; an op that errored or vanished fails.
 """
 
 import copy
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.kernels.compare import compare, gate
+from benchmarks.kernels.compare import compare, gate, weighted_ratio
 
 pytestmark = pytest.mark.smoke
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -126,3 +126,20 @@ def test_other_gpu_fails() -> None:
     other = copy.deepcopy(BASELINE)
     other["meta"]["gpu"] = "NVIDIA B200"
     assert gate(other, BASELINE) == 1
+
+
+def test_work_weighted_total() -> None:
+    base = copy.deepcopy(BASELINE)
+    for r in timed(base):
+        r.setdefault("work", 1)
+        r.setdefault("layers", 1)
+    assert weighted_ratio(base, base) == 1.0
+    slower = inflate(base, timed(base), 1.04)
+    assert compare(slower, base) == [] and gate(slower, base) == 0
+    short = [r for r in timed(base) if r["median_us"] * 0.06 < 3.0]  # 6% slower is inside 5% + 3 us
+    slower = inflate(base, short, 1.06)
+    for r in timed(base):
+        r["work"] = 1 if r in short else 0
+    assert compare(slower, base) == []
+    assert abs(weighted_ratio(slower, base) - 1.06) < 1e-9
+    assert gate(slower, base) == 1
