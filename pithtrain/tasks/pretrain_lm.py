@@ -235,15 +235,6 @@ def train_step(
         num_tokens = local_count * dp_size * cp_size
 
     # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
-    upcast_params = []
-    if dense_fsdp is not None and dense_fsdp.bf16_sharded_gradients:
-        for param in model.parameters():
-            if param.grad is not None:
-                grad = param.grad.to(torch.float32)
-                param.grad = None
-                param.grad_dtype = torch.float32
-                param.grad = grad
-                upcast_params.append(param)
     scale_grads_(local_grads(model), 1.0 / num_tokens)
 
     gradient_norm = clip_grad_norm(
@@ -255,8 +246,6 @@ def train_step(
         optimizer.step()
         optimizer.zero_grad(set_to_none=release_grads)
         scheduler.step()
-    for param in upcast_params:
-        param.grad_dtype = torch.bfloat16
     next_batches = None
     if (
         dense_fsdp is not None

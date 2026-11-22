@@ -65,9 +65,6 @@ class DenseFSDPCfg(SlottedDefault):
 
     reduce_dtype: Literal["fp32", "bf16"] = "fp32"
 
-    bf16_sharded_gradients: bool = False
-    """Accumulate reduced shards in BF16 and upcast once before AdamW."""
-
     reuse_gradient_shards: bool = False
     """Zero the dense model's FP32 gradient shards in place after AdamW."""
 
@@ -270,10 +267,6 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.prefetch must be nonnegative")
     if cfg.reduce_dtype not in ("fp32", "bf16"):
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
-    if cfg.bf16_sharded_gradients and cfg.reduce_dtype != "bf16":
-        raise ValueError("BF16 sharded gradients require BF16 reduction")
-    if cfg.reuse_gradient_shards and cfg.bf16_sharded_gradients:
-        raise ValueError("Reusing gradient shards requires FP32 gradient storage")
     if cfg.reduce_at_step_end < 0:
         raise ValueError("dense_fsdp.reduce_at_step_end must be nonnegative")
     if cfg.activation_checkpoint not in ("none", "selective", "full", "offload"):
@@ -289,9 +282,6 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("Symmetric reduce-scatter requires one input buffer")
 
     reduce_dtype = torch.float32 if cfg.reduce_dtype == "fp32" else torch.bfloat16
-    if cfg.bf16_sharded_gradients:
-        for param in model.parameters():
-            param.grad_dtype = torch.bfloat16
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=reduce_dtype,
