@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Optional
@@ -23,7 +24,7 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35 import Qwen35Model, Qwen35TextModel
-from pithtrain.models.qwen35_moe import Qwen35MoeModel
+from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeRotaryEmbedding
 from pithtrain.modules import imbalance
 from pithtrain.modules.dense_fsdp import DenseFSDPCfg, shard_dense_model
 from pithtrain.modules.fp8_param_gather import (
@@ -405,11 +406,18 @@ def setup_model(
         mesh = distributed.attn_mesh["dp"]
         if distributed_cfg.hsdp_replica > 1:
             mesh = split_replicas(mesh, distributed_cfg.hsdp_replica)
-        model = Qwen35TextModel(module_config)
-        init_weights(
-            model, module_config.num_hidden_layers, cfg.init_std, cfg.seed, pipeline_chunks=False
-        )
+        # The HF loader fills every parameter shard when there is no resumable DCP location.
+        from_hf = cfg.hf_import_path is not None and cfg.save_location is None
+        with torch.device("meta") if from_hf else nullcontext():
+            model = Qwen35TextModel(module_config)
+        if not from_hf:
+            init_weights(
+                model, module_config.num_hidden_layers, cfg.init_std, cfg.seed, pipeline_chunks=False
+            )
         shard_dense_model(model, mesh, cfg.dense_fsdp)
+        if from_hf:
+            model.to_empty(device=distributed.device)
+            model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
         training.model = model
         return
 
