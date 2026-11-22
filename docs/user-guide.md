@@ -22,14 +22,13 @@ uv sync
 
 | Model | Total / active params | Example dir | Default mesh | GPUs (8×H200 nodes) |
 |---|---|---|---|---|
-| DeepSeek-V2-Lite | ~16B / ~2.4B | `deepseek-v2-lite` | `pp=4, ep=1`, micro-batch 4, FP8 | 8 (1 node) |
 | Qwen3-30B-A3B | ~30B / ~3B | `qwen3-30b-a3b` | `pp=2, ep=4`, micro-batch 2 | 8 (1 node) |
 | Qwen3.5-35B-A3B | ~35B / ~3B | `qwen3.5-35b-a3b` | `pp=1, ep=8`, micro-batch 1 | 8 (1 node) |
 | Qwen3.5-27B | ~27B dense | `qwen3.5-27b` | `pp=8, ep=1`, micro-batch 1 | 16 (2 nodes) |
 | GPT-OSS-20B | ~21B / ~3.6B | `gpt-oss-20b` | `pp=1, ep=2`, micro-batch 2 | 8 (1 node) |
 | GPT-OSS-120B | ~117B / ~5B | `gpt-oss-120b` | `pp=4, ep=8`, micro-batch 2 | 32 (4 nodes) |
 
-Example dirs live under `examples/pretrain_lm/<dir>/`. Every example pretrains at 4K context (`sequence_length = 4096`, 1024 sequences per step) with no context parallelism, and its default mesh is sized for 8×H200 nodes (141 GB per GPU): each peaks between about 98 and 121 GB there. The meshes are starting points — see [Scaling](#scaling-a-run) to change them. **On 80 GB GPUs (8×H100) the single-node defaults do not fit as shipped:** lower `micro_batch_size`, or add nodes and raise `pp` or `ep`, and check the mesh with `tools.memory_estimator` first. **Qwen3.5-27B needs two H200 nodes and GPT-OSS-120B four.**
+Example dirs live under `examples/pretrain_lm/<dir>/`. Every example pretrains at 4K context (`sequence_length = 4096`, 1024 sequences per step) with no context parallelism, and its default mesh is sized for 8×H200 nodes (141 GB per GPU): each peaks between about 98 and 119 GB there. The meshes are starting points — see [Scaling](#scaling-a-run) to change them. **On 80 GB GPUs (8×H100) the single-node defaults do not fit as shipped:** lower `micro_batch_size`, or add nodes and raise `pp` or `ep`, and check the mesh with `tools.memory_estimator` first. **Qwen3.5-27B needs two H200 nodes and GPT-OSS-120B four.**
 
 ## End-to-end workflow
 

@@ -8,7 +8,7 @@ Tokenize the training corpus (one-time step):
 
 ```bash
 bash examples/tokenize_corpus/launch.sh dclm-qwen3
-bash examples/tokenize_corpus/launch.sh dclm-deepseek-v2
+bash examples/tokenize_corpus/launch.sh dclm-qwen3.5
 ```
 
 See [tokenize_corpus](../tokenize_corpus/) for details.
@@ -17,7 +17,7 @@ See [tokenize_corpus](../tokenize_corpus/) for details.
 
 ```bash
 bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
-bash examples/pretrain_lm/launch.sh deepseek-v2-lite
+bash examples/pretrain_lm/launch.sh qwen3.5-35b-a3b
 ```
 
 The launch script auto-detects available GPUs and works with both single-node and multi-node (SLURM) setups. Run the multi-node models under `srun` with one task per node:
@@ -34,7 +34,6 @@ Every example pretrains at 4K context (`sequence_length = 4096`, global batch 10
 
 | Model | H200 nodes | Mesh | Micro-batch |
 |---|---|---|---|
-| [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) (FP8) | 1 | 4-way pipeline x 1-way expert | 4 |
 | [GPT-OSS-20B](https://huggingface.co/openai/gpt-oss-20b) | 1 | 1-way pipeline x 2-way expert | 2 |
 | [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | 1 | 2-way pipeline x 4-way expert | 2 |
 | [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | 1 | 1-way pipeline x 8-way expert | 1 |

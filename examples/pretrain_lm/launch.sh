@@ -3,9 +3,9 @@
 #
 # Every example pretrains at 4K context, sized for 8x H200 nodes.
 #
-# Usage (one node: deepseek-v2-lite, gpt-oss-20b, qwen3-30b-a3b, qwen3.5-35b-a3b):
+# Usage (one node: gpt-oss-20b, qwen3-30b-a3b, qwen3.5-35b-a3b):
 #   bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
-#   bash examples/pretrain_lm/launch.sh deepseek-v2-lite
+#   bash examples/pretrain_lm/launch.sh qwen3.5-35b-a3b
 #
 # For multi-node training with SLURM (qwen3.5-27b: two nodes, gpt-oss-120b: four):
 #   srun -N 2 --ntasks-per-node=1 -W 0 examples/pretrain_lm/launch.sh qwen3.5-27b
