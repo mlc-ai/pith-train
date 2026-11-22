@@ -91,7 +91,7 @@ class Qwen35DecoderLayer(nn.Module):
     def forward_stock_stages(self, hidden_states, rotary_posemb, cu_seqlens=None):
         hidden_states, residual, _ = self.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
         hidden_states = self.forward_stage3(hidden_states)
-        return self.forward_stage5(hidden_states, None, residual)
+        return self.forward_stage5(hidden_states, None, None, residual)
 
     def forward(self, hidden_states, rotary_posemb, cu_seqlens=None, *, checkpoint_delta=False):
         if self.to_contiguous:
