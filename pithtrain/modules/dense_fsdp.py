@@ -74,6 +74,9 @@ class DenseFSDPCfg(SlottedDefault):
     separate_reduce_scatter: bool = False
     """Use a dedicated communicator for reduce-scatter to allow backward all-gather overlap."""
 
+    collective_buffers: Literal["default", "process-group", "symmetric"] = "default"
+    """Select the allocator for all-gather and reduce-scatter staging buffers."""
+
     activation_checkpoint: Literal["none", "selective", "full", "offload"] = "none"
 
     compile_blocks: bool = False
@@ -169,6 +172,13 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
         )
 
+    if cfg.collective_buffers not in ("default", "process-group", "symmetric"):
+        raise ValueError(
+            "dense_fsdp.collective_buffers must be default, process-group or symmetric"
+        )
+    if cfg.collective_buffers == "symmetric" and cfg.reduce_scatter_buffers != 1:
+        raise ValueError("Symmetric reduce-scatter requires one input buffer")
+
     reduce_dtype = torch.float32 if cfg.reduce_dtype == "fp32" else torch.bfloat16
     if cfg.bf16_sharded_gradients:
         for param in model.parameters():
@@ -261,3 +271,10 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         model.set_reduce_scatter_max_input_buffers(cfg.reduce_scatter_buffers)
     if cfg.separate_reduce_scatter:
         model.set_separate_reduce_scatter_group()
+    if cfg.collective_buffers != "default":
+        for unit in (*order, model):
+            if cfg.collective_buffers == "symmetric":
+                unit.set_force_sum_reduction_for_comms(True)
+                unit.set_symm_mem_for_comm()
+            else:
+                unit.set_allocate_memory_from_process_group_for_comm(True)

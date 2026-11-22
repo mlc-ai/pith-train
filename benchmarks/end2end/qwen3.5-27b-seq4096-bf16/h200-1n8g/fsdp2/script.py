@@ -42,6 +42,9 @@ if __name__ == "__main__":
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
     parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument(
+        "--collective-buffers", choices=("default", "process-group", "symmetric"), default="default"
+    )
+    parser.add_argument(
         "--checkpoint", choices=("none", "selective", "full", "offload"), default="none"
     )
     parser.add_argument("--compile-blocks", action="store_true")
@@ -92,6 +95,7 @@ if __name__ == "__main__":
     train.dense_fsdp.prefetch_data_during_optimizer = args.prefetch_data_during_optimizer
     train.dense_fsdp.reduce_scatter_buffers = args.reduce_scatter_buffers
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
+    train.dense_fsdp.collective_buffers = args.collective_buffers
     train.dense_fsdp.activation_checkpoint = args.checkpoint
     train.dense_fsdp.compile_blocks = args.compile_blocks
     train.dense_fsdp.compile_mode = args.compile_mode

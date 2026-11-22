@@ -165,6 +165,10 @@ def train_step(
     step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
+    dense_fsdp = cfg.training.dense_fsdp
+    initial_alloc_retries = (
+        torch.cuda.memory_stats()["num_alloc_retries"] if dense_fsdp is not None else 0
+    )
 
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     model.train()
@@ -175,7 +179,6 @@ def train_step(
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     cp_size = distributed.cp_size
-    dense_fsdp = cfg.training.dense_fsdp
     if dense_fsdp is not None:
         batches = prefetched_batches
         if batches is None:
@@ -268,9 +271,15 @@ def train_step(
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
-    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
-    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+    memory = [torch.cuda.max_memory_allocated() / 1024**3]
+    if dense_fsdp is not None:
+        memory += [
+            torch.cuda.max_memory_reserved() / 1024**3,
+            torch.cuda.memory_stats()["num_alloc_retries"] - initial_alloc_retries,
+        ]
+    peak_gpu_stats = torch.tensor(memory, device=device)
+    torch.distributed.all_reduce(peak_gpu_stats, op=torch.distributed.ReduceOp.MAX)
+    peak_gpu_mem = peak_gpu_stats[0]
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -298,6 +307,10 @@ def train_step(
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
+        if dense_fsdp is not None:
+            reserved, retries = peak_gpu_stats[1:].tolist()
+            statements.append("peak-gpu-reserved %.2f GB" % reserved)
+            statements.append("cuda-alloc-retries %d" % retries)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
