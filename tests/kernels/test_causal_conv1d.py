@@ -1,6 +1,5 @@
 """
-The causal depthwise conv kernels at the spec's shapes against float64, within elementwise bounds
-of half a bf16 ulp plus fp32 accumulation error.
+causal_conv1d_fwd / _bwd at the causal_conv1d cases, within one bf16 rounding plus fp32 slack.
 """
 
 import pytest
@@ -9,14 +8,13 @@ import torch.nn.functional as F
 
 from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_empty, causal_conv1d_fwd
 from tests.kernels.cases import params, seed_of
-from tests.kernels.references import worst_ratio
 
 BF16_HALF_ULP = 2.0**-8
 FP32_EPS = 2.0**-24
 DW_ACCUMULATION = 2.0**-16
 
 
-def make(case: dict) -> tuple[torch.Tensor, ...]:
+def causal_conv1d_inputs(case: dict) -> tuple[torch.Tensor, ...]:
     axes = case["axes"]
     B, S, C, K = axes["B"], axes["T_local"], axes["C"], axes["width"]
     offset = K - 1 if axes["cp"] > 1 else 0
@@ -27,7 +25,7 @@ def make(case: dict) -> tuple[torch.Tensor, ...]:
     return x, weight, grad_out, offset
 
 
-def reference(x, weight, grad_out, offset):
+def causal_conv1d_reference(x, weight, grad_out, offset):
     """
     float64 y, dx, dw of the definition, each with the sum of its terms' magnitudes.
     """
@@ -59,7 +57,7 @@ def reference(x, weight, grad_out, offset):
 
 @pytest.mark.parametrize("case", params("causal_conv1d"))
 def test_causal_conv1d_at_training_shapes(case: dict) -> None:
-    x, weight, grad_out, offset = make(case)
+    x, weight, grad_out, offset = causal_conv1d_inputs(case)
     K = weight.shape[-1]
     y = causal_conv1d_fwd(x, weight, offset)
     dx, dw = causal_conv1d_bwd(grad_out, x, weight, offset)
@@ -67,7 +65,9 @@ def test_causal_conv1d_at_training_shapes(case: dict) -> None:
     fake = causal_conv1d_empty(x.to("meta"), offset)  # the operator's fake implementation
     assert (fake.shape, fake.stride(), fake.dtype) == (y.shape, y.stride(), y.dtype)
     assert dx.shape == x.shape and dw.shape == weight.shape and dw.dtype == weight.dtype
-    y_ref, y_abs, dx_ref, dx_abs, dw_ref, dw_abs = reference(x, weight, grad_out, offset)
+    y_ref, y_abs, dx_ref, dx_abs, dw_ref, dw_abs = causal_conv1d_reference(
+        x, weight, grad_out, offset
+    )
     ratios = {
         "y": worst_ratio(y, y_ref, BF16_HALF_ULP * y_ref.abs() + K * FP32_EPS * y_abs),
         "dx": worst_ratio(dx, dx_ref, BF16_HALF_ULP * dx_ref.abs() + K * FP32_EPS * dx_abs),
@@ -77,3 +77,13 @@ def test_causal_conv1d_at_training_shapes(case: dict) -> None:
     assert all(torch.isfinite(t).all() for t in (y, dx, dw))
     bad = {name: ratio for name, ratio in ratios.items() if ratio > 1.0}
     assert not bad, f"error / bound above 1: {bad}"
+
+
+def worst_ratio(out: torch.Tensor, ref: torch.Tensor, tol: torch.Tensor) -> float:
+    """
+    max |out - ref| / tol elementwise (<= 1 passes); tol broadcasts against ref.
+    """
+    if out.numel() == 0:
+        return 0.0
+    err = (out.double() - ref.double()).abs()
+    return float((err / (tol.double() + 1e-30)).max())

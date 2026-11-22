@@ -120,7 +120,7 @@ MOE_MODELS = sorted(name for name, model in MODELS.items() if model.experts is n
 @pytest.mark.parametrize("name", MOE_MODELS)
 def test_moe_cases_reach_the_routes(name: str) -> None:
     experts = MODELS[name].experts
-    found = [case["axes"] for case in select("moe_experts", model=name)]
+    found = [case["axes"] for case in select("bf16_expert_gemm", model=name)]
     assert any(a["empty_groups"] for a in found), "no case with an empty expert"
     split = module_constant(KERNELS / "fp8_gemm.py", "K_GROUPED_MAX_ROWS")
     assert any(a["max_rows"] > split for a in found), f"no group past {split} rows (SM90 k-grouped split)"  # fmt: skip
@@ -136,7 +136,7 @@ def test_moe_cases_reach_the_routes(name: str) -> None:
 
 
 def test_moe_routing_is_consistent() -> None:
-    for case in select("moe_experts"):
+    for case in select("bf16_expert_gemm"):
         a = case["axes"]
         sizes = a["group_sizes"]
         assert len(sizes) == a["G"] and sum(sizes) == a["rows"], case["id"]

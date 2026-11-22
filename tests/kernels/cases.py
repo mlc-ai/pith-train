@@ -374,111 +374,33 @@ def meshes_of(model: Model) -> list[Mesh]:
 
 # Families ----------------------------------------------------------------------------------------
 
-FAMILIES = OrderedDict(
-    moe_experts=dict(
-        doc="Routed experts of one EP rank: the gate_up and down grouped GEMMs (forward, dgrad, wgrad) in FP8 and BF16, the fused activation (+ quantization) between them, and the token movement around them.",
-        kernels=[
-            "fp8_quant_grouped",
-            "fp8_quant_weight_grouped",
-            "fp8_grouped_gemm",
-            "fp8_group_indices",
-            "k_grouped_fp8_gemm",
-            "fp8_grouped_wgrad_empty",
-            "fp8_silu_mul_fwd",
-            "fp8_silu_mul_bwd",
-            "fp8_silu_mul_gu_fwd",
-            "fp8_silu_mul_gu_bwd",
-            "fp8_clamped_swiglu_rowwise",
-            "fp8_clamped_swiglu_kmajor",
-            "fp8_clamped_swiglu_bwd",
-            "clamped_swiglu_fwd",
-            "clamped_swiglu_bwd",
-            "scatter_quant",
-            "group_bias_add",
-            "segment_sum",
-            "scatter_by_expert",
-            "ep_dispatch_send_idx",
-            "ep_dispatch_recv_idx",
-            "bf16_expert_gate_up_fwd",
-            "bf16_expert_down_fwd",
-            "bf16_expert_down_dgrad",
-            "bf16_expert_gate_up_dgrad",
-            "bf16_expert_gate_up_wgrad",
-            "bf16_expert_down_wgrad",
-            "bf16_expert_group_slots",
-            "bf16_expert_gather_rows",
-            "bf16_expert_gather_sum",
-            "bf16_expert_segment_sum",
-        ],  # fmt: skip
-    ),
-    dense_gemm=dict(
-        doc="FP8 dense linears (training.Linear with fp8=True): y = x W^T, dgrad and wgrad with the activation / gradient quantizations, at M = tokens per GPU.",
-        kernels=[
-            "fp8_quant_act",
-            "fp8_quant_grad",
-            "fp8_quant_weight",
-            "fp8_gemm_fwd",
-            "fp8_gemm_bwd",
-        ],  # fmt: skip
-    ),
-    weight_quant=dict(
-        doc="FP8 weight quantization and the FP8 parameter all-gather kernels, per rank's weights.",
-        kernels=[
-            "fp8_quant_weight",
-            "fp8_quant_weight_grouped",
-            "fp8_pack_transpose",
-            "fp8_scales",
-            "fp8_scales_multi",
-            "fp8_shard_amax",
-            "fp8_shard_amax_multi",
-            "fp8_shard_cast",
-        ],  # fmt: skip
-    ),
-    attention=dict(
-        doc="FlashAttention-4 launches as training makes them: dense causal at CP 1, the three zigzag ring-step launches at CP > 1 (diag: causal over the local 2 blocks; front: local q over the remote front block, a strided k / v view; back: the local back-block q view over the remote 2 blocks), and packed varlen at CP 1.",
-        kernels=["memoized_launch"],
-    ),
-    ring_attention=dict(
-        doc="The CP ring operators end to end on cp GPUs (CP 16 spans two nodes): ring_attention_func / mla_ring_attention_func at the production S_local, forward and backward (FlashAttention-4 called through its own interface, no pithtrain kernel).",
-        kernels=[],
-    ),
-    gated_delta_rule=dict(
-        doc="Gated DeltaNet with the batch folded into the heads: the pinned kernels at CP 1, the CP operator (gdr_cp_* pieces around its all-gather) on cp GPUs.",
-        kernels=[
-            "chunk_gdr_fwd_pinned",
-            "chunk_gdr_bwd_pinned",
-            "gdr_cp_fwd_local",
-            "gdr_cp_fwd_output",
-            "gdr_cp_merge",
-            "gdr_cp_bwd_local",
-            "gdr_cp_bwd_output",
-            "gdr_cp_bwd_states",
-            "gated_delta_rule_cp_plan",
-        ],  # fmt: skip
-    ),
-    causal_conv1d=dict(
-        doc="Qwen3.5's channels-last causal depthwise conv over the mixed q / k / v channels.",
-        kernels=["causal_conv1d_fwd", "causal_conv1d_bwd", "causal_conv1d_empty"],
-    ),
-    cross_entropy=dict(
-        doc="The lm_head loss on the last pipeline stage: rows = tokens per GPU, the full vocab.",
-        kernels=["cross_entropy_fwd_bwd", "log_prob_fwd", "log_prob_bwd"],
-    ),
-    swiglu_dense=dict(
-        doc="SiLU-mul of the dense and shared-expert MLPs at M = tokens per GPU, and for DeepSeek-V2 the fused FP8 MLP (pithtrain.operators.fp8_swiglu_mlp).",
-        kernels=[
-            "silu_mul_fwd",
-            "silu_mul_bwd",
-            "fp8_gemm_nt",
-            "act_scale_like",
-            "fp8_channels_as_rows",
-        ],
-    ),
-    pointwise_layers=dict(
-        doc="The torch-compiled per-token layers around attention and the experts (no pithtrain kernel; Inductor-generated from each model's own modules): RMSNorm, q / k norm, RoPE, router top-k.",
-        kernels=[],
-    ),
-)
+FAMILIES = {
+    'bf16_expert_gemm': dict(shapes=['moe_experts'], kernels=['bf16_expert_gate_up_fwd', 'bf16_expert_down_fwd', 'bf16_expert_down_dgrad', 'bf16_expert_gate_up_dgrad', 'bf16_expert_gate_up_wgrad', 'bf16_expert_down_wgrad']),
+    'bf16_expert_slots': dict(shapes=['moe_experts'], kernels=['bf16_expert_group_slots', 'bf16_expert_gather_rows', 'bf16_expert_gather_sum', 'bf16_expert_segment_sum']),
+    'causal_conv1d': dict(shapes=['causal_conv1d'], kernels=['causal_conv1d_fwd', 'causal_conv1d_bwd', 'causal_conv1d_empty']),
+    'clamped_swiglu': dict(shapes=['moe_experts'], kernels=['clamped_swiglu_fwd', 'clamped_swiglu_bwd']),
+    'cross_entropy': dict(shapes=['cross_entropy'], kernels=['cross_entropy_fwd_bwd']),
+    'ep_dispatch': dict(shapes=['moe_experts'], kernels=['ep_dispatch_send_idx', 'ep_dispatch_recv_idx']),
+    'flash_attn_memoize': dict(shapes=['attention'], kernels=['memoized_launch']),
+    'fp8_clamped_swiglu_quant': dict(shapes=['moe_experts'], kernels=['fp8_clamped_swiglu_rowwise', 'fp8_clamped_swiglu_kmajor', 'fp8_clamped_swiglu_bwd']),
+    'fp8_gemm': dict(shapes=['dense_gemm', 'moe_experts', 'swiglu_dense'], kernels=['fp8_gemm_fwd', 'fp8_gemm_bwd', 'fp8_gemm_nt', 'fp8_channels_as_rows', 'fp8_grouped_gemm', 'k_grouped_fp8_gemm', 'fp8_grouped_wgrad_empty', 'fp8_quant_grouped', 'fp8_quant_act', 'fp8_quant_grad', 'act_scale_like']),
+    'fp8_scatter_quant': dict(shapes=['moe_experts'], kernels=['scatter_quant', 'fp8_group_indices']),
+    'fp8_silu_mul_quant': dict(shapes=['moe_experts'], kernels=['fp8_silu_mul_fwd', 'fp8_silu_mul_bwd', 'fp8_silu_mul_gu_fwd', 'fp8_silu_mul_gu_bwd']),
+    'fp8_weight_quant': dict(shapes=['weight_quant'], kernels=['fp8_quant_weight', 'fp8_quant_weight_grouped', 'fp8_pack_transpose', 'fp8_scales', 'fp8_scales_multi', 'fp8_shard_amax', 'fp8_shard_amax_multi', 'fp8_shard_cast']),
+    'gated_delta_rule_cp': dict(shapes=['gated_delta_rule'], kernels=['gdr_cp_fwd_local', 'gdr_cp_fwd_output', 'gdr_cp_merge', 'gdr_cp_bwd_local', 'gdr_cp_bwd_output', 'gdr_cp_bwd_states', 'gated_delta_rule_cp_plan']),
+    'gated_delta_rule_pinned': dict(shapes=['gated_delta_rule'], kernels=['chunk_gdr_fwd_pinned', 'chunk_gdr_bwd_pinned']),
+    'group_bias_add': dict(shapes=['moe_experts'], kernels=['group_bias_add']),
+    'log_prob': dict(shapes=['cross_entropy'], kernels=['log_prob_fwd', 'log_prob_bwd']),
+    'ring_attention': dict(shapes=['ring_attention'], kernels=[]),
+    'segment_sum': dict(shapes=['moe_experts'], kernels=['segment_sum']),
+    'silu_mul': dict(shapes=['swiglu_dense'], kernels=['silu_mul_fwd', 'silu_mul_bwd']),
+    'token_scatter': dict(shapes=['moe_experts'], kernels=['scatter_by_expert']),
+    'pointwise_layers': dict(shapes=['pointwise_layers'], kernels=[]),
+}  # fmt: skip
+"""
+Test family (the pithtrain.kernels module, or the operator, its test file is named for) -> the case
+shapes it runs and the kernels its tests call.
+"""
 
 SHAPE_INDEPENDENT = ["fp8_fused_experts_supported", "bf16_experts_supported", "gated_delta_rule_pinned_supported", "gated_delta_rule_cp_supported", "tune_kernels", "stage_compile_options"]  # fmt: skip
 
@@ -790,30 +712,38 @@ def pointwise_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
     return collect.cases
 
 
+def shapes_of(model: Model) -> list[str]:
+    shapes = ["dense_gemm", "weight_quant"]
+    shapes += ["moe_experts"] if model.experts is not None else []
+    shapes += ["attention"] + (["ring_attention"] if model.attention.supports_cp else [])
+    shapes += ["gated_delta_rule", "causal_conv1d"] if model.linear_attention is not None else []
+    shapes += ["cross_entropy"] + (["swiglu_dense"] if model.swiglu_widths else [])
+    return shapes + ["pointwise_layers"]
+
+
 def families_of(model: Model) -> list[str]:
-    families = ["dense_gemm", "weight_quant"]
-    families += ["moe_experts"] if model.experts is not None else []
-    families += ["attention"] + (["ring_attention"] if model.attention.supports_cp else [])
-    families += ["gated_delta_rule", "causal_conv1d"] if model.linear_attention is not None else []
-    families += ["cross_entropy"] + (["swiglu_dense"] if model.swiglu_widths else [])
-    return families + ["pointwise_layers"]
+    shapes = shapes_of(model)
+    return [family for family, meta in FAMILIES.items() if set(meta["shapes"]) & set(shapes)]
 
 
 def model_cases(model: Model) -> list[dict]:
     meshes = meshes_of(model)
-    per_family = OrderedDict()
-    for family in families_of(model):
-        if family == "gated_delta_rule":
-            per_family["gated_delta_rule"], per_family["causal_conv1d"] = gdn_cases(model, meshes)
-        elif family != "causal_conv1d":
-            per_family[family] = GENERATORS[family](model, meshes)
+    per_shape = OrderedDict()
+    for shape in shapes_of(model):
+        if shape == "gated_delta_rule":
+            per_shape["gated_delta_rule"], per_shape["causal_conv1d"] = gdn_cases(model, meshes)
+        elif shape != "causal_conv1d":
+            per_shape[shape] = GENERATORS[shape](model, meshes)
     cases = []
-    for family, collected in per_family.items():
-        for label, case in collected.items():
-            row = dict(id=f"{family}/{model.name}/{label}", family=family, model=model.name, axes=case["axes"], meshes=case["meshes"])  # fmt: skip
-            if "weight" in case:
-                row["weight"] = case["weight"]
-            cases.append(row)
+    for family, meta in FAMILIES.items():
+        for shape in meta["shapes"]:
+            for label, case in per_shape.get(shape, {}).items():
+                row = dict(id=f"{family}/{model.name}/{label}", family=family, model=model.name, axes=case["axes"], meshes=case["meshes"])  # fmt: skip
+                if "weight" in case:
+                    row["weight"] = case["weight"]
+                cases.append(row)
+    ids = [case["id"] for case in cases]
+    assert len(ids) == len(set(ids)), "duplicate case ids"
     return cases
 
 

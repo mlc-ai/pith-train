@@ -1,6 +1,5 @@
 """
-FlashAttention-4 at the spec's dense, varlen and ring-step launches against fp32 attention.
-Relative L2 error (max abs for lse) within BOUNDS, about 3x measured on the H200.
+FlashAttention-4 (through memoized_launch) at the flash_attn_memoize cases against fp32 attention.
 """
 
 import json
@@ -11,9 +10,8 @@ import torch
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from tests.kernels.attention_reference import attention_reference
 from tests.kernels.cases import params, seed_of
-from tests.kernels.references import rel_l2
+from tests.kernels.common import flash_attn_memoize_reference, randn, rel_l2
 
 BOUNDS = {
     "out": 7e-3,  # measured 2.31e-3
@@ -23,15 +21,13 @@ BOUNDS = {
     "dv": 7.5e-3,  # measured 2.37e-3
     "dsink": 1e-2,  # measured 3.03e-3
 }
+
+
 LSE_SHIFT = 0.5
 ERROR_LOG = os.environ.get("PITHTRAIN_SPEC_ERROR_LOG")
 
 
-def randn(gen: torch.Generator, *shape: int, dtype=torch.bfloat16) -> torch.Tensor:
-    return torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32).to(dtype)
-
-
-def check(case: dict, got: dict, want: dict) -> None:
+def check_attention(case: dict, got: dict, want: dict) -> None:
     errors = {}
     for name, value in got.items():
         value = value.detach()
@@ -66,14 +62,14 @@ def run_dense(case: dict, gen: torch.Generator) -> None:
     want = {name: [] for name in ("out", "dq", "dk", "dv")}
     dsink = 0
     for b in range(B):
-        ref = attention_reference(q[b].detach(), k[b].detach(), v[b].detach(), scale, True, a["window"], sink.detach() if sink is not None else None, dout[b])  # fmt: skip
+        ref = flash_attn_memoize_reference(q[b].detach(), k[b].detach(), v[b].detach(), scale, True, a["window"], sink.detach() if sink is not None else None, dout[b])  # fmt: skip
         for name in want:
             want[name].append(ref[name])
         if sink is not None:
             dsink = dsink + ref["dsink"]
     want = {name: torch.stack(value) for name, value in want.items()}
     want["dsink"] = dsink
-    check(case, got, want)
+    check_attention(case, got, want)
 
 
 def run_varlen(case: dict, gen: torch.Generator) -> None:
@@ -96,14 +92,14 @@ def run_varlen(case: dict, gen: torch.Generator) -> None:
     want = {name: [] for name in ("out", "dq", "dk", "dv")}
     dsink = 0
     for start, end in zip(cu, cu[1:]):
-        ref = attention_reference(q[start:end].detach(), k[start:end].detach(), v[start:end].detach(), scale, True, a["window"], sink.detach() if sink is not None else None, dout[start:end])  # fmt: skip
+        ref = flash_attn_memoize_reference(q[start:end].detach(), k[start:end].detach(), v[start:end].detach(), scale, True, a["window"], sink.detach() if sink is not None else None, dout[start:end])  # fmt: skip
         for name in want:
             want[name].append(ref[name])
         if sink is not None:
             dsink = dsink + ref["dsink"]
     want = {name: torch.cat(value) for name, value in want.items()}
     want["dsink"] = dsink
-    check(case, got, want)
+    check_attention(case, got, want)
 
 
 def run_ring_step(case: dict, gen: torch.Generator) -> None:
@@ -137,16 +133,16 @@ def run_ring_step(case: dict, gen: torch.Generator) -> None:
     got = dict(out=out, lse=lse, dq=dq, dk=dk, dv=dv)
     want = {name: [] for name in got}
     for b in range(B):
-        fwd = attention_reference(q_call[b], k_call[b], v_call[b], scale, causal)
-        bwd = attention_reference(q_call[b], k_call[b], v_call[b], scale, causal, dout=dout[b], o_in=out[b], lse_in=lse_in[b])  # fmt: skip
+        fwd = flash_attn_memoize_reference(q_call[b], k_call[b], v_call[b], scale, causal)
+        bwd = flash_attn_memoize_reference(q_call[b], k_call[b], v_call[b], scale, causal, dout=dout[b], o_in=out[b], lse_in=lse_in[b])  # fmt: skip
         want["out"].append(fwd["out"])
         want["lse"].append(fwd["lse"])
         for name in ("dq", "dk", "dv"):
             want[name].append(bwd[name])
-    check(case, got, {name: torch.stack(value) for name, value in want.items()})
+    check_attention(case, got, {name: torch.stack(value) for name, value in want.items()})
 
 
-@pytest.mark.parametrize("case", params("attention"))
+@pytest.mark.parametrize("case", params("flash_attn_memoize"))
 def test_attention(case: dict) -> None:
     gen = torch.Generator(device="cuda").manual_seed(seed_of(case))
     kind = case["axes"]["kind"]

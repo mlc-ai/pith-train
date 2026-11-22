@@ -3,7 +3,7 @@ Times the kernels at the cases of tests/kernels/cases.py, for this tree alone or
 ref (--base), each op over cold-L2 single launches and weighted by its work times its layers.
 
     python -m benchmarks.kernels --base upstream/main --family cross_entropy --out ab.json
-    python -m benchmarks.kernels --base upstream/main --family moe_experts --op 'quant|silu'
+    python -m benchmarks.kernels --base upstream/main --family fp8_silu_mul_quant
     python -m benchmarks.kernels --base-dir . --family weight_quant      (the noise floor)
     python -m benchmarks.kernels --out results.json                       (this tree alone)
     python -m benchmarks.kernels --shard 3/8 --out shard3.json            (one per GPU)
@@ -34,15 +34,6 @@ from tests.kernels.cases import all_cases, select
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEV = "cuda"
 TOLERANCE = 0.05
-FAMILIES = [
-    "moe_experts",
-    "dense_gemm",
-    "weight_quant",
-    "attention",
-    "gated_delta_rule",
-    "causal_conv1d",
-    "cross_entropy",
-]
 
 
 def randn(*shape: int, scale: float = 1.0, gen: torch.Generator) -> torch.Tensor:
@@ -87,14 +78,19 @@ class Timer:
         return dict(median_us=pick(0.5), p10_us=pick(0.1), p90_us=pick(0.9))
 
 
-def moe_ops(axes: dict, gen: torch.Generator) -> dict:
+def padded_groups(axes: dict) -> tuple[list[int], torch.Tensor]:
     """
-    The FP8 expert GEMMs and quantizations, and the fused BF16 expert GEMMs where supported.
+    Each local expert's rows padded to 128 (the FP8 expert layout) and their int32 end offsets.
+    """
+    sizes = [-(-c // 128) * 128 for c in axes["group_sizes"]]
+    return sizes, torch.tensor(sizes, dtype=torch.int64).cumsum(0).to(torch.int32).to(DEV)
+
+
+def fp8_gemm_ops(axes: dict, gen: torch.Generator) -> dict:
+    """
+    The dense FP8 GEMMs, or the expert grouped quantization and grouped GEMMs.
     """
     from pithtrain.kernels import (
-        bf16_expert_down_fwd,
-        bf16_expert_gate_up_fwd,
-        bf16_experts_supported,
         fp8_grouped_gemm,
         fp8_grouped_wgrad_empty,
         fp8_quant_grouped,
@@ -102,43 +98,88 @@ def moe_ops(axes: dict, gen: torch.Generator) -> dict:
         k_grouped_fp8_gemm,
     )
 
+    if "projection" in axes:
+        return fp8_gemm_dense_ops(axes, gen)
+    if "group_sizes" not in axes or axes["routing"] == "boundary":
+        return {}
     G, H, inter = axes["G"], axes["hidden"], axes["inter"]
-    ops = {}
-    w_gu, w_dn = (
-        randn(G, 2 * inter, H, scale=0.02, gen=gen),
-        randn(G, H, inter, scale=0.02, gen=gen),
+    w_gu, w_dn = randn(G, 2 * inter, H, scale=0.02, gen=gen), randn(G, H, inter, scale=0.02, gen=gen)  # fmt: skip
+    sizes, offs = padded_groups(axes)
+    M = sum(sizes)
+    ks = torch.tensor(sizes, dtype=torch.int32, device=DEV)
+    x, dy, h = randn(M, H, gen=gen), randn(M, H, gen=gen), randn(M, inter, gen=gen)
+    x_fp8, x_scale, _, _ = fp8_quant_grouped(x, offs)
+    h_fp8, h_scale, h_ch, h_ch_scale = fp8_quant_grouped(h, offs)
+    dy_fp8, dy_scale, dy_ch, dy_ch_scale = fp8_quant_grouped(dy, offs)
+    gu_fp8, gu_scale, _, _ = fp8_quant_weight_grouped(w_gu)
+    dn_fp8, dn_scale, dnt_fp8, dnt_scale = fp8_quant_weight_grouped(w_dn)
+    wgrad = fp8_grouped_wgrad_empty(torch.Size((G, H, inter)), torch.device(DEV))
+    gemm = 2 * M * H * inter
+    return {
+        "fp8_quant_grouped[x]": mem(lambda: fp8_quant_grouped(x, offs), x),
+        "fp8_grouped_gemm[gate_up_fwd]": Op(
+            lambda: fp8_grouped_gemm((x_fp8, x_scale), (gu_fp8, gu_scale), 2 * inter, offs),
+            2 * gemm,
+        ),  # fmt: skip
+        "fp8_grouped_gemm[down_fwd]": Op(
+            lambda: fp8_grouped_gemm((h_fp8, h_scale), (dn_fp8, dn_scale), H, offs), gemm
+        ),  # fmt: skip
+        "fp8_grouped_gemm[down_dgrad]": Op(
+            lambda: fp8_grouped_gemm((dy_fp8, dy_scale), (dnt_fp8, dnt_scale), inter, offs), gemm
+        ),  # fmt: skip
+        "k_grouped_fp8_gemm[down_wgrad]": Op(
+            lambda: k_grouped_fp8_gemm((dy_ch, dy_ch_scale), (h_ch, h_ch_scale), wgrad, sizes, ks),
+            gemm,
+        ),  # fmt: skip
+    }
+
+
+def bf16_expert_gemm_ops(axes: dict, gen: torch.Generator) -> dict:
+    """
+    The fused BF16 expert gate_up and down forward GEMMs, where the fused path runs.
+    """
+    from pithtrain.kernels import (
+        bf16_expert_down_fwd,
+        bf16_expert_gate_up_fwd,
+        bf16_experts_supported,
     )
-    if axes["routing"] != "boundary":
-        sizes = [-(-c // 128) * 128 for c in axes["group_sizes"]]
-        M = sum(sizes)
-        offs = torch.tensor(sizes, dtype=torch.int64).cumsum(0).to(torch.int32).to(DEV)
-        ks = torch.tensor(sizes, dtype=torch.int32, device=DEV)
-        x, dy, h = randn(M, H, gen=gen), randn(M, H, gen=gen), randn(M, inter, gen=gen)
-        ops["fp8_quant_grouped[x]"] = mem(lambda: fp8_quant_grouped(x, offs), x)
-        x_fp8, x_scale, _, _ = fp8_quant_grouped(x, offs)
-        h_fp8, h_scale, h_ch, h_ch_scale = fp8_quant_grouped(h, offs)
-        dy_fp8, dy_scale, dy_ch, dy_ch_scale = fp8_quant_grouped(dy, offs)
-        gu_fp8, gu_scale, _, _ = fp8_quant_weight_grouped(w_gu)
-        dn_fp8, dn_scale, dnt_fp8, dnt_scale = fp8_quant_weight_grouped(w_dn)
-        wgrad = fp8_grouped_wgrad_empty(torch.Size((G, H, inter)), torch.device(DEV))
-        gemm = 2 * M * H * inter
-        ops["fp8_grouped_gemm[gate_up_fwd]"] = Op(lambda: fp8_grouped_gemm((x_fp8, x_scale), (gu_fp8, gu_scale), 2 * inter, offs), 2 * gemm)  # fmt: skip
-        ops["fp8_grouped_gemm[down_fwd]"] = Op(lambda: fp8_grouped_gemm((h_fp8, h_scale), (dn_fp8, dn_scale), H, offs), gemm)  # fmt: skip
-        ops["fp8_grouped_gemm[down_dgrad]"] = Op(lambda: fp8_grouped_gemm((dy_fp8, dy_scale), (dnt_fp8, dnt_scale), inter, offs), gemm)  # fmt: skip
-        ops["k_grouped_fp8_gemm[down_wgrad]"] = Op(lambda: k_grouped_fp8_gemm((dy_ch, dy_ch_scale), (h_ch, h_ch_scale), wgrad, sizes, ks), gemm)  # fmt: skip
-        ops.update(activation_quant_ops(axes, M, offs, gen))
-    if axes["bf16_fused"] and bf16_experts_supported(G):
-        raw = axes["group_sizes"]
-        M_raw = sum(raw)
-        cu = torch.tensor([0] + raw, dtype=torch.int64).cumsum(0).to(torch.int32).to(DEV)
-        a_idx = torch.randperm(M_raw, device=DEV, generator=gen).to(torch.int32)
-        slot_of = torch.randperm(M_raw, device=DEV, generator=gen).to(torch.int32)
-        xb, hb = randn(M_raw, H, gen=gen), randn(M_raw, inter, gen=gen)
-        w_gate, w_up = w_gu[:, :inter], w_gu[:, inter:]
-        gu_bias, dn_bias = (randn(G, 2 * inter, gen=gen), randn(G, H, gen=gen)) if axes["bias"] else (None, None)  # fmt: skip
-        act = (axes["swiglu_alpha"], axes["swiglu_limit"]) if axes["act"] == "clamped_swiglu" else ()  # fmt: skip
-        ops["bf16_expert_gate_up_fwd"] = Op(lambda: bf16_expert_gate_up_fwd(xb, w_gate, w_up, cu, a_idx, gu_bias, act), 4 * M_raw * H * inter)  # fmt: skip
-        ops["bf16_expert_down_fwd"] = Op(lambda: bf16_expert_down_fwd(hb, w_dn, cu, slot_of, dn_bias), 2 * M_raw * H * inter)  # fmt: skip
+
+    G, H, inter = axes["G"], axes["hidden"], axes["inter"]
+    if not (axes["bf16_fused"] and bf16_experts_supported(G)):
+        return {}
+    w_gu, w_dn = randn(G, 2 * inter, H, scale=0.02, gen=gen), randn(G, H, inter, scale=0.02, gen=gen)  # fmt: skip
+    raw = axes["group_sizes"]
+    M = sum(raw)
+    cu = torch.tensor([0] + raw, dtype=torch.int64).cumsum(0).to(torch.int32).to(DEV)
+    a_idx = torch.randperm(M, device=DEV, generator=gen).to(torch.int32)
+    slot_of = torch.randperm(M, device=DEV, generator=gen).to(torch.int32)
+    x, h = randn(M, H, gen=gen), randn(M, inter, gen=gen)
+    w_gate, w_up = w_gu[:, :inter], w_gu[:, inter:]
+    gu_bias, dn_bias = (randn(G, 2 * inter, gen=gen), randn(G, H, gen=gen)) if axes["bias"] else (None, None)  # fmt: skip
+    act = (axes["swiglu_alpha"], axes["swiglu_limit"]) if axes["act"] == "clamped_swiglu" else ()
+    return {
+        "bf16_expert_gate_up_fwd": Op(
+            lambda: bf16_expert_gate_up_fwd(x, w_gate, w_up, cu, a_idx, gu_bias, act),
+            4 * M * H * inter,
+        ),  # fmt: skip
+        "bf16_expert_down_fwd": Op(
+            lambda: bf16_expert_down_fwd(h, w_dn, cu, slot_of, dn_bias), 2 * M * H * inter
+        ),  # fmt: skip
+    }
+
+
+def activation_ops(clamped: bool):
+    """
+    The fused activation quantization ops of the expert cases with (or without) gpt-oss's clamped
+    SwiGLU.
+    """
+
+    def ops(axes: dict, gen: torch.Generator) -> dict:
+        if axes["routing"] == "boundary" or (axes["act"] == "clamped_swiglu") != clamped:
+            return {}
+        sizes, offs = padded_groups(axes)
+        return activation_quant_ops(axes, sum(sizes), offs, gen)
+
     return ops
 
 
@@ -184,7 +225,7 @@ def activation_quant_ops(axes: dict, M: int, offs: torch.Tensor, gen: torch.Gene
     }
 
 
-def weight_quant_ops(axes: dict, gen: torch.Generator) -> dict:
+def fp8_weight_quant_ops(axes: dict, gen: torch.Generator) -> dict:
     """
     The FP8 quantization of one weight and the packing of its bytes for the parameter all-gather.
     """
@@ -201,7 +242,7 @@ def weight_quant_ops(axes: dict, gen: torch.Generator) -> dict:
     }
 
 
-def dense_ops(axes: dict, gen: torch.Generator) -> dict:
+def fp8_gemm_dense_ops(axes: dict, gen: torch.Generator) -> dict:
     from pithtrain.kernels import fp8_gemm_bwd, fp8_gemm_fwd, fp8_quant_weight
 
     M, N, K = axes["M"], axes["N"], axes["K"]
@@ -216,7 +257,7 @@ def dense_ops(axes: dict, gen: torch.Generator) -> dict:
     }
 
 
-def attention_ops(axes: dict, gen: torch.Generator) -> dict:
+def flash_attn_memoize_ops(axes: dict, gen: torch.Generator) -> dict:
     """
     FA4 forward and backward, with the strided views of the ring steps.
     """
@@ -242,7 +283,7 @@ def attention_ops(axes: dict, gen: torch.Generator) -> dict:
         q, k, v = randn(B, Sq, Hq, D, gen=gen), randn(B, Skv, Hkv, D, gen=gen), randn(B, Skv, Hkv, Dv, gen=gen)  # fmt: skip
     out, lse, *_ = _flash_attn_fwd(q, k, v, softmax_scale=scale, return_lse=True, **extra)
     dout = torch.randn_like(out)
-    flops = attention_flops(axes)
+    flops = flash_attn_memoize_flops(axes)
     return {
         "fa4_fwd": Op(
             lambda: _flash_attn_fwd(q, k, v, softmax_scale=scale, return_lse=True, **extra), flops
@@ -254,7 +295,7 @@ def attention_ops(axes: dict, gen: torch.Generator) -> dict:
     }
 
 
-def attention_flops(axes: dict) -> int:
+def flash_attn_memoize_flops(axes: dict) -> int:
     if axes["kind"] == "varlen":
         cu = axes["cu_seqlens"]
         pairs = sum((b - a) * (b - a) // 2 for a, b in zip(cu, cu[1:]))
@@ -265,7 +306,7 @@ def attention_flops(axes: dict) -> int:
     return 2 * axes["Hq"] * pairs * (axes["D"] + axes["Dv"])
 
 
-def gdn_ops(axes: dict, gen: torch.Generator) -> dict:
+def gated_delta_rule_pinned_ops(axes: dict, gen: torch.Generator) -> dict:
     from pithtrain.kernels import (
         chunk_gdr_bwd_pinned,
         chunk_gdr_fwd_pinned,
@@ -293,7 +334,7 @@ def gdn_ops(axes: dict, gen: torch.Generator) -> dict:
     }
 
 
-def conv_ops(axes: dict, gen: torch.Generator) -> dict:
+def causal_conv1d_ops(axes: dict, gen: torch.Generator) -> dict:
     from pithtrain.kernels import causal_conv1d_bwd, causal_conv1d_fwd
 
     B, T, C, W = axes["B"], axes["T_local"], axes["C"], axes["width"]
@@ -307,7 +348,7 @@ def conv_ops(axes: dict, gen: torch.Generator) -> dict:
     }
 
 
-def ce_ops(axes: dict, gen: torch.Generator) -> dict:
+def cross_entropy_ops(axes: dict, gen: torch.Generator) -> dict:
     """
     The cross_entropy op forward and backward and the fused kernel, each timed with a logits copy.
     """
@@ -334,13 +375,15 @@ def ce_ops(axes: dict, gen: torch.Generator) -> dict:
 
 
 OPS = dict(
-    moe_experts=moe_ops,
-    dense_gemm=dense_ops,
-    weight_quant=weight_quant_ops,
-    attention=attention_ops,
-    gated_delta_rule=gdn_ops,
-    causal_conv1d=conv_ops,
-    cross_entropy=ce_ops,
+    fp8_gemm=fp8_gemm_ops,
+    fp8_silu_mul_quant=activation_ops(clamped=False),
+    fp8_clamped_swiglu_quant=activation_ops(clamped=True),
+    bf16_expert_gemm=bf16_expert_gemm_ops,
+    fp8_weight_quant=fp8_weight_quant_ops,
+    flash_attn_memoize=flash_attn_memoize_ops,
+    gated_delta_rule_pinned=gated_delta_rule_pinned_ops,
+    causal_conv1d=causal_conv1d_ops,
+    cross_entropy=cross_entropy_ops,
 )
 
 
@@ -409,7 +452,7 @@ def run(args) -> dict:
     torch.backends.cuda.matmul.allow_tf32 = False
     timer, pattern = Timer(args.warmup, args.reps), re.compile(args.op) if args.op else None
     results = []
-    for case in cases_of(args.family or FAMILIES, args.model, args.shard):
+    for case in cases_of(args.family or list(OPS), args.model, args.shard):
         for op, timing in time_case(case, timer, pattern).items():
             row = dict(case=case["id"], op=op, layers=layers_of(case), **timing)
             if "median_us" in row and not row["memory_bound"] and row["work"]:
@@ -520,7 +563,7 @@ def regressions(rows: list[dict], summary: dict) -> list[str]:
 def ab(args) -> int:
     sides = dict(base=Worker(args.base_dir.resolve() if args.base_dir else base_tree(args.base)), head=Worker(REPO_ROOT))  # fmt: skip
     rows = []
-    for case in cases_of(args.family or FAMILIES, args.model, args.shard):
+    for case in cases_of(args.family or list(OPS), args.model, args.shard):
         request = dict(case=case["id"], op=args.op, warmup=args.warmup, reps=args.reps)
         timings = dict(base=defaultdict(list), head=defaultdict(list))
         for r in range(args.rounds):  # base, head, head, base, ...
@@ -548,7 +591,7 @@ def ab(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
-    parser.add_argument("--family", action="append", choices=FAMILIES)
+    parser.add_argument("--family", action="append", choices=list(OPS))
     parser.add_argument("--model")
     parser.add_argument("--op", help="time only the ops whose name matches this regex")
     parser.add_argument("--shard", help="I/N: every N-th case starting at I")

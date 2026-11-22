@@ -15,8 +15,7 @@ from transformers import AutoConfig
 
 from pithtrain.kernels import stage_compile_options
 from tests.kernels.cases import params
-from tests.kernels.fp8_reference import half_ulp_bf16
-from tests.kernels.measure import record
+from tests.kernels.common import half_ulp_bf16, record
 
 DEV = "cuda"
 F64 = torch.float64

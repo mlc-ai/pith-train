@@ -1,6 +1,6 @@
 """
-FP8 weight quantization at every weight_quant shape, bit-exact against the 128x128 E8M0 recipe:
-fp8_quant_weight(_grouped) and the FP8 parameter all-gather kernels over SHARDS simulated ranks.
+FP8 weight quantization and the parameter all-gather kernels at the fp8_weight_quant cases,
+bit-exact against the E8M0 recipe.
 """
 
 import pytest
@@ -17,16 +17,16 @@ from pithtrain.kernels import (
     fp8_shard_cast,
 )
 from tests.kernels.cases import params
-from tests.kernels.fp8_reference import (
+from tests.kernels.common import (
     BLOCK,
+    DEV,
     assert_fp8_equal,
     assert_scale_equal,
     blocks,
     e8m0_scale,
-    quant_blockwise,
+    fp8_quant_weight_reference,
 )
 
-DEV = "cuda"
 SHARDS = 8
 
 
@@ -42,10 +42,10 @@ def master_weight(case: dict) -> torch.Tensor:
     return w
 
 
-@pytest.mark.parametrize("case", params("weight_quant"))
+@pytest.mark.parametrize("case", params("fp8_weight_quant"))
 def test_quant_weight(case: dict) -> None:
     w = master_weight(case).to(torch.bfloat16)
-    ref, ref_scale = quant_blockwise(w)
+    ref, ref_scale = fp8_quant_weight_reference(w)
     if case["axes"]["G"] == 0:
         w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(w[0])
         ref, ref_scale = ref[0], ref_scale[0]
@@ -92,7 +92,7 @@ def shard_tile_amax(shard: torch.Tensor, row_offset: int, group_offset: int, gri
     return grid, touched
 
 
-@pytest.mark.parametrize("case", params("weight_quant"))
+@pytest.mark.parametrize("case", params("fp8_weight_quant"))
 def test_param_gather(case: dict) -> None:
     dense = case["axes"]["G"] == 0
     w = master_weight(case)
@@ -110,7 +110,7 @@ def test_param_gather(case: dict) -> None:
         grids.append(grid)
         reduced = torch.maximum(reduced, grid)
     w_bf16 = w.to(torch.bfloat16)
-    ref, ref_scale = quant_blockwise(w_bf16)
+    ref, ref_scale = fp8_quant_weight_reference(w_bf16)
     padded = torch.zeros(G, grid_shape[1] * BLOCK, grid_shape[2] * BLOCK, device=DEV)
     padded[:, :N, :K] = w_bf16.float().abs()
     whole_amax = padded.view(G, grid_shape[1], BLOCK, grid_shape[2], BLOCK).amax(dim=(2, 4))

@@ -16,9 +16,8 @@ from pithtrain.operators.ring_attention import (
     ring_attention_func,
     ring_attention_varlen_func,
 )
-from tests.kernels.attention_reference import attention_reference
 from tests.kernels.cases import params, seed_of
-from tests.kernels.references import rel_l2
+from tests.kernels.common import flash_attn_memoize_reference, rel_l2
 from tests.utilities import cosine_error, launch
 
 
@@ -488,7 +487,7 @@ def gqa_worker(case: dict) -> None:
 
     want = {name: [] for name in got}
     for b in range(B):
-        ref = attention_reference(q[b, rows], k[b], v[b], scale, True, dout=dout[b, rows], q_positions=rows)  # fmt: skip
+        ref = flash_attn_memoize_reference(q[b, rows], k[b], v[b], scale, True, dout=dout[b, rows], q_positions=rows)  # fmt: skip
         dk, dv = ref["dk"].contiguous(), ref["dv"].contiguous()
         dist.all_reduce(dk, group=group)
         dist.all_reduce(dv, group=group)
@@ -529,7 +528,7 @@ def mla_worker(case: dict) -> None:
         kv = (normed_kv[b].float() @ w32.T).view(seq, H, NOPE + VDIM)
         k_full = torch.cat([kv[..., :NOPE], k_pe[b].float().expand(seq, H, ROPE)], dim=-1)
         q_rows = torch.cat([q_nope[b, rows], q_pe[b, rows]], dim=-1)
-        ref = attention_reference(q_rows, k_full, kv[..., NOPE:], scale, True, dout=dout[b, rows], q_positions=rows)  # fmt: skip
+        ref = flash_attn_memoize_reference(q_rows, k_full, kv[..., NOPE:], scale, True, dout=dout[b, rows], q_positions=rows)  # fmt: skip
         del kv, k_full
         dk, dv = ref["dk"].contiguous(), ref["dv"].contiguous()
         dist.all_reduce(dk, group=group)

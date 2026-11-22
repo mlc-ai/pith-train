@@ -296,7 +296,7 @@ Code that appears in more than one file lives once, in the shared module for its
 ## 8. Tests
 
 - Every exported name belongs to a family of the kernel-shape spec (`tests/kernels/cases.py`) and is
-  verified against plain PyTorch at the shapes training launches, by `tests/kernels/test_<family>.py`.
+  verified against plain PyTorch at the shapes training launches, by `tests/kernels/test_<module>.py`.
   FP8 bytes and E8M0 scales are compared exactly; GEMMs within analytic or calibrated bounds.
   **(checked: `tests/kernels/test_spec.py`)**
 - Never verify against an `_sm100` sibling, and never add an architecture override to run
