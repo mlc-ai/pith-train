@@ -1,5 +1,5 @@
 """
-Times the kernels at the cases of tools/kernel_cases/kernel_cases.json, the same cases the spec
+Times the kernels at the cases of tests/kernels/cases.py, the same cases the kernel
 tests verify, and writes machine-readable results; --compare checks them against a stored baseline
 with the docs/kernel-styles.md section 9 rule (median within 5% + 3 us; benchmarks/kernels/compare.py).
 
@@ -9,7 +9,7 @@ with the docs/kernel-styles.md section 9 rule (median within 5% + 3 us; benchmar
 
 One case runs several ops (e.g. the FP8 gate_up forward, its dgrad and wgrad); each op is timed
 with CUDA events around single launches, the L2 flushed before each, after warmup, and reported as
-median / p10 / p90 microseconds and TFLOP/s. Correctness is not checked here (tests/spec does).
+median / p10 / p90 microseconds and TFLOP/s. Correctness is not checked here (tests/kernels does).
 Timings are only comparable on an otherwise idle GPU.
 """
 
@@ -54,7 +54,7 @@ from pithtrain.kernels import (
     gated_delta_rule_pinned_supported,
     k_grouped_fp8_gemm,
 )
-from tools.kernel_cases import load_spec, select
+from tests.kernels.cases import select
 
 DEV = "cuda"
 BF16 = dict(device=DEV, dtype=torch.bfloat16)
@@ -389,11 +389,10 @@ def environment() -> dict:
 
 def run(args) -> dict:
     torch.backends.cuda.matmul.allow_tf32 = False
-    spec = load_spec()
     timer = Timer(args.warmup, args.reps)
     results = []
     for family in args.family or FAMILIES:
-        for case in select(family, args.tier, model=args.model, spec=spec):
+        for case in select(family, args.tier, model=args.model):
             if args.tier != "stress" and case["tier"] == "stress":
                 continue
             gen = torch.Generator(device=DEV).manual_seed(0)

@@ -38,9 +38,9 @@ from torch import nn
 from transformers import AutoConfig
 
 from pithtrain.kernels import stage_compile_options
-from tests.spec.cases import spec_params
-from tests.spec.fp8_reference import half_ulp_bf16
-from tests.spec.measure import record
+from tests.kernels.cases import params
+from tests.kernels.fp8_reference import half_ulp_bf16
+from tests.kernels.measure import record
 
 DEV = "cuda"
 F64 = torch.float64
@@ -194,7 +194,7 @@ def scaled_rows(shape: tuple, gen: torch.Generator) -> torch.Tensor:
     return (x * scale).to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("case", spec_params("pointwise_layers"))
+@pytest.mark.parametrize("case", params("pointwise_layers"))
 def test_rmsnorm(case: dict) -> None:
     axes = case["axes"]
     config = model_config(case["model"])
@@ -236,7 +236,7 @@ def rope_parts(config, Hq: int, Hkv: int):
     return Attention.apply_rotary_posemb, Rotary(config), (Hq, D), (Hkv, D)
 
 
-@pytest.mark.parametrize("case", spec_params("pointwise_layers"))
+@pytest.mark.parametrize("case", params("pointwise_layers"))
 def test_rope(case: dict) -> None:
     axes = case["axes"]
     config = model_config(case["model"])
@@ -318,7 +318,7 @@ def weights_of(config, logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
             return weights
 
 
-@pytest.mark.parametrize("case", spec_params("pointwise_layers", keep=lambda c: "E" in c["axes"]))
+@pytest.mark.parametrize("case", params("pointwise_layers", keep=lambda c: "E" in c["axes"]))
 def test_router(case: dict) -> None:
     """
     The compiled gate against float64 from the same logits (the GEMM's own rounding is the

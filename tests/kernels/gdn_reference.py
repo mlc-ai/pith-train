@@ -24,9 +24,7 @@ BOUNDS = {"o": 2e-5, "dq": 2e-5, "dk": 3e-5, "dv": 2e-5, "dg": 1e-4, "dbeta": 2e
 MAX_ABS = 2e-2
 
 
-def make_inputs(
-    S: int, H: int, hv: int, B: int = 1, seed: int = 0
-) -> tuple[torch.Tensor, ...]:
+def make_inputs(S: int, H: int, hv: int, B: int = 1, seed: int = 0) -> tuple[torch.Tensor, ...]:
     """
     q / k (B, S, H, D) L2-normalized bf16, v (B, S, hv, D) bf16, g (B, S, hv) fp32, beta (B, S, hv)
     bf16 and do like v, the gate drawn as the model computes it: -exp(A_log) * softplus(a + dt_bias)

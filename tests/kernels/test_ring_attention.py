@@ -1,6 +1,6 @@
 """
-The context-parallel ring attention operators end to end, at every CP mesh of
-tools/kernel_cases/kernel_cases.json (family "ring_attention"): cp ranks on one node, each holding
+The context-parallel ring attention operators end to end, at every CP mesh of the spec (family
+ring_attention of tests/kernels/cases.py): cp ranks, one per GPU (CP 16 on two nodes), each holding
 its zigzag share (blocks r and 2 cp - 1 - r of 2 cp) of B sequences of seq = cp x S_local tokens.
 
 - GQA / MHA models: ring_attention_func(q, k, v), as qwen3 and qwen3.5 call it.
@@ -8,7 +8,7 @@ its zigzag share (blocks r and 2 cp - 1 - r of 2 cp) of B sequences of seq = cp 
   bf16 kv_b (training.fp8 off), as deepseek_v2.py calls it.
 
 Reference, independent of FlashAttention and of the ring: every rank draws the whole sequence from
-the same seed and computes fp32 causal attention (tests/spec/attention_reference.py) of its own
+the same seed and computes fp32 causal attention (tests/kernels/attention_reference.py) of its own
 query rows over all keys, with a random output gradient; its partial key / value gradients (and,
 for MLA, the decompression through kv_b in fp32) are summed over the CP group with all_reduce, so
 each rank checks its local output and the gradients of every input it holds, and the kv_b weight
@@ -32,9 +32,9 @@ import torch.distributed as dist
 from pithtrain.contexts import distributed
 from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.ring_attention import mla_ring_attention_func, ring_attention_func
-from tests.spec.attention_reference import attention_reference
-from tests.spec.cases import spec_params
-from tests.spec.references import rel_l2
+from tests.kernels.attention_reference import attention_reference
+from tests.kernels.cases import params, seed_of
+from tests.kernels.references import rel_l2
 from tests.utilities import launch
 
 BOUNDS = {
@@ -49,10 +49,6 @@ BOUNDS = {
     "dkv_b": 1e-2,  # measured 3.1e-3 (ring_attention/deepseek-v2-lite/006)
 }
 NOPE, ROPE, VDIM, LORA = 128, 64, 128, 512  # DeepSeek-V2-Lite's MLA dims (config.json)
-
-
-def seed_of(case: dict) -> int:
-    return sum((i + 1) * ord(c) for i, c in enumerate(case["id"])) % (2**31)
 
 
 def zigzag_rows(rank: int, cp: int, seq: int, device) -> torch.Tensor:
@@ -178,12 +174,18 @@ def run(case: dict) -> None:
     launch(cfg, worker, case)
 
 
-# Two functions so that -k selects by GPU count: CP 2 and 4 fit in 4 GPUs, CP 8 needs 8.
-@pytest.mark.parametrize("case", spec_params("ring_attention", keep=lambda c: c["axes"]["cp"] <= 4, marks=[pytest.mark.multigpu]))  # fmt: skip
+# One function per GPU count, so that -k selects what a run has: CP 2 and 4 fit in 4 GPUs, CP 8 needs
+# a node of 8, CP 16 two nodes (see README.md, "Running").
+@pytest.mark.parametrize("case", params("ring_attention", keep=lambda c: c["axes"]["cp"] <= 4, multigpu=True))  # fmt: skip
 def test_ring_attention(case: dict) -> None:
     run(case)
 
 
-@pytest.mark.parametrize("case", spec_params("ring_attention", keep=lambda c: c["axes"]["cp"] == 8, marks=[pytest.mark.multigpu]))  # fmt: skip
+@pytest.mark.parametrize("case", params("ring_attention", keep=lambda c: c["axes"]["cp"] == 8, multigpu=True))  # fmt: skip
 def test_ring_attention_cp8(case: dict) -> None:
+    run(case)
+
+
+@pytest.mark.parametrize("case", params("ring_attention", keep=lambda c: c["axes"]["cp"] == 16, multigpu=True))  # fmt: skip
+def test_ring_attention_cp16(case: dict) -> None:
     run(case)

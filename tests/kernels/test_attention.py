@@ -1,6 +1,6 @@
 """
-FlashAttention-4 at every attention launch of tools/kernel_cases/kernel_cases.json (family
-"attention"), against fp32 attention in plain PyTorch (tests/spec/attention_reference.py), forward
+FlashAttention-4 at every attention launch of the spec (family attention of
+tests/kernels/cases.py), against fp32 attention in plain PyTorch (tests/kernels/attention_reference.py), forward
 and backward with a random output gradient.
 
 Each case is launched the way training launches it:
@@ -34,9 +34,9 @@ import torch
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
-from tests.spec.attention_reference import attention_reference
-from tests.spec.cases import spec_params
-from tests.spec.references import rel_l2
+from tests.kernels.attention_reference import attention_reference
+from tests.kernels.cases import params, seed_of
+from tests.kernels.references import rel_l2
 
 BOUNDS = {
     "out": 7e-3,  # measured 2.3e-3 (attention/qwen3.5-35b-a3b/026)
@@ -48,10 +48,6 @@ BOUNDS = {
 }
 LSE_SHIFT = 0.5
 ERROR_LOG = os.environ.get("PITHTRAIN_SPEC_ERROR_LOG")
-
-
-def seed_of(case: dict) -> int:
-    return sum((i + 1) * ord(c) for i, c in enumerate(case["id"])) % (2**31)
 
 
 def randn(gen: torch.Generator, *shape: int, dtype=torch.bfloat16) -> torch.Tensor:
@@ -177,7 +173,7 @@ def run_ring_step(case: dict, gen: torch.Generator) -> None:
     check(case, got, {name: torch.stack(value) for name, value in want.items()})
 
 
-@pytest.mark.parametrize("case", spec_params("attention"))
+@pytest.mark.parametrize("case", params("attention"))
 def test_attention(case: dict) -> None:
     gen = torch.Generator(device="cuda").manual_seed(seed_of(case))
     kind = case["axes"]["kind"]

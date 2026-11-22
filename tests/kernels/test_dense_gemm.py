@@ -6,7 +6,7 @@ and K of each training.Linear), called as FP8Linear calls it (pithtrain/operator
     y, xt_fp8, xt_scale = fp8_gemm_fwd(x, w_fp8, w_scale)           x quantized by fp8_quant_act
     dx, dw = fp8_gemm_bwd(dy, wt_fp8, wt_scale, xt_fp8, xt_scale, K)  dy quantized by fp8_quant_grad
 
-Checked against references written here (tests/spec/fp8_reference.py), not against other kernels:
+Checked against references written here (tests/kernels/fp8_reference.py), not against other kernels:
 
 - the quantized operands, bit-exact: fp8_quant_weight's w (128x128) and w.T, fp8_quant_act's x
   (1x128) and x.T (128x128), fp8_quant_grad's dy and dy.T (1x128);
@@ -40,8 +40,8 @@ from pithtrain.kernels import (
     fp8_quant_grad,
     fp8_quant_weight,
 )
-from tests.spec.cases import spec_params
-from tests.spec.fp8_reference import (
+from tests.kernels.cases import params
+from tests.kernels.fp8_reference import (
     assert_fp8_equal,
     assert_scale_equal,
     dequant_blockwise,
@@ -50,7 +50,7 @@ from tests.spec.fp8_reference import (
     quant_blockwise,
     quant_rowwise,
 )
-from tests.spec.measure import record
+from tests.kernels.measure import record
 
 DEV = "cuda"
 ROWS_PER_CHUNK = 4096
@@ -132,7 +132,7 @@ def no_tf32():
     torch.backends.cuda.matmul.allow_tf32 = previous
 
 
-@pytest.mark.parametrize("case", spec_params("dense_gemm"))
+@pytest.mark.parametrize("case", params("dense_gemm"))
 def test_fp8_linear(case: dict) -> None:
     axes = case["axes"]
     M, N, K = axes["M"], axes["N"], axes["K"]
@@ -183,7 +183,7 @@ def test_fp8_linear(case: dict) -> None:
     check(case["id"], "dw", dw, (dequant_rowwise(ref_dyt, ref_dyt_scale), xt_dq), (dy.float().T.contiguous(), x.float().T.contiguous()))  # fmt: skip
 
 
-WGRAD_CASES = [c for c in spec_params("dense_gemm") if c.values[0]["tier"] == "smoke"]
+WGRAD_CASES = [c for c in params("dense_gemm") if c.values[0]["tier"] == "smoke"]
 
 
 @pytest.mark.parametrize("case", WGRAD_CASES)

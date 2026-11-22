@@ -1,8 +1,9 @@
 """
-CPU-only checks of the kernel benchmark gate (benchmarks/kernels/compare.py) against the stored H200
-baseline: an unchanged run passes; inflating a few ops past 5% + 3 us flags exactly those and exits
-1, through the function and through the command line; noise within the bound, ops of cases a run
-did not select, and timings below the absolute slack pass; an op that errored or vanished fails.
+The kernel benchmark gate (benchmarks/kernels/compare.py) against the stored H200 baseline, in the
+smoke tier (no GPU work): an unchanged run passes; inflating a few ops past 5% + 3 us flags exactly
+those and exits 1, through the function and through the command line; noise within the bound, ops of
+cases a run did not select, and timings below the absolute slack pass; an op that errored or vanished
+fails.
 """
 
 import copy
@@ -11,9 +12,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from benchmarks.kernels.compare import compare, gate
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.smoke
+REPO_ROOT = Path(__file__).resolve().parents[2]
 BASELINE_PATH = REPO_ROOT / "benchmarks" / "kernels" / "baselines" / "h200.json"
 BASELINE = json.loads(BASELINE_PATH.read_text())
 

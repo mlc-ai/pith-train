@@ -23,9 +23,9 @@ from pithtrain.kernels import fp8_fused_experts_supported, silu_mul_bwd, silu_mu
 from pithtrain.operators.fp8_swiglu_mlp import fp8_swiglu_mlp
 from pithtrain.operators.linear import FP8Linear
 from pithtrain.operators.silu_mul import silu_mul
-from tests.spec.cases import spec_params
-from tests.spec.fp8_reference import half_ulp_bf16
-from tests.spec.measure import record
+from tests.kernels.cases import params
+from tests.kernels.fp8_reference import half_ulp_bf16
+from tests.kernels.measure import record
 
 DEV = "cuda"
 ROWS_PER_CHUNK = 4096
@@ -40,7 +40,7 @@ def ratio(out: torch.Tensor, exact: torch.Tensor, magnitude: torch.Tensor) -> fl
     return float((err / (half_ulp_bf16(exact) + SLACK * magnitude + 1e-300)).max())
 
 
-@pytest.mark.parametrize("case", spec_params("swiglu_dense"))
+@pytest.mark.parametrize("case", params("swiglu_dense"))
 def test_silu_mul(case: dict) -> None:
     M, inter = case["axes"]["M"], case["axes"]["inter"]
     gen = torch.Generator(device=DEV).manual_seed(M + inter)
@@ -80,9 +80,7 @@ def calc_diff(got: torch.Tensor, exact: torch.Tensor) -> float:
     return float(1 - 2 * (got * exact).sum() / (got.square().sum() + exact.square().sum()))
 
 
-@pytest.mark.parametrize(
-    "case", spec_params("swiglu_dense", keep=lambda c: c["axes"]["fp8_swiglu_mlp"])
-)
+@pytest.mark.parametrize("case", params("swiglu_dense", keep=lambda c: c["axes"]["fp8_swiglu_mlp"]))
 def test_fp8_swiglu_mlp(case: dict) -> None:
     if not fp8_fused_experts_supported():
         pytest.skip("the fused FP8 MLP needs fp8_fused_experts_supported()")

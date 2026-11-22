@@ -1,7 +1,7 @@
 """
 The routed experts of one EP rank at every training shape of the spec (family moe_experts of
-tools/kernel_cases/kernel_cases.json): per case, the local experts G, the rows each receives
-(group_sizes, from balanced, log-normal, skewed and stress routing) and the model's hidden / inter
+tests/kernels/cases.py): per case, the local experts G, the rows each receives
+(group_sizes, from balanced, log-normal, skewed, stress and boundary routing) and the model's hidden / inter
 widths. Nothing here restates a shape.
 
 FP8 (every case), mirroring FP8GroupedLinear and the fused FP8 expert ops: each group padded to a
@@ -38,22 +38,20 @@ BF16 (cases with bf16_fused, i.e. G <= 64, when bf16_experts_supported(G)): the 
 the raw group sizes, gate / up laid out as training holds them (two separate weights for
 DeepSeek-V2-Lite and Qwen3, the halves of one fused weight for Qwen3.5, gpt-oss's interleaved rows
 with biases and its clamped SwiGLU), received tokens read through a random a_idx and the output
-scattered through slot_of (a permutation), against float64 with the bound of
-tests/kernels/test_bf16_expert_gemm.py: half a bf16 ulp + 1e-5 x sum |products| (measured 2.3e-6;
+scattered through slot_of (a permutation), against float64: half a bf16 ulp + 1e-5 x sum |products| (measured 2.3e-6;
 calc_diff 1.38e-6, bound 5e-6), and for the fp32 main grads 2 fp32 ulps + 2.5e-4 x sum |products|
 (measured 8.0e-5 at 1.1M rows of one expert, 3.6e-5 below 300k: fp32 accumulation error grows with
 the rows summed; calc_diff 7.5e-7, bound 3e-6).
 
-The stress tier passes 2^31 elements in one per-channel output (e.g. gpt-oss-20b at T = 16k and
-EP 32 with every token on one expert): SM90 fp8_quant_grouped and the fused activation-quant kernels
-used to reject it (int32 length of their flat K-major output) and are checked there.
+The stress tier passes 2^31 elements in one per-channel output (e.g. the 5760-wide gate_up gradient
+of gpt-oss-20b at T = 32k and EP 16 with every token on one expert): SM90 fp8_quant_grouped and the
+fused activation-quant kernels used to reject it (int32 length of their flat K-major output) and are
+checked there.
 
-SM100 routes the cases reach (computed from the axes, asserted by test_spec_crosses_sm100_routes):
-fp8_grouped_gemm_sm100 switches from its small-group kernels to the large-group ones (w320r for
-n = 2880 / 5760, rotating-256, scale-tail) at M >= 512 G; its k-grouped GEMM switches config at
-M >= 2048 G; the BF16 gate_up fwd leaves swap-AB above 448 rows per expert, the other BF16 kinds
-above 512, and the gpt-oss gate_up fwd materializes at M >= 1024 G. The H200 runs the same cases
-through DeepGEMM / QuACK.
+The boundary cases (BF16 only) put every expert at one edge of a tuning bucket of the BF16 expert
+GEMMs (pithtrain/kernels/tuning.py: the config is picked per power-of-two bucket of rows per expert),
+for every bucket the realistic routings reach, so each bucket's default config is run at both ends.
+
 """
 
 import json
@@ -84,7 +82,7 @@ from pithtrain.kernels import (
     fp8_silu_mul_gu_fwd,
     k_grouped_fp8_gemm,
 )
-from tests.spec.cases import SPEC, spec_params
+from tests.kernels.cases import params, select
 
 BLOCK = 128
 CHUNK = 32768
@@ -99,6 +97,7 @@ FP8_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-8}
 BF16_REL = {"bf16": 2.0**-8, "fp32": 2.0**-22}
 BF16_COEF = {"bf16": 1e-5, "fp32": 2.5e-4}
 BF16_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-6}
+FP8 = lambda case: case["axes"]["routing"] != "boundary"  # boundary cases are for the BF16 picker
 ALPHA = 1.702  # gpt-oss clamped SwiGLU; the tests assert the spec's swiglu_alpha / swiglu_limit
 LIMIT = 7.0
 
@@ -207,17 +206,14 @@ def dq_weight(fp8: torch.Tensor, scale: torch.Tensor, group: int) -> torch.Tenso
 def dq_channels(pair, counts: list[int], group_start: int, group: int, start: int, end: int, channels: int):  # fmt: skip
     """
     The per-channel FP8 of fp8_quant_grouped for grouped rows [start, end) of one group, as fp32
-    (channels, end - start): SM90's flat K-major blocks or SM100's (M, channels) data.
+    (channels, end - start), from SM90's flat K-major blocks.
     """
     data, scale = pair
     first, last = (start - group_start), (end - group_start)
-    if data.ndim == 1:
-        rows = counts[group]
-        block = data[group_start * channels : (group_start + rows) * channels].view(channels, rows)
-        block_scale = scale[:, start // BLOCK : end // BLOCK].repeat_interleave(BLOCK, dim=1)
-        return block[:, first:last].float() * block_scale
-    block_scale = scale[start // BLOCK : end // BLOCK].repeat_interleave(BLOCK, dim=0)
-    return (data[start:end].float() * block_scale).T
+    rows = counts[group]
+    block = data[group_start * channels : (group_start + rows) * channels].view(channels, rows)
+    block_scale = scale[:, start // BLOCK : end // BLOCK].repeat_interleave(BLOCK, dim=1)
+    return block[:, first:last].float() * block_scale
 
 
 def check_m_grouped(case, what, out, a_pair, w_pair, counts, transposed=False):
@@ -267,7 +263,7 @@ def grouped_input(rows: int, width: int, counts: list[int], padded: list[int], g
     return x
 
 
-@pytest.mark.parametrize("case", spec_params("moe_experts"))
+@pytest.mark.parametrize("case", params("moe_experts", keep=FP8))
 def test_fp8_expert_gemms(case: dict) -> None:
     axes = case["axes"]
     G, H, inter = axes["G"], axes["hidden"], axes["inter"]
@@ -376,7 +372,7 @@ def bf16_check(what: str, wgrad: bool = False) -> Check:
     return Check(f"bf16 {what}", BF16_REL["fp32" if wgrad else "bf16"])
 
 
-@pytest.mark.parametrize("case", spec_params("moe_experts", keep=lambda c: c["axes"]["bf16_fused"]))  # fmt: skip
+@pytest.mark.parametrize("case", params("moe_experts", keep=lambda c: c["axes"]["bf16_fused"]))  # fmt: skip
 def test_bf16_expert_gemms(case: dict) -> None:
     axes = case["axes"]
     G, H, inter = axes["G"], axes["hidden"], axes["inter"]
@@ -552,17 +548,14 @@ def check_rowwise(check: QuantCheck, pair, ref_fn, M: int) -> None:
 
 def check_channels(check: QuantCheck, pair, ref_fn, counts: list[int], channels: int) -> None:
     """
-    A per-channel (128 rows x 1 within each group) pair, either layout, against ref_fn rows.
+    A per-channel (128 rows x 1 within each group) pair, SM90's K-major layout, against ref_fn rows.
     """
     data, scale = pair
     for group, group_start, start, end in row_chunks(counts):
         ref = ref_fn(start, end)  # (rows, channels)
         rounded = ref.to(torch.bfloat16).float().abs()
         amax = rounded.view(-1, BLOCK, channels).amax(1)  # (rows / 128, channels)
-        if data.ndim == 1:
-            sc = scale[:, start // BLOCK : end // BLOCK].T
-        else:
-            sc = scale[start // BLOCK : end // BLOCK]
+        sc = scale[:, start // BLOCK : end // BLOCK].T
         check.add_scales(sc, amax)
         deq = dq_channels(pair, counts, group_start, group, start, end, channels).T
         check.add(deq, sc.repeat_interleave(BLOCK, dim=0), ref)
@@ -577,7 +570,7 @@ def dsilu_ref(g, u, dh):
     return dh * u * sig * (1 + g * (1 - sig)), dh * g * sig
 
 
-@pytest.mark.parametrize("case", spec_params("moe_experts"))
+@pytest.mark.parametrize("case", params("moe_experts", keep=FP8))
 def test_fp8_expert_activation(case: dict) -> None:
     """
     The fused activation + FP8 quantization between the expert GEMMs, as the model runs it:
@@ -674,12 +667,13 @@ def test_fp8_expert_activation(case: dict) -> None:
         check.verify(case)
 
 
+@pytest.mark.smoke
 def test_fp8_check_is_sharp() -> None:
     """
     The FP8 GEMM check fails a grouped GEMM run against the wrong expert's weights, and one that
     skipped the activation quantization (the bf16 product): calc_diff < 1e-3 passes the latter.
     """
-    case = next(c for c in SPEC["cases"] if c["family"] == "moe_experts" and c["tier"] == "smoke")
+    case = select("moe_experts", "smoke")[0]
     axes = case["axes"]
     G, H, n = axes["G"], axes["hidden"], axes["inter"]
     ks = [-(-count // BLOCK) * BLOCK for count in axes["group_sizes"]]
@@ -697,25 +691,3 @@ def test_fp8_check_is_sharp() -> None:
     unquantized = torch.cat([x[a:b] @ w[g].T for g, (a, b) in enumerate(zip([0] + offs.tolist()[:-1], offs.tolist()))])  # fmt: skip
     with pytest.raises(AssertionError):
         check_m_grouped(case, "unquantized", unquantized, x_pair, w_pair, ks)
-
-
-# Route coverage (CPU) ----------------------------------------------------------------------------
-
-
-def test_spec_crosses_sm100_routes() -> None:
-    """
-    For every MoE model the spec holds FP8 cases on both sides of fp8_grouped_gemm_sm100's
-    M >= 512 G switch and of its k-grouped M >= 2048 G switch, BF16 cases on both sides of the
-    swap-AB switch (448 / 512 rows per expert), and for gpt-oss the materialized gate_up
-    (M >= 1024 G).
-    """
-    cases = [case for case in SPEC["cases"] if case["family"] == "moe_experts"]
-    for model in sorted({case["model"] for case in cases}):
-        mine = [case["axes"] for case in cases if case["model"] == model]
-        fp8 = [(axes["fp8_rows"], axes["G"]) for axes in mine]
-        assert any(M < 512 * G for M, G in fp8) and any(M >= 512 * G for M, G in fp8), model
-        assert any(M < 2048 * G for M, G in fp8) and any(M >= 2048 * G for M, G in fp8), model
-        bf16 = [(axes["rows"], axes["G"]) for axes in mine if axes["bf16_fused"]]
-        assert any(M <= 448 * G for M, G in bf16) and any(M > 512 * G for M, G in bf16), model
-        if mine[0]["hidden"] == mine[0]["inter"] == 2880:
-            assert any(M >= 1024 * G for M, G in bf16) and any(M < 1024 * G for M, G in bf16), model

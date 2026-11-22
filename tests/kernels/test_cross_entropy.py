@@ -25,9 +25,9 @@ import torch
 
 from pithtrain.kernels import cross_entropy_fwd_bwd, log_prob_bwd, log_prob_fwd
 from pithtrain.operators.cross_entropy import cross_entropy
-from tests.spec.cases import spec_params
-from tests.spec.fp8_reference import half_ulp_bf16
-from tests.spec.measure import record
+from tests.kernels.cases import params
+from tests.kernels.fp8_reference import half_ulp_bf16
+from tests.kernels.measure import record
 
 DEV = "cuda"
 ROWS_PER_BLOCK = 512
@@ -108,7 +108,7 @@ def grad_ratio(grad: torch.Tensor, logits: torch.Tensor, target: torch.Tensor, s
     return worst, dot / norm - 1.0
 
 
-@pytest.mark.parametrize("case", spec_params("cross_entropy"))
+@pytest.mark.parametrize("case", params("cross_entropy"))
 def test_cross_entropy_kernel(case: dict) -> None:
     logits, target = make_case(case)
     want, count = exact_ce(logits, target)
@@ -125,7 +125,7 @@ def test_cross_entropy_kernel(case: dict) -> None:
 GRAD_OUTPUT = 1.0 / 3.0
 
 
-@pytest.mark.parametrize("case", spec_params("cross_entropy"))
+@pytest.mark.parametrize("case", params("cross_entropy"))
 def test_cross_entropy_op_grad_output(case: dict) -> None:
     logits, target = make_case(case)
     want, count = exact_ce(logits, target)
@@ -139,7 +139,7 @@ def test_cross_entropy_op_grad_output(case: dict) -> None:
     assert ratio <= 1.0, f"gradient error {ratio:.3g}x one bf16 rounding (scale bias {bias:.3g})"
 
 
-@pytest.mark.parametrize("case", spec_params("cross_entropy"))
+@pytest.mark.parametrize("case", params("cross_entropy"))
 def test_log_prob(case: dict) -> None:
     logits, target = make_case(case)
     rows = logits.shape[0]

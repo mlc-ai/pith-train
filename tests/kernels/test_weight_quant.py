@@ -1,7 +1,7 @@
 """
 FP8 weight quantization at every weight the spec's meshes put on a rank (family weight_quant: the
 dense projections, and each EP degree's (G = E / ep, N, K) expert weights), bit-exact against the
-128x128 E8M0 recipe written in tests/spec/fp8_reference.py:
+128x128 E8M0 recipe written in tests/kernels/fp8_reference.py:
 
 - fp8_quant_weight (dense) / fp8_quant_weight_grouped (experts): w and w.T per tile;
 - the FP8 parameter all-gather (modules/fp8_param_gather.py) over SHARDS simulated FSDP ranks,
@@ -29,8 +29,8 @@ from pithtrain.kernels import (
     fp8_shard_amax_multi,
     fp8_shard_cast,
 )
-from tests.spec.cases import spec_params
-from tests.spec.fp8_reference import (
+from tests.kernels.cases import params
+from tests.kernels.fp8_reference import (
     BLOCK,
     assert_fp8_equal,
     assert_scale_equal,
@@ -55,7 +55,7 @@ def master_weight(case: dict) -> torch.Tensor:
     return w
 
 
-@pytest.mark.parametrize("case", spec_params("weight_quant"))
+@pytest.mark.parametrize("case", params("weight_quant"))
 def test_quant_weight(case: dict) -> None:
     w = master_weight(case).to(torch.bfloat16)
     ref, ref_scale = quant_blockwise(w)
@@ -107,7 +107,7 @@ def shard_tile_amax(shard: torch.Tensor, row_offset: int, group_offset: int, gri
     return grid, touched
 
 
-@pytest.mark.parametrize("case", spec_params("weight_quant"))
+@pytest.mark.parametrize("case", params("weight_quant"))
 def test_param_gather(case: dict) -> None:
     dense = case["axes"]["G"] == 0
     w = master_weight(case)

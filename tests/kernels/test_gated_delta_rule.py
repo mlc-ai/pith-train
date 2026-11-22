@@ -1,6 +1,6 @@
 """
-Gated DeltaNet at every training shape of tools/kernel_cases/kernel_cases.json (family
-gated_delta_rule): Qwen3.5-35B-A3B (16 key / 32 value heads) and Qwen3.5-27B (16 / 48), dims 128,
+Gated DeltaNet at every training shape of the spec (family gated_delta_rule of
+tests/kernels/cases.py): Qwen3.5-35B-A3B (16 key / 32 value heads) and Qwen3.5-27B (16 / 48), dims 128,
 the micro-batch folded into the heads (H = 16 mbs, HV = 32 mbs or 48 mbs, value head j reading key
 head j // (HV / H)) as pithtrain/operators/gated_delta_rule.py folds it, at T_local = seq / cp.
 
@@ -11,14 +11,14 @@ head j // (HV / H)) as pithtrain/operators/gated_delta_rule.py folds it, at T_lo
   autograd; CP 2, 4 and 8.
 
 Inputs are drawn as the model computes them (q, k L2-normalized, gate -exp(A_log) softplus(a +
-dt_bias), beta = sigmoid), by make_inputs of tests/spec/gdn_reference.py.
+dt_bias), beta = sigmoid), by make_inputs of tests/kernels/gdn_reference.py.
 
 Reference: the recurrence in fp64, in its chunked form with autograd (chunked_reference of the same
 file, itself checked there against the token-by-token loop), run over the whole sequence a block of
 value heads at a time (the heads are independent) so that 128k-token sequences fit in memory. It is
 never a pithtrain kernel.
 
-Bounds: those of tests/spec/gdn_reference.py (BOUNDS: calc_diff per output; MAX_ABS: largest absolute error
+Bounds: those of tests/kernels/gdn_reference.py (BOUNDS: calc_diff per output; MAX_ABS: largest absolute error
 within 2e-2 of the reference's largest magnitude), calibrated there at T <= 8192 and checked here up
 to T_local = 32k and folded heads up to 4x, and over 128k-token CP sequences. Largest errors
 measured on the H200 over the 25 single-GPU cases (T_local 1k .. 32k, HV 32 .. 192): calc_diff
@@ -42,8 +42,8 @@ from pithtrain.kernels import (
 )
 from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
-from tests.spec import gdn_reference
-from tests.spec.cases import spec_params
+from tests.kernels import gdn_reference
+from tests.kernels.cases import params, seed_of
 from tests.utilities import launch
 
 NAMES = ("o", "dq", "dk", "dv", "dg", "dbeta")
@@ -52,10 +52,6 @@ TOKEN_HEADS_PER_BLOCK = 1 << 21
 Sequence length x value heads the fp64 reference holds at once (its autograd keeps about 2 KB per
 token-head): a 131072-token sequence runs 16 value heads at a time.
 """
-
-
-def seed_of(case: dict) -> int:
-    return int(case["id"].rsplit("/", 1)[1]) * 7919 + case["axes"]["T_local"]
 
 
 def reference_by_heads(q, k, v, g, beta, do, keep=slice(None), key_grads=False):
@@ -101,7 +97,7 @@ def failures_of(label: str, got: list, ref: list) -> list[str]:
     return failures
 
 
-@pytest.mark.parametrize("case", spec_params("gated_delta_rule", keep=lambda c: c["axes"]["cp"] == 1))  # fmt: skip
+@pytest.mark.parametrize("case", params("gated_delta_rule", keep=lambda c: c["axes"]["cp"] == 1))  # fmt: skip
 def test_pinned_at_training_shapes(case: dict) -> None:
     axes = case["axes"]
     S, H, HV = axes["T_local"], axes["H"], axes["HV"]
@@ -143,13 +139,27 @@ def cp_worker(case: dict) -> None:
     assert not failures, "\n".join(failures)
 
 
-@pytest.mark.parametrize("case", spec_params("gated_delta_rule", keep=lambda c: c["axes"]["cp"] > 1, marks=[pytest.mark.multigpu]))  # fmt: skip
-def test_context_parallel_at_training_shapes(case: dict) -> None:
-    if torch.cuda.device_count() < case["axes"]["cp"]:
-        pytest.skip(f"needs {case['axes']['cp']} GPUs, have {torch.cuda.device_count()}")
+def run_cp(case: dict) -> None:
     cfg = DistributedCfg()
     cfg.context_parallel_size = case["axes"]["cp"]
     launch(cfg, cp_worker, case)
+
+
+# One function per GPU count, so that -k selects what a run has: CP 2 and 4 fit in 4 GPUs, CP 8 needs
+# a node of 8, CP 16 two nodes (see README.md, "Running").
+@pytest.mark.parametrize("case", params("gated_delta_rule", keep=lambda c: 1 < c["axes"]["cp"] <= 4, multigpu=True))  # fmt: skip
+def test_context_parallel(case: dict) -> None:
+    run_cp(case)
+
+
+@pytest.mark.parametrize("case", params("gated_delta_rule", keep=lambda c: c["axes"]["cp"] == 8, multigpu=True))  # fmt: skip
+def test_context_parallel_cp8(case: dict) -> None:
+    run_cp(case)
+
+
+@pytest.mark.parametrize("case", params("gated_delta_rule", keep=lambda c: c["axes"]["cp"] == 16, multigpu=True))  # fmt: skip
+def test_context_parallel_cp16(case: dict) -> None:
+    run_cp(case)
 
 
 @pytest.mark.smoke
