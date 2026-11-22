@@ -96,7 +96,9 @@ def make_adamw_optimizer(
     cfg: TrainingCfg, *, weight_decay: float = 0.1, fused: bool = True
 ) -> tuple[Optimizer, ...]:
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
-    return (AdamW(training.model.parameters(), fused=fused, **kwargs),)
+    return (
+        AdamW(training.model.parameters(), fused=fused, foreach=None if fused else True, **kwargs),
+    )
 
 
 def make_wsd_scheduler(
@@ -412,7 +414,11 @@ def setup_model(
             model = Qwen35TextModel(module_config)
         if not from_hf:
             init_weights(
-                model, module_config.num_hidden_layers, cfg.init_std, cfg.seed, pipeline_chunks=False
+                model,
+                module_config.num_hidden_layers,
+                cfg.init_std,
+                cfg.seed,
+                pipeline_chunks=False,
             )
         shard_dense_model(model, mesh, cfg.dense_fsdp)
         if from_hf:
