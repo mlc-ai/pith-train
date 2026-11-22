@@ -346,6 +346,26 @@ def use_native_collective_pool(units: list[nn.Module]) -> None:
         unit.set_custom_reduce_scatter(reduce_scatter)
 
 
+def recycle_reduce_scatter_inputs(model: nn.Module, before: nn.Module) -> None:
+    from torch.distributed.fsdp._fully_shard._fsdp_common import is_bw
+
+    state = model._get_fsdp_state()
+
+    def recycle(_module, _inputs):
+        pending = state._comm_ctx.reduce_scatter_states
+        if not pending or is_bw():
+            return
+        current = torch.cuda.current_stream()
+        for reduction in pending:
+            if reduction.event is not None:
+                reduction.allocation_stream.wait_event(reduction.event)
+                if current != reduction.allocation_stream:
+                    current.wait_event(reduction.event)
+        pending.clear()
+
+    before.register_forward_pre_hook(recycle, prepend=True)
+
+
 def shard_dense_model(
     model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCfg, *, trace_recompute: bool = False
 ) -> None:
@@ -512,6 +532,11 @@ def shard_dense_model(
         order = [model.embed_tokens, *order, model.lm_head]
     model.retained_fsdp_units = retained_units
     fully_shard(model, mesh=mesh, reshard_after_forward=False, mp_policy=mp)
+    if cfg.overlap_microbatch_reductions:
+        # The last reduction already overlaps the next embedding and first decoder
+        # bucket. Release its packed input before later activations raise the peak.
+        next_bucket = decoder_groups[1][0] if len(decoder_groups) > 1 else model.lm_head
+        recycle_reduce_scatter_inputs(model, next_bucket)
 
     if cfg.edge_sharding == "root" and cfg.prefetch:
         if not cfg.prefetch_forward_copy_out:
