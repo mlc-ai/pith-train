@@ -193,14 +193,13 @@ def train_step(
         finalize_once = len(batches) > 1 and (
             deferred_units or dense_fsdp.overlap_microbatch_reductions
         )
-        retain = dense_fsdp.keep_gathered_across_microbatches and len(batches) > 1
+        retained_units = model.retained_fsdp_units if len(batches) > 1 else ()
         for unit in deferred_units:
             unit.set_requires_gradient_sync(False, recurse=unit is model)
         if finalize_once:
             model.set_is_last_backward(False)
-        if retain:
-            for group in model.retained_decoder_units:
-                group.set_reshard_after_backward(False, recurse=False)
+        for unit in retained_units:
+            unit.set_reshard_after_backward(False, recurse=False)
         losses, counts = [], []
         for i, (tokens, labels) in enumerate(batches):
             if i == len(batches) - 1:
@@ -208,9 +207,8 @@ def train_step(
                     unit.set_requires_gradient_sync(True, recurse=unit is model)
                 if finalize_once:
                     model.set_is_last_backward(True)
-                if retain:
-                    for group in model.retained_decoder_units:
-                        group.set_reshard_after_backward(True, recurse=False)
+                for unit in retained_units:
+                    unit.set_reshard_after_backward(True, recurse=False)
             loss, detached = objective((model(tokens),), (labels,))
             loss.backward()
             losses.append(detached)

@@ -51,6 +51,9 @@ class DenseFSDPCfg(SlottedDefault):
     skip_embedding_backward_gather: bool = False
     """Skip gathering the embedding weight in backward when it is its own bucket."""
 
+    keep_head_gathered: bool = False
+    """Keep the separately sharded LM head gathered until the final backward of each step."""
+
     prefetch: int = 0
     """Explicit lookahead in buckets in both directions. Zero uses FSDP's implicit prefetch."""
 
@@ -227,6 +230,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.edge_sharding must be separate or root")
     if cfg.edge_sharding == "root" and cfg.skip_embedding_backward_gather:
         raise ValueError("Skipping the embedding backward gather requires a separate embedding")
+    if cfg.edge_sharding == "root" and cfg.keep_head_gathered:
+        raise ValueError("Retaining LM head weights requires a separately sharded head")
     if cfg.reuse_single_weight_gather_buffers and (
         cfg.edge_sharding != "separate" or cfg.collective_buffers != "default"
     ):
@@ -323,8 +328,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             reshard_after_forward=reshard,
             mp_policy=mp,
         )
+    retained_units = ()
     if cfg.keep_gathered_across_microbatches:
-        model.retained_decoder_units = tuple(
+        retained_units = tuple(
             group[0] for group in decoder_groups[-cfg.keep_last_groups :]
         )
 
@@ -333,14 +339,19 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
     forward_groups = decoder_groups
     if cfg.edge_sharding == "separate":
         fully_shard(model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
-        fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
+        fully_shard(
+            model.lm_head, mesh=mesh, reshard_after_forward=not cfg.keep_head_gathered, mp_policy=mp
+        )
         if cfg.reuse_single_weight_gather_buffers:
             reuse_single_weight_gather_buffer(model.embed_tokens)
             reuse_single_weight_gather_buffer(model.lm_head)
         if cfg.skip_embedding_backward_gather:
             model.embed_tokens.set_unshard_in_backward(False)
+        if cfg.keep_head_gathered:
+            retained_units += (model.lm_head,)
         order = [model.embed_tokens, *order, model.lm_head]
         forward_groups = [[model.embed_tokens], *decoder_groups, [model.lm_head]]
+    model.retained_fsdp_units = retained_units
     fully_shard(model, mesh=mesh, reshard_after_forward=False, mp_policy=mp)
 
     if cfg.edge_sharding == "root" and cfg.prefetch:

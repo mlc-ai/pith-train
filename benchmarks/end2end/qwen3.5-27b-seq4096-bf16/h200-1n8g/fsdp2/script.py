@@ -33,6 +33,7 @@ if __name__ == "__main__":
     parser.add_argument("--keep-last-group", dest="keep_last_groups", action="store_const", const=1)
     parser.add_argument("--keep-gathered-across-microbatches", action="store_true")
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
+    parser.add_argument("--keep-head-gathered", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--prefetch-forward-copy-out", action="store_true")
     parser.add_argument("--fuse-gather-copy-in", action="store_true")
@@ -103,6 +104,7 @@ if __name__ == "__main__":
     train.dense_fsdp.keep_last_groups = args.keep_last_groups
     train.dense_fsdp.keep_gathered_across_microbatches = args.keep_gathered_across_microbatches
     train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
+    train.dense_fsdp.keep_head_gathered = args.keep_head_gathered
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.prefetch_forward_copy_out = args.prefetch_forward_copy_out
     train.dense_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
