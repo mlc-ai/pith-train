@@ -191,6 +191,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
             return self.block(hidden_states, cu_seqlens)
         return checkpoint(self.block, hidden_states, None, use_reentrant=False, context_fn=selective_recompute_contexts)  # fmt: skip
 
+    def project_gates(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
+
     def block(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -198,7 +201,7 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         quantized_hidden = training.Linear.quantize_input(hidden_states)
         mixed_qkv = self.in_proj_qkv(hidden_states, quantized_hidden)
         z = self.in_proj_z(hidden_states, quantized_hidden).reshape(B, S, -1, self.head_v_dim)
-        b, a = self.in_proj_b(hidden_states), self.in_proj_a(hidden_states)
+        b, a = self.project_gates(hidden_states)
         # Under CP, the tokens prepended from the previous rank replace the conv's zero padding, so
         # the valid output starts at offset.
         offset = 0
