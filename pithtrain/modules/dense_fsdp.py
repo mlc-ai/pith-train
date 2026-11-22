@@ -42,8 +42,8 @@ class DenseFSDPCfg(SlottedDefault):
     reshard_after_forward: bool | int = True
     """Reshard to the full mesh, retain gathered parameters, or reshard to a smaller group."""
 
-    keep_last_group: bool = False
-    """Keep the last decoder bucket materialized until its backward."""
+    keep_last_groups: int = 0
+    """Keep this many final decoder buckets materialized until backward."""
 
     skip_embedding_backward_gather: bool = False
     """Skip gathering the embedding weight in backward when it is its own bucket."""
@@ -107,6 +107,8 @@ def log_bucket_sizes(
 def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCfg) -> None:
     if cfg.blocks_per_group < 1:
         raise ValueError("dense_fsdp.blocks_per_group must be positive")
+    if cfg.keep_last_groups < 0:
+        raise ValueError("dense_fsdp.keep_last_groups must be nonnegative")
     if cfg.edge_sharding not in ("separate", "root"):
         raise ValueError("dense_fsdp.edge_sharding must be separate or root")
     if cfg.edge_sharding == "root" and cfg.skip_embedding_backward_gather:
@@ -165,11 +167,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
     log_bucket_sizes(buckets, mesh.size(mesh.ndim - 1), reduce_dtype)
 
     for i, group in enumerate(decoder_groups):
-        reshard = (
-            False
-            if cfg.keep_last_group and i == len(decoder_groups) - 1
-            else cfg.reshard_after_forward
-        )
+        keep = i >= len(decoder_groups) - cfg.keep_last_groups
+        reshard = False if keep else cfg.reshard_after_forward
         fully_shard(
             group[0] if len(group) == 1 else group,
             mesh=mesh,

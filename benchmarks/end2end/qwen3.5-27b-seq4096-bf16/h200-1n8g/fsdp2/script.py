@@ -20,6 +20,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=Path("examples/pretrain_lm/qwen3.5-27b"))
     parser.add_argument("--weights", type=Path)
+    parser.add_argument("--dataset", type=Path, help="Tokenized corpus directory for loss checks")
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--micro-batch", type=int, default=1)
@@ -28,7 +29,8 @@ if __name__ == "__main__":
     parser.add_argument("--group-by-attention-type", action="store_true")
     parser.add_argument("--edge-sharding", choices=("separate", "root"), default="separate")
     parser.add_argument("--reshard", type=reshard, default=True)
-    parser.add_argument("--keep-last-group", action="store_true")
+    parser.add_argument("--keep-last-groups", type=int, default=0)
+    parser.add_argument("--keep-last-group", dest="keep_last_groups", action="store_const", const=1)
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
@@ -47,11 +49,11 @@ if __name__ == "__main__":
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
     cfg = PretrainLMCfg()
-    cfg.dataset = Path(".")
+    cfg.dataset = args.dataset if args.dataset is not None else Path(".")
     train = cfg.training
     train.model = args.model
     train.hf_import_path = args.weights
-    train.benchmark = True
+    train.benchmark = args.dataset is None
     train.sequence_length = args.seq
     train.global_batch_size = args.batch
     train.micro_batch_size = args.micro_batch
@@ -64,7 +66,7 @@ if __name__ == "__main__":
     train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
     train.dense_fsdp.edge_sharding = args.edge_sharding
     train.dense_fsdp.reshard_after_forward = args.reshard
-    train.dense_fsdp.keep_last_group = args.keep_last_group
+    train.dense_fsdp.keep_last_groups = args.keep_last_groups
     train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
