@@ -35,7 +35,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
-    parser.add_argument("--bf16-sharded-gradients", action="store_true")
+    parser.add_argument(
+        "--bf16-sharded-gradients", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--reduce-at-step-end", action="store_true")
     parser.add_argument("--overlap-microbatch-reductions", action="store_true")
     parser.add_argument("--prefetch-data-during-optimizer", action="store_true")
