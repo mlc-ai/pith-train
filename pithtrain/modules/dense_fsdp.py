@@ -165,20 +165,34 @@ def log_bucket_sizes(
     logger.info("Dense FSDP buckets (AG/RS MiB) | %s", ", ".join(payloads))
 
 
-def prefetch_forward_copy_out(groups: list[list[nn.Module]]) -> None:
+def prefetch_forward_copy_out(units: list[nn.Module]) -> None:
     stream = torch.cuda.Stream()
 
-    def connect(current: list[nn.Module], following: list[nn.Module], first: bool) -> None:
+    def connect(current: nn.Module, following: nn.Module) -> None:
+        (group,) = following._get_fsdp_state()._fsdp_param_groups
         event = torch.cuda.Event()
         pending = False
+        current.set_modules_to_forward_prefetch([following])
 
         def prefetch(_module, _inputs):
             nonlocal pending
-            if first:
-                # The sharded weights may have been updated by the optimizer on this stream.
-                stream.wait_stream(torch.cuda.current_stream())
+            gather = group._all_gather_result
+            if gather is None or not gather.param_all_gather_input_numels:
+                return
+            # Weight storage allocated on the compute stream can be recycled in backward.
+            for param, sizes, dtypes in zip(
+                group.fsdp_params,
+                gather.param_all_gather_input_numels,
+                gather.param_all_gather_input_dtypes,
+                strict=True,
+            ):
+                param.init_all_gather_outputs(
+                    sizes, dtypes, group._all_gather_process_group.size(), group.device
+                )
+                param.alloc_all_gather_outputs()
+            stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                following[0].unshard()
+                following.unshard()
                 event.record()
             pending = True
 
@@ -187,17 +201,17 @@ def prefetch_forward_copy_out(groups: list[list[nn.Module]]) -> None:
             if pending:
                 current_stream = torch.cuda.current_stream()
                 current_stream.wait_event(event)
-                # FSDP releases these allocations after the consumer finishes issuing work.
-                for block in following:
-                    for param in block.parameters():
-                        param.record_stream(current_stream)
+                # The direct single-weight gather may allocate on the comm stream.
+                for param in group.fsdp_params:
+                    for output in param.all_gather_outputs:
+                        output.record_stream(current_stream)
                 pending = False
 
-        current[0].register_forward_pre_hook(prefetch)
-        following[0].register_forward_pre_hook(wait, prepend=True)
+        current.register_forward_pre_hook(prefetch)
+        following.register_forward_pre_hook(wait, prepend=True)
 
-    for i, (current, following) in enumerate(zip(groups, groups[1:])):
-        connect(current, following, i == 0)
+    for current, following in zip(units, units[1:]):
+        connect(current, following)
 
 
 def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
@@ -392,7 +406,6 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
 
     # One FSDP state per communication bucket, even when several blocks share it.
     order = [group[0] for group in decoder_groups]
-    forward_groups = decoder_groups
     if cfg.edge_sharding == "separate":
         fully_shard(model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
         fully_shard(
@@ -406,7 +419,6 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         if cfg.keep_head_gathered:
             retained_units += (model.lm_head,)
         order = [model.embed_tokens, *order, model.lm_head]
-        forward_groups = [[model.embed_tokens], *decoder_groups, [model.lm_head]]
     model.retained_fsdp_units = retained_units
     fully_shard(model, mesh=mesh, reshard_after_forward=False, mp_policy=mp)
 
@@ -421,7 +433,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
                 module.set_modules_to_forward_prefetch(order[i + 1 : i + 1 + cfg.prefetch])
             module.set_modules_to_backward_prefetch(order[max(0, i - cfg.prefetch) : i][::-1])
     if cfg.prefetch_forward_copy_out:
-        prefetch_forward_copy_out(forward_groups)
+        prefetch_forward_copy_out(order)
     model.set_gradient_divide_factor(1.0)
     if cfg.reduce_scatter_buffers != 1:
         model.set_reduce_scatter_max_input_buffers(cfg.reduce_scatter_buffers)
