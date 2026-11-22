@@ -72,18 +72,12 @@ def assert_fp8_equal(got: torch.Tensor, want: torch.Tensor, name: str) -> None:
 
 
 def assert_scale_equal(got: torch.Tensor, want: torch.Tensor, name: str) -> None:
-    """
-    Compares scales by logical value.
-    """
     assert got.dtype == torch.float32 and got.shape == want.shape, (name, got.shape, want.shape)
     differ = (got != want).sum().item()
     assert differ == 0, f"{name}: {differ} of {got.numel()} scales differ"
 
 
 def half_ulp_bf16(x: torch.Tensor) -> torch.Tensor:
-    """
-    Half a bf16 ulp at |x|, in float64.
-    """
     x = x.double().abs()
     _, exponent = torch.frexp(x)  # ulp = 2^(exponent - 8)
     exponent = exponent.clamp(min=-125)

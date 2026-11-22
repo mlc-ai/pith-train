@@ -1,7 +1,6 @@
 """
-Routed expert GEMMs and fused FP8 activation quantizations of one EP rank at the spec's moe_experts
-cases. FP8 GEMMs against the fp32 product of the dequantized operands, BF16 GEMMs against float64,
-both within a per-element bound plus calc_diff (about 3x the worst measured on the H200); the FP8
+Routed expert GEMMs and fused FP8 activation quantizations of one EP rank at the moe_experts cases.
+GEMMs within a per-element bound plus calc_diff (about 3x the worst measured on the H200); FP8
 activations within half an e4m3 ulp of float64, with the recipe's scales.
 """
 
@@ -122,13 +121,7 @@ def row_chunks(counts: list[int]):
 
 
 def gate_up_layout(case: dict) -> str:
-    """
-    The case's gate_up_layout: separate, halves or interleaved.
-    """
     return case["axes"]["gate_up_layout"]
-
-
-# FP8 ---------------------------------------------------------------------------------------------
 
 
 def dq_rows(fp8: torch.Tensor, scale: torch.Tensor, start: int, end: int) -> torch.Tensor:
@@ -217,11 +210,9 @@ def test_fp8_expert_gemms(case: dict) -> None:
     offs = torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).cuda()
     ks_tensor = torch.tensor(ks, dtype=torch.int32, device="cuda")
     gen = torch.Generator(device="cuda").manual_seed(sum(counts) + G)
-    # one 2I gate_up GEMM, or separate gate and up of I each
     gu_widths = [2 * inter] if gate_up_layout(case) != "separate" else [inter]
     M = sum(ks)
 
-    # forward: x -> gate_up, h -> down
     x = grouped_input(M, H, counts, ks, gen)
     x_fp8, x_scale, x_ch, x_ch_scale = fp8_quant_grouped(x, offs)
     del x
@@ -233,7 +224,6 @@ def test_fp8_expert_gemms(case: dict) -> None:
         assert out.shape == (M, n) and out.dtype == torch.bfloat16
         check_m_grouped(case, f"gate_up fwd n={n}", out, (x_fp8, x_scale), (w_fp8, w_scale), ks)
         del out
-        # dgrad: dpre (M, n) through the transposed pair to (M, H)
         dpre = grouped_input(M, n, counts, ks, gen)
         dp_fp8, dp_scale, dp_ch, dp_ch_scale = fp8_quant_grouped(dpre, offs)
         del dpre
@@ -241,7 +231,6 @@ def test_fp8_expert_gemms(case: dict) -> None:
         assert dx.shape == (M, H)
         check_m_grouped(case, f"gate_up dgrad n={n}", dx, (dp_fp8, dp_scale), (wt_fp8, wt_scale), ks)  # fmt: skip
         del dx, dp_fp8, dp_scale, w_fp8, w_scale, wt_fp8, wt_scale
-        # wgrad: d (G, n, H) += dpre_g^T x_g
         d = fp8_grouped_wgrad_empty(torch.Size((G, n, H)), torch.device("cuda"))
         d.zero_()
         k_grouped_fp8_gemm((dp_ch, dp_ch_scale), (x_ch, x_ch_scale), d, ks, ks_tensor)
@@ -271,9 +260,6 @@ def test_fp8_expert_gemms(case: dict) -> None:
     d.zero_()
     k_grouped_fp8_gemm((dy_ch, dy_ch_scale), (h_ch, h_ch_scale), d, ks, ks_tensor)
     check_k_grouped(case, "down wgrad", d, (dy_ch, dy_ch_scale), (h_ch, h_ch_scale), ks, H, inter)
-
-
-# BF16 --------------------------------------------------------------------------------------------
 
 
 def gate_up_pair(case: dict, G: int, n: int, k: int, gen, dtype=torch.bfloat16, scale: float = 1.0):  # fmt: skip
@@ -405,7 +391,6 @@ def test_bf16_expert_gemms(case: dict) -> None:
         if group_w >= 0 and not isinstance(inc, int):
             target, start_value = {"mg_gate": (mg_g, start_g), "mg_up": (mg_u, start_u), "mg_down": (mg_d, start_d)}[name]  # fmt: skip
             checks[name].add(target[group_w], start_value[group_w].to(F64) + inc, inc_abs)
-    # groups without rows keep their main grads bit for bit
     for group, count in enumerate(counts):
         if count == 0:
             for target, start_value in ((mg_g, start_g), (mg_u, start_u), (mg_d, start_d)):
@@ -414,9 +399,6 @@ def test_bf16_expert_gemms(case: dict) -> None:
         assert bool((pre[:, 0::2].float() > LIMIT).any()), "the clamp must be exercised"
     for name, check in checks.items():
         check.verify(case, BF16_COEF[kinds[name]], BF16_CALC_DIFF[kinds[name]])
-
-
-# FP8 fused activation + quantization --------------------------------------------------------------
 
 
 def e8m0(amax: torch.Tensor) -> torch.Tensor:
@@ -490,9 +472,9 @@ def check_channels(check: QuantCheck, pair, ref_fn, counts: list[int], channels:
     """
     data, scale = pair
     for group, group_start, start, end in row_chunks(counts):
-        ref = ref_fn(start, end)  # (rows, channels)
+        ref = ref_fn(start, end)
         rounded = ref.to(torch.bfloat16).float().abs()
-        amax = rounded.view(-1, BLOCK, channels).amax(1)  # (rows / 128, channels)
+        amax = rounded.view(-1, BLOCK, channels).amax(1)
         sc = scale[:, start // BLOCK : end // BLOCK].T
         check.add_scales(sc, amax)
         deq = dq_channels(pair, counts, group_start, group, start, end, channels).T
@@ -531,7 +513,7 @@ def test_fp8_expert_activation(case: dict) -> None:
         bias = (torch.randn(G, 2 * inter, device="cuda", generator=gen)).to(torch.bfloat16)
         row_bias = torch.repeat_interleave(bias, torch.tensor(ks, device="cuda"), dim=0, output_size=M)  # fmt: skip
 
-        def z(start, end):  # gate_up + bias in fp32, rounded to bf16
+        def z(start, end):
             return (gu[start:end].float() + row_bias[start:end].float()).to(torch.bfloat16).to(F64)  # fmt: skip
 
         h_fn = lambda s, e: clamped_ref(z(s, e)[:, 0::2], z(s, e)[:, 1::2])

@@ -100,7 +100,7 @@ def test_param_gather(case: dict) -> None:
     grid_shape = (G, blocks(N), blocks(K))
     shards = fsdp_shards(w, dense)
 
-    # per-shard amax, then the MAX reduction the all-reduce performs
+    # torch.maximum stands in for the all-reduce's MAX
     grids, reduced = [], torch.zeros(grid_shape, dtype=torch.float32, device=DEV)
     for shard, row_offset, group_offset in shards:
         grid = torch.zeros(grid_shape, dtype=torch.float32, device=DEV)
@@ -116,7 +116,6 @@ def test_param_gather(case: dict) -> None:
     whole_amax = padded.view(G, grid_shape[1], BLOCK, grid_shape[2], BLOCK).amax(dim=(2, 4))
     assert_scale_equal(reduced, whole_amax, "reduced amax")
 
-    # multi-launch amax matches the single launches
     multi_grids = [torch.zeros(grid_shape, dtype=torch.float32, device=DEV) for _ in shards]
     launch = fp8_shard_amax_multi([s for s, _, _ in shards], multi_grids, [r for _, r, _ in shards], [g for _, _, g in shards])  # fmt: skip
     if launch is not None:
@@ -124,7 +123,6 @@ def test_param_gather(case: dict) -> None:
         for index, (got, want) in enumerate(zip(multi_grids, grids)):
             assert_scale_equal(got, want, f"fp8_shard_amax_multi shard {index}")
 
-    # scales of the reduced grid, single and multi
     scale = torch.empty(grid_shape, dtype=torch.float32, device=DEV)
     scale_t = torch.empty(G, grid_shape[2], grid_shape[1], dtype=torch.float32, device=DEV)
     fp8_scales(reduced, scale, scale_t)
@@ -138,7 +136,6 @@ def test_param_gather(case: dict) -> None:
         assert_scale_equal(scale_m, scale, "fp8_scales_multi")
         assert_scale_equal(scale_t_m, scale_t, "fp8_scales_multi transposed")
 
-    # cast of each shard; the gathered shards are the recipe's bytes
     outs = []
     for shard, row_offset, group_offset in shards:
         out = torch.empty(shard.shape, dtype=torch.float8_e4m3fn, device=DEV)
@@ -147,7 +144,7 @@ def test_param_gather(case: dict) -> None:
     gathered = torch.cat(outs, dim=1 if dense else 0)
     assert_fp8_equal(gathered, ref, "gathered fp8_shard_cast")
 
-    # pack: the gathered bytes and their transpose, back to back (may exceed 2^31 bytes)
+    # may exceed 2^31 bytes
     packed = torch.empty(2 * gathered.numel(), dtype=torch.uint8, device=DEV)
     fp8_pack_transpose(gathered, packed)
     numel = gathered.numel()

@@ -1,14 +1,10 @@
 """
-Softmax attention and its gradients in plain fp32 PyTorch, one block of query rows at a time, as
-the reference of the spec-driven attention tests.
+fp32 softmax attention and its gradients, one block of query rows at a time.
 """
 
 import torch
 
-MAX_BLOCK_ELEMENTS = 1 << 26
-"""
-Largest (heads x query rows x keys) score block.
-"""
+MAX_BLOCK_ELEMENTS = 1 << 26  # caps each fp32 (heads x rows x keys) score block's memory
 
 
 def attention_reference(
@@ -40,8 +36,8 @@ def attention_blocks(q, k, v, scale, causal, window, sink, dout, q_positions, o_
     Skv, Hkv, Dv = v.shape
     group = Hq // Hkv
     f32 = torch.float32
-    qh = q.to(f32).transpose(0, 1).contiguous()  # (Hq, Sq, D)
-    kh = k.to(f32).repeat_interleave(group, dim=1).transpose(0, 1).contiguous()  # (Hq, Skv, D)
+    qh = q.to(f32).transpose(0, 1).contiguous()
+    kh = k.to(f32).repeat_interleave(group, dim=1).transpose(0, 1).contiguous()
     vh = v.to(f32).repeat_interleave(group, dim=1).transpose(0, 1).contiguous()
     if q_positions is None:
         q_positions = torch.arange(Sq, device=q.device) + (Skv - Sq)

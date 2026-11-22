@@ -29,18 +29,9 @@ from tests.kernels.measure import record
 DEV = "cuda"
 ROWS_PER_CHUNK = 4096
 
-ACCUM = 3e-4
-"""
-Accumulation error per unit of sum |a_k b_k|, beyond the output's bf16 rounding.
-"""
-EXACT_CALC_DIFF = 3e-6
-"""
-calc_diff against the exact-dequant product (bf16 rounding alone gives 1.39e-6).
-"""
-BF16_CALC_DIFF = 2e-3
-"""
-calc_diff against the bf16 product, from quantizing both operands to e4m3.
-"""
+ACCUM = 3e-4  # x sum |a_k b_k|, beyond the output's bf16 rounding
+EXACT_CALC_DIFF = 3e-6  # bf16 rounding alone gives 1.39e-6
+BF16_CALC_DIFF = 2e-3  # from quantizing both operands to e4m3
 
 
 def make(shape: tuple[int, int], seed: int, scale: float = 1.0) -> torch.Tensor:
@@ -108,7 +99,6 @@ def test_fp8_linear(case: dict) -> None:
     M, N, K = axes["M"], axes["N"], axes["K"]
     x, w, dy = make((M, K), 1), make((N, K), 2, 0.02), make((M, N), 3)
 
-    # weight: 128x128 tiles of w and of w.T
     w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(w)
     ref_w, ref_w_scale = quant_blockwise(w)
     assert_fp8_equal(w_fp8, ref_w, "w_fp8")
@@ -116,7 +106,6 @@ def test_fp8_linear(case: dict) -> None:
     assert_fp8_equal(wt_fp8, ref_w.T.contiguous(), "wt_fp8")
     assert_scale_equal(wt_scale, ref_w_scale.T.contiguous(), "wt_scale")
 
-    # activation: 1x128 rows of x and 128x128 tiles of x.T
     x_fp8, x_scale, _, _ = fp8_quant_act(x)
     ref_x, ref_x_scale = quant_rowwise(x)
     assert_fp8_equal(x_fp8, ref_x, "x_fp8")
@@ -132,7 +121,6 @@ def test_fp8_linear(case: dict) -> None:
     check(case["id"], "y", y, (dequant_rowwise(ref_x, ref_x_scale), w_dq), (x.float(), w.float()))
     del y
 
-    # gradient: 1x128 rows of dy and of dy.T
     dy_fp8, dy_scale, dyt_fp8, dyt_scale = fp8_quant_grad(dy)
     ref_dy, ref_dy_scale = quant_rowwise(dy)
     ref_dyt, ref_dyt_scale = quant_rowwise(dy.T)

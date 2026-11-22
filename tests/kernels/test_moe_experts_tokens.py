@@ -1,8 +1,7 @@
 """
-Token scatter, EP dispatch index math, slot maps and small reductions around the routed experts of
-one EP rank, at the spec's moe_experts cases (boundary routing excluded), against plain PyTorch on
-a synthesized top-k routing. Exact, except segment_sum (analytic fp32 bound) and clamped SwiGLU
-(half a bf16 ulp plus an fp32 term).
+Token scatter, EP dispatch index math, slot maps and small reductions around one EP rank's experts
+at the moe_experts cases, against PyTorch on a synthesized top-k routing. Exact, except segment_sum
+(analytic fp32 bound) and clamped SwiGLU (half a bf16 ulp plus an fp32 term).
 """
 
 import pytest
@@ -46,9 +45,6 @@ REALISTIC = lambda c: c["axes"]["routing"] != "boundary"
 
 @pytest.fixture(autouse=True)
 def empty_cache():
-    """
-    Empty the allocator cache around each test.
-    """
     torch.cuda.empty_cache()
     yield
     torch.cuda.empty_cache()
@@ -74,9 +70,6 @@ def row_chunks(sizes: list[int], chunk: int = CHUNK):
         for a in range(start, start + size, chunk):
             yield group, start, a, min(a + chunk, start + size)
         start += size
-
-
-# Routing -----------------------------------------------------------------------------------------
 
 
 def group_topk(case: dict, gen: torch.Generator) -> torch.Tensor:
@@ -110,7 +103,7 @@ def receive(topk: torch.Tensor, T: int, G: int) -> dict:
     local = topk < G
     token, col = local.nonzero(as_tuple=True)
     expert = topk[token, col]
-    order = torch.argsort(((token // T) * G + expert) * N + token)  # sender, expert, token
+    order = torch.argsort(((token // T) * G + expert) * N + token)
     token, expert = token[order], expert[order]
     visit = local.any(1)
     dedup_pos = visit.long().cumsum(0) - 1
@@ -170,9 +163,6 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     return t.view({1: torch.uint8, 2: torch.int16, 4: torch.int32}[t.element_size()])
 
 
-# Token scatter and the FP8 stage-3 input ---------------------------------------------------------
-
-
 @pytest.mark.parametrize("case", params("moe_experts", keep=lambda c: REALISTIC(c) and not c["axes"]["bf16_fused"]))  # fmt: skip
 def test_token_scatter(case: dict) -> None:
     a = case["axes"]
@@ -181,7 +171,6 @@ def test_token_scatter(case: dict) -> None:
     inp = stage3_input(case, gen)
     expert_idxs = inp["expert_idxs"]
     m = expert_idxs.numel()
-    # one row per slot
     x = torch.randn(m, H, generator=gen, **BF16)
     ids_before = expert_idxs.clone()
     out, reverse, offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, G, BLOCK, inp["group_counts"])  # fmt: skip
@@ -249,9 +238,6 @@ def test_scatter_quant(case: dict) -> None:
     assert hint.dtype == torch.int32 and hint.shape == (M,) and torch.equal(hint, want)
 
 
-# Expert biases (gpt-oss) -------------------------------------------------------------------------
-
-
 def grouped_rows(counts: list[int], width: int, gen: torch.Generator, scale: float = 1.0) -> torch.Tensor:  # fmt: skip
     """
     bf16 (sum of padded counts, width): random real rows per group, zero padding.
@@ -305,13 +291,9 @@ def test_bias_kernels(case: dict) -> None:
         want = (before[start:end].float() + bias[groups[start:end].long()].float()).to(torch.bfloat16)  # fmt: skip
         assert torch.equal(bits(y[start:end]), bits(want)), "group_bias_add is not y + bias[group]"
     del y, before
-    # d_bias of down, and of gate_up on the unfused path
     widths = [("down", H)] + ([("gate_up", 2 * inter)] if not a["bf16_fused"] else [])
     for what, width in widths:
         check_segment_sum(case, what, grouped_rows(counts, width, gen), ks)
-
-
-# Clamped SwiGLU (gpt-oss, unfused path) ----------------------------------------------------------
 
 
 @pytest.mark.parametrize("case", params("moe_experts", keep=lambda c: REALISTIC(c) and c["axes"]["act"] == "clamped_swiglu" and not c["axes"]["bf16_fused"]))  # fmt: skip
@@ -358,9 +340,6 @@ def test_clamped_swiglu(case: dict) -> None:
         assert value <= 1, f"clamped_swiglu {name}: error {value:.3g}x the bound"
 
 
-# EP dispatch index math (single GPU) -------------------------------------------------------------
-
-
 def send_reference(topk_ids: torch.Tensor, ep: int, epr: int) -> dict:
     """
     ep_dispatch_send_idx's outputs, placed stably.
@@ -372,11 +351,11 @@ def send_reference(topk_ids: torch.Tensor, ep: int, epr: int) -> dict:
     visit = torch.zeros(m, ep, dtype=torch.bool, device="cuda")
     visit.scatter_(1, topk_ids // epr, True)
     dedup = visit.sum(0)
-    position = visit.long().cumsum(0) - 1  # of a token within its rank's dedup chunk
+    position = visit.long().cumsum(0) - 1
     return dict(
         tokens_per_ep_rank=counts.view(ep, epr).sum(1),
         dedup=dedup,
-        dispatch=visit.T.nonzero()[:, 1],  # rank-major, token order within a rank
+        dispatch=visit.T.nonzero()[:, 1],
         idxs=idxs,
         expand=position[idxs // k, flat[idxs] // epr],
         send_meta=torch.cat([counts.view(ep, epr), dedup[:, None]], 1).reshape(-1),
@@ -410,7 +389,6 @@ def test_ep_dispatch(case: dict) -> None:
         starts = ref["dedup"].cumsum(0) - ref["dedup"]
         assert bool(((expand >= 0) & (expand < ref["dedup"][rank])).all())
         assert torch.equal(dispatch[starts[rank] + expand], idxs // k)
-        # what rank 0 receives from this sender
         recv_meta.append(send_meta.view(ep, G + 1)[0].clone())
         recv_expand.append(expand[: int(tokens_per_ep_rank[0])].clone())
         dedup_tokens.append(dispatch[: int(dedup[0])] + sender * T)
@@ -422,17 +400,13 @@ def test_ep_dispatch(case: dict) -> None:
     want_expand = recv_expand + dedup_start.repeat_interleave(rows[:, :G].sum(1))
     assert expert_idxs.dtype == expand_idx.dtype == torch.int64
     assert torch.equal(expert_idxs, want_expert) and torch.equal(expand_idx, want_expand)
-    # end to end against the synthesized routing
     recv = receive(topk, T, G)
     assert torch.bincount(expert_idxs, minlength=G).tolist() == a["group_sizes"]
-    assert torch.equal(expert_idxs, recv["expert"])  # sender-major, expert-minor
+    assert torch.equal(expert_idxs, recv["expert"])
     token = dedup_tokens[expand_idx]
     assert torch.equal(torch.sort(token * G + expert_idxs).values, torch.sort(recv["token"] * G + recv["expert"]).values)  # fmt: skip
     assert bool((topk[token] == expert_idxs[:, None]).any(1).all())
     assert torch.equal(token, recv["token"]) and torch.equal(expand_idx, recv["expand"])
-
-
-# BF16 fused experts: slot maps, gathers, segment sums --------------------------------------------
 
 
 def segment_sum_order(x: torch.Tensor, cu_host: list[int], idx: torch.Tensor | None) -> torch.Tensor:  # fmt: skip
@@ -473,7 +447,7 @@ def test_bf16_expert_slots(case: dict) -> None:
     maps = bf16_expert_group_slots(expert_idxs, expand_idx, G, num_tokens)
     cu_host = cumsum_list(counts)
     assert maps.cu_seqlens.dtype == torch.int32 and maps.cu_seqlens.tolist() == cu_host
-    order = torch.argsort(expert_idxs, stable=True)  # grouped row r holds slot order[r]
+    order = torch.argsort(expert_idxs, stable=True)
     row_of = torch.empty_like(order)
     row_of[order] = torch.arange(S, **I64)
     src = expand_idx if expand_idx is not None else torch.arange(S, **I64)
@@ -497,7 +471,6 @@ def test_bf16_expert_slots(case: dict) -> None:
         grad[::7] *= 1000  # a wide dynamic range, so the summation order shows
         out = bf16_expert_gather_sum(grad, maps, G, max_slots)
         assert out.shape == (num_tokens, H) and out.dtype == torch.bfloat16
-        # each token's grouped rows by local expert, padded with -1
         by_token = torch.argsort(expand_idx * G + expert_idxs)
         token = expand_idx[by_token]
         per_token = torch.bincount(expand_idx, minlength=num_tokens)

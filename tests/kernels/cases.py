@@ -1,26 +1,15 @@
 """
-The kernel-shape spec: every kernel launch shape training produces, generated at test collection
-from each examples/pretrain_lm/<model>/config.json (one extractor per model_type) and these mesh
-rules. Contexts 4k / 8k at CP 1, 16k at CP 2 / 4, 32k at CP 4 / 8, 64k at CP 8 / 16 (CONTEXTS: CP
-> 1 only where context / CP >= 4k); micro-batch 1 / 2 / 4 at CP 1, 1 under CP; EP 1 .. 16 dividing
-the expert count (EP 1 for dense models); gpt-oss (no ring attention) CP 1 only. Attention sees
-B = mbs sequences of context / CP tokens, the experts T = mbs x context / CP tokens per EP rank;
-expert routing is balanced, log-normal, skewed, stress, and boundary (both edges of every BF16
-tuning bucket reached). Shipped scripts are not read. Each family names its kernels and is consumed
-by tests/kernels/test_<family>.py (CP > 1 by tests/operators); `python -m tests.kernels.cases` prints each model's meshes and
-the case counts.
-
-pytest tests/kernels runs every case on one GPU. The CP > 1 cases of ring_attention and
-gated_delta_rule run as operator tests in tests/operators on CP GPUs (skipping on fewer); CP 16 runs
-one pytest per node, joined by WORLD_SIZE=16 LOCAL_WORLD_SIZE=8 NODE_RANK MASTER_ADDR.
-
-Tolerances: analytic where the arithmetic gives one (bit-exact, one bf16 rounding, an accumulation
-term), else about 3x the worst error measured over every case (H200), listed in each test module;
-a bound that must grow to pass a new case is a finding, not a fix.
-
-Kernel changes and agents take their shapes from here, never pick their own, and post a GPU run
-of pytest tests/kernels (plus tests/operators when CP code changes) and of python -m
-benchmarks.kernels --base upstream/main. They may add cases, never remove spec cases.
+The kernel-shape spec: every kernel launch shape training produces, generated at collection.
+- models: examples/pretrain_lm/*/config.json, one extractor per model_type
+- contexts: 4k / 8k at CP 1, 16k at CP 2 / 4, 32k at CP 4 / 8, 64k at CP 8 / 16
+- micro-batch 1 / 2 / 4 at CP 1, 1 under CP; EP 1 .. 16 dividing the expert count
+- gpt-oss: CP 1 only (no ring attention); dense models: EP 1
+- routing: balanced, log-normal, skewed, stress, BF16 tuning-bucket boundaries
+- pytest tests/kernels runs every case on one GPU; CP > 1 runs in tests/operators (CP 16: one
+  pytest per node with WORLD_SIZE=16 LOCAL_WORLD_SIZE=8 NODE_RANK MASTER_ADDR)
+- bounds: analytic, else about 3x the worst measured (H200); growing one is a finding
+- kernel PRs post pytest tests/kernels (+ tests/operators for CP code) and
+  python -m benchmarks.kernels --base main; add cases, never remove them
 """
 
 from __future__ import annotations
@@ -37,43 +26,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples" / "pretrain_lm"
 
-CONTEXTS = {4096: (1,), 8192: (1,), 16384: (2, 4), 32768: (4, 8), 65536: (8, 16)}
-"""
-Training context -> its CP degrees (context / CP >= MIN_LOCAL).
-"""
-
+CONTEXTS = {4096: (1,), 8192: (1,), 16384: (2, 4), 32768: (4, 8), 65536: (8, 16)}  # context: CP
 MIN_LOCAL = 4096
 MICRO_BATCH_SIZES = (1, 2, 4)
-"""
-Micro-batch sizes at CP 1; CP > 1 runs micro-batch 1.
-"""
-
 EXPERT_PARALLEL = (1, 2, 4, 8, 16)
-
-SIGMA = 0.2
-"""
-Log-normal spread of the per-expert token shares (measured 0.212 on Qwen3-30B-A3B).
-"""
-
-HOT_FACTOR = 4
-"""
-The skewed routing's hot expert, in multiples of the mean rows per local expert.
-"""
-
+SIGMA = 0.2  # log-normal routing spread, measured 0.212 on Qwen3-30B-A3B
+HOT_FACTOR = 4  # skewed routing's hot expert, x the mean
 FP8_GROUP_ALIGN = 128
-"""
-Rows the FP8 expert path pads every group to a multiple of.
-"""
-
-BF16_FUSED_MAX_GROUPS = 64
-"""
-Most local experts the fused BF16 experts take (bf16_experts_supported).
-"""
-
-TUNING_BUCKETS = (3, 17)
-"""
-tuning.py's MIN_BUCKET, MAX_BUCKET: buckets [2^b, 2^(b+1)) of rows per expert.
-"""
+BF16_FUSED_MAX_GROUPS = 64  # bf16_experts_supported's limit
+TUNING_BUCKETS = (3, 17)  # tuning.py's MIN_BUCKET, MAX_BUCKET
 
 
 # Models ------------------------------------------------------------------------------------------
@@ -82,7 +43,7 @@ tuning.py's MIN_BUCKET, MAX_BUCKET: buckets [2^b, 2^(b+1)) of rows per expert.
 @dataclass(frozen=True)
 class Projection:
     """
-    One training.Linear: y (M, n) = x (M, k) @ W.T, in layers layers.
+    One training.Linear: y (M, n) = x (M, k) @ W.T.
     """
 
     name: str
@@ -94,7 +55,7 @@ class Projection:
 @dataclass(frozen=True)
 class Attention:
     """
-    Softmax attention as FlashAttention-4 sees it (after MLA decompression for DeepSeek-V2).
+    Attention as FlashAttention-4 sees it (after MLA decompression).
     """
 
     num_heads: int
@@ -111,10 +72,6 @@ class Attention:
 
 @dataclass(frozen=True)
 class Experts:
-    """
-    Routed experts: num_experts of hidden -> 2 * inter -> hidden, top_k per token.
-    """
-
     num_experts: int
     top_k: int
     hidden: int
@@ -122,23 +79,13 @@ class Experts:
     layers: int
     act: str
     bias: bool
-    gate_up_layout: str
-    """
-    separate, halves (one [gate; up] weight) or interleaved (gpt-oss).
-    """
+    gate_up_layout: str  # separate, halves or interleaved (gpt-oss)
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
-    """
-    The clamped SwiGLU's alpha and limit.
-    """
 
 
 @dataclass(frozen=True)
 class LinearAttention:
-    """
-    Gated DeltaNet heads and its causal conv1d.
-    """
-
     num_key_heads: int
     num_value_heads: int
     key_dim: int
@@ -153,10 +100,6 @@ class LinearAttention:
 
 @dataclass(frozen=True)
 class Model:
-    """
-    Everything the case generator needs from one config.json.
-    """
-
     name: str
     model_type: str
     hidden: int
@@ -166,10 +109,9 @@ class Model:
     attention: Attention
     experts: Experts | None
     linear_attention: LinearAttention | None
-    swiglu_widths: tuple[tuple[str, int, int], ...] = field(default=())
-    """
-    (name, inter, layers) of the dense and shared-expert SwiGLU MLPs.
-    """
+    swiglu_widths: tuple[tuple[str, int, int], ...] = field(
+        default=()
+    )  # (name, inter, layers) of the dense / shared SwiGLU MLPs
 
 
 def count(layer_types: list[str], kind: str) -> int:
@@ -265,7 +207,7 @@ def gpt_oss(cfg: dict) -> dict:
         Projection("v_proj", kv * D, H, L),
         Projection("o_proj", H, heads * D, L),
     )
-    # sliding and full layers with sinks; ring attention has neither, so CP 1 only
+    # ring attention has no window or sinks, so CP 1 only
     attention = Attention(
         heads, kv, D, D, L, window=cfg["sliding_window"], sinks=True, supports_cp=False
     )
@@ -356,9 +298,6 @@ EXTRACTORS = {
     "qwen3_5_moe_text": lambda cfg: qwen3_5(cfg, moe=True),
     "qwen3_5_text": lambda cfg: qwen3_5(cfg, moe=False),
 }
-"""
-model_type -> extractor; the model_types setup_model builds (pithtrain/modules/training.py).
-"""
 
 
 def load_model(config_path: Path) -> Model:
@@ -380,9 +319,6 @@ def load_model(config_path: Path) -> Model:
 
 @cache
 def load_models() -> tuple[Model, ...]:
-    """
-    Every examples/pretrain_lm/<model>/config.json, in name order.
-    """
     return tuple(load_model(path) for path in sorted(CONFIG_ROOT.glob("*/config.json")))
 
 
@@ -391,10 +327,6 @@ def load_models() -> tuple[Model, ...]:
 
 @dataclass(frozen=True, order=True)
 class Mesh:
-    """
-    One training mesh of one model.
-    """
-
     model: str
     context: int
     cp: int
@@ -419,18 +351,12 @@ def k(n: int) -> str:
 
 
 def allowed_ep(model: Model) -> list[int]:
-    """
-    EP degrees that divide the expert count; EP 1 for dense models.
-    """
     if model.experts is None:
         return [1]
     return [ep for ep in EXPERT_PARALLEL if model.experts.num_experts % ep == 0]
 
 
 def mesh_rows(model: Model) -> list[tuple[int, int, int]]:
-    """
-    (context, cp, mbs) of every mesh of the model.
-    """
     rows = []
     for context, cps in CONTEXTS.items():
         for cp in cps:
@@ -555,19 +481,13 @@ FAMILIES = OrderedDict(
 )
 
 SHAPE_INDEPENDENT = ["fp8_fused_experts_supported", "bf16_experts_supported", "gated_delta_rule_pinned_supported", "gated_delta_rule_cp_supported", "tune_kernels", "stage_compile_options"]  # fmt: skip
-"""
-pithtrain.kernels names with no launch shape: capability queries, the tuner, compile options.
-"""
 
 SM100_ONLY = ["chunk_gdr_cp_fwd_pre", "chunk_gdr_cp_fwd_post", "chunk_gdr_cp_bwd_pre", "chunk_gdr_cp_bwd_post", "chunk_gdr_cp_supported"]  # fmt: skip
-"""
-pithtrain.kernels names only SM100 runs (the TIRx CP stages of Gated DeltaNet); the spec covers SM90.
-"""
 
 
 def stable_seed(*parts) -> int:
     """
-    A seed from a case's identity, stable across runs and Python versions (unlike hash()).
+    A seed stable across runs and Python versions (unlike hash()).
     """
     text = "/".join(str(p) for p in parts)
     return sum((i + 1) * ord(c) for i, c in enumerate(text)) % (2**31)
@@ -575,7 +495,7 @@ def stable_seed(*parts) -> int:
 
 def round_counts(exact: list[float], total: int, cap: int) -> list[int]:
     """
-    Largest-remainder rounding of exact to integers summing to total, each at most cap.
+    Largest-remainder rounding to integers summing to total, each at most cap.
     """
     counts = [min(int(math.floor(x)), cap) for x in exact]
     order = sorted(range(len(exact)), key=lambda i: (-(exact[i] - math.floor(exact[i])), i))
@@ -591,7 +511,7 @@ def round_counts(exact: list[float], total: int, cap: int) -> list[int]:
 
 def routing_counts(model: Model, T: int, ep: int, routing: str, seed: int) -> list[int]:
     """
-    Rows per local expert on the busiest EP rank for T tokens per GPU under one routing.
+    Rows per local expert on the busiest EP rank under one routing.
     """
     experts = model.experts
     E, top_k, G = experts.num_experts, experts.top_k, experts.num_experts // ep
@@ -624,7 +544,7 @@ def pad(count: int, align: int = FP8_GROUP_ALIGN) -> int:
 
 def tuning_bucket(rows_per_expert: int) -> int:
     """
-    The bucket tuning.Tunable.pick files a launch of this many rows per expert under.
+    The tuning bucket of a launch with this many rows per expert.
     """
     low, high = TUNING_BUCKETS
     return min(max(rows_per_expert.bit_length() - 1, low), high)
@@ -632,7 +552,7 @@ def tuning_bucket(rows_per_expert: int) -> int:
 
 class Collector:
     """
-    The cases of one family and model keyed by their label; a label seen again only adds its mesh.
+    A family's cases by label; a label seen again only adds its mesh.
     """
 
     def __init__(self):
@@ -677,7 +597,7 @@ def expert_axes(model: Model, T: int, ep: int, routing: str, counts: list[int]) 
 
 def moe_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
     """
-    Each (T, EP) under every routing, plus every expert at both edges of each BF16 tuning bucket reached.
+    Each (T, EP) under every routing, plus both edges of each BF16 tuning bucket reached.
     """
     experts = model.experts
     collect = Collector()
@@ -788,8 +708,7 @@ def attention_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
 
                 label = f"{kind}-B{B}-q{k(Sq)}-kv{k(Skv)}" + (f"-w{window}" if window is not None else "")  # fmt: skip
                 collect.add(label, mesh, make)
-    # packed documents at CP 1 and micro-batch 1 (the SFT path; pretraining runs dense): documents
-    # of log-normal length around context / 6, at least 128 tokens
+    # packed documents (the SFT path), log-normal lengths around context / 6
     for context in sorted({m.context for m in meshes if m.cp == 1}):
         rng = random.Random(stable_seed(model.name, "varlen", context))
         cu, left = [0], context
@@ -849,7 +768,7 @@ def swiglu_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
             continue
         for mesh in meshes:
             T = mesh.tokens_per_gpu
-            # DeepSeekV2MLP runs the fused FP8 operator (pithtrain/models/deepseek_v2.py)
+            # DeepSeekV2MLP runs the fused FP8 operator
             make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type == "deepseek_v2"), weight=dict(layers=layers))  # fmt: skip
             collect.add(f"{name}-M{k(T)}", mesh, make)
     return collect.cases
@@ -872,9 +791,6 @@ def pointwise_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
 
 
 def families_of(model: Model) -> list[str]:
-    """
-    The families the model's architecture launches.
-    """
     families = ["dense_gemm", "weight_quant"]
     families += ["moe_experts"] if model.experts is not None else []
     families += ["attention"] + (["ring_attention"] if model.attention.supports_cp else [])
@@ -919,15 +835,12 @@ def all_cases() -> tuple[dict, ...]:
 
 
 def select(family: str, model: str | None = None) -> list[dict]:
-    """
-    The cases of a family, of one model or all.
-    """
     return [c for c in all_cases() if c["family"] == family and model in (None, c["model"])]
 
 
 def params(family: str, keep=None) -> list:
     """
-    The family's cases (those keep accepts) as pytest params of one argument, id = the case id.
+    The family's cases as pytest params, id = the case id.
     """
     import pytest
 
@@ -940,7 +853,7 @@ def seed_of(case: dict) -> int:
 
 def main() -> int:
     """
-    Per model its meshes (context / CP x mbs), EP degrees and cases per family; then per family.
+    Per model its meshes, EP degrees and case counts; then per family.
     """
     for model in load_models():
         meshes = ", ".join(f"{k(c)}/cp{cp}x{mbs}" for c, cp, mbs in mesh_rows(model))

@@ -1,6 +1,5 @@
 """
-Mean cross-entropy of the lm_head logits through the log_prob kernels; the backward overwrites the
-logits with their gradient, rounded once.
+Mean cross-entropy of the lm_head logits through the log_prob kernels.
 """
 
 import torch
@@ -31,7 +30,7 @@ class CrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
         inp, target, row_max, log_sum, entropy, count = ctx.saved_tensors
         rows = inp.shape[0]
-        # d loss / d logp of every counted row, in fp32; log_prob_bwd drops it for ignored rows.
+        # fp32, so the logits gradient is rounded once
         grad_logp = (-grad_output.float() / count).expand(rows)
         grad_entropy = grad_logp.new_zeros(()).expand(rows)
         log_prob_bwd(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, 1.0)
@@ -44,7 +43,6 @@ def cross_entropy(
     ignore_index: int = -100,
 ) -> torch.Tensor:
     """
-    Mean cross-entropy of inp (N, V) against target (N,), ignore_index left out; fp32 scalar. The
-    backward overwrites inp with its gradient, so inp must not be read after it.
+    Mean cross-entropy of inp (N, V); the backward overwrites inp with its gradient.
     """
     return CrossEntropy.apply(inp, target, ignore_index)

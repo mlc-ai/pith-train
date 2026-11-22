@@ -443,9 +443,6 @@ NOPE, ROPE, VDIM, LORA = 128, 64, 128, 512  # DeepSeek-V2-Lite's MLA dims
 
 
 def zigzag_rows(rank: int, cp: int, seq: int, device) -> torch.Tensor:
-    """
-    The global indices of rank's zigzag tokens.
-    """
     block = seq // (2 * cp)
     front = torch.arange(rank * block, (rank + 1) * block, device=device)
     back = torch.arange((2 * cp - 1 - rank) * block, (2 * cp - rank) * block, device=device)

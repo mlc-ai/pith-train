@@ -1,6 +1,6 @@
 """
-The Gated DeltaNet recurrence in plain PyTorch, for the spec-driven GDN tests. BOUNDS (calc_diff)
-and MAX_ABS (max abs error over the reference's max magnitude) are about 3x measured on the H200.
+The Gated DeltaNet recurrence in plain PyTorch. BOUNDS (calc_diff) and MAX_ABS (max abs error over
+the reference's max magnitude) are about 3x measured on the H200.
 """
 
 import torch
@@ -93,10 +93,7 @@ def chunked_reference(q, k, v, g, beta, do, chunk: int = BT) -> tuple[torch.Tens
 
 
 NAMES = ("o", "dq", "dk", "dv", "dg", "dbeta")
-TOKEN_HEADS_PER_BLOCK = 1 << 21
-"""
-Sequence length x value heads the fp64 reference holds at once.
-"""
+TOKEN_HEADS_PER_BLOCK = 1 << 21  # caps the fp64 reference's memory
 
 
 def reference_by_heads(q, k, v, g, beta, do, keep=slice(None), key_grads=False):

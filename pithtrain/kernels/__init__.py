@@ -1,7 +1,5 @@
 """
-PithTrain's kernel library. __all__ is its whole interface and each name's docstring its contract;
-it picks the SM90 or SM100 implementation itself, and importing it never loads cutlass, QuACK or
-tvm_tirx.
+PithTrain's kernel library: __all__ is its interface, each name's docstring its contract.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad

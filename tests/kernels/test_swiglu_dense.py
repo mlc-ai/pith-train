@@ -16,10 +16,7 @@ from tests.kernels.measure import record
 
 DEV = "cuda"
 ROWS_PER_CHUNK = 4096
-SLACK = 2.0**-20
-"""
-Relative fp32 error of the kernels' sigmoid and products (a few fp32 ulps).
-"""
+SLACK = 2.0**-20  # a few fp32 ulps of the kernels' sigmoid and products
 
 
 def ratio(out: torch.Tensor, exact: torch.Tensor, magnitude: torch.Tensor) -> float:
@@ -55,9 +52,6 @@ def test_silu_mul(case: dict) -> None:
 
 
 FP8_CALC_DIFF = 7.5e-3
-"""
-calc_diff of the fused FP8 MLP's outputs against the float64 MLP.
-"""
 
 
 def calc_diff(got: torch.Tensor, exact: torch.Tensor) -> float:

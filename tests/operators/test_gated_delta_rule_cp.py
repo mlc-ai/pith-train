@@ -1,6 +1,6 @@
 """
-The Gated DeltaNet operator under CP at the spec's cases (tests/kernels/cases.py), every rank against
-the fp64 chunked recurrence over the whole sequence; skips when too few GPUs are visible.
+The Gated DeltaNet operator under CP at the spec's cases, every rank against the fp64 recurrence
+over the whole sequence.
 """
 
 import pytest

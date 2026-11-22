@@ -1,7 +1,6 @@
 """
-The causal depthwise conv kernels at every training shape of the spec, forward and backward,
-against the convolution in float64. Elementwise analytic bounds: half a bf16 ulp plus fp32
-accumulation error.
+The causal depthwise conv kernels at the spec's shapes against float64, within elementwise bounds
+of half a bf16 ulp plus fp32 accumulation error.
 """
 
 import pytest

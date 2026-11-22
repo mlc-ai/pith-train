@@ -1,7 +1,6 @@
 """
-FlashAttention-4 at every attention launch of the spec (dense, varlen and ring-step calls), forward
-and backward, against fp32 attention in plain PyTorch. Relative L2 error (max abs error for lse)
-within BOUNDS, about 3x measured on the H200.
+FlashAttention-4 at the spec's dense, varlen and ring-step launches against fp32 attention.
+Relative L2 error (max abs for lse) within BOUNDS, about 3x measured on the H200.
 """
 
 import json
@@ -33,9 +32,6 @@ def randn(gen: torch.Generator, *shape: int, dtype=torch.bfloat16) -> torch.Tens
 
 
 def check(case: dict, got: dict, want: dict) -> None:
-    """
-    Logs each output's error against want, then asserts the bounds.
-    """
     errors = {}
     for name, value in got.items():
         value = value.detach()

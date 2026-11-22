@@ -18,17 +18,8 @@ ROWS_PER_BLOCK = 512
 IGNORE = -100
 
 LOSS_REL = 6e-7
-"""
-Relative error of the fp32 mean loss.
-"""
-GRAD_SLACK = 2.0**-16
-"""
-fp32 softmax error relative to the gradient's term magnitudes, on top of half a bf16 ulp.
-"""
+GRAD_SLACK = 2.0**-16  # fp32 softmax error, on top of half a bf16 ulp
 STAT_ABS = 6e-6
-"""
-Absolute error of the fp32 per-row logp and entropy.
-"""
 
 
 def make_case(case: dict) -> tuple[torch.Tensor, torch.Tensor]:

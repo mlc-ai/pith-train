@@ -1,7 +1,6 @@
 """
-The pinned Gated DeltaNet kernels at every CP 1 shape of the spec, forward and backward, against the
-fp64 chunked recurrence (gdn_reference's BOUNDS and MAX_ABS). The CP cases are in
-tests/operators/test_gated_delta_rule_cp.py.
+The pinned Gated DeltaNet kernels at the spec's CP 1 shapes against the fp64 chunked recurrence.
+CP cases are in tests/operators/test_gated_delta_rule_cp.py.
 """
 
 import pytest

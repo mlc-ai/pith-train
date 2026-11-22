@@ -1,7 +1,6 @@
 """
 Times the kernels at the cases of tests/kernels/cases.py, for this tree alone or against a base git
-ref (--base). Each op is timed over single launches with a cold L2 (median / p10 / p90 us) and
-weighted by its work (FLOPs, or elements read when memory-bound) times its layers.
+ref (--base), each op over cold-L2 single launches and weighted by its work times its layers.
 
     python -m benchmarks.kernels --base upstream/main --family cross_entropy --out ab.json
     python -m benchmarks.kernels --base upstream/main --family moe_experts --op 'quant|silu'
@@ -10,8 +9,7 @@ weighted by its work (FLOPs, or elements read when memory-bound) times its layer
     python -m benchmarks.kernels --shard 3/8 --out shard3.json            (one per GPU)
     python -m benchmarks.kernels --merge shard*.json --out results.json
 
---base exits 1 when an op that runs at the base fails here, or an op name is more than 5% slower
-work-weighted; --base-dir . times the tree against itself, the noise floor.
+--base exits 1 when an op that ran at the base fails here, or an op name >5% slower work-weighted.
 """
 
 import argparse
@@ -427,9 +425,6 @@ def merge(paths: list[Path]) -> dict:
     """
     runs = [json.loads(path.read_text()) for path in paths]
     return dict(meta=dict(runs[0]["meta"], shards=len(runs)), results=[r for run in runs for r in run["results"]])  # fmt: skip
-
-
-# A / B against a base git ref ---------------------------------------------------------------------
 
 
 def serve(tree: str) -> None:

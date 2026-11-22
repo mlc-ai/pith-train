@@ -23,34 +23,13 @@ F64 = torch.float64
 BF16 = dict(device=DEV, dtype=torch.bfloat16)
 CONFIG_ROOT = Path(__file__).resolve().parents[2] / "examples" / "pretrain_lm"
 
-SLACK = 2.0**-18
-"""
-fp32 error, relative to the magnitude of an output's terms, that may flip one bf16 rounding.
-"""
+SLACK = 2.0**-18  # fp32 error that may flip one bf16 rounding
 POINTWISE = 1.0
-"""
-Multiple of one bf16 rounding (+ SLACK) allowed for RMSNorm and RoPE outputs and RoPE's gradients.
-"""
 ROW_REL = 1.2e-2
-"""
-Worst per-row error / the row's largest exact value of RMSNorm's input and weight gradients.
-"""
-ROUTE_TIE = 1.7e-2
-"""
-Relative logit gap below which two experts may be ranked either way against float64.
-"""
+ROUTE_TIE = 1.7e-2  # near-tied experts may rank either way against float64
 GEMM_COEF = 3.3e-2
-"""
-Router gradients (dx, dw, db): max error / sum |terms| of their GEMM.
-"""
 OWN_TIE = 2.0**-20
-"""
-Relative logit gap by which a chosen expert may sit below the k-th of the gate's own logits.
-"""
 WEIGHT_ABS = 8e-7
-"""
-Absolute error of the router weights against float64 from the gate's own logits.
-"""
 
 
 @functools.cache
@@ -106,9 +85,6 @@ def row_rel(got: torch.Tensor, exact: torch.Tensor) -> float:
     err = (got.double() - exact).abs().flatten(0, -2).amax(-1)
     scale = exact.abs().flatten(0, -2).amax(-1).clamp_min(1e-300)
     return float((err / scale).max())
-
-
-# RMSNorm -----------------------------------------------------------------------------------------
 
 
 def make_norm(config, dim: int) -> tuple[nn.Module, bool]:
@@ -175,9 +151,6 @@ def test_rmsnorm(case: dict) -> None:
         check_norm(case["id"], "kv_a", config, scaled_rows((B, S, config.kv_lora_rank), gen), gen)
 
 
-# RoPE --------------------------------------------------------------------------------------------
-
-
 def rope_parts(config, Hq: int, Hkv: int):
     """
     (apply_rotary_posemb, rotary embedding module, q heads x dims, k heads x dims) of the model.
@@ -239,9 +212,6 @@ def test_rope(case: dict) -> None:
     record(case["id"], "rope", **metrics)
     for key, value in metrics.items():
         assert value <= POINTWISE, f"{key}: {value:.3g}x one bf16 rounding"
-
-
-# Router ------------------------------------------------------------------------------------------
 
 
 def make_gate(config) -> nn.Module:
@@ -316,7 +286,6 @@ def test_router(case: dict) -> None:
     with torch.no_grad():
         dlogits = given.grad
 
-        # how far a chosen expert sits below the k-th largest logit
         def gap(logits):
             kth = logits.topk(top_k, dim=-1).values[:, -1]
             return float(((kth - logits.gather(-1, idx).amin(-1)) / logits.abs().amax(-1)).max())
