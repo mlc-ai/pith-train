@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from itertools import batched, groupby
@@ -117,6 +118,17 @@ def checkpoint_policy(ctx, op, *args, **kwargs):
 
 def selective_checkpoint_contexts():
     return create_selective_checkpoint_contexts(checkpoint_policy)
+
+
+def traced_selective_checkpoint_contexts():
+    forward, recompute = selective_checkpoint_contexts()
+
+    @contextmanager
+    def traced_recompute():
+        with torch.cuda.nvtx.range("dense/recompute"), recompute:
+            yield
+
+    return forward, traced_recompute()
 
 
 def offload_saved_activations(layer, forward):
@@ -280,7 +292,9 @@ def use_native_collective_pool(units: list[nn.Module]) -> None:
         unit.set_custom_reduce_scatter(reduce_scatter)
 
 
-def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCfg) -> None:
+def shard_dense_model(
+    model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCfg, *, trace_recompute: bool = False
+) -> None:
     if cfg.blocks_per_group < 1:
         raise ValueError("dense_fsdp.blocks_per_group must be positive")
     if cfg.keep_last_groups < 0:
@@ -342,6 +356,11 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         if cfg.compile_mode in ("default", "reduce-overhead"):
             compile_options |= stage_compile_options()
     checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
+    checkpoint_contexts = (
+        traced_selective_checkpoint_contexts
+        if trace_recompute and not cfg.compile_blocks
+        else selective_checkpoint_contexts
+    )
     for index, layer in enumerate(model.layers):
         if not cfg.compile_blocks:
             layer.forward = layer.forward_stock_stages
@@ -351,7 +370,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             )
         if index < checkpoint_blocks and cfg.activation_checkpoint in ("selective", "full"):
             ctx = (
-                {"context_fn": selective_checkpoint_contexts}
+                {"context_fn": checkpoint_contexts}
                 if cfg.activation_checkpoint == "selective"
                 else {}
             )

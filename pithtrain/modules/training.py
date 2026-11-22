@@ -422,7 +422,7 @@ def setup_model(
                 cfg.seed,
                 pipeline_chunks=False,
             )
-        shard_dense_model(model, mesh, cfg.dense_fsdp)
+        shard_dense_model(model, mesh, cfg.dense_fsdp, trace_recompute=cfg.nsys_start is not None)
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)

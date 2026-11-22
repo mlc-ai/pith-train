@@ -1,5 +1,6 @@
 import gc
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple
@@ -167,6 +168,15 @@ def train_step(
     torch.cuda.memory.reset_peak_memory_stats()
     dense_fsdp = cfg.training.dense_fsdp
     initial_memory = torch.cuda.memory_stats() if dense_fsdp is not None else None
+    profile_start, profile_stop = cfg.training.nsys_start, cfg.training.nsys_stop
+    trace_range = (
+        torch.cuda.nvtx.range
+        if dense_fsdp is not None
+        and profile_start is not None
+        and step >= profile_start
+        and (profile_stop is None or step < profile_stop)
+        else nullcontext
+    )
 
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     model.train()
@@ -207,8 +217,10 @@ def train_step(
                     model.set_is_last_backward(True)
                 for unit in retained_units:
                     unit.set_reshard_after_backward(True, recurse=False)
-            loss, detached = objective((model(tokens),), (labels,))
-            loss.backward()
+            with trace_range("dense/forward+loss"):
+                loss, detached = objective((model(tokens),), (labels,))
+            with trace_range("dense/backward"):
+                loss.backward()
             losses.append(detached)
             counts.append((labels != -100).sum())
 
@@ -234,18 +246,20 @@ def train_step(
         # Pretraining gives each DP/CP rank the same number of valid tokens.
         num_tokens = local_count * dp_size * cp_size
 
-    # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
-    scale_grads_(local_grads(model), 1.0 / num_tokens)
+    with trace_range("dense/normalize+clip"):
+        # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
+        scale_grads_(local_grads(model), 1.0 / num_tokens)
 
-    gradient_norm = clip_grad_norm(
-        model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
-    )
+        gradient_norm = clip_grad_norm(
+            model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
+        )
 
-    release_grads = dense_fsdp is None or not dense_fsdp.reuse_gradient_shards
-    for optimizer, scheduler in zip(optimizers, schedulers):
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=release_grads)
-        scheduler.step()
+    with trace_range("dense/optimizer"):
+        release_grads = dense_fsdp is None or not dense_fsdp.reuse_gradient_shards
+        for optimizer, scheduler in zip(optimizers, schedulers):
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=release_grads)
+            scheduler.step()
     next_batches = None
     if (
         dense_fsdp is not None
