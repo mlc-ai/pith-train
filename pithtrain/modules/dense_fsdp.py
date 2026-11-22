@@ -221,6 +221,17 @@ def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
         # The ordinary all-gather wait already orders NCCL before this hook.
         result.all_gather_output.record_stream(torch.cuda.current_stream())
 
+    unshard = group.unshard
+
+    def unshard_into_weight(async_op: bool = False):
+        # The copy-in updates a view of the saved weight when a backward gather
+        # restores its storage. Preserve the version as in FSDP's normal copy-out.
+        if param.all_gather_outputs and not param.all_gather_outputs[0].is_inference():
+            with torch.autograd._unsafe_preserve_version_counter(tuple(param.all_gather_outputs)):
+                return unshard(async_op=async_op)
+        return unshard(async_op=async_op)
+
+    group.unshard = unshard_into_weight
     group._all_gather_output_fn = reuse_output
     unit.set_custom_all_gather(AllGatherIntoWeight())
 
