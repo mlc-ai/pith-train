@@ -1,16 +1,6 @@
 """
-The Gated DeltaNet recurrence in plain PyTorch, for the spec-driven GDN tests. Per value head with
-state S of shape (K, V) and scale = K ** -0.5:
-
-    S = S * exp(g_t);  u = beta_t * (v_t - k_t @ S);  S = S + outer(k_t, u);  o_t = scale * q_t @ S
-
-q and k are L2-normalized per head, H key heads serve groups of HV // H consecutive value heads, g
-is the raw (natural-log) gate in fp32 and beta is bf16.
-
-BOUNDS (calc_diff per output) and MAX_ABS (largest absolute error over the reference's largest
-magnitude): about 3x the largest errors measured on the H200 over the spec's cases, listed in
-tests/kernels/test_gated_delta_rule.py. The kernels keep some chunk intermediates in bf16, so these
-are measured, not analytic.
+The Gated DeltaNet recurrence in plain PyTorch, for the spec-driven GDN tests. BOUNDS (calc_diff)
+and MAX_ABS (max abs error over the reference's max magnitude) are about 3x measured on the H200.
 """
 
 import torch
@@ -25,9 +15,7 @@ MAX_ABS = 2.8e-2
 
 def make_inputs(S: int, H: int, hv: int, B: int = 1, seed: int = 0) -> tuple[torch.Tensor, ...]:
     """
-    q / k (B, S, H, D) L2-normalized bf16, v (B, S, hv, D) bf16, g (B, S, hv) fp32, beta (B, S, hv)
-    bf16 and do like v, the gate drawn as the model computes it: -exp(A_log) * softplus(a + dt_bias)
-    with A_log = log U(0, 16).
+    Random q, k, v, g, beta and do, drawn as the model computes them.
     """
     gen = torch.Generator(device="cuda").manual_seed(seed)
     device, bf16 = "cuda", torch.bfloat16
@@ -57,7 +45,7 @@ def per_value_head(x: torch.Tensor, hv: int) -> torch.Tensor:
 
 def naive_gdr(q, k, v, g, beta):
     """
-    The token-by-token recurrence; q / k are per value head, (B, T, HV, D).
+    The token-by-token recurrence, q / k per value head.
     """
     B, T, num_heads, K = q.shape
     scale = K**-0.5
@@ -74,11 +62,7 @@ def naive_gdr(q, k, v, g, beta):
 
 def chunked_reference(q, k, v, g, beta, do, chunk: int = BT) -> tuple[torch.Tensor, dict]:
     """
-    The recurrence's output and autograd gradients (dq, dk per value head) in fp64, in its chunked
-    form, whose autograd stays small at long lengths: within a chunk entering with state S0 and
-    cumulative gate G, U solves (I + A) U = beta * (V - exp(G) * (K S0)) with A[t, i] = beta_t
-    exp(G_t - G_i) k_t . k_i for i < t; o = scale * (exp(G) * (Q S0) + (exp(G_t - G_i) q_t .
-    k_i)_{i <= t} U); the state leaving is exp(G_L) S0 + sum_i exp(G_L - G_i) outer(k_i, u_i).
+    The recurrence's output and autograd gradients in fp64, in chunked form.
     """
     hv = v.shape[2]
     leaves = [per_value_head(q, hv), per_value_head(k, hv), v, g, beta]

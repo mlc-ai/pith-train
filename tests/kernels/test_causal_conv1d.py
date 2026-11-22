@@ -1,25 +1,7 @@
 """
-The Gated DeltaNet's causal depthwise conv at every training shape of
-the spec (family causal_conv1d of tests/kernels/cases.py): causal_conv1d_fwd and
-causal_conv1d_bwd on the (B = mbs, T_local, C) mixed q / k / v channels (C = 8192 for
-Qwen3.5-35B-A3B, 10240 for Qwen3.5-27B), width 4, bf16 x and weight, called as
-pithtrain/operators/causal_conv1d.py and Qwen35MoeGatedDeltaNet.block call them:
-
-- cp == 1: offset 0, the conv's zero padding at the sequence start;
-- cp > 1: offset = width - 1, x led by the width - 1 tokens prepend_conv_state fetches from the
-  previous rank (random history here, as a middle rank holds), whose input gradient the kernel
-  returns too.
-
-Reference: the convolution as its definition in float64, y[b, t, c] = sum_k w[c, k] x[b, t + offset
-- (K - 1) + k, c] (taps at negative positions zero), dx and dw its exact adjoints, each with the sum
-of its terms' magnitudes.
-
-Bounds, elementwise: y and dx are K-term fp32 sums rounded once to bf16, so |got - ref| <= 2^-8
-|ref| (half a bf16 ulp, relative) + K 2^-24 sum|terms| (fp32 accumulation); dw is a B T-term fp32
-reduction rounded once to the weight's bf16, so |got - ref| <= 2^-8 |ref| + 2^-16 sum|terms|: fp32
-blocked reductions of up to 32768 terms stay far inside 2^-16 of the magnitude sum. Largest error /
-bound measured on the H200 over the 24 cases: y 0.996, dx 0.996, dw 0.922, the rounding term dominating
-(the outputs are correctly rounded fp32 sums); each case prints its ratios on a MEASURED line.
+The causal depthwise conv kernels at every training shape of the spec, forward and backward,
+against the convolution in float64. Elementwise analytic bounds: half a bf16 ulp plus fp32
+accumulation error.
 """
 
 import pytest
@@ -48,8 +30,7 @@ def make(case: dict) -> tuple[torch.Tensor, ...]:
 
 def reference(x, weight, grad_out, offset):
     """
-    float64 (y, |y| terms, dx, |dx| terms, dw, |dw| terms) of the definition, channel-blocked so a
-    32k x 10240 sequence stays within a few GB.
+    float64 y, dx, dw of the definition, each with the sum of its terms' magnitudes.
     """
     B, L, C = x.shape
     K, S = weight.shape[-1], L - offset
@@ -67,7 +48,7 @@ def reference(x, weight, grad_out, offset):
             tap = xp[:, offset + k : offset + k + S]  # x[t + offset - (K - 1) + k]
             y[..., ch] += w[ch, k] * tap
             y_abs[..., ch] += (w[ch, k] * tap).abs()
-            # dx[t + offset - (K - 1) + k] += w[k] g[t]: rows of xp shifted back by K - 1
+            # dx[t + offset - (K - 1) + k] += w[k] g[t]
             contrib = torch.zeros_like(xp)
             contrib[:, offset + k : offset + k + S] = w[ch, k] * g
             dx[..., ch] += contrib[:, K - 1 :]

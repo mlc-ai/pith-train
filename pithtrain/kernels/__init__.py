@@ -1,11 +1,7 @@
 """
-PithTrain's kernel library. __all__ is its whole interface: code outside this package imports names
-from pithtrain.kernels, never a submodule. Each name's docstring is its contract, verified against
-PyTorch at the training shapes in tests/kernels (tests/kernels/cases.py). The library picks the SM90 or SM100 implementation
-itself; callers that need to know whether a fused path exists use the capability queries
-fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported,
-gated_delta_rule_cp_supported and chunk_gdr_cp_supported. Importing the package never loads cutlass,
-QuACK or tvm_tirx.
+PithTrain's kernel library. __all__ is its whole interface and each name's docstring its contract;
+it picks the SM90 or SM100 implementation itself, and importing it never loads cutlass, QuACK or
+tvm_tirx.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad

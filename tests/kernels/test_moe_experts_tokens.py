@@ -1,69 +1,8 @@
 """
-The token movement, index math and small reductions around the routed experts of one EP rank, at
-every expert shape of the spec (family moe_experts of tests/kernels/cases.py; the boundary cases
-only matter to the BF16 GEMMs and are left out). Nothing here restates a shape: T, ep, E, top_k, G,
-hidden, inter and the rows of every local expert (group_sizes) come from the case.
-
-Routing. A case gives only the rows per local expert on the busiest rank. Each test synthesizes the
-whole EP group's top-k routing from it: N = T * ep tokens (T per sender), each with top_k distinct
-experts, where the G experts of rank 0 receive exactly group_sizes slots and the other E - G experts
-share the remaining N * top_k - rows slots evenly (each at most N). The slots are laid out expert by
-expert and dealt column-major over a (top_k, N) grid, so a run of one expert (at most N slots) never
-hits a token twice; then the tokens and each token's k columns are shuffled. From it, in plain
-PyTorch, the stage-3 input of rank 0 as the EP dispatch delivers it: at EP 1 the expanded slots in
-token-major order (expert_idxs = topk_ids.view(-1), no expand_idx, no host counts); at EP > 1 the
-received slots sender-major and expert-minor (token order within an expert), the deduplicated
-received tokens (every token of a sender with a pick on rank 0, sender-major, token order), each
-slot's row among them (expand_idx) and the host counts group_sizes. Its per-expert counts are
-asserted to be group_sizes.
-
-Checks (exact unless a bound is given):
-
-- test_token_scatter (cases where training scatters, G > 64: the unfused BF16 path):
-  scatter_by_expert as scatter_for_grouped_gemm calls it; every slot's row copied byte for byte into
-  its expert's first count rows, reverse_shuffle_idxs a bijection onto them, padding and the
-  allocation tail up to 1024 rows zero bytes, offsets and padded sizes exact, token order within an
-  expert (the SM90 kernels place stably).
-- test_scatter_quant (every case, the FP8 path): scatter_quant on the received tokens as
-  fp8_scatter_quant calls it; placement as above, and the rowwise and per-channel FP8 bytes and
-  scales byte-exact against tests/kernels/fp8_reference.py applied to the scattered bf16 rows
-  (rebuilt through reverse_shuffle_idxs), padding included; then fp8_group_indices on its offsets
-  (the hint precompute_group_indices takes): every grouped row's expert.
-- test_bias_kernels (gpt-oss, biases): group_bias_add on the down output (M = padded rows, hidden)
-  bit-identical to y + bias[group] (one fp32 add, one rounding); segment_sum of the gradient (hidden,
-  and 2 * inter where the unfused path's indexed_bias_add runs) with the analytic bound of its fp32
-  accumulation, |sum - exact| <= gamma_n * sum |x| with gamma_n = n u / (1 - n u), u = 2^-24, n =
-  the group's 128-row tiles + 126 (the depth of any order inside a tile, then the tile fold), and
-  the bf16 result exactly the fp32 result rounded once.
-- test_clamped_swiglu (gpt-oss where training runs it, G > 64: gpt-oss-120b at EP 1): forward and
-  backward on the padded grouped (M, 2 * inter) gate_up against float64 of the same bf16 inputs.
-  The contract is fp32 arithmetic rounded once to bf16, so |out - exact| <= half a bf16 ulp of the
-  exact value + 2 * REL * a, a the magnitude the fp32 evaluation works at (|exact| for the forward
-  and the up gradient; |dh| |up_c + 1| (sigma + |alpha gate_c| sigma) for the gate gradient, whose
-  factor 1 + alpha gate_c (1 - sigma) cancels near the swish minimum). The fp32 error REL has no
-  tight analytic value (the sigmoid's exp argument, |alpha gate_c| up to 12, is itself rounded, so
-  its relative error grows with it): REL = 2^-18, about 3x the measured 2^-19.8 (1.11e-6, the
-  smallest REL every case passes; the same in all three outputs). Zero gradients exactly where
-  clamped.
-- test_ep_dispatch (EP > 1): ep_dispatch_send_idx on each sender's T tokens (meta_out as the
-  operator passes it): counts and send_meta exact, the slot and token orders exact against a stable
-  reference, and dispatch_token_idxs[rank start + expand_idx] == idxs // k; then ep_dispatch_recv_idx on rank 0's received metadata and
-  expand_idx segments (the all-to-alls emulated in one process, no communication), exact against
-  plain PyTorch, and end to end: per-expert counts == group_sizes, every received slot resolving to
-  its sender's token and expert.
-- test_bf16_expert_slots (cases with bf16_fused, where bf16_experts_supported(G)): the maps of
-  bf16_expert_group_slots (cu_seqlens, the stable expert-major order, a_idx, row_of, slot_of, the
-  token bitmask), bf16_expert_gather_rows (EP 1, no expand_idx) and bf16_expert_gather_sum (EP > 1,
-  fp32 in ascending local-expert order from zero, rounded once) bit for bit, and for gpt-oss
-  bf16_expert_segment_sum of grad_preact (2 * inter) and of grad_out read through slot_of (hidden)
-  bit for bit against the contract's order (256-row chunks from each segment's start summed row by
-  row in fp32, then the chunk sums in order).
-
-Measured on the H200 over every smoke, spec and stress case (PITHTRAIN_SPEC_ERRORS records them),
-as a fraction of the bound: segment_sum's fp32 error 0.0036 of its analytic bound (worst case,
-gate_up width; 0.0029 at hidden); clamped_swiglu forward 0.998, gate gradient 0.998, up gradient
-0.998, each dominated by its half-ulp term (the bf16 rounding itself), with the fp32 term at 1 /
-3.4 of 2 * REL * a.
+Token scatter, EP dispatch index math, slot maps and small reductions around the routed experts of
+one EP rank, at the spec's moe_experts cases (boundary routing excluded), against plain PyTorch on
+a synthesized top-k routing. Exact, except segment_sum (analytic fp32 bound) and clamped SwiGLU
+(half a bf16 ulp plus an fp32 term).
 """
 
 import pytest
@@ -100,7 +39,7 @@ F64 = torch.float64
 I64 = dict(device="cuda", dtype=torch.int64)
 BF16 = dict(device="cuda", dtype=torch.bfloat16)
 ALPHA, LIMIT = 1.702, 7.0  # gpt-oss clamped SwiGLU; asserted against the case
-REL = 2.0**-18
+REL = 2.0**-18  # clamped SwiGLU fp32 error, about 3x the worst measured (2^-19.8)
 U32 = 2.0**-24
 REALISTIC = lambda c: c["axes"]["routing"] != "boundary"
 
@@ -108,7 +47,7 @@ REALISTIC = lambda c: c["axes"]["routing"] != "boundary"
 @pytest.fixture(autouse=True)
 def empty_cache():
     """
-    Each test starts and ends with an empty allocator cache (the stress cases move GBs of rows).
+    Empty the allocator cache around each test.
     """
     torch.cuda.empty_cache()
     yield
@@ -128,7 +67,7 @@ def cumsum_list(values: list[int]) -> list[int]:
 
 def row_chunks(sizes: list[int], chunk: int = CHUNK):
     """
-    (group, group start, chunk start, chunk end) over grouped rows, chunks inside one group.
+    Yield (group, group start, chunk start, chunk end) over grouped rows, chunks within a group.
     """
     start = 0
     for group, size in enumerate(sizes):
@@ -142,8 +81,7 @@ def row_chunks(sizes: list[int], chunk: int = CHUNK):
 
 def group_topk(case: dict, gen: torch.Generator) -> torch.Tensor:
     """
-    (T * ep, top_k) int64 distinct expert ids per token for the whole EP group (module docstring):
-    rank 0's experts 0 .. G - 1 receive exactly group_sizes slots.
+    Top-k expert ids (T * ep, top_k) of the EP group; rank 0's experts get exactly group_sizes.
     """
     a = case["axes"]
     T, ep, E, k, G = a["T"], a["ep"], a["E"], a["top_k"], a["G"]
@@ -166,8 +104,7 @@ def group_topk(case: dict, gen: torch.Generator) -> torch.Tensor:
 
 def receive(topk: torch.Tensor, T: int, G: int) -> dict:
     """
-    Rank 0's received slots in plain PyTorch: expert (local), the global token of each slot, the
-    slot's row among the deduplicated received tokens (expand), and their count.
+    Rank 0's received slots: local expert, token, row among the deduplicated tokens, their count.
     """
     N, _ = topk.shape
     local = topk < G
@@ -182,8 +119,7 @@ def receive(topk: torch.Tensor, T: int, G: int) -> dict:
 
 def stage3_input(case: dict, gen: torch.Generator) -> dict:
     """
-    What stage 3 of rank 0 hands the expert kernels: expert_idxs (S,), expand_idx (S,) or None, the
-    source row count and the host counts (None at EP 1), as the dispatch delivers them.
+    Rank 0's stage-3 input as the EP dispatch delivers it.
     """
     a = case["axes"]
     T, ep, G = a["T"], a["ep"], a["G"]
@@ -212,8 +148,7 @@ def stable_rank(expert_idxs: torch.Tensor, G: int) -> torch.Tensor:
 
 def check_placement(reverse: torch.Tensor, expert_idxs: torch.Tensor, counts: list[int], ks: list[int], M: int) -> None:  # fmt: skip
     """
-    Each slot inside its expert's first count rows, no two slots on one row, and slots in token order
-    within an expert (SM90 places stably).
+    Each slot in its expert's first count rows, one slot per row, in slot order within an expert.
     """
     assert reverse.dtype == torch.int64 and reverse.shape == expert_idxs.shape
     starts = torch.tensor(cumsum_list(ks)[:-1], **I64)
@@ -246,7 +181,7 @@ def test_token_scatter(case: dict) -> None:
     inp = stage3_input(case, gen)
     expert_idxs = inp["expert_idxs"]
     m = expert_idxs.numel()
-    # the slots' rows, as padded_index_gather (EP > 1) or the top-k expansion (EP 1) gives them
+    # one row per slot
     x = torch.randn(m, H, generator=gen, **BF16)
     ids_before = expert_idxs.clone()
     out, reverse, offs, ks_tensor, ks = scatter_by_expert(x, expert_idxs, G, BLOCK, inp["group_counts"])  # fmt: skip
@@ -269,8 +204,7 @@ def test_token_scatter(case: dict) -> None:
 
 def received_tokens(rows: int, H: int, gen: torch.Generator) -> torch.Tensor:
     """
-    bf16 tokens with per-row magnitudes from 2^-8 to 2^8 and some zero rows, so the block scales
-    vary.
+    bf16 tokens with row magnitudes from 2^-8 to 2^8 and some zero rows.
     """
     x = torch.randn(rows, H, generator=gen, device="cuda")
     x *= torch.exp2(torch.randint(-8, 9, (rows, 1), generator=gen, device="cuda").float())
@@ -320,7 +254,7 @@ def test_scatter_quant(case: dict) -> None:
 
 def grouped_rows(counts: list[int], width: int, gen: torch.Generator, scale: float = 1.0) -> torch.Tensor:  # fmt: skip
     """
-    bf16 (sum of padded counts, width): random rows for each group's real rows, zeros in its padding.
+    bf16 (sum of padded counts, width): random real rows per group, zero padding.
     """
     ks = [pad(c) for c in counts]
     x = torch.zeros(sum(ks), width, **BF16)
@@ -371,7 +305,7 @@ def test_bias_kernels(case: dict) -> None:
         want = (before[start:end].float() + bias[groups[start:end].long()].float()).to(torch.bfloat16)  # fmt: skip
         assert torch.equal(bits(y[start:end]), bits(want)), "group_bias_add is not y + bias[group]"
     del y, before
-    # d_bias_down (the fused FP8 experts' backward), and on the unfused path d_bias_gate_up too
+    # d_bias of down, and of gate_up on the unfused path
     widths = [("down", H)] + ([("gate_up", 2 * inter)] if not a["bf16_fused"] else [])
     for what, width in widths:
         check_segment_sum(case, what, grouped_rows(counts, width, gen), ks)
@@ -429,7 +363,7 @@ def test_clamped_swiglu(case: dict) -> None:
 
 def send_reference(topk_ids: torch.Tensor, ep: int, epr: int) -> dict:
     """
-    Every sender-side output of ep_dispatch_send_idx, placed stably (token order in each bucket).
+    ep_dispatch_send_idx's outputs, placed stably.
     """
     m, k = topk_ids.shape
     flat = topk_ids.reshape(-1)
@@ -476,7 +410,7 @@ def test_ep_dispatch(case: dict) -> None:
         starts = ref["dedup"].cumsum(0) - ref["dedup"]
         assert bool(((expand >= 0) & (expand < ref["dedup"][rank])).all())
         assert torch.equal(dispatch[starts[rank] + expand], idxs // k)
-        # what rank 0 receives from this sender (the operator's all-to-alls)
+        # what rank 0 receives from this sender
         recv_meta.append(send_meta.view(ep, G + 1)[0].clone())
         recv_expand.append(expand[: int(tokens_per_ep_rank[0])].clone())
         dedup_tokens.append(dispatch[: int(dedup[0])] + sender * T)
@@ -488,7 +422,7 @@ def test_ep_dispatch(case: dict) -> None:
     want_expand = recv_expand + dedup_start.repeat_interleave(rows[:, :G].sum(1))
     assert expert_idxs.dtype == expand_idx.dtype == torch.int64
     assert torch.equal(expert_idxs, want_expert) and torch.equal(expand_idx, want_expand)
-    # end to end: rank 0's experts get group_sizes, each slot its sender's token and expert
+    # end to end against the synthesized routing
     recv = receive(topk, T, G)
     assert torch.bincount(expert_idxs, minlength=G).tolist() == a["group_sizes"]
     assert torch.equal(expert_idxs, recv["expert"])  # sender-major, expert-minor
@@ -503,8 +437,7 @@ def test_ep_dispatch(case: dict) -> None:
 
 def segment_sum_order(x: torch.Tensor, cu_host: list[int], idx: torch.Tensor | None) -> torch.Tensor:  # fmt: skip
     """
-    bf16_expert_segment_sum's documented order in plain PyTorch: per segment, 256-row chunks from
-    its start each summed row by row in fp32 from zero, then the chunk sums added in order.
+    bf16_expert_segment_sum's order: per segment, fp32 sums of 256-row chunks, added in order.
     """
     G, n = len(cu_host) - 1, x.shape[1]
     out = torch.zeros(G, n, device="cuda", dtype=torch.float32)
@@ -564,7 +497,7 @@ def test_bf16_expert_slots(case: dict) -> None:
         grad[::7] *= 1000  # a wide dynamic range, so the summation order shows
         out = bf16_expert_gather_sum(grad, maps, G, max_slots)
         assert out.shape == (num_tokens, H) and out.dtype == torch.bfloat16
-        # each token's grouped rows in ascending local expert, padded with -1 to max_slots
+        # each token's grouped rows by local expert, padded with -1
         by_token = torch.argsort(expand_idx * G + expert_idxs)
         token = expand_idx[by_token]
         per_token = torch.bincount(expand_idx, minlength=num_tokens)

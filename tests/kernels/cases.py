@@ -42,44 +42,40 @@ CONFIG_ROOT = REPO_ROOT / "examples" / "pretrain_lm"
 
 CONTEXTS = {4096: (1,), 8192: (1,), 16384: (2, 4), 32768: (4, 8), 65536: (8, 16)}
 """
-Training context (sequence length) -> its CP degrees. CP > 1 only where context / CP >= MIN_LOCAL.
+Training context -> its CP degrees (context / CP >= MIN_LOCAL).
 """
 
 MIN_LOCAL = 4096
 MICRO_BATCH_SIZES = (1, 2, 4)
 """
-Micro-batch sizes at CP 1; a CP > 1 mesh runs micro-batch 1.
+Micro-batch sizes at CP 1; CP > 1 runs micro-batch 1.
 """
 
 EXPERT_PARALLEL = (1, 2, 4, 8, 16)
 
 SIGMA = 0.2
 """
-Log-normal spread of the per-expert token shares (pithtrain/modules/imbalance.py, measured 0.212 on
-Qwen3-30B-A3B).
+Log-normal spread of the per-expert token shares (measured 0.212 on Qwen3-30B-A3B).
 """
 
 HOT_FACTOR = 4
 """
-The skewed routing's hot expert: HOT_FACTOR x the mean rows per local expert (p99 of the measured
-spread is about 2.1x), next to one empty expert.
+The skewed routing's hot expert, in multiples of the mean rows per local expert.
 """
 
 FP8_GROUP_ALIGN = 128
 """
-The FP8 expert path pads every group to a multiple of 128 rows (fp8_quant_grouped's contract).
+Rows the FP8 expert path pads every group to a multiple of.
 """
 
 BF16_FUSED_MAX_GROUPS = 64
 """
-bf16_experts_supported(num_groups): the fused BF16 experts take at most 64 local experts; above it
-training runs F.grouped_mm.
+Most local experts the fused BF16 experts take (bf16_experts_supported).
 """
 
 TUNING_BUCKETS = (3, 17)
 """
-pithtrain/kernels/tuning.py MIN_BUCKET, MAX_BUCKET: the SM90 BF16 expert GEMMs pick their launch
-config per bucket b of rows per expert, [2^b, 2^(b+1)), clamped to these.
+tuning.py's MIN_BUCKET, MAX_BUCKET: buckets [2^b, 2^(b+1)) of rows per expert.
 """
 
 
@@ -89,7 +85,7 @@ config per bucket b of rows per expert, [2^b, 2^(b+1)), clamped to these.
 @dataclass(frozen=True)
 class Projection:
     """
-    One training.Linear of a layer: y (M, n) = x (M, k) @ W.T, run layers times per micro-batch.
+    One training.Linear: y (M, n) = x (M, k) @ W.T, in layers layers.
     """
 
     name: str
@@ -131,21 +127,19 @@ class Experts:
     bias: bool
     gate_up_layout: str
     """
-    separate (two (E, I, H) weights), halves (one (E, 2I, H) weight [gate; up]) or interleaved (one
-    weight, gate / up rows alternating, gpt-oss): it decides the gate_up GEMM width and kernels.
+    separate, halves (one [gate; up] weight) or interleaved (gpt-oss).
     """
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
     """
-    The clamped SwiGLU's alpha (1.702 in pithtrain/models/gpt_oss.py) and limit (config).
+    The clamped SwiGLU's alpha and limit.
     """
 
 
 @dataclass(frozen=True)
 class LinearAttention:
     """
-    Gated DeltaNet: key heads of key_dim, value heads of value_dim, and its causal conv1d over the
-    mixed q / k / v channels.
+    Gated DeltaNet heads and its causal conv1d.
     """
 
     num_key_heads: int
@@ -177,7 +171,7 @@ class Model:
     linear_attention: LinearAttention | None
     swiglu_widths: tuple[tuple[str, int, int], ...] = field(default=())
     """
-    (name, inter, layers) of the dense / shared-expert SwiGLU MLPs (silu_mul at M = tokens).
+    (name, inter, layers) of the dense and shared-expert SwiGLU MLPs.
     """
 
 
@@ -274,8 +268,7 @@ def gpt_oss(cfg: dict) -> dict:
         Projection("v_proj", kv * D, H, L),
         Projection("o_proj", H, heads * D, L),
     )
-    # Alternating sliding (window sliding_window, FA4 left window sliding_window - 1) and full
-    # layers, both with learnable sinks. Ring attention has neither, so gpt-oss runs CP 1 only.
+    # sliding and full layers with sinks; ring attention has neither, so CP 1 only
     attention = Attention(
         heads, kv, D, D, L, window=cfg["sliding_window"], sinks=True, supports_cp=False
     )
@@ -430,7 +423,7 @@ def k(n: int) -> str:
 
 def allowed_ep(model: Model) -> list[int]:
     """
-    EP degrees with whole experts per rank (E % ep == 0); dense models have only EP 1.
+    EP degrees that divide the expert count; EP 1 for dense models.
     """
     if model.experts is None:
         return [1]
@@ -439,7 +432,7 @@ def allowed_ep(model: Model) -> list[int]:
 
 def mesh_rows(model: Model) -> list[tuple[int, int, int]]:
     """
-    (context, cp, mbs) of every mesh the model trains with, before EP.
+    (context, cp, mbs) of every mesh of the model.
     """
     rows = []
     for context, cps in CONTEXTS.items():
@@ -601,17 +594,7 @@ def round_counts(exact: list[float], total: int, cap: int) -> list[int]:
 
 def routing_counts(model: Model, T: int, ep: int, routing: str, seed: int) -> list[int]:
     """
-    Rows per local expert on the busiest EP rank, for T tokens per GPU on each of the ep ranks of
-    the EP group, each token picking top_k distinct experts:
-
-    - balanced: every expert the same share;
-    - lognormal: per-expert shares log-normal with SIGMA over all E experts, the rank whose experts
-      carry the most rows;
-    - skewed: one local expert at HOT_FACTOR x the local mean and one empty, the rest even;
-    - stress: every token of the EP group routes to local expert 0 (its rows = ep * T), the other
-      top_k - 1 picks spread over the remaining experts.
-
-    (The boundary cases of moe_cases set their counts directly.)
+    Rows per local expert on the busiest EP rank for T tokens per GPU under one routing.
     """
     experts = model.experts
     E, top_k, G = experts.num_experts, experts.top_k, experts.num_experts // ep
@@ -697,10 +680,7 @@ def expert_axes(model: Model, T: int, ep: int, routing: str, counts: list[int]) 
 
 def moe_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
     """
-    Per (T, ep) the meshes reach: balanced, lognormal and skewed routing (spec), and stress at the
-    largest EP > 1 of each T (stress tier). Then boundary cases (spec) at both edges of every BF16
-    tuning bucket the realistic routings reach at each EP the fused BF16 path runs (G <= 64): every
-    expert the same rows, 2^b and 2^(b+1) - 1, so the config of every bucket training uses is run.
+    Each (T, EP) under every routing, plus every expert at both edges of each BF16 tuning bucket reached.
     """
     experts = model.experts
     collect = Collector()

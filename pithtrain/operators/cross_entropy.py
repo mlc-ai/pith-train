@@ -1,12 +1,6 @@
 """
-Mean cross-entropy of the lm_head logits, through the log_prob kernels (pithtrain.kernels.log_prob):
-the forward reads the logits once for the per-row statistics and keeps them; the backward
-overwrites them in place with grad_output * (softmax - onehot) / n, computed in fp32 and rounded
-once to the logits' dtype.
-
-The fused cross_entropy_fwd_bwd kernel writes the unscaled gradient during the forward, so a
-grad_output other than 1 cost a second rounding (and, rounded to bf16 first, a bias of up to 2^-9
-on every logits gradient) plus a second pass over the logits.
+Mean cross-entropy of the lm_head logits through the log_prob kernels; the backward overwrites the
+logits with their gradient, rounded once.
 """
 
 import torch
@@ -50,10 +44,7 @@ def cross_entropy(
     ignore_index: int = -100,
 ) -> torch.Tensor:
     """
-    Mean cross-entropy of logits inp (N, V) against target (N,), as a float32 scalar; targets equal
-    to ignore_index are left out (n = max(counted rows, 1)). Computes in fp32. The backward
-    overwrites inp in place with its gradient when inp is row-contiguous (otherwise a contiguous
-    copy), grad_output included before the single rounding to inp's dtype; inp must not be read
-    after the backward.
+    Mean cross-entropy of inp (N, V) against target (N,), ignore_index left out; fp32 scalar. The
+    backward overwrites inp with its gradient, so inp must not be read after it.
     """
     return CrossEntropy.apply(inp, target, ignore_index)

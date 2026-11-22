@@ -1,30 +1,6 @@
 """
-The torch-compiled per-token layers around attention and the experts (family pointwise_layers: no
-pithtrain kernel, Inductor generates them) at every training shape of the spec, each model's own
-module or function compiled as its stages compile it (fullgraph, static shapes, the models'
-Inductor options, TF32 matmuls as training sets them), forward and backward, against float64:
-
-- RMSNorm: the decoder norm on (T, hidden) (torch.nn.RMSNorm, or Qwen3.5's (1 + w) form), and the
-  per-head q / k norms (Qwen3, Qwen3.5) or DeepSeek-V2's kv_a_layernorm; output, input gradient
-  and weight gradient;
-- RoPE: the attention's apply_rotary_posemb on q and k with the model's bf16 cos / sin table
-  (DeepSeek-V2's interleaved rope dims, Qwen3.5's partial rotary), output and input gradients;
-- the router (MoE models): the gate's top-k selection, its weights and their gradients with respect
-  to the hidden states, the router weight and gpt-oss's bias.
-
-Pointwise outputs are checked as a multiple of one bf16 rounding of the exact value plus SLACK x
-the magnitude of their terms; RMSNorm's gradients (through the norm's mean, and the weight's summed
-over T rows) as the worst per-row error relative to the row's largest exact value. The router is
-checked on top of its logits GEMM, whose bf16 (or TF32) rounding is the model's own: its weights
-against float64 from the gate's eager logits, its gradients as the error over the sum of the
-magnitudes of their GEMM terms, and its choice against the exact float64 logits, where it may
-differ only between experts within ROUTE_TIE of each other. Bounds are about 3x the largest values
-measured on the H200 over the smoke and spec tiers (see each constant; one bf16 rounding where the
-measurement is already at it).
-
-Inputs: hidden states N(0, 1) with per-row scales in [0.25, 4], norm weights near their init
-(1 + N(0, 0.1^2), or N(0, 0.1^2) for (1 + w)), q / k N(0, 1), router weights N(0, 1 / hidden) so
-logits are about N(0, 1), gpt-oss bias N(0, 0.1^2), output gradients N(0, 1).
+The torch-compiled per-token layers (RMSNorm, RoPE, the MoE router) at every pointwise_layers
+shape, compiled as the model stages compile them, forward and backward against float64.
 """
 
 import copy
@@ -49,40 +25,31 @@ CONFIG_ROOT = Path(__file__).resolve().parents[2] / "examples" / "pretrain_lm"
 
 SLACK = 2.0**-18
 """
-fp32 error, relative to the magnitude of an output's terms, that may flip one bf16 rounding (the
-fused fp32 arithmetic of a few operations).
+fp32 error, relative to the magnitude of an output's terms, that may flip one bf16 rounding.
 """
 POINTWISE = 1.0
 """
-Multiple of one bf16 rounding (+ SLACK) allowed for RMSNorm and RoPE outputs and RoPE's gradients:
-Inductor fuses each into fp32 arithmetic rounded once. Measured on the H200: at most 0.999.
+Multiple of one bf16 rounding (+ SLACK) allowed for RMSNorm and RoPE outputs and RoPE's gradients.
 """
 ROW_REL = 1.2e-2
 """
 Worst per-row error / the row's largest exact value of RMSNorm's input and weight gradients.
-Measured on the H200: at most 3.89e-3 (dx; dw 3.61e-3).
 """
 ROUTE_TIE = 1.7e-2
 """
-Logit gap, relative to the token's largest |logit|, below which two experts may be ranked either
-way (the bf16 or TF32 rounding of the logits GEMM). Measured on the H200: at most 5.4e-3, with up to
-1.5k of 32k tokens choosing differently from float64.
+Relative logit gap below which two experts may be ranked either way against float64.
 """
 GEMM_COEF = 3.3e-2
 """
-Router gradients (dx, dw, gpt-oss's db): max error / sum |terms| of the GEMM of the float64 logits
-gradient; the compiled backward rounds that gradient to bf16 before its bf16 GEMMs. Measured on
-the H200: at most 1.08e-2 (dx of gpt-oss-20b at T = 16k, B = 4; dw 3.6e-3, db 8.3e-4).
+Router gradients (dx, dw, db): max error / sum |terms| of their GEMM.
 """
 OWN_TIE = 2.0**-20
 """
-Logit gap, relative to the token's largest |logit|, by which a chosen expert may sit below the
-k-th largest of the gate's own logits (fp32 rounding of the scores). Measured on the H200: 0.
+Relative logit gap by which a chosen expert may sit below the k-th of the gate's own logits.
 """
 WEIGHT_ABS = 8e-7
 """
-Absolute error of the router weights (each at most 1) against float64 from the gate's own logits.
-Measured on the H200: at most 2.6e-7.
+Absolute error of the router weights against float64 from the gate's own logits.
 """
 
 
@@ -108,8 +75,7 @@ def compiled(fn):
 @pytest.fixture(autouse=True)
 def stage_setup():
     """
-    A fresh Dynamo cache per case (each shape compiles once, as a stage does) and training's TF32
-    matmul setting (pithtrain.modules.distributed).
+    A fresh Dynamo cache per case and training's TF32 matmul setting.
     """
     torch._dynamo.reset()
     tf32, precision = torch.backends.cuda.matmul.allow_tf32, torch.get_float32_matmul_precision()
@@ -293,8 +259,7 @@ def make_gate(config) -> nn.Module:
 
 def model_logits(config, gate: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """
-    The gate's logits as its forward computes them, eagerly: a bf16 GEMM (Qwen3, Qwen3.5, gpt-oss
-    with its bias) or an fp32 one under training's TF32 setting (DeepSeek-V2).
+    The gate's logits as its forward computes them, eagerly.
     """
     if family(config) == "deepseek_v2":
         return F.linear(x.float(), gate.weight.float())
@@ -321,10 +286,7 @@ def weights_of(config, logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("case", params("pointwise_layers", keep=lambda c: "E" in c["axes"]))
 def test_router(case: dict) -> None:
     """
-    The compiled gate against float64 from the same logits (the GEMM's own rounding is the
-    model's, so the softmax, top-k and normalization are checked on top of it), its gradients as
-    the float64 product of the float64 logits gradient with x and the weight, and its choice
-    against the exact float64 logits up to ROUTE_TIE.
+    The compiled gate's choice, weights and gradients against float64.
     """
     axes = case["axes"]
     config = model_config(case["model"])
@@ -338,7 +300,7 @@ def test_router(case: dict) -> None:
     x = scaled_rows((T, hidden), gen)
     grad = torch.randn(T, top_k, device=DEV, generator=gen)
     leaf = x.clone().requires_grad_(True)
-    # gpt-oss's router forward is a compiled stage of its own; the others run inside stage 1
+    # gpt-oss compiles its router itself
     run = gate if family(config) == "gpt_oss" else compiled(lambda h: gate(h))
     idx, weights, _ = run(leaf)
     weights.backward(grad)
@@ -354,8 +316,7 @@ def test_router(case: dict) -> None:
     with torch.no_grad():
         dlogits = given.grad
 
-        # a choice may differ from the exact top-k only between near-ties of the exact logits, and
-        # from the top-k of the gate's own logits not at all (up to fp32 rounding of the scores)
+        # how far a chosen expert sits below the k-th largest logit
         def gap(logits):
             kth = logits.topk(top_k, dim=-1).values[:, -1]
             return float(((kth - logits.gather(-1, idx).amin(-1)) / logits.abs().amax(-1)).max())
@@ -367,7 +328,6 @@ def test_router(case: dict) -> None:
             own_gap=max(gap(given), 0.0),
             mismatched_tokens=int((exact_idx != idx.sort(-1).values).any(-1).sum()),
             weight=float((weights.double() - ref_weights).abs().max()),
-            # the gradients are GEMMs of the logits' gradient: error / sum |terms|
             dx=gemm_coef(leaf.grad, dlogits @ wd, dlogits.abs() @ wd.abs()),
             dw=gemm_coef(gate.weight.grad, dlogits.T @ xd, dlogits.abs().T @ xd.abs()),
         )

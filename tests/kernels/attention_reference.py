@@ -1,16 +1,13 @@
 """
-Softmax attention and its gradients in plain fp32 PyTorch, computed one block of query rows at a
-time so that sequences of 32k+ tokens fit (no S x S matrix, no autograd), as the reference of the
-spec-driven attention tests. Independent of FlashAttention: the forward is softmax(scale q k^T +
-mask) v with an optional per-head sink logit in the denominator, the backward the textbook
-dV = P^T dO, dP = dO V^T, dS = P * (dP - rowsum(dO * O)), dQ = scale dS K, dK = scale dS^T Q.
+Softmax attention and its gradients in plain fp32 PyTorch, one block of query rows at a time, as
+the reference of the spec-driven attention tests.
 """
 
 import torch
 
 MAX_BLOCK_ELEMENTS = 1 << 26
 """
-Largest (heads x query rows x keys) score block, about 256 MB per fp32 temporary.
+Largest (heads x query rows x keys) score block.
 """
 
 
@@ -28,17 +25,7 @@ def attention_reference(
     lse_in: torch.Tensor | None = None,
 ) -> dict:
     """
-    One sequence: q (Sq, Hq, D), k (Skv, Hkv, D), v (Skv, Hkv, Dv), any float dtype, computed in fp32
-    (TF32 off). Query head h reads key / value head h // (Hq / Hkv).
-
-    - causal: query row i sees keys j <= q_positions[i] (default i + Skv - Sq, FlashAttention's
-      bottom-right alignment); window: also j >= q_positions[i] - window.
-    - sink (Hq,): a logit per head added to every row's softmax denominator, carrying no value.
-    - dout (Sq, Hq, Dv): when given, the gradients too. o_in / lse_in ((Sq, Hq, Dv) / (Hq, Sq)):
-      the output and log-sum-exp the backward uses in place of its own, as a ring step's backward
-      receives the combined ones.
-
-    Returns fp32 out (Sq, Hq, Dv) and lse (Hq, Sq), and with dout dq, dk, dv (and dsink with sink).
+    Attention of one sequence in fp32: out and lse, plus dq, dk, dv (and dsink) when dout is given.
     """
     prev_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False

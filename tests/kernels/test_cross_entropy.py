@@ -1,23 +1,7 @@
 """
-The lm_head loss at every training shape of the spec (family cross_entropy: rows = tokens per GPU on
-the last pipeline stage, the model's full vocab, up to 32768 x 248320 = 8.1e9 logits), against a
-float64 log-softmax computed here in row blocks:
-
-- cross_entropy_fwd_bwd (the kernel, implied grad_output 1): loss to fp32 accuracy, and the
-  gradient (softmax - onehot) / n within one bf16 rounding of the exact value (half an ulp plus
-  GRAD_SLACK x |exact| for the kernel's fp32 arithmetic);
-- the CrossEntropy autograd op (pithtrain.operators.cross_entropy) as training uses it, with a
-  grad_output of 1/3 (not representable in bf16; pretrain_lm scales the loss by num_tokens and the
-  step divides by the global count, so grad_output is rarely a power of two): the gradient
-  g (softmax - onehot) / n within one bf16 rounding too. The op used to multiply the fused
-  kernel's bf16 gradient by grad_output rounded to bf16, rounding twice: measured on the H200 up to
-  2.65x the one-rounding bound and the off-target gradient scaled by 1.0017 .. 1.0019 (bf16(1/3)
-  = 0.333984 is 1/3 + 0.2%). It now runs log_prob_fwd / log_prob_bwd with grad_logp = -g / n in
-  fp32, one rounding;
-- log_prob_fwd / log_prob_bwd at the same shapes (temperature 1): logp and entropy to fp32
-  accuracy, the gradient within one bf16 rounding (measured 0.996x).
-
-Logits are N(0, 2^2) bf16 with about 3% ignored (-100) rows.
+The lm_head loss at every cross_entropy shape against a float64 log-softmax: cross_entropy_fwd_bwd,
+the cross_entropy op with a non-power-of-two grad_output, and log_prob_fwd / log_prob_bwd.
+Losses to fp32 accuracy, gradients within one bf16 rounding.
 """
 
 import pytest
@@ -35,19 +19,15 @@ IGNORE = -100
 
 LOSS_REL = 6e-7
 """
-Relative error of the fp32 mean loss: the per-row logsumexp in fp32 summed over up to 32768 rows in
-fp32; measured at most 1.91e-7 on the H200 (about 3x that).
+Relative error of the fp32 mean loss.
 """
 GRAD_SLACK = 2.0**-16
 """
-fp32 arithmetic of the softmax (exp of x - logsumexp, |x - logsumexp| up to about 30, so a few
-fp32 ulps times 30), relative to the magnitude of the terms of the gradient (scale x p, plus the
-target's 1 and the entropy terms for log_prob), on top of half a bf16 ulp.
+fp32 softmax error relative to the gradient's term magnitudes, on top of half a bf16 ulp.
 """
 STAT_ABS = 6e-6
 """
-Absolute error of the fp32 per-row logp and entropy (values up to about 20); measured at most
-1.93e-6 on the H200 (about 3x that).
+Absolute error of the fp32 per-row logp and entropy.
 """
 
 
@@ -55,7 +35,7 @@ def make_case(case: dict) -> tuple[torch.Tensor, torch.Tensor]:
     rows, vocab = case["axes"]["rows"], case["axes"]["vocab"]
     gen = torch.Generator(device=DEV).manual_seed(rows + vocab)
     logits = torch.empty(rows, vocab, dtype=torch.bfloat16, device=DEV)
-    for start in range(0, rows, 4096):  # draw in fp32 slices: one (rows, V) fp32 temporary is 32 GB
+    for start in range(0, rows, 4096):  # draw in slices to bound the fp32 temporary
         chunk = logits[start : start + 4096]
         chunk.copy_(torch.randn(chunk.shape, device=DEV, generator=gen) * 2.0)
     target = torch.randint(0, vocab, (rows,), device=DEV, generator=gen)
@@ -85,9 +65,7 @@ def exact_ce(logits: torch.Tensor, target: torch.Tensor) -> tuple[float, int]:
 
 def grad_ratio(grad: torch.Tensor, logits: torch.Tensor, target: torch.Tensor, scale: float) -> tuple[float, float]:  # fmt: skip
     """
-    max |grad - exact| / (half_ulp(exact) + GRAD_SLACK scale p) over all logits, exact being
-    scale * (softmax - onehot) on valid rows and 0 on ignored ones; and the systematic scale error
-    of the off-target gradient, <grad, exact> / <exact, exact> - 1 over the non-target logits.
+    Worst gradient error in units of one bf16 rounding, and the off-target gradient's scale bias.
     """
     worst, dot, norm = 0.0, 0.0, 0.0
     for rows, logp, valid, safe in reference_blocks(logits, target):
@@ -100,9 +78,7 @@ def grad_ratio(grad: torch.Tensor, logits: torch.Tensor, target: torch.Tensor, s
         if bool(zero_rows.any()):
             assert bool((grad[rows][zero_rows] == 0).all()), "ignored rows must get zero gradient"
         worst = max(worst, float((err / (tol + 1e-300)).max()))
-        off_target = exact.scatter(
-            1, safe[:, None], 0.0
-        )  # the softmax terms, which vary per element
+        off_target = exact.scatter(1, safe[:, None], 0.0)
         dot += float((grad[rows].double() * off_target).sum())
         norm += float((off_target * off_target).sum())
     return worst, dot / norm - 1.0

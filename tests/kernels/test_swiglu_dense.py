@@ -1,19 +1,6 @@
 """
-silu_mul_fwd / silu_mul_bwd (the eager SwiGLU of the dense and shared-expert MLPs) at every training
-shape of the spec (family swiglu_dense: M = tokens per GPU, the MLP's intermediate width), against
-float64 references written here:
-
-    out = silu(g) * u,  dg = dout * u * s * (1 + g (1 - s)),  du = dout * silu(g),  s = sigmoid(g)
-
-Each output is computed in fp32 and rounded once to bf16 (the contract), so it must lie within half
-a bf16 ulp of the float64 value plus SLACK x the magnitude of its terms, the fp32 error of the
-approximate sigmoid (ex2.approx, div.full) that can flip a rounding near a tie.
-
-The DeepSeek-V2 cases (fp8_swiglu_mlp set: its dense and shared-expert MLPs) also run the whole
-fused FP8 MLP, pithtrain.operators.fp8_swiglu_mlp, forward and backward at M x hidden x inter:
-bit-identical to the unfused FP8Linear -> silu_mul -> FP8Linear path it replaces (its contract:
-y, dx and the three weight gradients), and within FP8_CALC_DIFF of the float64 MLP of the same
-bf16 inputs.
+silu_mul_fwd / silu_mul_bwd at every swiglu_dense shape, within one bf16 rounding of float64; and
+the fused FP8 MLP (fp8_swiglu_mlp), bit-identical to the unfused path and close to float64.
 """
 
 import pytest
@@ -69,9 +56,7 @@ def test_silu_mul(case: dict) -> None:
 
 FP8_CALC_DIFF = 7.5e-3
 """
-calc_diff (1 - 2 <a, b> / (|a|^2 + |b|^2)) of the fused FP8 MLP's outputs against the float64 MLP:
-e4m3 operands (3 mantissa bits) at every GEMM. Measured on the H200 over the smoke and spec tiers:
-at most 2.41e-3 (dw_gate; y 2.19e-3, dx 2.30e-3).
+calc_diff of the fused FP8 MLP's outputs against the float64 MLP.
 """
 
 

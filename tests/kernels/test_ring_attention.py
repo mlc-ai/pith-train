@@ -1,25 +1,7 @@
 """
-The context-parallel ring attention operators end to end, at every CP mesh of the spec (family
-ring_attention of tests/kernels/cases.py): cp ranks, one per GPU (CP 16 on two nodes), each holding
-its zigzag share (blocks r and 2 cp - 1 - r of 2 cp) of B sequences of seq = cp x S_local tokens.
-
-- GQA / MHA models: ring_attention_func(q, k, v), as qwen3 and qwen3.5 call it.
-- DeepSeek-V2 (MLA): mla_ring_attention_func(q_nope, q_pe, normed_kv, k_pe, kv_b weight) with the
-  bf16 kv_b (training.fp8 off), as deepseek_v2.py calls it.
-
-Reference, independent of FlashAttention and of the ring: every rank draws the whole sequence from
-the same seed and computes fp32 causal attention (tests/kernels/attention_reference.py) of its own
-query rows over all keys, with a random output gradient; its partial key / value gradients (and,
-for MLA, the decompression through kv_b in fp32) are summed over the CP group with all_reduce, so
-each rank checks its local output and the gradients of every input it holds, and the kv_b weight
-gradient summed over the ranks.
-
-Checked per output on every rank: finite, and relative L2 error within BOUNDS (about 3x the
-largest error measured on the H200 over all 24 cases, CP 2 .. 16, every rank, listed next to
-each bound: the floor of the bf16 outputs plus, for MLA, the bf16 rounding of the decompressed
-k / v and of the combined ring partials;
-PITHTRAIN_SPEC_ERROR_LOG=<path> appends each rank's errors as JSON lines). Every case is marked
-multigpu: it needs cp GPUs, and too few fails rather than skips (tests/conftest.py).
+The ring attention operators (GQA and MLA) end to end at every CP mesh of the spec, against fp32
+causal attention in plain PyTorch over the whole sequence. Relative L2 error within BOUNDS, about
+3x measured on the H200.
 """
 
 import json
@@ -38,22 +20,22 @@ from tests.kernels.references import rel_l2
 from tests.utilities import launch
 
 BOUNDS = {
-    "out": 9e-3,  # measured 2.84e-3 (ring_attention/qwen3.5-27b/cp8-B1-S8k)
-    "dq": 9e-3,  # measured 2.97e-3 (ring_attention/qwen3-30b-a3b/cp2-B1-S8k)
-    "dk": 9e-3,  # measured 2.97e-3 (ring_attention/qwen3.5-27b/cp2-B1-S8k)
-    "dv": 9e-3,  # measured 2.95e-3 (ring_attention/qwen3.5-27b/cp2-B1-S8k)
-    "dq_nope": 1e-2,  # measured 3.11e-3 (ring_attention/deepseek-v2-lite/cp4-B1-S4k)
-    "dq_pe": 1.15e-2,  # measured 3.69e-3 (ring_attention/deepseek-v2-lite/cp2-B1-S8k)
-    "dnormed_kv": 1.05e-2,  # measured 3.40e-3 (ring_attention/deepseek-v2-lite/cp4-B1-S8k)
-    "dk_pe": 1.25e-2,  # measured 4.06e-3 (ring_attention/deepseek-v2-lite/cp4-B1-S8k)
-    "dkv_b": 8e-3,  # measured 2.56e-3 (ring_attention/deepseek-v2-lite/cp2-B1-S8k)
+    "out": 9e-3,  # measured 2.84e-3
+    "dq": 9e-3,  # measured 2.97e-3
+    "dk": 9e-3,  # measured 2.97e-3
+    "dv": 9e-3,  # measured 2.95e-3
+    "dq_nope": 1e-2,  # measured 3.11e-3
+    "dq_pe": 1.15e-2,  # measured 3.69e-3
+    "dnormed_kv": 1.05e-2,  # measured 3.40e-3
+    "dk_pe": 1.25e-2,  # measured 4.06e-3
+    "dkv_b": 8e-3,  # measured 2.56e-3
 }
-NOPE, ROPE, VDIM, LORA = 128, 64, 128, 512  # DeepSeek-V2-Lite's MLA dims (config.json)
+NOPE, ROPE, VDIM, LORA = 128, 64, 128, 512  # DeepSeek-V2-Lite's MLA dims
 
 
 def zigzag_rows(rank: int, cp: int, seq: int, device) -> torch.Tensor:
     """
-    The global indices of rank's tokens: block rank, then block 2 cp - 1 - rank, of seq / (2 cp).
+    The global indices of rank's zigzag tokens.
     """
     block = seq // (2 * cp)
     front = torch.arange(rank * block, (rank + 1) * block, device=device)
@@ -174,8 +156,7 @@ def run(case: dict) -> None:
     launch(cfg, worker, case)
 
 
-# One function per GPU count, so that -k selects what a run has: CP 2 and 4 fit in 4 GPUs, CP 8 needs
-# a node of 8, CP 16 two nodes (see cases.py).
+# One test per GPU count, so -k selects what a run has.
 @pytest.mark.parametrize("case", params("ring_attention", keep=lambda c: c["axes"]["cp"] <= 4, multigpu=True))  # fmt: skip
 def test_ring_attention(case: dict) -> None:
     run(case)

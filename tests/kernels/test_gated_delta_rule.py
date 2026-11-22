@@ -1,29 +1,7 @@
 """
-Gated DeltaNet at every training shape of the spec (family gated_delta_rule of
-tests/kernels/cases.py): Qwen3.5-35B-A3B (16 key / 32 value heads) and Qwen3.5-27B (16 / 48), dims
-128, the micro-batch folded into the heads (H = 16 mbs, HV = 32 mbs or 48 mbs, value head j reading key
-head j // (HV / H)) as pithtrain/operators/gated_delta_rule.py folds it, at T_local = seq / cp.
-
-- cp == 1: chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned at the folded geometry, T_local 4k and 8k.
-- cp > 1 (multigpu): the operator gated_delta_rule(q, k, v, g, beta, cp_group) on cp ranks, one
-  process per GPU, each holding its contiguous T_local slice of a seq = cp * T_local sequence with
-  the unfolded (mbs, T_local, heads, 128) inputs training passes, forward and backward through
-  autograd; CP 2, 4, 8 and 16 (two nodes).
-
-Inputs are drawn as the model computes them (q, k L2-normalized, gate -exp(A_log) softplus(a +
-dt_bias), beta = sigmoid), by make_inputs of tests/kernels/gdn_reference.py.
-
-Reference: the recurrence in fp64, in its chunked form with autograd (chunked_reference of the same
-file, itself checked there against the token-by-token loop), run over the whole sequence a block of
-value heads at a time (the heads are independent) so that 64k-token sequences fit in memory. It is
-never a pithtrain kernel.
-
-Bounds: tests/kernels/gdn_reference.py's BOUNDS (calc_diff per output) and MAX_ABS (largest absolute
-error over the reference's largest magnitude), about 3x the largest errors measured on the H200 over
-the 24 cases (12 single-GPU, T_local 4k / 8k, HV 32 .. 192; 12 under CP 2 .. 16, every rank):
-calc_diff 5.2e-6 (o), 6.8e-6 (dq), 6.9e-6 (dk), 4.6e-6 (dv), 6.4e-6 (dg), 4.7e-6 (dbeta), and
-9.2e-3 of the reference's largest magnitude (o at CP 16), with no growth with T, the folded head
-count or CP. Each case prints its errors on a MEASURED line (pytest -s).
+Gated DeltaNet at every training shape of the spec, the pinned kernels at CP 1 and the operator
+under CP, forward and backward, against the fp64 chunked recurrence. calc_diff and max abs error
+within gdn_reference's BOUNDS and MAX_ABS.
 """
 
 import pytest
@@ -45,17 +23,13 @@ from tests.utilities import launch
 NAMES = ("o", "dq", "dk", "dv", "dg", "dbeta")
 TOKEN_HEADS_PER_BLOCK = 1 << 21
 """
-Sequence length x value heads the fp64 reference holds at once (its autograd keeps about 2 KB per
-token-head): a 131072-token sequence runs 16 value heads at a time.
+Sequence length x value heads the fp64 reference holds at once.
 """
 
 
 def reference_by_heads(q, k, v, g, beta, do, keep=slice(None), key_grads=False):
     """
-    [o, dq, dk, dv, dg, dbeta] of the fp64 chunked recurrence for B = 1 inputs (q, k with the H
-    key heads), computed a block of value heads at a time; dq and dk per value head, or with
-    key_grads summed over each key head's group (the operator's key-head gradients). Only tokens
-    keep along the sequence are returned, in fp32.
+    The fp64 reference's [o, dq, dk, dv, dg, dbeta] for B = 1, a block of value heads at a time.
     """
     S, H, HV = q.shape[1], q.shape[2], v.shape[2]
     group = HV // H
@@ -75,7 +49,7 @@ def reference_by_heads(q, k, v, g, beta, do, keep=slice(None), key_grads=False):
 
 def errors(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float, bool]:
     """
-    (calc_diff, largest absolute error / the reference's largest magnitude, all finite).
+    (calc_diff, max abs error / the reference's max magnitude, all finite).
     """
     scale = float(ref.abs().max())
     err = float((got.float() - ref).abs().max())
@@ -113,7 +87,7 @@ def cp_worker(case: dict) -> None:
     axes = case["axes"]
     b, T = axes["mbs"], axes["T_local"]
     H, HV, S = axes["H"] // b, axes["HV"] // b, W * T
-    # the whole sequence, identical on every rank (same seed), unfolded as training passes it
+    # the whole sequence, identical on every rank
     q, k, v, g, beta, do = gdn_reference.make_inputs(S, H, HV, B=b, seed=seed_of(case))  # fmt: skip
     mine = slice(rank * T, (rank + 1) * T)
     leaves = [x[:, mine].contiguous().requires_grad_() for x in (q, k, v, g, beta)]
@@ -141,8 +115,7 @@ def run_cp(case: dict) -> None:
     launch(cfg, cp_worker, case)
 
 
-# One function per GPU count, so that -k selects what a run has: CP 2 and 4 fit in 4 GPUs, CP 8 needs
-# a node of 8, CP 16 two nodes (see cases.py).
+# One test per GPU count, so -k selects what a run has.
 @pytest.mark.parametrize("case", params("gated_delta_rule", keep=lambda c: 1 < c["axes"]["cp"] <= 4, multigpu=True))  # fmt: skip
 def test_context_parallel(case: dict) -> None:
     run_cp(case)
@@ -161,8 +134,7 @@ def test_context_parallel_cp16(case: dict) -> None:
 @pytest.mark.smoke
 def test_chunked_reference_is_the_recurrence() -> None:
     """
-    The fp64 chunked reference equals the token-by-token recurrence (in fp64) to rounding, a ragged
-    last chunk included.
+    The fp64 chunked reference equals the token-by-token recurrence, a ragged last chunk included.
     """
     q, k, v, g, beta, do = gdn_reference.make_inputs(150, 16, 32, seed=9)
     ref, ref_grads = gdn_reference.chunked_reference(q, k, v, g, beta, do)

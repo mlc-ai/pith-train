@@ -1,18 +1,6 @@
 """
-The spec itself, checked in the smoke tier (static: no GPU work):
-
-- the mesh rules hold for every model: contexts from 4k, CP > 1 only at context / CP >= 4k and
-  micro-batch 1, EP dividing the expert count (EP 1 for dense models), CP 1 only for gpt-oss;
-- every examples/pretrain_lm/<model>/config.json has cases, a smoke case among them, in every family
-  its architecture launches;
-- every name in pithtrain.kernels.__all__ belongs to a family (or is shape-independent or SM100-only)
-  and every family's kernels exist;
-- every family has its tests/kernels/test_<family>.py (and any test_<family>_<part>.py), each
-  parametrized from params("<family>"), and each of the family's kernels is called there or by a
-  pithtrain operator those tests import;
-- the expert cases reach an empty expert, a group past the SM90 k-grouped split (65536 rows), every
-  local expert count E / ep, and both edges of every BF16 tuning bucket the realistic routings reach
-  at each EP the fused BF16 path runs; their routing is consistent.
+Static smoke checks of the kernel-shape spec (tests/kernels/cases.py): the mesh rules, cases and a
+test for every model and family, every exported kernel in a family, and expert routing coverage.
 """
 
 import ast
@@ -83,8 +71,7 @@ def test_every_kernel_is_in_a_family() -> None:
 
 def imported_sources(path: Path, seen: set[Path]) -> list[str]:
     """
-    The source of every pithtrain module (outside pithtrain.kernels) path imports, following
-    pithtrain.operators modules into the operators they import.
+    Sources of the pithtrain modules a file imports, following pithtrain.operators recursively.
     """
     sources = []
     for node in ast.walk(ast.parse(path.read_text())):

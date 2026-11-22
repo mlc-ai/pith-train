@@ -1,6 +1,5 @@
 """
-Error metrics shared by the spec-driven tests. Each test writes its own reference in plain PyTorch;
-only the ways of comparing against it live here.
+Error metrics shared by the spec-driven kernel tests.
 """
 
 import torch
@@ -8,7 +7,7 @@ import torch
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     """
-    1 - 2 <x, y> / (|x|^2 + |y|^2) in float64, about half the squared relative L2 error.
+    1 - 2 <x, y> / (|x|^2 + |y|^2) in float64.
     """
     x, y = x.double(), y.double()
     den = (x * x + y * y).sum()

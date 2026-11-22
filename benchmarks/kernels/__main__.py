@@ -1,7 +1,7 @@
 """
-Times the kernels at the cases of tests/kernels/cases.py, the same cases the kernel tests verify:
-one tree alone, or a change against a base git ref (--base), which is how a kernel change is judged
-(no baseline is stored).
+Times the kernels at the cases of tests/kernels/cases.py, for this tree alone or against a base git
+ref (--base). Each op is timed over single launches with a cold L2 (median / p10 / p90 us) and
+weighted by its work (FLOPs, or elements read when memory-bound) times its layers.
 
     python -m benchmarks.kernels --base upstream/main --family cross_entropy --out ab.json
     python -m benchmarks.kernels --base upstream/main --family moe_experts --op 'quant|silu'
@@ -10,27 +10,8 @@ one tree alone, or a change against a base git ref (--base), which is how a kern
     python -m benchmarks.kernels --tier spec --shard 3/8 --out shard3.json   (one per GPU)
     python -m benchmarks.kernels --merge shard*.json --out results.json
 
-The default tier is spec (smoke and spec cases; stress with --tier stress). One case runs several
-ops (e.g. the FP8 gate_up forward, its dgrad and wgrad); each op is timed with CUDA events around
-single launches, the L2 flushed before each, after warmup: median / p10 / p90 microseconds. Each op
-also records its work, FLOPs for GEMMs, attention, GDN and conv, and for memory-bound ops
-(quantizations, fused activations, packing, cross entropy) the elements it reads, and the layers
-launching its case, so totals weight every op by its work per step. Correctness is not checked here
-(tests/kernels does). Timings are only comparable on an otherwise idle GPU.
-
---base REF checks the ref out into a worktree (workspace/ab/<sha>, kept for reuse); --base-dir uses
-a directory that already holds one. Two worker processes run on the current GPU, one importing
-pithtrain from the base tree and one from this tree; everything else (the cases, the op builders
-below, which import pithtrain inside their functions, the libraries of this environment) is this
-tree's, so the two differ only in pithtrain. Every case's ops are timed --rounds times on each side,
-alternating which side goes first, and the medians of the rounds compared: speedup = base / head
-(above 1: this tree is faster). Per op name the work-weighted speedup sum(w) / sum(w / speedup),
-w = work x layers, is the ratio of the total time the cases take. The run fails (exit 1) when an op
-that runs at the base fails in this tree or an op name is more than TOLERANCE (5%) slower
-work-weighted. --base-dir . times the tree against itself, the noise floor: on the H200 single ops
-of about 1 GB (gpt-oss-120b's expert weights, its EP 1 activations) then differ by up to 10% either
-way between the two processes, from where their buffers are placed, so judge by the weighted
-speedup, not by one such op.
+--base exits 1 when an op that runs at the base fails here, or an op name is more than 5% slower
+work-weighted; --base-dir . times the tree against itself, the noise floor.
 """
 
 import argparse
@@ -110,10 +91,7 @@ class Timer:
 
 def moe_ops(axes: dict, gen: torch.Generator) -> dict:
     """
-    FP8: the grouped quantization, gate_up and down forward, the down dgrad (the grouped GEMM
-    against the transposed weight), the k-grouped wgrad, and the fused activation quantizations;
-    BF16 fused gate_up and down forward where the fused path runs. Boundary cases (rows at the edges
-    of the BF16 tuning buckets) time only the BF16 GEMMs.
+    The FP8 expert GEMMs and quantizations, and the fused BF16 expert GEMMs where supported.
     """
     from pithtrain.kernels import (
         bf16_expert_down_fwd,
@@ -168,8 +146,7 @@ def moe_ops(axes: dict, gen: torch.Generator) -> dict:
 
 def activation_quant_ops(axes: dict, M: int, offs: torch.Tensor, gen: torch.Generator) -> dict:
     """
-    The fused activation + FP8 quantization between the expert GEMMs, forward and backward, in the
-    model's gate / up layout (separate, the halves of one weight, or gpt-oss's interleaved rows).
+    The fused activation + FP8 quantization between the expert GEMMs, in the model's layout.
     """
     from pithtrain.kernels import (
         fp8_clamped_swiglu_bwd,
@@ -211,8 +188,7 @@ def activation_quant_ops(axes: dict, M: int, offs: torch.Tensor, gen: torch.Gene
 
 def weight_quant_ops(axes: dict, gen: torch.Generator) -> dict:
     """
-    The per-step FP8 weight quantization of one weight (dense, or the (G, N, K) experts of a rank)
-    and the packing of its FP8 bytes with their transpose for the parameter all-gather.
+    The FP8 quantization of one weight and the packing of its bytes for the parameter all-gather.
     """
     from pithtrain.kernels import fp8_pack_transpose, fp8_quant_weight, fp8_quant_weight_grouped
 
@@ -244,8 +220,7 @@ def dense_ops(axes: dict, gen: torch.Generator) -> dict:
 
 def attention_ops(axes: dict, gen: torch.Generator) -> dict:
     """
-    FA4 forward and backward through the interface ring_attention.py and flash_attn_v4.py call, with
-    the strided views of the ring steps.
+    FA4 forward and backward, with the strided views of the ring steps.
     """
     from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
@@ -311,7 +286,7 @@ def gdn_ops(axes: dict, gen: torch.Generator) -> dict:
         return {}
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     do = torch.randn_like(o)
-    flops = 4 * T * HV * K * K * 2  # chunked: ~state update + output per token, order of magnitude
+    flops = 4 * T * HV * K * K * 2  # order of magnitude
     return {
         "chunk_gdr_fwd_pinned": Op(lambda: chunk_gdr_fwd_pinned(q, k, v, g, beta), flops),
         "chunk_gdr_bwd_pinned": Op(
@@ -336,10 +311,7 @@ def conv_ops(axes: dict, gen: torch.Generator) -> dict:
 
 def ce_ops(axes: dict, gen: torch.Generator) -> dict:
     """
-    The lm_head loss as training runs it, pithtrain.operators.cross_entropy forward and backward
-    (grad_output 1 / 3, as a loss scale gives), and the fused cross_entropy_fwd_bwd kernel. Both
-    overwrite the logits with their gradient, so each launch first restores them (the copy is part
-    of the time).
+    The cross_entropy op forward and backward and the fused kernel, each timed with a logits copy.
     """
     from pithtrain.kernels import cross_entropy_fwd_bwd
     from pithtrain.operators.cross_entropy import cross_entropy
@@ -412,8 +384,7 @@ def error_of(error: BaseException) -> dict:
 
 def time_case(case: dict, timer: Timer, pattern: re.Pattern | None) -> dict:
     """
-    {op: timing and work, or {"error": ...}} of the case's ops whose name matches pattern; "*" when
-    the ops cannot be built. An op a kernel rejects fails alone.
+    {op: timing and work, or {"error": ...}} of the case's ops matching pattern ("*": build failed).
     """
     reply, ops = {}, {}
     try:
@@ -463,8 +434,7 @@ def merge(paths: list[Path]) -> dict:
 
 def serve(tree: str) -> None:
     """
-    An A/B worker: pithtrain from tree; one JSON request line in ({"case", "op", "warmup", "reps"}),
-    one JSON line of time_case out.
+    An A/B worker importing pithtrain from tree: one JSON request line in, one time_case line out.
     """
     sys.path.insert(0, tree)
     import pithtrain

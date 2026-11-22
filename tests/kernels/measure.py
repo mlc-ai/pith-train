@@ -1,7 +1,5 @@
 """
-Recording of the errors the spec-driven tests measure, for calibrating their bounds: with
-PITHTRAIN_SPEC_ERRORS=<path> set, every record() call appends one JSON line (case id, output,
-metrics). Re-measure on a new architecture or kernel version before changing a bound.
+Appends measured errors as JSON lines to PITHTRAIN_SPEC_ERRORS, for calibrating bounds.
 """
 
 import json

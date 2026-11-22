@@ -1,19 +1,6 @@
 """
-FP8 weight quantization at every weight the spec's meshes put on a rank (family weight_quant: the
-dense projections, and each EP degree's (G = E / ep, N, K) expert weights), bit-exact against the
-128x128 E8M0 recipe written in tests/kernels/fp8_reference.py:
-
-- fp8_quant_weight (dense) / fp8_quant_weight_grouped (experts): w and w.T per tile;
-- the FP8 parameter all-gather (modules/fp8_param_gather.py) over SHARDS simulated FSDP ranks,
-  sharded on dim 0 as FSDP does (rows of a dense weight, experts of a grouped one; ranks past the
-  end hold nothing): fp8_shard_amax per shard into a zeroed grid (exactly the tiles the shard
-  touches, the max |bf16(x)| over its elements), the MAX reduction over the shards equal to the
-  tile amax of the whole bf16 weight, fp8_scales of it (and its transpose), fp8_shard_cast of each
-  shard whose gather equals the recipe's bytes, fp8_pack_transpose of the gathered weight, and the
-  _multi launches against the single ones.
-
-The master weights are fp32 with values not representable in bf16, so the bf16 rounding the shard
-kernels apply first is exercised.
+FP8 weight quantization at every weight_quant shape, bit-exact against the 128x128 E8M0 recipe:
+fp8_quant_weight(_grouped) and the FP8 parameter all-gather kernels over SHARDS simulated ranks.
 """
 
 import pytest
@@ -72,8 +59,7 @@ def test_quant_weight(case: dict) -> None:
 
 def fsdp_shards(w: torch.Tensor, dense: bool) -> list[tuple[torch.Tensor, int, int]]:
     """
-    (shard (g_local, rows, K) fp32 contiguous, row_offset, group_offset) per non-empty rank, cut on
-    dim 0 like FSDP: chunks of ceil(dim0 / SHARDS).
+    (shard, row_offset, group_offset) per non-empty rank, cut on dim 0 as FSDP does.
     """
     shards = []
     if dense:
@@ -91,8 +77,7 @@ def fsdp_shards(w: torch.Tensor, dense: bool) -> list[tuple[torch.Tensor, int, i
 
 def shard_tile_amax(shard: torch.Tensor, row_offset: int, group_offset: int, grid_shape) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
     """
-    The reference grid of one shard: zeros except the tiles the shard touches, which hold the max
-    |bf16(x)| over the shard's elements in them; and the mask of those tiles.
+    The reference tile-amax grid of one shard (zero outside its tiles) and the mask of its tiles.
     """
     G, R, C = grid_shape
     g_local, rows, K = shard.shape
@@ -131,7 +116,7 @@ def test_param_gather(case: dict) -> None:
     whole_amax = padded.view(G, grid_shape[1], BLOCK, grid_shape[2], BLOCK).amax(dim=(2, 4))
     assert_scale_equal(reduced, whole_amax, "reduced amax")
 
-    # the multi-launch amax over every shard (each into its own grid) matches the single launches
+    # multi-launch amax matches the single launches
     multi_grids = [torch.zeros(grid_shape, dtype=torch.float32, device=DEV) for _ in shards]
     launch = fp8_shard_amax_multi([s for s, _, _ in shards], multi_grids, [r for _, r, _ in shards], [g for _, _, g in shards])  # fmt: skip
     if launch is not None:
@@ -162,8 +147,7 @@ def test_param_gather(case: dict) -> None:
     gathered = torch.cat(outs, dim=1 if dense else 0)
     assert_fp8_equal(gathered, ref, "gathered fp8_shard_cast")
 
-    # pack: the gathered bytes and their per-expert transpose, back to back
-    # gpt-oss-120b's gate_up experts at EP 1 (128 x 5760 x 2880) pack into 4.2e9 bytes, past 2^31
+    # pack: the gathered bytes and their transpose, back to back (may exceed 2^31 bytes)
     packed = torch.empty(2 * gathered.numel(), dtype=torch.uint8, device=DEV)
     fp8_pack_transpose(gathered, packed)
     numel = gathered.numel()

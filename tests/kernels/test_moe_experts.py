@@ -1,57 +1,8 @@
 """
-The routed experts of one EP rank at every training shape of the spec (family moe_experts of
-tests/kernels/cases.py): per case, the local experts G, the rows each receives
-(group_sizes, from balanced, log-normal, skewed, stress and boundary routing) and the model's hidden / inter
-widths. Nothing here restates a shape.
-
-FP8 (every case), mirroring FP8GroupedLinear and the fused FP8 expert ops: each group padded to a
-multiple of 128 rows (zero rows), operands from fp8_quant_grouped / fp8_quant_weight_grouped, and
-
-    gate_up fwd   x @ W_gu[g]^T        N = 2I (fused gate_up: Qwen3.5, gpt-oss) or I (separate
-                                       gate / up weights: DeepSeek-V2-Lite, Qwen3; both run)
-    down fwd      h @ W_down[g]^T      N = H
-    down dgrad    dy @ W_down[g]       through the transposed weight pair, N = I
-    gate_up dgrad dpre @ W_gu[g]       N = H
-    down wgrad    dy_g^T h_g           k_grouped_fp8_gemm into fp8_grouped_wgrad_empty
-    gate_up wgrad dpre_g^T x_g
-
-each against the fp32 product (TF32 off) of the exactly dequantized FP8 operands the kernels were
-given, computed per group in row chunks. Bound per output element:
-
-    |out - ref| <= rel |ref| + coef * (|a| @ |b|)        rel = 2^-8 (bf16 out), 2^-20 (fp32 wgrad)
-
-plus calc_diff over the whole output, and every value finite. Largest values measured on the H200
-over every smoke, spec and stress case, and the bounds (about 3x):
-
-    FP8 grouped GEMM, bf16 out  coef 1.37e-4 (bound 2^-11 = 4.9e-4)  calc_diff 1.39e-6 (bound 5e-6)
-    FP8 k-grouped wgrad, fp32   coef 5.29e-4 (bound 2^-9 = 2.0e-3)   calc_diff 7.82e-9 (bound 3e-8)
-
-The calc_diff floor of a bf16 output is its own rounding (about 1.3e-6 for these inputs), so 5e-6
-leaves room for accumulation order only; the repo's calc_diff < 1e-3 elsewhere is 200x looser. The
-activation-fused quantizations between the GEMMs (test_fp8_expert_activation) are checked element by
-element against float64 activations of the same bf16 inputs (QuantCheck: within half an e4m3 ulp
-plus one bf16 rounding; measured worst 0.941 of that bound, the e4m3 rounding itself), with block
-scales equal to the recipe's; gpt-oss's bias gradient within 2^-8 of the absolute sum (the bf16
-rounding of each summand; measured coef 1.64e-3).
-
-BF16 (cases with bf16_fused, i.e. G <= 64, when bf16_experts_supported(G)): the six fused GEMMs on
-the raw group sizes, gate / up laid out as training holds them (two separate weights for
-DeepSeek-V2-Lite and Qwen3, the halves of one fused weight for Qwen3.5, gpt-oss's interleaved rows
-with biases and its clamped SwiGLU), received tokens read through a random a_idx and the output
-scattered through slot_of (a permutation), against float64: half a bf16 ulp + 7e-6 x sum |products|
-(measured 2.29e-6; calc_diff 1.38e-6, bound 5e-6), and for the fp32 main grads 2 fp32 ulps + 1.6e-4
-x sum |products| (measured 5.29e-5, at 524k rows of one expert: fp32 accumulation error grows with
-the rows summed; calc_diff 1.71e-7, bound 5e-7).
-
-The stress tier passes 2^31 elements in one per-channel output (e.g. the 5760-wide gate_up gradient
-of gpt-oss-20b at T = 32k and EP 16 with every token on one expert): SM90 fp8_quant_grouped and the
-fused activation-quant kernels used to reject it (int32 length of their flat K-major output) and are
-checked there.
-
-The boundary cases (BF16 only) put every expert at one edge of a tuning bucket of the BF16 expert
-GEMMs (pithtrain/kernels/tuning.py: the config is picked per power-of-two bucket of rows per expert),
-for every bucket the realistic routings reach, so each bucket's default config is run at both ends.
-
+Routed expert GEMMs and fused FP8 activation quantizations of one EP rank at the spec's moe_experts
+cases. FP8 GEMMs against the fp32 product of the dequantized operands, BF16 GEMMs against float64,
+both within a per-element bound plus calc_diff (about 3x the worst measured on the H200); the FP8
+activations within half an e4m3 ulp of float64, with the recipe's scales.
 """
 
 import json
@@ -89,8 +40,7 @@ CHUNK = 32768
 F64 = torch.float64
 BF16 = dict(device="cuda", dtype=torch.bfloat16)
 
-# Bounds per output kind (bf16 outputs / fp32 weight gradients), about 3x the largest values measured
-# on the H200 over every smoke, spec and stress case (the module docstring lists them).
+# Bounds per output kind, about 3x the worst measured on the H200.
 FP8_REL = {"bf16": 2.0**-8, "fp32": 2.0**-20}
 FP8_COEF = {"bf16": 2.0**-11, "fp32": 2.0**-9}
 FP8_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-8}
@@ -98,14 +48,13 @@ BF16_REL = {"bf16": 2.0**-8, "fp32": 2.0**-22}
 BF16_COEF = {"bf16": 7e-6, "fp32": 1.6e-4}
 BF16_CALC_DIFF = {"bf16": 5e-6, "fp32": 5e-7}
 FP8 = lambda case: case["axes"]["routing"] != "boundary"  # boundary cases are for the BF16 picker
-ALPHA = 1.702  # gpt-oss clamped SwiGLU; the tests assert the spec's swiglu_alpha / swiglu_limit
+ALPHA = 1.702  # gpt-oss clamped SwiGLU, asserted against the case
 LIMIT = 7.0
 
 
 def record(case: dict, what: str, **values) -> None:
     """
-    Append one measurement to $PITHTRAIN_SPEC_MEASURE.<pid> (JSON lines), for calibrating the
-    bounds.
+    Append one measurement to $PITHTRAIN_SPEC_MEASURE.<pid> for calibrating the bounds.
     """
     path = os.environ.get("PITHTRAIN_SPEC_MEASURE")
     if path:
@@ -116,8 +65,7 @@ def record(case: dict, what: str, **values) -> None:
 @pytest.fixture(autouse=True)
 def no_tf32():
     """
-    fp32 references without TF32, each test starting from an empty allocator cache (the stress
-    cases need most of the GPU).
+    Disable TF32 and empty the allocator cache around each test.
     """
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -129,8 +77,7 @@ def no_tf32():
 
 class Check:
     """
-    Running error statistics of one output, fed chunk by chunk: calc_diff, the smallest coef with
-    |out - ref| <= rel |ref| + coef |a| @ |b| everywhere, and finiteness.
+    Running error statistics of one output: calc_diff, the smallest passing coef, finiteness.
     """
 
     def __init__(self, what: str, rel: float):
@@ -165,8 +112,7 @@ class Check:
 
 def row_chunks(counts: list[int]):
     """
-    (group, group start, chunk start, chunk end) over the grouped rows, chunks of at most CHUNK rows
-    inside one group.
+    Yield (group, group start, chunk start, chunk end) over grouped rows, chunks within a group.
     """
     start = 0
     for group, count in enumerate(counts):
@@ -177,8 +123,7 @@ def row_chunks(counts: list[int]):
 
 def gate_up_layout(case: dict) -> str:
     """
-    How the model holds gate and up (the spec's gate_up_layout): one fused (G, 2I, H) weight
-    (Qwen3.5: halves; gpt-oss: interleaved rows) or two separate weights (DeepSeek-V2-Lite, Qwen3).
+    The case's gate_up_layout: separate, halves or interleaved.
     """
     return case["axes"]["gate_up_layout"]
 
@@ -188,7 +133,7 @@ def gate_up_layout(case: dict) -> str:
 
 def dq_rows(fp8: torch.Tensor, scale: torch.Tensor, start: int, end: int) -> torch.Tensor:
     """
-    Rows [start, end) of a 1x128 rowwise FP8 operand, dequantized exactly to fp32.
+    Rows [start, end) of a 1x128 rowwise FP8 operand, dequantized to fp32.
     """
     K = fp8.shape[1]
     return fp8[start:end].float() * scale[start:end].repeat_interleave(BLOCK, dim=1)[:, :K]
@@ -196,7 +141,7 @@ def dq_rows(fp8: torch.Tensor, scale: torch.Tensor, start: int, end: int) -> tor
 
 def dq_weight(fp8: torch.Tensor, scale: torch.Tensor, group: int) -> torch.Tensor:
     """
-    Expert group of a 128x128 blockwise FP8 weight (G, N, K), dequantized exactly to fp32.
+    One expert of a 128x128 blockwise FP8 weight (G, N, K), dequantized to fp32.
     """
     N, K = fp8.shape[1:]
     full = scale[group].repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
@@ -205,8 +150,7 @@ def dq_weight(fp8: torch.Tensor, scale: torch.Tensor, group: int) -> torch.Tenso
 
 def dq_channels(pair, counts: list[int], group_start: int, group: int, start: int, end: int, channels: int):  # fmt: skip
     """
-    The per-channel FP8 of fp8_quant_grouped for grouped rows [start, end) of one group, as fp32
-    (channels, end - start), from SM90's flat K-major blocks.
+    Rows [start, end) of one group's per-channel FP8, dequantized to fp32 (channels, rows).
     """
     data, scale = pair
     first, last = (start - group_start), (end - group_start)
@@ -218,7 +162,7 @@ def dq_channels(pair, counts: list[int], group_start: int, group: int, start: in
 
 def check_m_grouped(case, what, out, a_pair, w_pair, counts, transposed=False):
     """
-    out[rows of g] = dq(a)[rows] @ dq(w[g])^T, w being (G, N, K) (or its transpose pair).
+    Check out[rows of g] against dq(a)[rows] @ dq(w[g])^T.
     """
     check = Check(what, FP8_REL["bf16"])
     w_dq, w_group = None, -1
@@ -232,7 +176,7 @@ def check_m_grouped(case, what, out, a_pair, w_pair, counts, transposed=False):
 
 def check_k_grouped(case, what, d, a_pair, b_pair, counts, N, K):
     """
-    d[g] (zero start) = dq(a)_g @ dq(b)_g^T over the rows of g, a with N channels, b with K.
+    Check d[g] against dq(a)_g @ dq(b)_g^T over the rows of group g.
     """
     check = Check(what, FP8_REL["fp32"])
     group_start = 0
@@ -252,7 +196,7 @@ def check_k_grouped(case, what, d, a_pair, b_pair, counts, N, K):
 
 def grouped_input(rows: int, width: int, counts: list[int], padded: list[int], gen) -> torch.Tensor:
     """
-    bf16 (sum(padded), width): random rows for each group's real rows, zeros in its padding.
+    bf16 (sum(padded), width): random real rows per group, zero padding.
     """
     x = torch.zeros(sum(padded), width, **BF16)
     start = 0
@@ -273,7 +217,7 @@ def test_fp8_expert_gemms(case: dict) -> None:
     offs = torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).cuda()
     ks_tensor = torch.tensor(ks, dtype=torch.int32, device="cuda")
     gen = torch.Generator(device="cuda").manual_seed(sum(counts) + G)
-    # gate_up projections as the model launches them: one 2I GEMM, or gate and up of I each
+    # one 2I gate_up GEMM, or separate gate and up of I each
     gu_widths = [2 * inter] if gate_up_layout(case) != "separate" else [inter]
     M = sum(ks)
 
@@ -334,8 +278,7 @@ def test_fp8_expert_gemms(case: dict) -> None:
 
 def gate_up_pair(case: dict, G: int, n: int, k: int, gen, dtype=torch.bfloat16, scale: float = 1.0):  # fmt: skip
     """
-    (gate, up), each (G, n, k), in the model's layout: two separate allocations, the halves of one
-    (G, 2n, k) tensor, or its interleaved rows (gpt-oss). Weights and their main grads alike.
+    (gate, up), each (G, n, k), in the model's gate_up layout.
     """
     layout = gate_up_layout(case)
     if layout == "separate":
@@ -478,7 +421,7 @@ def test_bf16_expert_gemms(case: dict) -> None:
 
 def e8m0(amax: torch.Tensor) -> torch.Tensor:
     """
-    The recipe's scale: the power of two at or above max(amax, 1e-4) * fp32(1 / 448).
+    The recipe's E8M0 scale of a block amax.
     """
     raw = amax.float().clamp(min=1e-4) * torch.tensor(1.0 / 448.0, dtype=torch.float32)
     bits = raw.view(torch.int32)
@@ -488,12 +431,7 @@ def e8m0(amax: torch.Tensor) -> torch.Tensor:
 
 class QuantCheck:
     """
-    An FP8 operand of an activation against its float64 value: every element within half an e4m3
-    ulp (2^-4 relative) of the bf16-rounded value plus half the subnormal step of its block scale
-    (scale * 2^-10), with one more bf16 rounding (2^-8) for the kernel's own fp32 arithmetic; and
-    every block scale the recipe's scale of the block's bf16 amax, except where that amax lies
-    within 2^-7 of a scale boundary (where one bf16 rounding of the kernel's arithmetic may cross
-    it). Counts are reported; any element out of bounds fails.
+    An FP8 activation operand against float64: within half an e4m3 ulp, with the recipe's scales.
     """
 
     def __init__(self, what: str):
@@ -501,7 +439,7 @@ class QuantCheck:
 
     def add(self, deq: torch.Tensor, scale_full: torch.Tensor, ref: torch.Tensor) -> None:
         """
-        deq, scale_full and ref are aligned (any 2-D shape); scale_full repeats each block's scale.
+        Check aligned deq and ref; scale_full repeats each block's scale.
         """
         if deq.numel() == 0:
             return
@@ -513,7 +451,7 @@ class QuantCheck:
 
     def add_scales(self, scale: torch.Tensor, amax: torch.Tensor) -> None:
         """
-        scale and amax per block (same shape); amax of the bf16-rounded reference.
+        Check per-block scales against the recipe's scale of the bf16 amax.
         """
         lo, hi = e8m0(amax * (1 - 2.0**-7)), e8m0(amax * (1 + 2.0**-7))
         near = lo != hi
@@ -528,7 +466,7 @@ class QuantCheck:
 
 def check_rowwise(check: QuantCheck, pair, ref_fn, M: int) -> None:
     """
-    A 1x128 rowwise (fp8, scale) against ref_fn(start, end), the float64 rows.
+    Check a 1x128 rowwise (fp8, scale) pair against the float64 rows ref_fn(start, end).
     """
     fp8, scale = pair
     N = fp8.shape[1]
@@ -548,7 +486,7 @@ def check_rowwise(check: QuantCheck, pair, ref_fn, M: int) -> None:
 
 def check_channels(check: QuantCheck, pair, ref_fn, counts: list[int], channels: int) -> None:
     """
-    A per-channel (128 rows x 1 within each group) pair, SM90's K-major layout, against ref_fn rows.
+    Check a per-channel (fp8, scale) pair (SM90 K-major) against the float64 rows of ref_fn.
     """
     data, scale = pair
     for group, group_start, start, end in row_chunks(counts):
@@ -573,12 +511,7 @@ def dsilu_ref(g, u, dh):
 @pytest.mark.parametrize("case", params("moe_experts", keep=FP8))
 def test_fp8_expert_activation(case: dict) -> None:
     """
-    The fused activation + FP8 quantization between the expert GEMMs, as the model runs it:
-    fp8_silu_mul_fwd / _bwd on separate gate and up (DeepSeek-V2-Lite, Qwen3),
-    fp8_silu_mul_gu_fwd / _gu_bwd on the fused gate_up halves (Qwen3.5), and gpt-oss's
-    fp8_clamped_swiglu_rowwise / _kmajor / _bwd with its per-expert bias, each against float64
-    activations of the same bf16 inputs (QuantCheck); gpt-oss's d_bias against the float64
-    per-group sums of the bf16 gradient.
+    The fused activation + FP8 quantization kernels in the model's layout against float64.
     """
     axes = case["axes"]
     G, inter = axes["G"], axes["inter"]
@@ -594,11 +527,11 @@ def test_fp8_expert_activation(case: dict) -> None:
 
     if layout == "interleaved":
         assert (case["axes"]["swiglu_alpha"], case["axes"]["swiglu_limit"]) == (ALPHA, LIMIT)
-        gu = gu * 4  # reach the clamp at |x| = LIMIT (exact in bf16)
+        gu = gu * 4  # reach the clamp
         bias = (torch.randn(G, 2 * inter, device="cuda", generator=gen)).to(torch.bfloat16)
         row_bias = torch.repeat_interleave(bias, torch.tensor(ks, device="cuda"), dim=0, output_size=M)  # fmt: skip
 
-        def z(start, end):  # gate_up + bias, added in fp32 and rounded to bf16 (the contract)
+        def z(start, end):  # gate_up + bias in fp32, rounded to bf16
             return (gu[start:end].float() + row_bias[start:end].float()).to(torch.bfloat16).to(F64)  # fmt: skip
 
         h_fn = lambda s, e: clamped_ref(z(s, e)[:, 0::2], z(s, e)[:, 1::2])
@@ -631,7 +564,7 @@ def test_fp8_expert_activation(case: dict) -> None:
                 part = dgu_fn(start, min(start + CHUNK, group_start + size))
                 ref += part.sum(0)
                 absref += part.abs().sum(0)
-            # each summand rounded to bf16 once: 2^-8 of the absolute sum covers it
+            # one bf16 rounding per summand
             bias_check.add(d_bias[group], ref, absref)
             group_start += size
         bias_check.verify(case, 2.0**-8, None)
@@ -670,8 +603,7 @@ def test_fp8_expert_activation(case: dict) -> None:
 @pytest.mark.smoke
 def test_fp8_check_is_sharp() -> None:
     """
-    The FP8 GEMM check fails a grouped GEMM run against the wrong expert's weights, and one that
-    skipped the activation quantization (the bf16 product): calc_diff < 1e-3 passes the latter.
+    The FP8 GEMM check rejects a wrong-expert GEMM and an unquantized bf16 product.
     """
     case = select("moe_experts", "smoke")[0]
     axes = case["axes"]

@@ -1,33 +1,7 @@
 """
-The FP8 dense linear at every training shape of the spec (family dense_gemm: M = tokens per GPU, N
-and K of each training.Linear), called as FP8Linear calls it (pithtrain/operators/linear.py):
-
-    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(w)
-    y, xt_fp8, xt_scale = fp8_gemm_fwd(x, w_fp8, w_scale)           x quantized by fp8_quant_act
-    dx, dw = fp8_gemm_bwd(dy, wt_fp8, wt_scale, xt_fp8, xt_scale, K)  dy quantized by fp8_quant_grad
-
-Checked against references written here (tests/kernels/fp8_reference.py), not against other kernels:
-
-- the quantized operands, bit-exact: fp8_quant_weight's w (128x128) and w.T, fp8_quant_act's x
-  (1x128) and x.T (128x128), fp8_quant_grad's dy and dy.T (1x128);
-- each GEMM output against the fp32 product of the exactly dequantized FP8 operands (the GEMM's
-  own input), elementwise: |out - ref| <= half a bf16 ulp of ref + ACCUM * (|a| @ |b|)_ij, the
-  bf16 rounding of the result plus the accumulation error of FP8 tensor-core GEMMs, proportional
-  to the sum of absolute products; and calc_diff(out, ref) <= EXACT_CALC_DIFF;
-- each GEMM output against the fp32 product of the unquantized bf16 operands (what the layer
-  approximates): calc_diff <= BF16_CALC_DIFF, the error of quantizing both operands to e4m3.
-
-Bounds, about 3x the largest errors measured on the H200 over every smoke and spec case (seed 0,
-recorded with PITHTRAIN_SPEC_ERRORS): see ACCUM, EXACT_CALC_DIFF and BF16_CALC_DIFF below.
-
-Weight-gradient precision: fp8_gemm_bwd returns weight_grad in bf16 (the dtype of dy), and FP8Linear
-hands it to autograd as the bf16 weight's gradient. Unlike BF16Linear, GroupedLinear and
-FP8GroupedLinear, FP8Linear gets no fp32 main_grad from install_wgrad_accumulation
-(modules/wgrad_accumulation.py), so every micro-batch's dense FP8 weight gradient is rounded to bf16
-before the fp32 sum across micro-batches: a relative L2 error of 1.7e-3 per micro-batch term
-(calc_diff 1.39e-6, all of it the bf16 rounding; the GEMM's own accumulation error is an order
-smaller). test_wgrad_bf16_rounding pins that cost down: the accumulated gradient stays within the
-sum of the per-term bf16 roundings (measured at most 0.37 of it).
+The FP8 dense linear (fp8_quant_weight, fp8_gemm_fwd, fp8_gemm_bwd) at every dense_gemm shape.
+Quantized operands are checked bit-exact; GEMM outputs against fp32 products of the dequantized
+and of the bf16 operands.
 """
 
 import pytest
@@ -57,19 +31,15 @@ ROWS_PER_CHUNK = 4096
 
 ACCUM = 3e-4
 """
-Accumulation error per unit of sum |a_k b_k|, beyond the output's bf16 rounding; measured at most
-9.9e-5 (y), 9.1e-5 (dx), 2.2e-5 (dw) on the H200.
+Accumulation error per unit of sum |a_k b_k|, beyond the output's bf16 rounding.
 """
 EXACT_CALC_DIFF = 3e-6
 """
-calc_diff against the exact-dequant product: the bf16 rounding of the output alone gives 1.39e-6
-(measured 1.39e-6 at every shape, so the accumulation adds nothing visible); about twice that.
+calc_diff against the exact-dequant product (bf16 rounding alone gives 1.39e-6).
 """
 BF16_CALC_DIFF = 2e-3
 """
-calc_diff against the bf16 product: e4m3 keeps 3 mantissa bits (relative error up to 2^-4, about
-2.6% rms for normal inputs), so each operand contributes about 3.4e-4, the product about 7e-4
-(measured at most 7.15e-4).
+calc_diff against the bf16 product, from quantizing both operands to e4m3.
 """
 
 
@@ -146,8 +116,7 @@ def test_fp8_linear(case: dict) -> None:
     assert_fp8_equal(wt_fp8, ref_w.T.contiguous(), "wt_fp8")
     assert_scale_equal(wt_scale, ref_w_scale.T.contiguous(), "wt_scale")
 
-    # activation: 1x128 rows of x (checked through fp8_quant_act, which fp8_gemm_fwd calls) and
-    # 128x128 tiles of x.T (returned by fp8_gemm_fwd)
+    # activation: 1x128 rows of x and 128x128 tiles of x.T
     x_fp8, x_scale, _, _ = fp8_quant_act(x)
     ref_x, ref_x_scale = quant_rowwise(x)
     assert_fp8_equal(x_fp8, ref_x, "x_fp8")
@@ -189,11 +158,7 @@ WGRAD_CASES = [c for c in params("dense_gemm") if c.values[0]["tier"] == "smoke"
 @pytest.mark.parametrize("case", WGRAD_CASES)
 def test_wgrad_bf16_rounding(case: dict) -> None:
     """
-    Accumulating MICROBATCHES micro-batches of weight gradients in fp32 from fp8_gemm_bwd's bf16
-    weight_grad (training today) against accumulating the exact-dequant fp32 products: the error
-    must stay within the bf16 rounding of each term (half an ulp of each partial product, summed),
-    i.e. the bf16 hand-off loses precision but does not bias or blow up. Records the relative L2
-    error of the accumulated gradient so the cost is visible.
+    The fp32 sum of bf16 weight gradients over micro-batches stays within their bf16 roundings.
     """
     microbatches = 4
     axes = case["axes"]

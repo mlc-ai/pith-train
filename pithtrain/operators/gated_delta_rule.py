@@ -261,11 +261,8 @@ def dense_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
     gated_delta_rule_pinned_supported first.
 
     CuTe kernels on SM90 and TIRx kernels on SM100, on the chunk algorithm of FLA 0.5.2 at every
-    length (a length that is not a multiple of 64 runs as if zero-padded to one). The output and the
-    gradients match the fp64 recurrence to the bounds of tests/kernels/gdn_reference.py
-    (tests/kernels/test_gated_delta_rule.py). On SM100 a beta below 2^-20 runs as 2^-20 in both directions (see chunk_gdr_fwd_pinned): the
-    output differs from the recurrence only by such a beta's own term, and dbeta there is the
-    gradient at 2^-20.
+    length (a length that is not a multiple of 64 runs as if zero-padded to one). On SM100 a beta
+    below 2^-20 runs as 2^-20 in both directions (see chunk_gdr_fwd_pinned).
     """
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     B, S, H, K = k.shape

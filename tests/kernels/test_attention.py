@@ -1,29 +1,7 @@
 """
-FlashAttention-4 at every attention launch of the spec (family attention of tests/kernels/cases.py),
-against fp32 attention in plain PyTorch (tests/kernels/attention_reference.py), forward and backward
-with a random output gradient.
-
-Each case is launched the way training launches it:
-
-- dense: flash_attn_func on (B, S, H, D), causal, as the models call it at CP 1 (gpt-oss with its
-  sliding window (window, 0) or full, and a bf16 sink logit per head; DeepSeek-V2's MLA after
-  decompression: D = 192, Dv = 128, Hkv = Hq);
-- varlen: flash_attn_varlen_func over the case's packed documents (cu_seqlens);
-- ring_diag / ring_front / ring_back: the three FA4 calls of one zigzag ring step
-  (pithtrain/operators/ring_attention.py) with the same arguments: step 0 causal over the local
-  2 blocks; front: all local queries over k[:, :block], v[:, :block] (strided views); back: the
-  q[:, block:] view over the remote 2 blocks. The forward returns out and lse; the backward takes,
-  as in the ring, an output and log-sum-exp that are not its own forward's (the ring passes the
-  combined ones): here the forward's out and its lse + LSE_SHIFT, and the reference uses the same.
-
-Checked per output: finite, and the relative L2 error (out, dq, dk, dv, dsink) or the largest
-absolute error (lse) within BOUNDS. Setting PITHTRAIN_SPEC_ERROR_LOG=<path> appends each case's
-measured errors there (JSON lines), which is how BOUNDS were calibrated: about 3x the largest error
-measured on the H200 over all 88 smoke and spec cases, listed next to each bound. The measured
-errors sit at the floor of rounding the outputs to bf16 (a relative L2 of about 2^-9 for unit
-normal values), so a wrong mask, scale or accumulation on as little as about 1% of the output
-exceeds them; the repo's earlier bounds (1e-2 forward, 2e-2 backward, at S = 1024 only) were
-about 4-8x looser.
+FlashAttention-4 at every attention launch of the spec (dense, varlen and ring-step calls), forward
+and backward, against fp32 attention in plain PyTorch. Relative L2 error (max abs error for lse)
+within BOUNDS, about 3x measured on the H200.
 """
 
 import json
@@ -39,12 +17,12 @@ from tests.kernels.cases import params, seed_of
 from tests.kernels.references import rel_l2
 
 BOUNDS = {
-    "out": 7e-3,  # measured 2.31e-3 (attention/qwen3.5-27b/ring_back-B1-q4k-kv8k)
-    "lse": 9e-6,  # largest absolute error, measured 2.86e-6 (attention/qwen3.5-27b/ring_diag-B1-q8k-kv8k)
-    "dq": 7.5e-3,  # measured 2.49e-3 (attention/qwen3.5-35b-a3b/varlen-4k)
-    "dk": 7.5e-3,  # measured 2.48e-3 (attention/qwen3.5-35b-a3b/varlen-4k)
-    "dv": 7.5e-3,  # measured 2.37e-3 (attention/qwen3.5-27b/ring_diag-B1-q8k-kv8k)
-    "dsink": 1e-2,  # measured 3.03e-3 (attention/gpt-oss-20b/dense-B2-q8k-kv8k-w127)
+    "out": 7e-3,  # measured 2.31e-3
+    "lse": 9e-6,  # max abs error, measured 2.86e-6
+    "dq": 7.5e-3,  # measured 2.49e-3
+    "dk": 7.5e-3,  # measured 2.48e-3
+    "dv": 7.5e-3,  # measured 2.37e-3
+    "dsink": 1e-2,  # measured 3.03e-3
 }
 LSE_SHIFT = 0.5
 ERROR_LOG = os.environ.get("PITHTRAIN_SPEC_ERROR_LOG")
@@ -56,7 +34,7 @@ def randn(gen: torch.Generator, *shape: int, dtype=torch.bfloat16) -> torch.Tens
 
 def check(case: dict, got: dict, want: dict) -> None:
     """
-    Compares each output got has against want; logs the errors, then asserts the bounds.
+    Logs each output's error against want, then asserts the bounds.
     """
     errors = {}
     for name, value in got.items():
@@ -134,8 +112,7 @@ def run_varlen(case: dict, gen: torch.Generator) -> None:
 
 def run_ring_step(case: dict, gen: torch.Generator) -> None:
     """
-    One zigzag ring step's FA4 forward and backward, called exactly as zigzag_forward /
-    zigzag_backward call them.
+    One zigzag ring step's FA4 forward and backward, called as the ring calls them.
     """
     a = case["axes"]
     kind, B, Hq, Hkv, D, Dv = a["kind"], a["B"], a["Hq"], a["Hkv"], a["D"], a["Dv"]
@@ -157,7 +134,7 @@ def run_ring_step(case: dict, gen: torch.Generator) -> None:
     out, lse, *_ = _flash_attn_fwd(q_call, k_call, v_call, softmax_scale=scale, causal=causal, return_lse=True)  # fmt: skip
     dout = randn(gen, *out.shape)
     lse_in = lse + LSE_SHIFT
-    if kind == "ring_back":  # the backward's back-block operands are contiguous copies
+    if kind == "ring_back":  # contiguous copies, as the ring passes them
         dq, dk, dv = _flash_attn_bwd(q_call.contiguous(), k_call, v_call, out.contiguous(), dout.contiguous(), lse_in.contiguous(), softmax_scale=scale, causal=False)  # fmt: skip
     else:
         dq, dk, dv = _flash_attn_bwd(q_call, k_call, v_call, out, dout, lse_in, softmax_scale=scale, causal=causal)  # fmt: skip
