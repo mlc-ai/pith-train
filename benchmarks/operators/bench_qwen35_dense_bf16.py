@@ -192,7 +192,13 @@ def cases(args, config):
         run(f"{name}-mix", lambda: layer.forward_stage1(x, pos)[0], leaves, mix_flops)
 
     if {"all", "delta-core", "fla"}.intersection(args.cases):
-        q, k = [random_tensor(b, s, gk, kd) for _ in range(2)]
+        q, k = [
+            F.normalize(random_tensor(b, s, gk, kd).float(), dim=-1)
+            .bfloat16()
+            .detach()
+            .requires_grad_()
+            for _ in range(2)
+        ]
         v = random_tensor(b, s, gv, vd)
         g = -torch.rand(b, s, gv, device="cuda")
         beta = torch.rand(b, s, gv, device="cuda", dtype=torch.bfloat16)
@@ -250,7 +256,9 @@ def cases(args, config):
         norm_compiled = torch.compile(norm, fullgraph=True)
         run("norm-compiled", lambda: norm_compiled(x), (x, *norm.parameters()))
 
-    if {"all", "embedding", "head", "head-chunk", "head-native"}.intersection(args.cases):
+    if {"all", "embedding", "head", "head-chunk", "head-native", "head-torch"}.intersection(
+        args.cases
+    ):
         ids = torch.randint(vocab, (b, s), device="cuda")
         labels = ids.flatten().roll(-1)
         labels[::17] = -100
@@ -286,6 +294,17 @@ def cases(args, config):
             return sum(losses) / weights
 
         run("head-chunk", chunked, leaves, 6 * h * vocab)
+        chunk_options = nn.LinearCrossEntropyOptions(
+            batch_chunk_size=args.chunk, chunking_method=None
+        )
+
+        def torch_chunked():
+            normalized = norm(x).flatten(0, 1)
+            return F.linear_cross_entropy(
+                normalized, head.weight, labels, reduction="sum", options=chunk_options
+            ) / (labels != -100).sum().clamp_min(1)
+
+        run("head-torch", torch_chunked, leaves, 6 * h * vocab)
 
     for out_features, in_features in dict.fromkeys(
         [
