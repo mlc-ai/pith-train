@@ -95,6 +95,9 @@ class DenseFSDPCfg(SlottedDefault):
     checkpoint_blocks: int | None = None
     """Apply the chosen block checkpoint to this many leading decoder blocks, or all by default."""
 
+    checkpoint_mlp_tail: int = 0
+    """Limit selective checkpointing to the MLP in this many trailing checkpointed blocks."""
+
     recompute_mlp_blocks: int = 0
     """Recompute the stock MLP in this many leading decoder blocks."""
 
@@ -328,6 +331,11 @@ def shard_dense_model(
             raise ValueError("checkpoint_blocks requires activation checkpointing")
         if not 1 <= cfg.checkpoint_blocks <= len(model.layers):
             raise ValueError("dense_fsdp.checkpoint_blocks must be within the decoder depth")
+    checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
+    if not 0 <= cfg.checkpoint_mlp_tail <= checkpoint_blocks:
+        raise ValueError("checkpoint_mlp_tail must be within the checkpointed decoder depth")
+    if cfg.checkpoint_mlp_tail and (cfg.activation_checkpoint != "selective" or cfg.compile_blocks):
+        raise ValueError("checkpoint_mlp_tail requires selective checkpointing of the stock stages")
     if not 0 <= cfg.recompute_mlp_blocks <= len(model.layers):
         raise ValueError("dense_fsdp.recompute_mlp_blocks must be within the decoder depth")
     if cfg.recompute_mlp_blocks and (cfg.compile_blocks or cfg.activation_checkpoint != "none"):
@@ -355,7 +363,6 @@ def shard_dense_model(
         compile_options = list_mode_options(cfg.compile_mode)
         if cfg.compile_mode in ("default", "reduce-overhead"):
             compile_options |= stage_compile_options()
-    checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
     checkpoint_contexts = (
         traced_selective_checkpoint_contexts
         if trace_recompute and not cfg.compile_blocks
@@ -374,9 +381,18 @@ def shard_dense_model(
                 if cfg.activation_checkpoint == "selective"
                 else {}
             )
-            layer.forward = partial(
-                checkpoint, layer.forward, use_reentrant=False, preserve_rng_state=False, **ctx
-            )
+            if index >= checkpoint_blocks - cfg.checkpoint_mlp_tail:
+                layer.forward_stage3 = partial(
+                    checkpoint,
+                    layer.forward_stage3,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    **ctx,
+                )
+            else:
+                layer.forward = partial(
+                    checkpoint, layer.forward, use_reentrant=False, preserve_rng_state=False, **ctx
+                )
         if cfg.compile_blocks:
             layer.forward = torch.compile(
                 layer.forward,
