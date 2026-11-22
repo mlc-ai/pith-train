@@ -11,14 +11,14 @@ head j // (HV / H)) as pithtrain/operators/gated_delta_rule.py folds it, at T_lo
   autograd; CP 2, 4 and 8.
 
 Inputs are drawn as the model computes them (q, k L2-normalized, gate -exp(A_log) softplus(a +
-dt_bias), beta = sigmoid), by make_inputs of tests/kernels/test_gated_delta_rule_pinned.py.
+dt_bias), beta = sigmoid), by make_inputs of tests/spec/gdn_reference.py.
 
 Reference: the recurrence in fp64, in its chunked form with autograd (chunked_reference of the same
 file, itself checked there against the token-by-token loop), run over the whole sequence a block of
 value heads at a time (the heads are independent) so that 128k-token sequences fit in memory. It is
 never a pithtrain kernel.
 
-Bounds: those of the pinned verifier (BOUNDS: calc_diff per output; MAX_ABS: largest absolute error
+Bounds: those of tests/spec/gdn_reference.py (BOUNDS: calc_diff per output; MAX_ABS: largest absolute error
 within 2e-2 of the reference's largest magnitude), calibrated there at T <= 8192 and checked here up
 to T_local = 32k and folded heads up to 4x, and over 128k-token CP sequences. Largest errors
 measured on the H200 over the 25 single-GPU cases (T_local 1k .. 32k, HV 32 .. 192): calc_diff
@@ -42,6 +42,7 @@ from pithtrain.kernels import (
 )
 from pithtrain.modules.distributed import DistributedCfg
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
+from tests.spec import gdn_reference
 from tests.spec.cases import spec_params
 from tests.utilities import launch
 
@@ -51,16 +52,6 @@ TOKEN_HEADS_PER_BLOCK = 1 << 21
 Sequence length x value heads the fp64 reference holds at once (its autograd keeps about 2 KB per
 token-head): a 131072-token sequence runs 16 value heads at a time.
 """
-
-
-def pinned_verifier():
-    """
-    tests/kernels/test_gated_delta_rule_pinned.py, imported on first use (it probes the GPU at
-    import, which a spawned worker must do only after setup_distributed picked its device).
-    """
-    from tests.kernels import test_gated_delta_rule_pinned
-
-    return test_gated_delta_rule_pinned
 
 
 def seed_of(case: dict) -> int:
@@ -74,14 +65,13 @@ def reference_by_heads(q, k, v, g, beta, do, keep=slice(None), key_grads=False):
     key_grads summed over each key head's group (the operator's key-head gradients). Only tokens
     keep along the sequence are returned, in fp32.
     """
-    verifier = pinned_verifier()
     S, H, HV = q.shape[1], q.shape[2], v.shape[2]
     group = HV // H
     block = max(group, min(HV, TOKEN_HEADS_PER_BLOCK // S) // group * group)
     outs = [[] for _ in NAMES]
     for start in range(0, HV, block):
         values, keys = slice(start, start + block), slice(start // group, (start + block) // group)
-        ref, grads = verifier.chunked_reference(q[:, :, keys], k[:, :, keys], *(t[:, :, values] for t in (v, g, beta, do)))  # fmt: skip
+        ref, grads = gdn_reference.chunked_reference(q[:, :, keys], k[:, :, keys], *(t[:, :, values] for t in (v, g, beta, do)))  # fmt: skip
         dq, dk = grads["dq"], grads["dk"]
         if key_grads:
             dq, dk = (x.view(1, S, -1, group, x.shape[-1]).sum(3) for x in (dq, dk))
@@ -95,21 +85,19 @@ def errors(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float, bool]:
     """
     (calc_diff, largest absolute error / the reference's largest magnitude, all finite).
     """
-    verifier = pinned_verifier()
     scale = float(ref.abs().max())
     err = float((got.float() - ref).abs().max())
-    return verifier.calc_diff(got, ref), err / scale if scale else err, bool(torch.isfinite(got).all())  # fmt: skip
+    return gdn_reference.calc_diff(got, ref), err / scale if scale else err, bool(torch.isfinite(got).all())  # fmt: skip
 
 
 def failures_of(label: str, got: list, ref: list) -> list[str]:
-    verifier = pinned_verifier()
     failures = []
     for name, x, y in zip(NAMES, got, ref):
         assert x.shape == y.shape, (label, name, x.shape, y.shape)
         diff, rel_max, finite = errors(x, y)
         print(f"MEASURED {label} {name} calc_diff={diff:.3e} max_abs/ref_max={rel_max:.3e}")
-        if not (finite and diff < verifier.BOUNDS[name] and rel_max <= verifier.MAX_ABS):
-            failures.append(f"{label} {name}: calc_diff {diff:.2e} (bound {verifier.BOUNDS[name]:.0e}), max abs {rel_max:.2e} of ref max (bound {verifier.MAX_ABS:.0e}), finite {finite}")  # fmt: skip
+        if not (finite and diff < gdn_reference.BOUNDS[name] and rel_max <= gdn_reference.MAX_ABS):
+            failures.append(f"{label} {name}: calc_diff {diff:.2e} (bound {gdn_reference.BOUNDS[name]:.0e}), max abs {rel_max:.2e} of ref max (bound {gdn_reference.MAX_ABS:.0e}), finite {finite}")  # fmt: skip
     return failures
 
 
@@ -117,8 +105,7 @@ def failures_of(label: str, got: list, ref: list) -> list[str]:
 def test_pinned_at_training_shapes(case: dict) -> None:
     axes = case["axes"]
     S, H, HV = axes["T_local"], axes["H"], axes["HV"]
-    verifier = pinned_verifier()
-    q, k, v, g, beta, do = verifier.make_inputs(S, H=H, gate="model", seed=seed_of(case), hv=HV)
+    q, k, v, g, beta, do = gdn_reference.make_inputs(S, H, HV, seed=seed_of(case))
     assert gated_delta_rule_pinned_supported(q, k, v, g, beta), case["id"]
     o, g_cum, A = chunk_gdr_fwd_pinned(q, k, v, g, beta)
     dq, dk, dv, dg, dbeta = chunk_gdr_bwd_pinned(q, k, v, g_cum, beta, A, do)
@@ -134,9 +121,8 @@ def cp_worker(case: dict) -> None:
     axes = case["axes"]
     b, T = axes["mbs"], axes["T_local"]
     H, HV, S = axes["H"] // b, axes["HV"] // b, W * T
-    verifier = pinned_verifier()
     # the whole sequence, identical on every rank (same seed), unfolded as training passes it
-    q, k, v, g, beta, do = verifier.make_inputs(S, H=H, B=b, gate="model", seed=seed_of(case), hv=HV)  # fmt: skip
+    q, k, v, g, beta, do = gdn_reference.make_inputs(S, H, HV, B=b, seed=seed_of(case))  # fmt: skip
     mine = slice(rank * T, (rank + 1) * T)
     leaves = [x[:, mine].contiguous().requires_grad_() for x in (q, k, v, g, beta)]
     o = gated_delta_rule(*leaves, cp_group=group)
@@ -164,3 +150,20 @@ def test_context_parallel_at_training_shapes(case: dict) -> None:
     cfg = DistributedCfg()
     cfg.context_parallel_size = case["axes"]["cp"]
     launch(cfg, cp_worker, case)
+
+
+@pytest.mark.smoke
+def test_chunked_reference_is_the_recurrence() -> None:
+    """
+    The fp64 chunked reference equals the token-by-token recurrence (in fp64) to rounding, a ragged
+    last chunk included.
+    """
+    q, k, v, g, beta, do = gdn_reference.make_inputs(150, 16, 32, seed=9)
+    ref, ref_grads = gdn_reference.chunked_reference(q, k, v, g, beta, do)
+    leaves = [gdn_reference.per_value_head(q, 32), gdn_reference.per_value_head(k, 32), v, g, beta]
+    leaves = [x.detach().double().requires_grad_() for x in leaves]
+    naive = gdn_reference.naive_gdr(*leaves)
+    naive.backward(do.double())
+    torch.testing.assert_close(ref, naive.detach(), rtol=1e-9, atol=1e-9)
+    for name, leaf in zip(gdn_reference.GRADS, leaves):
+        torch.testing.assert_close(ref_grads[name], leaf.grad, rtol=1e-8, atol=1e-8)

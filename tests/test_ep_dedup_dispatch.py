@@ -1,6 +1,6 @@
 """
-The index kernels of prepare_dispatch are verified in tests/kernels/test_ep_dispatch.py; this file
-runs the operator across EP ranks.
+The index kernels of prepare_dispatch are verified at the training shapes in
+tests/kernels/test_moe_experts.py; this file runs the operator across EP ranks.
 """
 
 import pytest

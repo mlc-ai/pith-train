@@ -11,9 +11,6 @@ library's interface, over pithtrain/, tests/, benchmarks/, tools/ and examples/:
 - outside kernels/ nothing in pithtrain/ or tests/kernels/ branches on the architecture: no
   get_device_capability, ARCH_MAJOR, NATIVE_E8M0, is_sm90 or is_sm90_device (capability queries
   named for a feature are exported instead);
-- every name in __all__ is imported and used by tests/kernels/test_<feature>.py, where feature is
-  its module's stem without _sm90 / _sm100, and tests/kernels/ imports nothing from pithtrain but
-  pithtrain.kernels;
 - inside kernels/ every module lists its exports in a literal __all__, defines no name with a
   leading underscore at any level (functions, classes, methods, attributes, locals, parameters,
   import aliases), and imports from a sibling only names in that sibling's __all__ (directly or as
@@ -165,21 +162,6 @@ def eager_closure(root: str) -> set[str]:
                 seen.add(t)
                 stack.append(t)
     return seen
-
-
-VERIFIER_OF = {"tuning": "bf16_expert_gemm"}
-"""
-Modules verified through another feature's verifier: launch-config tuning by the GEMMs it tunes.
-"""
-
-
-def feature_of(stem: str) -> str:
-    if stem in VERIFIER_OF:
-        return VERIFIER_OF[stem]
-    for suffix in ("_sm90", "_sm100"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem
 
 
 def top_level_names(path: Path) -> set[str]:
@@ -370,33 +352,6 @@ def find_violations() -> set[tuple[str, str, str]]:
                 name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None  # fmt: skip
                 if name in ARCH_NAMES:
                     found.add(("arch-outside-kernels", rel, name))
-
-    kernel_tests = ROOT / "tests" / "kernels"
-    for module, names in EXPORTS.items():
-        test = kernel_tests / f"test_{feature_of(module)}.py"
-        if not test.exists():
-            found.add(("verifier-missing", str(test.relative_to(ROOT)), module))
-            continue
-        tree = ast.parse(test.read_text())
-        imported = {d for _, form, d in kernel_imports(test) if form == "name"}
-        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        for name in names:
-            if name not in imported or name not in used:
-                found.add(("verifier-coverage", str(test.relative_to(ROOT)), name))
-    if kernel_tests.exists():
-        for path in sorted(kernel_tests.rglob("*.py")):
-            for node in ast.walk(ast.parse(path.read_text())):
-                mods = []
-                if isinstance(node, ast.Import):
-                    mods = [a.name for a in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    mods = [node.module or ""] if node.level == 0 else ["." * node.level]
-                for m in mods:
-                    if m.startswith(".") or (
-                        (m == "pithtrain" or m.startswith(("pithtrain.", "tests")))
-                        and m != "pithtrain.kernels"
-                    ):
-                        found.add(("verifier-imports", str(path.relative_to(ROOT)), m))
 
     for mod, path in MODULES.items():
         layer, stem = layer_of(mod), stem_of(mod)
