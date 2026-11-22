@@ -60,6 +60,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint", choices=("none", "selective", "full", "offload"), default="none"
     )
+    parser.add_argument("--checkpoint-blocks", type=int)
     parser.add_argument("--recompute-mlp-blocks", type=int, default=0)
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument(
@@ -118,6 +119,7 @@ if __name__ == "__main__":
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
     train.dense_fsdp.collective_buffers = args.collective_buffers
     train.dense_fsdp.activation_checkpoint = args.checkpoint
+    train.dense_fsdp.checkpoint_blocks = args.checkpoint_blocks
     train.dense_fsdp.recompute_mlp_blocks = args.recompute_mlp_blocks
     train.dense_fsdp.compile_blocks = args.compile_blocks
     train.dense_fsdp.compile_mode = args.compile_mode

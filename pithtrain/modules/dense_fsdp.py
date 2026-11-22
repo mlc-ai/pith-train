@@ -88,6 +88,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     activation_checkpoint: Literal["none", "selective", "full", "offload"] = "none"
 
+    checkpoint_blocks: int | None = None
+    """Apply the chosen block checkpoint to this many leading decoder blocks, or all by default."""
+
     recompute_mlp_blocks: int = 0
     """Recompute the stock MLP in this many leading decoder blocks."""
 
@@ -276,6 +279,11 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError(
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
         )
+    if cfg.checkpoint_blocks is not None:
+        if cfg.activation_checkpoint == "none":
+            raise ValueError("checkpoint_blocks requires activation checkpointing")
+        if not 1 <= cfg.checkpoint_blocks <= len(model.layers):
+            raise ValueError("dense_fsdp.checkpoint_blocks must be within the decoder depth")
     if not 0 <= cfg.recompute_mlp_blocks <= len(model.layers):
         raise ValueError("dense_fsdp.recompute_mlp_blocks must be within the decoder depth")
     if cfg.recompute_mlp_blocks and (cfg.compile_blocks or cfg.activation_checkpoint != "none"):
@@ -303,6 +311,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         compile_options = list_mode_options(cfg.compile_mode)
         if cfg.compile_mode in ("default", "reduce-overhead"):
             compile_options |= stage_compile_options()
+    checkpoint_blocks = cfg.checkpoint_blocks or len(model.layers)
     for index, layer in enumerate(model.layers):
         if not cfg.compile_blocks:
             layer.forward = layer.forward_stock_stages
@@ -310,7 +319,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             layer.forward_stage3 = partial(
                 checkpoint, layer.forward_stage3, use_reentrant=False, preserve_rng_state=False
             )
-        if cfg.activation_checkpoint in ("selective", "full"):
+        if index < checkpoint_blocks and cfg.activation_checkpoint in ("selective", "full"):
             ctx = (
                 {"context_fn": selective_checkpoint_contexts}
                 if cfg.activation_checkpoint == "selective"
@@ -326,7 +335,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
                 dynamic=False,
                 options=compile_options or None,
             )
-        if cfg.activation_checkpoint == "offload":
+        if index < checkpoint_blocks and cfg.activation_checkpoint == "offload":
             layer.forward = offload_saved_activations(layer, layer.forward)
 
     decoder_groups = [
