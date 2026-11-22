@@ -314,7 +314,8 @@ Code that appears in more than one file lives once, in the shared module for its
    - `pytest tests/kernels -m "smoke or spec or stress"` passes on an H200 (and `-m multigpu` when
      CP code changed), and its results are posted on the PR;
    - every kernel those features launch, run against the code before the change on the same GPU,
-     gives bit-identical outputs and a median time within 5% (+3 us for very short kernels).
+     gives bit-identical outputs and a median time within 5% (+3 us for very short kernels);
+     `python -m benchmarks.kernels.ab --base <ref>` times them side by side.
      Timings are taken with nothing else running on the node: kernels timed side by side with
      other jobs vary by more than that. A timing over the limit is retaken once before it counts;
      a real regression is fixed (usually an order change, 4.2, or a lost `const_expr`) or the

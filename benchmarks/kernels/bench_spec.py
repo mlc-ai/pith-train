@@ -1,11 +1,9 @@
 """
 Times the kernels at the cases of tests/kernels/cases.py, the same cases the kernel tests verify,
-and writes machine-readable results; --compare gates them on a stored baseline
-(benchmarks/kernels/compare.py: every op's median within 5% + 3 us, and the work-weighted total
-within 5%).
+and writes machine-readable results. A change is judged by benchmarks/kernels/ab.py, which runs these
+op builders at a base git ref and at the working tree on one GPU; no baseline is stored.
 
     python -m benchmarks.kernels.bench_spec --tier spec --out results.json
-    python -m benchmarks.kernels.bench_spec --tier spec --compare benchmarks/kernels/baselines/h200.json
     python -m benchmarks.kernels.bench_spec --family moe_experts --model qwen3-30b-a3b
     python -m benchmarks.kernels.bench_spec --tier spec --shard 3/8 --out shard3.json   (one per GPU)
     python -m benchmarks.kernels.bench_spec --merge shard*.json --out results.json
@@ -37,7 +35,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from benchmarks.kernels.compare import gate
 from tests.kernels.cases import TIER_ORDER, select
 
 DEV = "cuda"
@@ -449,19 +446,16 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--compare", type=Path, help="baseline JSON; exit 1 on a regression")
-    parser.add_argument("--merge", nargs="+", type=Path, metavar="SHARD", help="merge shard results into --out (and --compare them) instead of running")  # fmt: skip
+    parser.add_argument("--merge", nargs="+", type=Path, metavar="SHARD", help="merge shard results into --out instead of running")  # fmt: skip
     args = parser.parse_args()
     if args.merge:
         result = merge(args.merge)
         if args.out:
             args.out.write_text(json.dumps(result, indent=1) + "\n")
-        return gate(result, json.loads(args.compare.read_text())) if args.compare else 0
+        return 0
     result = run(args)
     if args.out:
         args.out.write_text(json.dumps(result, indent=1) + "\n")
-    if args.compare:
-        return gate(result, json.loads(args.compare.read_text()))
     return 0 if all(math.isfinite(r.get("median_us", math.nan)) for r in result["results"]) else 1
 
 

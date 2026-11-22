@@ -23,6 +23,10 @@ time the cases take, weighted by how often a step runs them; and the same over e
 about 1 GB (gpt-oss-120b's expert weights, its EP 1 activations) then differ by up to 10% either way
 between the two processes, from where their buffers are placed, so judge a change by the weighted
 speedup and by ops that move together, not by one such op.
+
+The gate (exit 1): an op that runs at the base but fails in the working tree, or an op name whose
+work-weighted speedup is below 1 / (1 + TOLERANCE), i.e. the working tree more than 5% slower on
+that op summed over its cases. Kernel PRs post this run against main.
 """
 
 import argparse
@@ -35,6 +39,7 @@ from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+TOLERANCE = 0.05
 
 
 def worker(tree: str) -> None:
@@ -129,6 +134,18 @@ def summarize(rows: list[dict]) -> dict:
     return out
 
 
+def regressions(rows: list[dict], summary: dict) -> list[str]:
+    """
+    Ops that run at the base but fail in the working tree, and op names more than TOLERANCE slower
+    work-weighted.
+    """
+    problems = [f"{r['case']} {r['op']}: {r['head_error']}" for r in rows if "head_error" in r and "base_us" in r]  # fmt: skip
+    for name, s in sorted(summary.items()):
+        if name != "*" and s["weighted_speedup"] and s["weighted_speedup"] < 1 / (1 + TOLERANCE):
+            problems.append(f"{name}: work-weighted speedup x{s['weighted_speedup']:.3f}")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
     parser.add_argument("--worker", help=argparse.SUPPRESS)
@@ -186,10 +203,14 @@ def main() -> int:
     for name, s in sorted(summary.items()):
         weighted = f"{s['weighted_speedup']:.3f}" if s["weighted_speedup"] else "-"
         print(f"{name:<40} {s['ops']:5d} ops  work-weighted speedup x{weighted}  (min {s['min']:.3f}, max {s['max']:.3f})")  # fmt: skip
+    problems = regressions(rows, summary)
+    for line in problems:
+        print("REGRESSION", line)
+    print(f"{len(problems)} regressions")
     if args.out:
         meta = dict(base=args.base or str(args.base_dir), base_pithtrain=base.pithtrain, head_pithtrain=head.pithtrain, rounds=args.rounds, tier=args.tier)  # fmt: skip
-        args.out.write_text(json.dumps(dict(meta=meta, summary=summary, results=rows), indent=1) + "\n")  # fmt: skip
-    return 0
+        args.out.write_text(json.dumps(dict(meta=meta, summary=summary, results=rows, regressions=problems), indent=1) + "\n")  # fmt: skip
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":
