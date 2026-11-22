@@ -39,7 +39,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bf16-sharded-gradients", action=argparse.BooleanOptionalAction, default=False
     )
-    parser.add_argument("--reduce-at-step-end", action="store_true")
+    parser.add_argument(
+        "--reduce-at-step-end",
+        type=int,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Defer reduce-scatter for all parameters or the first N decoder buckets",
+    )
     parser.add_argument("--overlap-microbatch-reductions", action="store_true")
     parser.add_argument("--prefetch-data-during-optimizer", action="store_true")
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)

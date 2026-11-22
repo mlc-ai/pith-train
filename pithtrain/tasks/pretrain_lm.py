@@ -183,13 +183,19 @@ def train_step(
         batches = prefetched_batches
         if batches is None:
             batches = get_batch_tensors(cfg, dataset, step, device)
-        delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
+        deferred_units = ()
+        if len(batches) > 1 and dense_fsdp.reduce_at_step_end:
+            deferred_units = (
+                (model,)
+                if dense_fsdp.reduce_at_step_end is True
+                else model.deferred_gradient_sync_units
+            )
         finalize_once = len(batches) > 1 and (
-            delay_reduce or dense_fsdp.overlap_microbatch_reductions
+            deferred_units or dense_fsdp.overlap_microbatch_reductions
         )
         retain = dense_fsdp.keep_gathered_across_microbatches and len(batches) > 1
-        if delay_reduce:
-            model.set_requires_gradient_sync(False)
+        for unit in deferred_units:
+            unit.set_requires_gradient_sync(False, recurse=unit is model)
         if finalize_once:
             model.set_is_last_backward(False)
         if retain:
@@ -198,8 +204,8 @@ def train_step(
         losses, counts = [], []
         for i, (tokens, labels) in enumerate(batches):
             if i == len(batches) - 1:
-                if delay_reduce:
-                    model.set_requires_gradient_sync(True)
+                for unit in deferred_units:
+                    unit.set_requires_gradient_sync(True, recurse=unit is model)
                 if finalize_once:
                     model.set_is_last_backward(True)
                 if retain:

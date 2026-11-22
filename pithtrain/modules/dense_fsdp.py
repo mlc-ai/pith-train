@@ -62,8 +62,8 @@ class DenseFSDPCfg(SlottedDefault):
     bf16_sharded_gradients: bool = False
     """Accumulate reduced shards in BF16 and upcast once before AdamW."""
 
-    reduce_at_step_end: bool = False
-    """Accumulate unsharded gradients across microbatches and reduce them in the last backward."""
+    reduce_at_step_end: bool | int = False
+    """Defer reduction for all parameters (True) or the first N decoder buckets."""
 
     overlap_microbatch_reductions: bool = False
     """Wait for pending reduce-scatters only on the optimizer step's final backward."""
@@ -205,6 +205,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
     if cfg.bf16_sharded_gradients and cfg.reduce_dtype != "bf16":
         raise ValueError("BF16 sharded gradients require BF16 reduction")
+    if cfg.reduce_at_step_end < 0:
+        raise ValueError("dense_fsdp.reduce_at_step_end must be nonnegative")
     if cfg.activation_checkpoint not in ("none", "selective", "full", "offload"):
         raise ValueError(
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
@@ -259,6 +261,12 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         )
         for group in batched(run, cfg.blocks_per_group)
     ]
+    if cfg.reduce_at_step_end > len(decoder_groups):
+        raise ValueError("Cannot defer reduction for more buckets than there are decoder buckets")
+    if type(cfg.reduce_at_step_end) is int:
+        model.deferred_gradient_sync_units = tuple(
+            group[0] for group in decoder_groups[: cfg.reduce_at_step_end]
+        )
     buckets = []
     for group in decoder_groups:
         kinds = {layer.layer_type for layer in group}
