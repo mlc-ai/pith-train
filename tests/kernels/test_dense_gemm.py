@@ -27,7 +27,7 @@ FP8GroupedLinear, FP8Linear gets no fp32 main_grad from install_wgrad_accumulati
 before the fp32 sum across micro-batches: a relative L2 error of 1.7e-3 per micro-batch term
 (calc_diff 1.39e-6, all of it the bf16 rounding; the GEMM's own accumulation error is an order
 smaller). test_wgrad_bf16_rounding pins that cost down: the accumulated gradient stays within the
-sum of the per-term bf16 roundings (measured at most 0.41 of it).
+sum of the per-term bf16 roundings (measured at most 0.37 of it).
 """
 
 import pytest
@@ -58,7 +58,7 @@ ROWS_PER_CHUNK = 4096
 ACCUM = 3e-4
 """
 Accumulation error per unit of sum |a_k b_k|, beyond the output's bf16 rounding; measured at most
-9.9e-5 (y), 9.1e-5 (dx), 3.1e-5 (dw) on the H200.
+9.9e-5 (y), 9.1e-5 (dx), 2.2e-5 (dw) on the H200.
 """
 EXACT_CALC_DIFF = 3e-6
 """

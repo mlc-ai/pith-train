@@ -15,7 +15,7 @@ each rank checks its local output and the gradients of every input it holds, and
 gradient summed over the ranks.
 
 Checked per output on every rank: finite, and relative L2 error within BOUNDS (about 3x the
-largest error measured on the H200 over all 140 smoke and spec cases, every rank, listed next to
+largest error measured on the H200 over all 24 cases, CP 2 .. 16, every rank, listed next to
 each bound: the floor of the bf16 outputs plus, for MLA, the bf16 rounding of the decompressed
 k / v and of the combined ring partials;
 PITHTRAIN_SPEC_ERROR_LOG=<path> appends each rank's errors as JSON lines). Every case is marked
@@ -38,15 +38,15 @@ from tests.kernels.references import rel_l2
 from tests.utilities import launch
 
 BOUNDS = {
-    "out": 1e-2,  # measured 3.1e-3 (ring_attention/deepseek-v2-lite/006)
-    "dq": 9e-3,  # measured 3.0e-3 (ring_attention/qwen3-30b-a3b/018)
-    "dk": 9e-3,  # measured 3.0e-3 (ring_attention/qwen3.5-27b/006)
-    "dv": 9e-3,  # measured 3.0e-3 (ring_attention/qwen3-30b-a3b/000)
-    "dq_nope": 1.1e-2,  # measured 3.5e-3 (ring_attention/deepseek-v2-lite/006)
-    "dq_pe": 1.2e-2,  # measured 3.7e-3 (ring_attention/deepseek-v2-lite/027)
-    "dnormed_kv": 1.1e-2,  # measured 3.4e-3 (ring_attention/deepseek-v2-lite/028)
-    "dk_pe": 1.25e-2,  # measured 4.1e-3 (ring_attention/deepseek-v2-lite/000)
-    "dkv_b": 1e-2,  # measured 3.1e-3 (ring_attention/deepseek-v2-lite/006)
+    "out": 9e-3,  # measured 2.84e-3 (ring_attention/qwen3.5-27b/cp8-B1-S8k)
+    "dq": 9e-3,  # measured 2.97e-3 (ring_attention/qwen3-30b-a3b/cp2-B1-S8k)
+    "dk": 9e-3,  # measured 2.97e-3 (ring_attention/qwen3.5-27b/cp2-B1-S8k)
+    "dv": 9e-3,  # measured 2.95e-3 (ring_attention/qwen3.5-27b/cp2-B1-S8k)
+    "dq_nope": 1e-2,  # measured 3.11e-3 (ring_attention/deepseek-v2-lite/cp4-B1-S4k)
+    "dq_pe": 1.15e-2,  # measured 3.69e-3 (ring_attention/deepseek-v2-lite/cp2-B1-S8k)
+    "dnormed_kv": 1.05e-2,  # measured 3.40e-3 (ring_attention/deepseek-v2-lite/cp4-B1-S8k)
+    "dk_pe": 1.25e-2,  # measured 4.06e-3 (ring_attention/deepseek-v2-lite/cp4-B1-S8k)
+    "dkv_b": 8e-3,  # measured 2.56e-3 (ring_attention/deepseek-v2-lite/cp2-B1-S8k)
 }
 NOPE, ROPE, VDIM, LORA = 128, 64, 128, 512  # DeepSeek-V2-Lite's MLA dims (config.json)
 

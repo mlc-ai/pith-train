@@ -17,8 +17,8 @@ of its terms' magnitudes.
 Bounds, elementwise: y and dx are K-term fp32 sums rounded once to bf16, so |got - ref| <= 2^-8
 |ref| (half a bf16 ulp, relative) + K 2^-24 sum|terms| (fp32 accumulation); dw is a B T-term fp32
 reduction rounded once to the weight's bf16, so |got - ref| <= 2^-8 |ref| + 2^-16 sum|terms|: fp32
-blocked reductions of up to 131072 terms stay far inside 2^-16 of the magnitude sum. Largest error / bound
-measured on the H200 over the 95 cases: y 0.996, dx 0.996, dw 0.932, the rounding term dominating
+blocked reductions of up to 32768 terms stay far inside 2^-16 of the magnitude sum. Largest error /
+bound measured on the H200 over the 24 cases: y 0.996, dx 0.996, dw 0.922, the rounding term dominating
 (the outputs are correctly rounded fp32 sums); each case prints its ratios on a MEASURED line.
 """
 

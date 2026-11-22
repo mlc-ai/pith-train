@@ -1,33 +1,29 @@
 """
 Gated DeltaNet at every training shape of the spec (family gated_delta_rule of
-tests/kernels/cases.py): Qwen3.5-35B-A3B (16 key / 32 value heads) and Qwen3.5-27B (16 / 48), dims 128,
-the micro-batch folded into the heads (H = 16 mbs, HV = 32 mbs or 48 mbs, value head j reading key
+tests/kernels/cases.py): Qwen3.5-35B-A3B (16 key / 32 value heads) and Qwen3.5-27B (16 / 48), dims
+128, the micro-batch folded into the heads (H = 16 mbs, HV = 32 mbs or 48 mbs, value head j reading key
 head j // (HV / H)) as pithtrain/operators/gated_delta_rule.py folds it, at T_local = seq / cp.
 
-- cp == 1: chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned at the folded geometry, T_local 1k .. 32k.
+- cp == 1: chunk_gdr_fwd_pinned / chunk_gdr_bwd_pinned at the folded geometry, T_local 4k and 8k.
 - cp > 1 (multigpu): the operator gated_delta_rule(q, k, v, g, beta, cp_group) on cp ranks, one
   process per GPU, each holding its contiguous T_local slice of a seq = cp * T_local sequence with
   the unfolded (mbs, T_local, heads, 128) inputs training passes, forward and backward through
-  autograd; CP 2, 4 and 8.
+  autograd; CP 2, 4, 8 and 16 (two nodes).
 
 Inputs are drawn as the model computes them (q, k L2-normalized, gate -exp(A_log) softplus(a +
 dt_bias), beta = sigmoid), by make_inputs of tests/kernels/gdn_reference.py.
 
 Reference: the recurrence in fp64, in its chunked form with autograd (chunked_reference of the same
 file, itself checked there against the token-by-token loop), run over the whole sequence a block of
-value heads at a time (the heads are independent) so that 128k-token sequences fit in memory. It is
+value heads at a time (the heads are independent) so that 64k-token sequences fit in memory. It is
 never a pithtrain kernel.
 
-Bounds: those of tests/kernels/gdn_reference.py (BOUNDS: calc_diff per output; MAX_ABS: largest absolute error
-within 2e-2 of the reference's largest magnitude), calibrated there at T <= 8192 and checked here up
-to T_local = 32k and folded heads up to 4x, and over 128k-token CP sequences. Largest errors
-measured on the H200 over the 25 single-GPU cases (T_local 1k .. 32k, HV 32 .. 192): calc_diff
-5.3e-6 (o), 5.3e-6 (dq), 5.7e-6 (dk), 4.6e-6 (dv), 8.6e-6 (dg), 4.9e-6 (dbeta), all within the
-bounds calibrated at T <= 8192 (2e-5 .. 1e-4), and a largest absolute error of 7.4e-3 of the
-reference's largest magnitude (bound 2e-2): no growth with T or with the folded head count. Over
-the 70 CP cases (CP 2 / 4 / 8, sequences to 128k tokens), per rank: calc_diff 6.1e-6 (o), 7.7e-6
-(dq), 8.3e-6 (dk), 5.0e-6 (dv), 1.1e-5 (dg), 5.5e-6 (dbeta), largest absolute error 8.2e-3 of the
-reference's largest magnitude. Each case prints its errors on a MEASURED line (pytest -s).
+Bounds: tests/kernels/gdn_reference.py's BOUNDS (calc_diff per output) and MAX_ABS (largest absolute
+error over the reference's largest magnitude), about 3x the largest errors measured on the H200 over
+the 24 cases (12 single-GPU, T_local 4k / 8k, HV 32 .. 192; 12 under CP 2 .. 16, every rank):
+calc_diff 5.2e-6 (o), 6.8e-6 (dq), 6.9e-6 (dk), 4.6e-6 (dv), 6.4e-6 (dg), 4.7e-6 (dbeta), and
+9.2e-3 of the reference's largest magnitude (o at CP 16), with no growth with T, the folded head
+count or CP. Each case prints its errors on a MEASURED line (pytest -s).
 """
 
 import pytest

@@ -23,25 +23,25 @@ given, computed per group in row chunks. Bound per output element:
 plus calc_diff over the whole output, and every value finite. Largest values measured on the H200
 over every smoke, spec and stress case, and the bounds (about 3x):
 
-    FP8 grouped GEMM, bf16 out  coef 1.4e-4 (bound 2^-11 = 4.9e-4)  calc_diff 1.39e-6 (bound 5e-6)
-    FP8 k-grouped wgrad, fp32   coef 5.3e-4 (bound 2^-9 = 2.0e-3)   calc_diff 7.8e-9  (bound 3e-8)
+    FP8 grouped GEMM, bf16 out  coef 1.37e-4 (bound 2^-11 = 4.9e-4)  calc_diff 1.39e-6 (bound 5e-6)
+    FP8 k-grouped wgrad, fp32   coef 5.29e-4 (bound 2^-9 = 2.0e-3)   calc_diff 7.82e-9 (bound 3e-8)
 
 The calc_diff floor of a bf16 output is its own rounding (about 1.3e-6 for these inputs), so 5e-6
 leaves room for accumulation order only; the repo's calc_diff < 1e-3 elsewhere is 200x looser. The
 activation-fused quantizations between the GEMMs (test_fp8_expert_activation) are checked element by
 element against float64 activations of the same bf16 inputs (QuantCheck: within half an e4m3 ulp
 plus one bf16 rounding; measured worst 0.941 of that bound, the e4m3 rounding itself), with block
-scales equal to the recipe's; gpt-oss's bias gradient within 2^-8 of the absolute sum (measured
-coef 1.6e-3, the bf16 rounding of each summand).
+scales equal to the recipe's; gpt-oss's bias gradient within 2^-8 of the absolute sum (the bf16
+rounding of each summand; measured coef 1.64e-3).
 
 BF16 (cases with bf16_fused, i.e. G <= 64, when bf16_experts_supported(G)): the six fused GEMMs on
 the raw group sizes, gate / up laid out as training holds them (two separate weights for
 DeepSeek-V2-Lite and Qwen3, the halves of one fused weight for Qwen3.5, gpt-oss's interleaved rows
 with biases and its clamped SwiGLU), received tokens read through a random a_idx and the output
-scattered through slot_of (a permutation), against float64: half a bf16 ulp + 1e-5 x sum |products| (measured 2.3e-6;
-calc_diff 1.38e-6, bound 5e-6), and for the fp32 main grads 2 fp32 ulps + 2.5e-4 x sum |products|
-(measured 8.0e-5 at 1.1M rows of one expert, 3.6e-5 below 300k: fp32 accumulation error grows with
-the rows summed; calc_diff 7.5e-7, bound 3e-6).
+scattered through slot_of (a permutation), against float64: half a bf16 ulp + 7e-6 x sum |products|
+(measured 2.29e-6; calc_diff 1.38e-6, bound 5e-6), and for the fp32 main grads 2 fp32 ulps + 1.6e-4
+x sum |products| (measured 5.29e-5, at 524k rows of one expert: fp32 accumulation error grows with
+the rows summed; calc_diff 1.71e-7, bound 5e-7).
 
 The stress tier passes 2^31 elements in one per-channel output (e.g. the 5760-wide gate_up gradient
 of gpt-oss-20b at T = 32k and EP 16 with every token on one expert): SM90 fp8_quant_grouped and the
@@ -95,8 +95,8 @@ FP8_REL = {"bf16": 2.0**-8, "fp32": 2.0**-20}
 FP8_COEF = {"bf16": 2.0**-11, "fp32": 2.0**-9}
 FP8_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-8}
 BF16_REL = {"bf16": 2.0**-8, "fp32": 2.0**-22}
-BF16_COEF = {"bf16": 1e-5, "fp32": 2.5e-4}
-BF16_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-6}
+BF16_COEF = {"bf16": 7e-6, "fp32": 1.6e-4}
+BF16_CALC_DIFF = {"bf16": 5e-6, "fp32": 5e-7}
 FP8 = lambda case: case["axes"]["routing"] != "boundary"  # boundary cases are for the BF16 picker
 ALPHA = 1.702  # gpt-oss clamped SwiGLU; the tests assert the spec's swiglu_alpha / swiglu_limit
 LIMIT = 7.0

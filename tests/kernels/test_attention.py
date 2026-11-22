@@ -1,7 +1,7 @@
 """
-FlashAttention-4 at every attention launch of the spec (family attention of
-tests/kernels/cases.py), against fp32 attention in plain PyTorch (tests/kernels/attention_reference.py), forward
-and backward with a random output gradient.
+FlashAttention-4 at every attention launch of the spec (family attention of tests/kernels/cases.py),
+against fp32 attention in plain PyTorch (tests/kernels/attention_reference.py), forward and backward
+with a random output gradient.
 
 Each case is launched the way training launches it:
 
@@ -19,7 +19,7 @@ Each case is launched the way training launches it:
 Checked per output: finite, and the relative L2 error (out, dq, dk, dv, dsink) or the largest
 absolute error (lse) within BOUNDS. Setting PITHTRAIN_SPEC_ERROR_LOG=<path> appends each case's
 measured errors there (JSON lines), which is how BOUNDS were calibrated: about 3x the largest error
-measured on the H200 over all 279 smoke and spec cases, listed next to each bound. The measured
+measured on the H200 over all 88 smoke and spec cases, listed next to each bound. The measured
 errors sit at the floor of rounding the outputs to bf16 (a relative L2 of about 2^-9 for unit
 normal values), so a wrong mask, scale or accumulation on as little as about 1% of the output
 exceeds them; the repo's earlier bounds (1e-2 forward, 2e-2 backward, at S = 1024 only) were
@@ -39,12 +39,12 @@ from tests.kernels.cases import params, seed_of
 from tests.kernels.references import rel_l2
 
 BOUNDS = {
-    "out": 7e-3,  # measured 2.3e-3 (attention/qwen3.5-35b-a3b/026)
-    "lse": 2e-5,  # largest absolute error, measured 3.8e-6 (attention/deepseek-v2-lite/039)
-    "dq": 7.5e-3,  # measured 2.5e-3 (attention/qwen3-30b-a3b/049)
-    "dk": 7.5e-3,  # measured 2.5e-3 (attention/qwen3.5-35b-a3b/049)
-    "dv": 7.5e-3,  # measured 2.4e-3 (attention/qwen3.5-35b-a3b/017)
-    "dsink": 1e-2,  # measured 3.1e-3 (attention/gpt-oss-120b/021)
+    "out": 7e-3,  # measured 2.31e-3 (attention/qwen3.5-27b/ring_back-B1-q4k-kv8k)
+    "lse": 9e-6,  # largest absolute error, measured 2.86e-6 (attention/qwen3.5-27b/ring_diag-B1-q8k-kv8k)
+    "dq": 7.5e-3,  # measured 2.49e-3 (attention/qwen3.5-35b-a3b/varlen-4k)
+    "dk": 7.5e-3,  # measured 2.48e-3 (attention/qwen3.5-35b-a3b/varlen-4k)
+    "dv": 7.5e-3,  # measured 2.37e-3 (attention/qwen3.5-27b/ring_diag-B1-q8k-kv8k)
+    "dsink": 1e-2,  # measured 3.03e-3 (attention/gpt-oss-20b/dense-B2-q8k-kv8k-w127)
 }
 LSE_SHIFT = 0.5
 ERROR_LOG = os.environ.get("PITHTRAIN_SPEC_ERROR_LOG")

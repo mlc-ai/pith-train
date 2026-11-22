@@ -33,10 +33,10 @@ DEV = "cuda"
 ROWS_PER_BLOCK = 512
 IGNORE = -100
 
-LOSS_REL = 1e-6
+LOSS_REL = 6e-7
 """
 Relative error of the fp32 mean loss: the per-row logsumexp in fp32 summed over up to 32768 rows in
-fp32; measured at most 1.9e-7 on the H200.
+fp32; measured at most 1.91e-7 on the H200 (about 3x that).
 """
 GRAD_SLACK = 2.0**-16
 """
@@ -44,10 +44,10 @@ fp32 arithmetic of the softmax (exp of x - logsumexp, |x - logsumexp| up to abou
 fp32 ulps times 30), relative to the magnitude of the terms of the gradient (scale x p, plus the
 target's 1 and the entropy terms for log_prob), on top of half a bf16 ulp.
 """
-STAT_ABS = 1e-5
+STAT_ABS = 6e-6
 """
 Absolute error of the fp32 per-row logp and entropy (values up to about 20); measured at most
-1.9e-6 on the H200.
+1.93e-6 on the H200 (about 3x that).
 """
 
 

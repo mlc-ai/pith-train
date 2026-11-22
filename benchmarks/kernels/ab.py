@@ -18,6 +18,11 @@ rejected, OOM) is reported with its error.
 The summary gives per op name the work-weighted speedup sum(w) / sum(w / speedup), w = work x layers
 (FLOPs, or elements for memory-bound ops, per step; bench_spec.py), which is the ratio of the total
 time the cases take, weighted by how often a step runs them; and the same over every op.
+
+--base-dir . times the working tree against itself: the noise floor. On the H200 single ops of
+about 1 GB (gpt-oss-120b's expert weights, its EP 1 activations) then differ by up to 10% either way
+between the two processes, from where their buffers are placed, so judge a change by the weighted
+speedup and by ops that move together, not by one such op.
 """
 
 import argparse

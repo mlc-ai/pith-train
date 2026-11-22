@@ -109,7 +109,9 @@ python -m benchmarks.kernels.ab --base upstream/main --family cross_entropy --ou
   GPUs.
 - `ab` measures a change's speedup: the same cases with the pithtrain of a base git ref (checked out
   as a worktree) and of the working tree, on one GPU, interleaved op by op over several rounds;
-  per op base / head time and the work-weighted speedup per op name and overall.
+  per op base / head time and the work-weighted speedup per op name and overall. `--base-dir .`
+  times the tree against itself, the noise floor: up to 10% either way on single ops of about 1 GB
+  (buffer placement), so read the weighted speedup.
 
 ## Kernel changes and kernel-design agents
 

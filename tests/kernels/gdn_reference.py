@@ -8,10 +8,9 @@ q and k are L2-normalized per head, H key heads serve groups of HV // H consecut
 is the raw (natural-log) gate in fp32 and beta is bf16.
 
 BOUNDS (calc_diff per output) and MAX_ABS (largest absolute error over the reference's largest
-magnitude) are those the pinned kernels were calibrated with at T <= 8192 (about 2.5 to 3 times the
-largest errors measured on the H200: calc_diff 8.1e-6 (o), 8.1e-6 (dq), 1.1e-5 (dk), 6.1e-6 (dv),
-3.6e-5 (dg, at T = 2), 7.7e-6 (dbeta), and 9.3e-3 of the largest magnitude). The kernels keep some
-chunk intermediates in bf16, so these are measured, not analytic.
+magnitude): about 3x the largest errors measured on the H200 over the spec's cases, listed in
+tests/kernels/test_gated_delta_rule.py. The kernels keep some chunk intermediates in bf16, so these
+are measured, not analytic.
 """
 
 import torch
@@ -20,8 +19,8 @@ import torch.nn.functional as F
 D = 128  # Qwen3.5's key and value head dims
 BT = 64  # the kernels' chunk size
 GRADS = ("dq", "dk", "dv", "dg", "dbeta")
-BOUNDS = {"o": 2e-5, "dq": 2e-5, "dk": 3e-5, "dv": 2e-5, "dg": 1e-4, "dbeta": 2e-5}
-MAX_ABS = 2e-2
+BOUNDS = {"o": 1.6e-5, "dq": 2e-5, "dk": 2e-5, "dv": 1.4e-5, "dg": 2e-5, "dbeta": 1.4e-5}
+MAX_ABS = 2.8e-2
 
 
 def make_inputs(S: int, H: int, hv: int, B: int = 1, seed: int = 0) -> tuple[torch.Tensor, ...]:

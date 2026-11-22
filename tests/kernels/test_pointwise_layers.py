@@ -65,24 +65,24 @@ Measured on the H200: at most 3.89e-3 (dx; dw 3.61e-3).
 ROUTE_TIE = 1.7e-2
 """
 Logit gap, relative to the token's largest |logit|, below which two experts may be ranked either
-way (the bf16 or TF32 rounding of the logits GEMM). Measured on the H200: at most 5.5e-3, with up to
+way (the bf16 or TF32 rounding of the logits GEMM). Measured on the H200: at most 5.4e-3, with up to
 1.5k of 32k tokens choosing differently from float64.
 """
-GEMM_COEF = 2.3e-2
+GEMM_COEF = 3.3e-2
 """
 Router gradients (dx, dw, gpt-oss's db): max error / sum |terms| of the GEMM of the float64 logits
 gradient; the compiled backward rounds that gradient to bf16 before its bf16 GEMMs. Measured on
-the H200: at most 7.6e-3 (dx of gpt-oss-120b; DeepSeek-V2's TF32 4.2e-3; dw 4.1e-3, db 1.3e-3).
+the H200: at most 1.08e-2 (dx of gpt-oss-20b at T = 16k, B = 4; dw 3.6e-3, db 8.3e-4).
 """
 OWN_TIE = 2.0**-20
 """
 Logit gap, relative to the token's largest |logit|, by which a chosen expert may sit below the
 k-th largest of the gate's own logits (fp32 rounding of the scores). Measured on the H200: 0.
 """
-WEIGHT_ABS = 1e-6
+WEIGHT_ABS = 8e-7
 """
 Absolute error of the router weights (each at most 1) against float64 from the gate's own logits.
-Measured on the H200: at most 3.2e-7.
+Measured on the H200: at most 2.6e-7.
 """
 
 
