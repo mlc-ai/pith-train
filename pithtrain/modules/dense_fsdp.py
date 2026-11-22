@@ -1,8 +1,10 @@
 """FSDP2 configuration and sharding for a dense text tower."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from torch.distributed import DeviceMesh
@@ -16,7 +18,9 @@ from torch.utils.checkpoint import (
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import training
 from pithtrain.kernels import stage_compile_options
-from pithtrain.models.qwen35 import Qwen35TextModel
+
+if TYPE_CHECKING:
+    from pithtrain.models.qwen35 import Qwen35TextModel
 
 __all__ = ["DenseFSDPCfg", "shard_dense_model"]
 
