@@ -247,7 +247,12 @@ def cases(args, config):
             except ImportError as exc:
                 print(json.dumps({"case": "fla", "error": str(exc)}), flush=True)
             else:
-                run("fla", lambda: chunk_gated_delta_rule(*leaves, scale=1.0)[0], leaves, gdn_core)
+                run(
+                    "fla",
+                    lambda: chunk_gated_delta_rule(*leaves, scale=kd**-0.5)[0],
+                    leaves,
+                    gdn_core,
+                )
 
     if {"all", "fa4", "fa3", "sdpa"}.intersection(args.cases):
         q, k, v = random_tensor(b, s, qh, d), random_tensor(b, s, kh, d), random_tensor(b, s, kh, d)
