@@ -53,6 +53,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     reduce_dtype: Literal["fp32", "bf16"] = "fp32"
 
+    reduce_at_step_end: bool = False
+    """Accumulate unsharded gradients across microbatches and reduce them in the last backward."""
+
     reduce_scatter_buffers: int = 1
     """Maximum number of in-flight reduce-scatter staging buffers."""
 

@@ -169,10 +169,18 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     cp_size = distributed.cp_size
-    if cfg.training.dense_fsdp is not None:
+    dense_fsdp = cfg.training.dense_fsdp
+    if dense_fsdp is not None:
         batches = get_batch_tensors(cfg, dataset, step, device)
+        delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
+        if delay_reduce:
+            model.set_requires_gradient_sync(False)
+            model.set_is_last_backward(False)
         losses, counts = [], []
-        for tokens, labels in batches:
+        for i, (tokens, labels) in enumerate(batches):
+            if delay_reduce and i == len(batches) - 1:
+                model.set_requires_gradient_sync(True)
+                model.set_is_last_backward(True)
             loss, detached = objective((model(tokens),), (labels,))
             loss.backward()
             losses.append(detached)
