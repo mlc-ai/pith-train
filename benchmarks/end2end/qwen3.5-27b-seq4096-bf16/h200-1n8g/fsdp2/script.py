@@ -55,7 +55,7 @@ if __name__ == "__main__":
     parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument(
         "--collective-buffers",
-        choices=("default", "native-pool", "process-group", "symmetric"),
+        choices=("default", "native-pool", "uniform", "process-group", "symmetric"),
         default="default",
     )
     parser.add_argument(

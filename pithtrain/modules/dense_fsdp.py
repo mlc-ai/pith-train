@@ -86,7 +86,9 @@ class DenseFSDPCfg(SlottedDefault):
     separate_reduce_scatter: bool = False
     """Use a dedicated communicator for reduce-scatter to allow backward all-gather overlap."""
 
-    collective_buffers: Literal["default", "native-pool", "process-group", "symmetric"] = "default"
+    collective_buffers: Literal[
+        "default", "native-pool", "uniform", "process-group", "symmetric"
+    ] = "default"
     """Select the allocator for all-gather and reduce-scatter staging buffers."""
 
     activation_checkpoint: Literal["none", "selective", "full", "offload"] = "none"
@@ -253,28 +255,37 @@ def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
     unit.set_custom_all_gather(AllGatherIntoWeight())
 
 
-def use_native_collective_pool(units: list[nn.Module]) -> None:
+def use_native_collective_buffers(units: list[nn.Module], *, isolate: bool) -> None:
     from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
         DefaultAllGather,
         DefaultReduceScatter,
     )
 
-    pool = torch.cuda.MemPool()
+    pool = torch.cuda.MemPool() if isolate else None
 
-    class PooledAllocation:
+    class NativeAllocation:
         def allocate(self, size, *, dtype, device):
-            # Keep staging blocks apart from the activations that otherwise split them.
-            with torch.cuda.use_mem_pool(pool, device=device):
-                return torch.empty(size, dtype=dtype, device=device)
+            if pool is not None:
+                # Keep staging blocks apart from activations.
+                with torch.cuda.use_mem_pool(pool, device=device):
+                    return torch.empty(size, dtype=dtype, device=device)
+            (numel,) = size
+            if numel * dtype.itemsize < 2**30:
+                return torch.empty(numel, dtype=dtype, device=device)
+            # Paired DeltaNet and attention buckets share storage sizes. Keep the wire
+            # tensor at its original size and leave the smaller gradient shards alone.
+            alignment = (64 * 2**20) // dtype.itemsize
+            capacity = -(-numel // alignment) * alignment
+            return torch.empty(capacity, dtype=dtype, device=device)[:numel]
 
-    class PooledAllGather(PooledAllocation, DefaultAllGather):
+    class NativeAllGather(NativeAllocation, DefaultAllGather):
         pass
 
-    class PooledReduceScatter(PooledAllocation, DefaultReduceScatter):
+    class NativeReduceScatter(NativeAllocation, DefaultReduceScatter):
         pass
 
-    all_gather = PooledAllGather()
-    reduce_scatter = PooledReduceScatter()
+    all_gather = NativeAllGather()
+    reduce_scatter = NativeReduceScatter()
     for unit in units:
         unit.set_custom_all_gather(all_gather)
         unit.set_custom_reduce_scatter(reduce_scatter)
@@ -321,9 +332,15 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             "Partial MLP recompute requires the stock stages without block checkpointing"
         )
 
-    if cfg.collective_buffers not in ("default", "native-pool", "process-group", "symmetric"):
+    if cfg.collective_buffers not in (
+        "default",
+        "native-pool",
+        "uniform",
+        "process-group",
+        "symmetric",
+    ):
         raise ValueError(
-            "dense_fsdp.collective_buffers must be default, native-pool, process-group or symmetric"
+            "dense_fsdp.collective_buffers must be default, native-pool, uniform, process-group or symmetric"
         )
     if cfg.collective_buffers == "symmetric" and cfg.reduce_scatter_buffers != 1:
         raise ValueError("Symmetric reduce-scatter requires one input buffer")
@@ -444,8 +461,10 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         model.set_reduce_scatter_max_input_buffers(cfg.reduce_scatter_buffers)
     if cfg.separate_reduce_scatter:
         model.set_separate_reduce_scatter_group()
-    if cfg.collective_buffers == "native-pool":
-        use_native_collective_pool([*order, model])
+    if cfg.collective_buffers in ("native-pool", "uniform"):
+        use_native_collective_buffers(
+            [*order, model], isolate=cfg.collective_buffers == "native-pool"
+        )
     elif cfg.collective_buffers != "default":
         for unit in (*order, model):
             if cfg.collective_buffers == "symmetric":
