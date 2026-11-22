@@ -175,7 +175,7 @@ def run(case: dict) -> None:
 
 
 # One function per GPU count, so that -k selects what a run has: CP 2 and 4 fit in 4 GPUs, CP 8 needs
-# a node of 8, CP 16 two nodes (see README.md, "Running").
+# a node of 8, CP 16 two nodes (see cases.py).
 @pytest.mark.parametrize("case", params("ring_attention", keep=lambda c: c["axes"]["cp"] <= 4, multigpu=True))  # fmt: skip
 def test_ring_attention(case: dict) -> None:
     run(case)

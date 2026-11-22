@@ -1,38 +1,30 @@
 """
-The kernel-shape spec of PithTrain as code (tests/kernels/README.md is its human-read form): the
-kernel cases every model's training meshes launch, generated at test collection from
+The kernel-shape spec: every kernel launch shape training produces, generated at test collection
+from each examples/pretrain_lm/<model>/config.json (one extractor per model_type) and these mesh
+rules. Contexts 4k / 8k at CP 1, 16k at CP 2 / 4, 32k at CP 4 / 8, 64k at CP 8 / 16 (CONTEXTS: CP
+> 1 only where context / CP >= 4k); micro-batch 1 / 2 / 4 at CP 1, 1 under CP; EP 1 .. 16 dividing
+the expert count (EP 1 for dense models); gpt-oss (no ring attention) CP 1 only. Attention sees
+B = mbs sequences of context / CP tokens, the experts T = mbs x context / CP tokens per EP rank;
+expert routing is balanced, log-normal, skewed, stress, and boundary (both edges of every BF16
+tuning bucket reached). Shipped scripts are not read. Each family names its kernels and is consumed
+by tests/kernels/test_<family>.py; `python -m tests.kernels.cases` prints each model's meshes and
+the case counts.
 
-- the models: every examples/pretrain_lm/<model>/config.json, read by one extractor per model_type
-  written against the model files in pithtrain/models/ (an unknown model_type fails collection, so
-  a model cannot land without cases);
-- the mesh rules: per model, the contexts and CP degrees of CONTEXTS (context / CP >= 4k), the
-  micro-batch sizes of MICRO_BATCH_SIZES at CP 1 and 1 under CP, and every EP of EXPERT_PARALLEL
-  that divides the expert count (EP 1 for dense models); gpt-oss has no ring attention, so it
-  trains at CP 1 only.
+Tiers (pytest -m): smoke (default; one or two cases per family and model, and test_spec.py's
+checks), spec (every shape), stress (past balanced training); multigpu (ring attention, GDN under
+CP; in no other tier, and a skip for missing GPUs fails). Shard a tier over a node's GPUs with
+CUDA_VISIBLE_DEVICES=i pytest tests/kernels -m "smoke or spec or stress" --shard i/8. CP 16 runs one
+pytest per node, eight ranks each:
+    srun -N 2 --ntasks-per-node 1 --gres gpu:8 bash -c 'WORLD_SIZE=16 LOCAL_WORLD_SIZE=8 \
+      NODE_RANK=$SLURM_NODEID MASTER_ADDR=<first node> pytest tests/kernels -m multigpu -k cp16'
 
-How a mesh maps onto kernel shapes (pithtrain/modules/distributed.py, MoE parallel folding): there
-is no tensor parallelism; attention runs on B = mbs sequences of S_local = context / cp tokens; the
-experts of a rank see T = mbs * S_local tokens from each of the ep ranks of its EP group, about
-T * top_k rows over G = E / ep local experts; pipeline parallelism only decides which layers a rank
-holds, so it changes no shape.
+Tolerances: analytic where the arithmetic gives one (bit-exact, one bf16 rounding, an accumulation
+term), else about 3x the worst error measured over the smoke, spec and stress tiers (H200), listed
+in each test module; a bound that must grow to pass a new case is a finding, not a fix.
 
-Each family (FAMILIES) names the pithtrain.kernels entry points its cases drive and the test that
-consumes them, tests/kernels/test_<family>.py. A case is one distinct launch shape, a dict
-
-    id      "<family>/<model>/<label>", stable as long as the shape is
-    family, model
-    tier    smoke (one or two per family and model), spec (every shape the meshes produce) or stress
-            (past balanced training)
-    axes    the shape, all a test or benchmark reads
-    meshes  the meshes that launch it ("ctx<k>-cp<n>-mbs<n>-ep<n>")
-    weight  FLOPs of one forward launch and the layers launching it per micro-batch, where known
-
-Expert routing is materialized here (axes["group_sizes"], the rows of each local expert), so the
-tests and the benchmark run the same counts; random.Random streams are stable across Python
-versions.
-
-    python -m tests.kernels.cases --summary   case counts per family, model and tier
-    python -m tests.kernels.cases --readme    the generated per-model sections of README.md
+Kernel changes and agents take their shapes from here, never pick their own, and post a GPU run of
+the tiers (multigpu when CP code changes) and of benchmarks/kernels/bench_spec.py --base
+upstream/main. They may add cases (a rule or edge case here or in a test), never remove spec cases.
 """
 
 from __future__ import annotations
@@ -48,7 +40,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples" / "pretrain_lm"
-README = Path(__file__).resolve().parent / "README.md"
 
 CONTEXTS = {4096: (1,), 8192: (1,), 16384: (2, 4), 32768: (4, 8), 65536: (8, 16)}
 """
@@ -989,69 +980,16 @@ def seed_of(case: dict) -> int:
     return stable_seed(case["id"])
 
 
-# README ------------------------------------------------------------------------------------------
-
-
-def shape_rows(model: Model) -> list[tuple[str, str]]:
-    att, experts, gdn = model.attention, model.experts, model.linear_attention
-    rows = [("model_type", f"`{model.model_type}`"), ("hidden / vocab / layers", f"{model.hidden} / {model.vocab} / {model.num_layers}")]  # fmt: skip
-    heads = f"{att.num_heads} q / {att.num_kv_heads} kv heads, head dim {att.head_dim}" + (f" (v {att.v_head_dim})" if att.v_head_dim != att.head_dim else "")  # fmt: skip
-    if att.mla_kv_lora_rank is not None:
-        heads += f", MLA kv rank {att.mla_kv_lora_rank}, rope dim {att.mla_rope_dim}"
-    if att.window is not None:
-        heads += f", sliding window {att.window} on half the layers, sinks"
-    rows.append((f"attention ({layers(att.layers)})", heads))
-    if gdn is not None:
-        rows.append((f"Gated DeltaNet ({layers(gdn.layers)})", f"{gdn.num_key_heads} key / {gdn.num_value_heads} value heads, dims {gdn.key_dim} / {gdn.value_dim}, conv width {gdn.conv_kernel} over {gdn.conv_channels} channels"))  # fmt: skip
-    if experts is not None:
-        act = experts.act.replace("_", " ") + (f" (alpha {experts.swiglu_alpha}, limit {experts.swiglu_limit:g}), biases" if experts.act == "clamped_swiglu" else "")  # fmt: skip
-        rows.append((f"experts ({layers(experts.layers)})", f"{experts.num_experts} experts, top {experts.top_k}, inter {experts.inter}, gate / up {experts.gate_up_layout}, {act}"))  # fmt: skip
-    for name, inter, count in model.swiglu_widths:
-        if count:
-            rows.append((f"{name.replace('_', ' ')} ({layers(count)})", f"SwiGLU, inter {inter}"))
-    projections = ", ".join(f"{p.name} {p.n}x{p.k}" for p in model.projections if p.layers)
-    rows.append(("dense projections (N x K)", projections))
-    return rows
-
-
-def layers(n: int) -> str:
-    return f"{n} layer" + ("" if n == 1 else "s")
-
-
-def mesh_table(model: Model) -> list[tuple[str, ...]]:
-    eps = ", ".join(str(ep) for ep in allowed_ep(model))
-    return [(k(c), str(cp), str(mbs), k(mbs * c // cp), eps) for c, cp, mbs in mesh_rows(model)]
-
-
-def table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
-    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
-    return "\n".join(lines + ["| " + " | ".join(row) + " |" for row in rows])
-
-
-def readme_models() -> str:
-    """
-    The per-model sections of README.md, as the code generates them.
-    """
-    sections = []
-    for model in load_models():
-        counts = Counter(c["family"] for c in model_cases(model))
-        families = ", ".join(f"{family} {n}" for family, n in counts.items())
-        sections.append(f"### {model.name}\n\n{table(('shape', 'value'), shape_rows(model))}\n\n{table(('context', 'CP', 'mbs', 'tokens/GPU', 'EP'), mesh_table(model))}\n\nCases: {families}.")  # fmt: skip
-    return "\n\n".join(sections) + "\n"
-
-
-def readme_models_section(text: str) -> str:
-    """
-    The per-model sections of a README.md text: from the first "### " after "## Models" to the end.
-    """
-    models = text.index("\n## Models\n")
-    return text[text.index("\n### ", models) + 1 :]
-
-
 def main() -> int:
-    if "--readme" in sys.argv:
-        print(readme_models(), end="")
-        return 0
+    """
+    Per model its meshes (context / CP x mbs) and EP degrees and its cases per family; then per
+    family the cases per tier.
+    """
+    for model in load_models():
+        meshes = ", ".join(f"{k(c)}/cp{cp}x{mbs}" for c, cp, mbs in mesh_rows(model))
+        families = Counter(c["family"] for c in model_cases(model))
+        print(f"{model.name}: meshes {meshes}; EP {', '.join(map(str, allowed_ep(model)))}")
+        print("  " + ", ".join(f"{family} {n}" for family, n in families.items()))
     counts = Counter((c["family"], c["tier"]) for c in all_cases())
     for family in FAMILIES:
         tiers = {tier: counts[(family, tier)] for tier in TIER_ORDER if counts[(family, tier)]}

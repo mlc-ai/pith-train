@@ -1,8 +1,6 @@
 """
 The spec itself, checked in the smoke tier (static: no GPU work):
 
-- README.md is current: its per-model sections (shapes, mesh table, case counts) are the ones
-  cases.py generates (`python -m tests.kernels.cases --readme` prints them);
 - the mesh rules hold for every model: contexts from 4k, CP > 1 only at context / CP >= 4k and
   micro-batch 1, EP dividing the expert count (EP 1 for dense models), CP 1 only for gpt-oss;
 - every examples/pretrain_lm/<model>/config.json has cases, a smoke case among them, in every family
@@ -29,7 +27,6 @@ from tests.kernels.cases import (
     CONFIG_ROOT,
     FAMILIES,
     MIN_LOCAL,
-    README,
     REPO_ROOT,
     SHAPE_INDEPENDENT,
     SM100_ONLY,
@@ -44,12 +41,6 @@ from tests.kernels.cases import (
 pytestmark = pytest.mark.smoke
 MODELS = {model.name: model for model in load_models()}
 KERNELS = REPO_ROOT / "pithtrain" / "kernels"
-
-
-def test_readme_is_current() -> None:
-    have = cases.readme_models_section(README.read_text())
-    want = cases.readme_models()
-    assert have == want, "tests/kernels/README.md is stale: replace its per-model sections with the output of python -m tests.kernels.cases --readme"  # fmt: skip
 
 
 @pytest.mark.parametrize("name", sorted(MODELS))

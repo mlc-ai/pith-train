@@ -142,7 +142,7 @@ def run_cp(case: dict) -> None:
 
 
 # One function per GPU count, so that -k selects what a run has: CP 2 and 4 fit in 4 GPUs, CP 8 needs
-# a node of 8, CP 16 two nodes (see README.md, "Running").
+# a node of 8, CP 16 two nodes (see cases.py).
 @pytest.mark.parametrize("case", params("gated_delta_rule", keep=lambda c: 1 < c["axes"]["cp"] <= 4, multigpu=True))  # fmt: skip
 def test_context_parallel(case: dict) -> None:
     run_cp(case)
