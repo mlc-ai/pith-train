@@ -52,11 +52,15 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
     Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
     after fully_shard.
     """
+    seen_groups = set()
     for module in model.modules():
         if not isinstance(module, FSDPModule):
             continue
         for group in fully_shard.state(module)._fsdp_param_groups:
             assert isinstance(group, FSDPParamGroup)
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
             pairs = []
             for fsdp_param in group.fsdp_params:
                 assert isinstance(fsdp_param, FSDPParam)
@@ -102,7 +106,9 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
                 if param.grad is not None:
                     main_grad.add_(param.grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
-                # grad_dtype of the parameter is fp32 (the reduce dtype) or None, so it takes fp32.
+                # A precision ablation may round at reduce-scatter copy-in, after the FP32 GEMM.
+                if fsdp_param.unsharded_grad_dtype != torch.float32:
+                    param.grad_dtype = None
                 param.grad = main_grad.contiguous()
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.

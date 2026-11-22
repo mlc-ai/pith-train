@@ -1,7 +1,6 @@
 """Dense Qwen3.5 text tower, including checkpoints published as Qwen3.8-27B."""
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -19,17 +18,6 @@ from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.silu_mul import silu_mul
 
 __all__ = ["Qwen35Model", "Qwen35TextModel"]
-
-
-class Qwen35GatedDeltaNet(Qwen35MoeGatedDeltaNet):
-    def project_gates(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if training.fp8:
-            return super().project_gates(hidden_states)
-        # Keep the original checkpoint tensors. One projection also computes their joint input
-        # gradient in one GEMM, with one BF16 rounding of the result.
-        weight = torch.cat((self.in_proj_b.weight, self.in_proj_a.weight), dim=0)
-        b, a = F.linear(hidden_states, weight).chunk(2, dim=-1)
-        return b, a
 
 
 class Qwen35MLP(nn.Module):
@@ -55,7 +43,7 @@ class Qwen35DecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.is_linear = self.layer_type == "linear_attention"
         if self.is_linear:
-            self.linear_attn = Qwen35GatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen35MoeGatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen35MoeAttention(config)
         else:
@@ -99,6 +87,11 @@ class Qwen35DecoderLayer(nn.Module):
 
     def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
         return self.forward(hidden_states, rotary_posemb, cu_seqlens, checkpoint_delta=True)
+
+    def forward_stock_stages(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        hidden_states, residual, _ = self.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)
+        hidden_states = self.forward_stage3(hidden_states)
+        return self.forward_stage5(hidden_states, None, residual)
 
     def forward(self, hidden_states, rotary_posemb, cu_seqlens=None, *, checkpoint_delta=False):
         if self.to_contiguous:

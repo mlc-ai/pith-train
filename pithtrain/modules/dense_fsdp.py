@@ -68,6 +68,9 @@ class DenseFSDPCfg(SlottedDefault):
     bf16_sharded_gradients: bool = False
     """Accumulate reduced shards in BF16 and upcast once before AdamW."""
 
+    reuse_gradient_shards: bool = False
+    """Zero the dense model's FP32 gradient shards in place after AdamW."""
+
     reduce_at_step_end: bool | int = False
     """Defer reduction for all parameters (True) or the first N decoder buckets."""
 
@@ -83,7 +86,7 @@ class DenseFSDPCfg(SlottedDefault):
     separate_reduce_scatter: bool = False
     """Use a dedicated communicator for reduce-scatter to allow backward all-gather overlap."""
 
-    collective_buffers: Literal["default", "process-group", "symmetric"] = "default"
+    collective_buffers: Literal["default", "native-pool", "process-group", "symmetric"] = "default"
     """Select the allocator for all-gather and reduce-scatter staging buffers."""
 
     activation_checkpoint: Literal["none", "selective", "full", "offload"] = "none"
@@ -219,6 +222,33 @@ def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
     unit.set_custom_all_gather(AllGatherIntoWeight())
 
 
+def use_native_collective_pool(units: list[nn.Module]) -> None:
+    from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+        DefaultAllGather,
+        DefaultReduceScatter,
+    )
+
+    pool = torch.cuda.MemPool()
+
+    class PooledAllocation:
+        def allocate(self, size, *, dtype, device):
+            # Keep staging blocks apart from the activations that otherwise split them.
+            with torch.cuda.use_mem_pool(pool, device=device):
+                return torch.empty(size, dtype=dtype, device=device)
+
+    class PooledAllGather(PooledAllocation, DefaultAllGather):
+        pass
+
+    class PooledReduceScatter(PooledAllocation, DefaultReduceScatter):
+        pass
+
+    all_gather = PooledAllGather()
+    reduce_scatter = PooledReduceScatter()
+    for unit in units:
+        unit.set_custom_all_gather(all_gather)
+        unit.set_custom_reduce_scatter(reduce_scatter)
+
+
 def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCfg) -> None:
     if cfg.blocks_per_group < 1:
         raise ValueError("dense_fsdp.blocks_per_group must be positive")
@@ -242,6 +272,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
     if cfg.bf16_sharded_gradients and cfg.reduce_dtype != "bf16":
         raise ValueError("BF16 sharded gradients require BF16 reduction")
+    if cfg.reuse_gradient_shards and cfg.bf16_sharded_gradients:
+        raise ValueError("Reusing gradient shards requires FP32 gradient storage")
     if cfg.reduce_at_step_end < 0:
         raise ValueError("dense_fsdp.reduce_at_step_end must be nonnegative")
     if cfg.activation_checkpoint not in ("none", "selective", "full", "offload"):
@@ -249,9 +281,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
         )
 
-    if cfg.collective_buffers not in ("default", "process-group", "symmetric"):
+    if cfg.collective_buffers not in ("default", "native-pool", "process-group", "symmetric"):
         raise ValueError(
-            "dense_fsdp.collective_buffers must be default, process-group or symmetric"
+            "dense_fsdp.collective_buffers must be default, native-pool, process-group or symmetric"
         )
     if cfg.collective_buffers == "symmetric" and cfg.reduce_scatter_buffers != 1:
         raise ValueError("Symmetric reduce-scatter requires one input buffer")
@@ -263,7 +295,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
+        output_dtype=None,
+        cast_forward_inputs=True,
     )
     if cfg.compile_blocks:
         from torch._inductor import list_mode_options
@@ -272,6 +305,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         if cfg.compile_mode in ("default", "reduce-overhead"):
             compile_options |= stage_compile_options()
     for layer in model.layers:
+        if not cfg.compile_blocks:
+            layer.forward = layer.forward_stock_stages
         if cfg.activation_checkpoint in ("selective", "full"):
             ctx = (
                 {"context_fn": selective_checkpoint_contexts}
@@ -330,9 +365,7 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         )
     retained_units = ()
     if cfg.keep_gathered_across_microbatches:
-        retained_units = tuple(
-            group[0] for group in decoder_groups[-cfg.keep_last_groups :]
-        )
+        retained_units = tuple(group[0] for group in decoder_groups[-cfg.keep_last_groups :])
 
     # One FSDP state per communication bucket, even when several blocks share it.
     order = [group[0] for group in decoder_groups]
@@ -371,7 +404,9 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         model.set_reduce_scatter_max_input_buffers(cfg.reduce_scatter_buffers)
     if cfg.separate_reduce_scatter:
         model.set_separate_reduce_scatter_group()
-    if cfg.collective_buffers != "default":
+    if cfg.collective_buffers == "native-pool":
+        use_native_collective_pool([*order, model])
+    elif cfg.collective_buffers != "default":
         for unit in (*order, model):
             if cfg.collective_buffers == "symmetric":
                 unit.set_force_sum_reduction_for_comms(True)

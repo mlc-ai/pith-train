@@ -42,6 +42,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bf16-sharded-gradients", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument("--reuse-gradient-shards", action="store_true")
     parser.add_argument(
         "--reduce-at-step-end",
         type=int,
@@ -55,7 +56,9 @@ if __name__ == "__main__":
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
     parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument(
-        "--collective-buffers", choices=("default", "process-group", "symmetric"), default="default"
+        "--collective-buffers",
+        choices=("default", "native-pool", "process-group", "symmetric"),
+        default="default",
     )
     parser.add_argument(
         "--checkpoint", choices=("none", "selective", "full", "offload"), default="none"
@@ -110,6 +113,7 @@ if __name__ == "__main__":
     train.dense_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
     train.dense_fsdp.bf16_sharded_gradients = args.bf16_sharded_gradients
+    train.dense_fsdp.reuse_gradient_shards = args.reuse_gradient_shards
     train.dense_fsdp.reduce_at_step_end = args.reduce_at_step_end
     train.dense_fsdp.overlap_microbatch_reductions = args.overlap_microbatch_reductions
     train.dense_fsdp.prefetch_data_during_optimizer = args.prefetch_data_during_optimizer

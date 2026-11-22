@@ -412,6 +412,8 @@ def setup_model(
         from_hf = cfg.hf_import_path is not None and cfg.save_location is None
         with torch.device("meta") if from_hf else nullcontext():
             model = Qwen35TextModel(module_config)
+        if any(param.dtype != torch.float32 for param in model.parameters()):
+            raise ValueError("Dense BF16 training requires FP32 master parameters")
         if not from_hf:
             init_weights(
                 model,
@@ -424,6 +426,7 @@ def setup_model(
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
+        install_wgrad_accumulation(model)
         training.model = model
         return
 

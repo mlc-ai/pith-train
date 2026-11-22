@@ -250,9 +250,10 @@ def train_step(
         model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
     )
 
+    release_grads = dense_fsdp is None or not dense_fsdp.reuse_gradient_shards
     for optimizer, scheduler in zip(optimizers, schedulers):
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=release_grads)
         scheduler.step()
     for param in upcast_params:
         param.grad_dtype = torch.bfloat16
