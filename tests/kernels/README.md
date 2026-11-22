@@ -6,7 +6,7 @@ collection from each model's `config.json` and the mesh rules below, so a new mo
 gets its cases by construction. This page is the spec as people read it; `test_spec.py` fails
 (smoke tier) when its per-model tables differ from what `cases.py` generates.
 
-H200 (SM90) only: the SM100 kernels are out of scope here.
+SM90 only (the bounds are calibrated on the H200): the SM100 kernels are out of scope here.
 
 ## Rules
 
@@ -94,30 +94,29 @@ grow to pass a new case is a finding, not a fix.
 
 ## Benchmarks
 
-`benchmarks/kernels/ab.py` measures a change: the same cases with the pithtrain of a base git ref
-(checked out as a worktree) and of the working tree, on one GPU, interleaved op by op over several
-rounds, so both sides see the same GPU and no baseline is stored. It reports per op base / head time
-and speedup, and per op name the work-weighted speedup (work: FLOPs, or for memory-bound ops the
-elements read, times the layers launching the case), and exits 1 when an op that ran at the base
-fails or an op name is more than 5% slower work-weighted. `--base-dir .` times the tree against
-itself, the noise floor: up to 10% either way on single ops of about 1 GB (buffer placement), so
-read the weighted speedup. `benchmarks/kernels/bench_spec.py` holds the op builders and times one
-tree alone (CUDA events around single launches, L2 flushed, median / p10 / p90; `--shard I/N` per
-GPU, `--merge` the shards).
+`benchmarks/kernels/bench_spec.py` times the same cases (CUDA events around single launches, L2
+flushed, median / p10 / p90 per op), and with `--base REF` measures a change: the cases with the
+pithtrain of the base ref (checked out as a worktree; `--base-dir DIR` for a checkout) and of the
+working tree, on one GPU, interleaved op by op over several rounds, so both sides see the same GPU
+and no baseline is stored. It reports per op base / head time and speedup, and per op name the
+work-weighted speedup (work: FLOPs, or for memory-bound ops the elements read, times the layers
+launching the case), and exits 1 when an op that ran at the base fails or an op name is more than
+5% slower work-weighted. `--base-dir .` times the tree against itself, the noise floor: up to 10%
+either way on single ops of about 1 GB (buffer placement), so read the weighted speedup.
 
 ```bash
-python -m benchmarks.kernels.ab --base upstream/main --family moe_experts --out ab.json
+python -m benchmarks.kernels.bench_spec --base upstream/main --family moe_experts --out ab.json
 ```
 
 ## Kernel changes and kernel-design agents
 
-A change to `pithtrain/kernels/` reads this page for its shapes, and its PR posts H200 results of
-`pytest tests/kernels -m "smoke or spec or stress"` (plus `-m multigpu` when CP code changes) and
-`ab` against main over the families it touches. An agent designing a kernel takes its cases from
-`cases.py`, never from a shape it picks, must pass `pytest tests/kernels -m "smoke or spec"` and `ab`
-against main on an H200, and may add cases (a new rule or edge case in `cases.py` or its test) but
-never remove a spec case. Shape specialization is allowed only to shapes in the spec, so a
-specialized route is always a verified one.
+A change to `pithtrain/kernels/` reads this page for its shapes, and its PR posts the results of a
+GPU run of `pytest tests/kernels -m "smoke or spec or stress"` (plus `-m multigpu` when CP code
+changes) and of `bench_spec --base upstream/main` over the families it touches. An agent designing a
+kernel takes its cases from `cases.py`, never from a shape it picks, must pass `pytest tests/kernels
+-m "smoke or spec"` and the `--base` A/B against main, and may add cases (a new rule or edge case in
+`cases.py` or its test) but never remove a spec case. Shape specialization is allowed only to shapes
+in the spec, so a specialized route is always a verified one.
 
 ## Changing the spec
 

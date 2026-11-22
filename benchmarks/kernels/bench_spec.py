@@ -1,43 +1,60 @@
 """
-Times the kernels at the cases of tests/kernels/cases.py, the same cases the kernel tests verify,
-and writes machine-readable results. A change is judged by benchmarks/kernels/ab.py, which runs these
-op builders at a base git ref and at the working tree on one GPU; no baseline is stored.
+Times the kernels at the cases of tests/kernels/cases.py, the same cases the kernel tests verify:
+one tree alone, or a change against a base git ref (--base), which is how a kernel change is judged
+(no baseline is stored).
 
-    python -m benchmarks.kernels.bench_spec --tier spec --out results.json
-    python -m benchmarks.kernels.bench_spec --family moe_experts --model qwen3-30b-a3b
+    python -m benchmarks.kernels.bench_spec --base upstream/main --family cross_entropy --out ab.json
+    python -m benchmarks.kernels.bench_spec --base upstream/main --family moe_experts --op 'quant|silu'
+    python -m benchmarks.kernels.bench_spec --base-dir . --family weight_quant      (the noise floor)
+    python -m benchmarks.kernels.bench_spec --tier spec --out results.json           (this tree alone)
     python -m benchmarks.kernels.bench_spec --tier spec --shard 3/8 --out shard3.json   (one per GPU)
     python -m benchmarks.kernels.bench_spec --merge shard*.json --out results.json
 
 The default tier is spec (smoke and spec cases; stress with --tier stress). One case runs several
 ops (e.g. the FP8 gate_up forward, its dgrad and wgrad); each op is timed with CUDA events around
-single launches, the L2 flushed before each, after warmup, and reported as median / p10 / p90
-microseconds. Each op also records its work: FLOPs for GEMMs, attention, GDN and conv (with TFLOP/s),
-and for memory-bound ops (quantizations, fused activations, packing, cross entropy) the elements it
-reads, so a total weighted by work per step (work x the layers launching the case) counts every op
-by its size. Correctness is not checked here (tests/kernels does). Timings are only comparable on an
-otherwise idle GPU.
+single launches, the L2 flushed before each, after warmup: median / p10 / p90 microseconds. Each op
+also records its work, FLOPs for GEMMs, attention, GDN and conv, and for memory-bound ops
+(quantizations, fused activations, packing, cross entropy) the elements it reads, and the layers
+launching its case, so totals weight every op by its work per step. Correctness is not checked here
+(tests/kernels does). Timings are only comparable on an otherwise idle GPU.
 
-The op builders import pithtrain inside their functions, so benchmarks/kernels/ab.py can run them
-against the pithtrain of another git ref; an op a ref lacks or rejects is an error of that op.
+--base REF checks the ref out into a worktree (workspace/ab/<sha>, kept for reuse); --base-dir uses
+a directory that already holds one. Two worker processes run on the current GPU, one importing
+pithtrain from the base tree and one from this tree; everything else (the cases, the op builders
+below, which import pithtrain inside their functions, the libraries of this environment) is this
+tree's, so the two differ only in pithtrain. Every case's ops are timed --rounds times on each side,
+alternating which side goes first, and the medians of the rounds compared: speedup = base / head
+(above 1: this tree is faster). Per op name the work-weighted speedup sum(w) / sum(w / speedup),
+w = work x layers, is the ratio of the total time the cases take. The run fails (exit 1) when an op
+that runs at the base fails in this tree or an op name is more than TOLERANCE (5%) slower
+work-weighted. --base-dir . times the tree against itself, the noise floor: on the H200 single ops
+of about 1 GB (gpt-oss-120b's expert weights, its EP 1 activations) then differ by up to 10% either
+way between the two processes, from where their buffers are placed, so judge by the weighted
+speedup, not by one such op.
 """
 
 import argparse
 import importlib.metadata
 import json
 import math
+import os
 import re
+import statistics
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from tests.kernels.cases import TIER_ORDER, select
+from tests.kernels.cases import TIER_ORDER, all_cases, select
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEV = "cuda"
+TOLERANCE = 0.05
 FAMILIES = [
     "moe_experts",
     "dense_gemm",
@@ -389,42 +406,47 @@ def build(case: dict) -> dict[str, Op]:
     return OPS[case["family"]](case["axes"], torch.Generator(device=DEV).manual_seed(0))
 
 
-def record(case: dict, op: str, entry: Op, timing: dict) -> dict:
-    layers = case.get("weight", {}).get("layers", 1)
-    row = dict(case=case["id"], op=op, **timing, work=entry.work, memory_bound=entry.memory_bound, layers=layers)  # fmt: skip
-    if not entry.memory_bound and entry.work:
-        row["tflops"] = entry.work / timing["median_us"] / 1e6
-    return row
+def error_of(error: BaseException) -> dict:
+    return dict(error=f"{type(error).__name__}: {error}"[:300])
 
 
-def error_row(case: dict, op: str, error: BaseException) -> dict:
-    return dict(case=case["id"], op=op, error=f"{type(error).__name__}: {error}"[:300])
+def time_case(case: dict, timer: Timer, pattern: re.Pattern | None) -> dict:
+    """
+    {op: timing and work, or {"error": ...}} of the case's ops whose name matches pattern; "*" when
+    the ops cannot be built. An op a kernel rejects fails alone.
+    """
+    reply, ops = {}, {}
+    try:
+        ops = build(case)
+        for op, entry in ops.items():
+            if pattern is None or pattern.search(op):
+                try:
+                    reply[op] = dict(timer(entry.fn), work=entry.work, memory_bound=entry.memory_bound)  # fmt: skip
+                except Exception as error:
+                    reply[op] = error_of(error)
+    except Exception as error:
+        reply["*"] = error_of(error)
+    finally:
+        ops = None
+        torch.cuda.empty_cache()
+    return reply
+
+
+def layers_of(case: dict) -> int:
+    return case.get("weight", {}).get("layers", 1)
 
 
 def run(args) -> dict:
     torch.backends.cuda.matmul.allow_tf32 = False
-    timer = Timer(args.warmup, args.reps)
-    pattern = re.compile(args.op) if args.op else None
+    timer, pattern = Timer(args.warmup, args.reps), re.compile(args.op) if args.op else None
     results = []
     for case in cases_of(args.family or FAMILIES, args.tier, args.model, args.shard):
-        ops = {}
-        try:
-            ops = build(case)
-            for op, entry in ops.items():
-                if pattern is not None and not pattern.search(op):
-                    continue
-                try:
-                    row = record(case, op, entry, timer(entry.fn))
-                except Exception as error:  # an op a kernel rejects fails alone
-                    row = error_row(case, op, error)
-                results.append(row)
-                print(f"{case['id']:<52} {op:<36} " + (f"{row['median_us']:10.1f} us" if "median_us" in row else row["error"]), flush=True)  # fmt: skip
-        except Exception as error:
-            results.append(error_row(case, "*", error))
-            print(f"{case['id']:<52} * {results[-1]['error']}", flush=True)
-        finally:
-            ops = None
-            torch.cuda.empty_cache()
+        for op, timing in time_case(case, timer, pattern).items():
+            row = dict(case=case["id"], op=op, layers=layers_of(case), **timing)
+            if "median_us" in row and not row["memory_bound"] and row["work"]:
+                row["tflops"] = row["work"] / row["median_us"] / 1e6
+            results.append(row)
+            print(f"{case['id']:<52} {op:<36} " + (f"{row['median_us']:10.1f} us" if "median_us" in row else row["error"]), flush=True)  # fmt: skip
     return dict(meta=dict(environment(), tier=args.tier, warmup=args.warmup, reps=args.reps), results=results)  # fmt: skip
 
 
@@ -434,6 +456,129 @@ def merge(paths: list[Path]) -> dict:
     """
     runs = [json.loads(path.read_text()) for path in paths]
     return dict(meta=dict(runs[0]["meta"], shards=len(runs)), results=[r for run in runs for r in run["results"]])  # fmt: skip
+
+
+# A / B against a base git ref ---------------------------------------------------------------------
+
+
+def serve(tree: str) -> None:
+    """
+    An A/B worker: pithtrain from tree; one JSON request line in ({"case", "op", "warmup", "reps"}),
+    one JSON line of time_case out.
+    """
+    sys.path.insert(0, tree)
+    import pithtrain
+
+    assert Path(pithtrain.__file__).resolve().is_relative_to(Path(tree).resolve()), pithtrain.__file__  # fmt: skip
+    sys.path.remove(tree)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    by_id, timer = {case["id"]: case for case in all_cases()}, None
+    print(json.dumps(dict(ready=pithtrain.__file__)), flush=True)
+    for line in sys.stdin:
+        request = json.loads(line)
+        timer = timer or Timer(request["warmup"], request["reps"])
+        print(json.dumps(time_case(by_id[request["case"]], timer, request["op"] and re.compile(request["op"]))), flush=True)  # fmt: skip
+
+
+class Worker:
+    def __init__(self, tree: Path):
+        cmd = [sys.executable, "-m", "benchmarks.kernels.bench_spec", "--serve", str(tree)]
+        env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
+        self.proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)  # fmt: skip
+        self.pithtrain = self.read()["ready"]
+
+    def read(self) -> dict:
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"worker exited with {self.proc.wait()}")
+        return json.loads(line)
+
+    def time(self, request: dict) -> dict:
+        self.proc.stdin.write(json.dumps(request) + "\n")
+        self.proc.stdin.flush()
+        return self.read()
+
+    def close(self) -> None:
+        self.proc.stdin.close()
+        self.proc.wait()
+
+
+def base_tree(ref: str) -> Path:
+    sha = subprocess.run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()  # fmt: skip
+    tree = REPO_ROOT / "workspace" / "ab" / sha[:12]
+    if not (tree / "pithtrain").is_dir():
+        subprocess.run(["git", "worktree", "add", "--detach", str(tree), sha], cwd=REPO_ROOT, check=True)  # fmt: skip
+    return tree
+
+
+def ab_row(case: dict, op: str, timings: dict) -> dict:
+    """
+    One op of a case: each side's median over the rounds (or its error) and the speedup.
+    """
+    row = dict(case=case["id"], op=op, layers=layers_of(case))
+    for side, rounds in timings.items():
+        times = [t["median_us"] for t in rounds if "median_us" in t]
+        if times:
+            row[f"{side}_us"], row["work"] = statistics.median(times), rounds[0]["work"]
+        else:
+            row[f"{side}_error"] = next((t["error"] for t in rounds if "error" in t), "not timed")
+    if "base_us" in row and "head_us" in row:
+        row["speedup"] = row["base_us"] / row["head_us"]
+    return row
+
+
+def summarize(rows: list[dict]) -> dict:
+    """
+    Per op name and over every op ("*"): the work-weighted speedup, the op count, min and max.
+    """
+    groups = defaultdict(list)
+    for row in rows:
+        if "speedup" in row:
+            groups[row["op"]].append(row)
+            groups["*"].append(row)
+    out = {}
+    for name, members in groups.items():
+        w = [r["work"] * r["layers"] for r in members]
+        weighted = sum(w) / sum(wi / r["speedup"] for wi, r in zip(w, members)) if sum(w) else None
+        out[name] = dict(ops=len(members), weighted_speedup=weighted, min=min(r["speedup"] for r in members), max=max(r["speedup"] for r in members))  # fmt: skip
+    return out
+
+
+def regressions(rows: list[dict], summary: dict) -> list[str]:
+    problems = [f"{r['case']} {r['op']}: {r['head_error']}" for r in rows if "head_error" in r and "base_us" in r]  # fmt: skip
+    for name, s in sorted(summary.items()):
+        if name != "*" and s["weighted_speedup"] and s["weighted_speedup"] < 1 / (1 + TOLERANCE):
+            problems.append(f"{name}: work-weighted speedup x{s['weighted_speedup']:.3f}")
+    return problems
+
+
+def ab(args) -> int:
+    sides = dict(base=Worker(args.base_dir.resolve() if args.base_dir else base_tree(args.base)), head=Worker(REPO_ROOT))  # fmt: skip
+    rows = []
+    for case in cases_of(args.family or FAMILIES, args.tier, args.model, args.shard):
+        request = dict(case=case["id"], op=args.op, warmup=args.warmup, reps=args.reps)
+        timings = dict(base=defaultdict(list), head=defaultdict(list))
+        for r in range(args.rounds):  # base, head, head, base, ...
+            for side in ("base", "head") if r % 2 == 0 else ("head", "base"):
+                for op, timing in sides[side].time(request).items():
+                    timings[side][op].append(timing)
+        for op in dict.fromkeys([*timings["base"], *timings["head"]]):
+            rows.append(ab_row(case, op, {side: timings[side][op] for side in timings}))
+            row = rows[-1]
+            shown = f"{row['base_us']:10.1f} {row['head_us']:10.1f} us  x{row['speedup']:.3f}" if "speedup" in row else f"base: {row.get('base_error', 'ok')} | head: {row.get('head_error', 'ok')}"  # fmt: skip
+            print(f"{case['id']:<52} {op:<36} {shown}", flush=True)
+    for worker in sides.values():
+        worker.close()
+    summary = summarize(rows)
+    for name, s in sorted(summary.items()):
+        weighted = f"{s['weighted_speedup']:.3f}" if s["weighted_speedup"] else "-"
+        print(f"{name:<40} {s['ops']:5d} ops  work-weighted speedup x{weighted}  (min {s['min']:.3f}, max {s['max']:.3f})")  # fmt: skip
+    problems = regressions(rows, summary)
+    print("".join(f"REGRESSION {line}\n" for line in problems) + f"{len(problems)} regressions")
+    if args.out:
+        meta = dict(base=args.base or str(args.base_dir), base_pithtrain=sides["base"].pithtrain, head_pithtrain=sides["head"].pithtrain, rounds=args.rounds, tier=args.tier)  # fmt: skip
+        args.out.write_text(json.dumps(dict(meta=meta, summary=summary, results=rows, regressions=problems), indent=1) + "\n")  # fmt: skip
+    return 1 if problems else 0
 
 
 def main() -> int:
@@ -446,14 +591,20 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--base", help="A/B: a git ref to time this tree against")
+    parser.add_argument("--base-dir", type=Path, help="A/B: a checkout to time this tree against")
+    parser.add_argument("--rounds", type=int, default=3, help="A/B: timings per op and side")
     parser.add_argument("--merge", nargs="+", type=Path, metavar="SHARD", help="merge shard results into --out instead of running")  # fmt: skip
+    parser.add_argument("--serve", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.merge:
-        result = merge(args.merge)
-        if args.out:
-            args.out.write_text(json.dumps(result, indent=1) + "\n")
+    if args.serve:
+        serve(args.serve)
         return 0
-    result = run(args)
+    if args.base or args.base_dir:
+        if args.base and args.base_dir:
+            parser.error("give one of --base and --base-dir")
+        return ab(args)
+    result = merge(args.merge) if args.merge else run(args)
     if args.out:
         args.out.write_text(json.dumps(result, indent=1) + "\n")
     return 0 if all(math.isfinite(r.get("median_us", math.nan)) for r in result["results"]) else 1
