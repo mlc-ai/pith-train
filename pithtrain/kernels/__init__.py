@@ -1,11 +1,5 @@
 """
-PithTrain's kernel library. __all__ is its whole interface: code outside this package imports names
-from pithtrain.kernels, never a submodule. Each name's docstring is its contract, verified against
-PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100 implementation
-itself; callers that need to know whether a fused path exists use the capability queries
-fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported,
-gated_delta_rule_cp_supported and chunk_gdr_cp_supported. Importing the package never loads cutlass,
-QuACK or tvm_tirx.
+PithTrain's kernel library: __all__ is its interface, each name's docstring its contract.
 """
 
 from pithtrain.kernels.bf16_expert_gemm import bf16_expert_down_dgrad, bf16_expert_gate_up_dgrad, bf16_expert_down_fwd, bf16_expert_gate_up_fwd, bf16_expert_down_wgrad, bf16_expert_gate_up_wgrad
@@ -13,7 +7,6 @@ from pithtrain.kernels.bf16_expert_slots import bf16_expert_gather_rows, bf16_ex
 from pithtrain.kernels.bf16_expert_support import bf16_experts_supported
 from pithtrain.kernels.causal_conv1d import causal_conv1d_bwd, causal_conv1d_fwd, causal_conv1d_empty
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
-from pithtrain.kernels.cross_entropy import cross_entropy_fwd_bwd
 from pithtrain.kernels.ep_dispatch import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.kernels.flash_attn_memoize import memoized_launch
 from pithtrain.kernels.fp8_clamped_swiglu_quant import fp8_clamped_swiglu_bwd, fp8_clamped_swiglu_kmajor, fp8_clamped_swiglu_rowwise
@@ -79,7 +72,6 @@ __all__.append("causal_conv1d_fwd")
 __all__.append("causal_conv1d_empty")
 __all__.append("clamped_swiglu_bwd")
 __all__.append("clamped_swiglu_fwd")
-__all__.append("cross_entropy_fwd_bwd")
 __all__.append("group_bias_add")
 __all__.append("segment_sum")
 __all__.append("silu_mul_bwd")

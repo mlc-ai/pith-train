@@ -1006,7 +1006,9 @@ def fp8_pack_transpose_sm90(x: torch.Tensor, out: torch.Tensor) -> None:
     key = ("pack", mode, x.dtype, out.dtype)
     fn = COMPILED.get(key)
     if fn is None:
-        fn = cute.compile(PackTranspose(mode), fake_row_major(TORCH2CUTE[x.dtype], 3, 1), fake_row_major(TORCH2CUTE[out.dtype], 1, 1), fake_stream(), options="--enable-tvm-ffi")
+        # out holds 2 x numel bytes, past 2^31 for the largest expert weights (gpt-oss-120b gate_up at EP 1): a 64-bit length; the kernel offsets in Int64.
+        out_fake = fake(TORCH2CUTE[out.dtype], (cute.sym_int64(),), (1,), 1)
+        fn = cute.compile(PackTranspose(mode), fake_row_major(TORCH2CUTE[x.dtype], 3, 1), out_fake, fake_stream(), options="--enable-tvm-ffi")
         COMPILED[key] = fn
     fn(x, out)
 

@@ -394,7 +394,7 @@ def get_kernel(N: int, backward: bool, device: torch.device) -> object:
         num_col_blocks = (N + BLOCK - 1) // BLOCK
         x = fake(cutlass.BFloat16, (M, N), (N, 1))
         fp8_type = cutlass.Float8E4M3FN
-        out = (fake(fp8_type, (M, N), (N, 1)), fake(Float32, (M, num_col_blocks), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int(),), (1,)), fake(Float32, (N, cute.sym_int()), (1, mn_pad(N)), 16))
+        out = (fake(fp8_type, (M, N), (N, 1)), fake(Float32, (M, num_col_blocks), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int64(),), (1,)), fake(Float32, (N, cute.sym_int()), (1, mn_pad(N)), 16))
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
         fn = cute.compile(SiluMulQuant(N, backward, SM_COUNT), x if backward else None, x, x, offs, *out, *(out if backward else (None,) * 4), fake_stream(), options="--enable-tvm-ffi")
         COMPILED[key] = fn
@@ -409,7 +409,7 @@ def get_kernel_gu(N: int, backward: bool, device: torch.device) -> object:
         num_channels = 2 * N if backward else N
         gu_half = fake(cutlass.BFloat16, (M, N), (2 * N, 1))
         fp8_type = cutlass.Float8E4M3FN
-        out = (fake(fp8_type, (M, num_channels), (num_channels, 1)), fake(Float32, (M, num_channels // BLOCK), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int(),), (1,)), fake(Float32, (num_channels, cute.sym_int()), (1, mn_pad(num_channels)), 16))
+        out = (fake(fp8_type, (M, num_channels), (num_channels, 1)), fake(Float32, (M, num_channels // BLOCK), (1, cute.sym_int64()), 16), fake(fp8_type, (cute.sym_int64(),), (1,)), fake(Float32, (num_channels, cute.sym_int()), (1, mn_pad(num_channels)), 16))
         offs = fake(Int32, (cute.sym_int(),), (1,), 4)
         fn = cute.compile(SiluMulQuantGU(N, backward, SM_COUNT), fake(cutlass.BFloat16, (M, N), (N, 1)) if backward else None, gu_half, gu_half, offs, *out, fake_stream(), options="--enable-tvm-ffi")
         COMPILED[key] = fn

@@ -1,15 +1,10 @@
-# Adapted from NVIDIA TransformerEngine (Apache 2.0)
-# https://github.com/NVIDIA/TransformerEngine
-#   transformer_engine/common/triton/cross_entropy.py  (Triton kernels)
-#   transformer_engine/pytorch/triton/cross_entropy.py  (autograd wrapper)
-# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# Modifications: fused online-softmax + cross-entropy into a single kernel,
-# removed tensor-parallelism / label-smoothing / distributed support.
+"""
+Mean cross-entropy of the lm_head logits through the log_prob kernels.
+"""
 
 import torch
 
-from pithtrain.kernels import cross_entropy_fwd_bwd
+from pithtrain.kernels import log_prob_bwd, log_prob_fwd
 
 __all__ = ["cross_entropy"]
 
@@ -17,14 +12,28 @@ __all__ = ["cross_entropy"]
 class CrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inp, target, ignore_index):
-        loss, inp = cross_entropy_fwd_bwd(inp, target, ignore_index)
-        ctx.save_for_backward(inp.detach())
-        return loss
+        num_cols = inp.shape[1]
+        if inp.stride(-1) != 1 or inp.stride(-2) != num_cols:
+            inp = inp.contiguous()
+        valid = target != ignore_index
+        # log_prob drops a target outside [0, V); an ignore_index inside it is mapped out.
+        if 0 <= ignore_index < num_cols:
+            target = torch.where(valid, target, -1)
+        elif target.stride(-1) != 1:
+            target = target.contiguous()
+        logp, entropy, row_max, log_sum = log_prob_fwd(inp, target, 1.0)
+        count = valid.sum().clamp_min(1).float()
+        ctx.save_for_backward(inp.detach(), target, row_max, log_sum, entropy, count)
+        return (0.0 - logp.sum()) / count  # +0 (not -0) when every row is ignored
 
     @staticmethod
     def backward(ctx, grad_output):
-        (inp,) = ctx.saved_tensors
-        inp.mul_(grad_output.to(inp.dtype))
+        inp, target, row_max, log_sum, entropy, count = ctx.saved_tensors
+        rows = inp.shape[0]
+        # fp32, so the logits gradient is rounded once
+        grad_logp = (-grad_output.float() / count).expand(rows)
+        grad_entropy = grad_logp.new_zeros(()).expand(rows)
+        log_prob_bwd(inp, target, row_max, log_sum, entropy, grad_logp, grad_entropy, 1.0)
         return inp, None, None
 
 
@@ -34,8 +43,6 @@ def cross_entropy(
     ignore_index: int = -100,
 ) -> torch.Tensor:
     """
-    Mean cross-entropy of logits inp (N, V) against target (N,), as a float32 scalar; targets equal
-    to ignore_index are left out. Computes in fp32 and, when inp is row-contiguous, overwrites it in
-    place with its gradient, in inp's dtype.
+    Mean cross-entropy of inp (N, V); the backward overwrites inp with its gradient.
     """
     return CrossEntropy.apply(inp, target, ignore_index)

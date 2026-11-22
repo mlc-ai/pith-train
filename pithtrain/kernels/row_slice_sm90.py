@@ -1,5 +1,5 @@
 """
-Row machinery shared by the SM90 row kernels (cross-entropy, log-probability): where a CTA's slice
+Row machinery of the SM90 row kernels (log-probability): where a CTA's slice
 of a row sits, the bulk copy of that slice into shared memory, the 16-byte unit unpack and pack, and
 the row's head and tail elements.
 """

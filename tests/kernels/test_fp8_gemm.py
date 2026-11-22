@@ -1,941 +1,421 @@
 """
-Verifies the fp8_gemm feature of pithtrain.kernels against PyTorch: quantizations by exact FP8
-bytes and E8M0 scale values, GEMMs against fp32 matmuls of the dequantized FP8 operands.
-
-fp8_quant_grouped's per-channel pair is K-major per group on SM90 and (M, K) with scale (M / 128, K)
-on SM100; the checks read the layout the output has (kmajor_layout), and the cases only the K-major
-layout has (padded operands, the SM90 k-grouped deadlock guard and its transposed wgrad buffer) run
-only there.
-
-Known SM100 difference: in a block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf
-(reciprocal -inf, bytes -/+448), SM100's native cvt.rp.satfinite.ue8m0x2 saturates the scale to
-2^127 (bytes +/-0). Inputs with inf mean training has already diverged, so either is accepted,
-element by element, in such blocks only; everywhere else the bytes and scales must match exactly.
+FP8 dense and grouped GEMMs, their activation quantizations and the fused FP8 SwiGLU MLP at the
+fp8_gemm cases, against fp32 of the exactly dequantized operands.
 """
-
-import functools
-import json
-import os
-import subprocess
-import sys
 
 import pytest
 import torch
 
 from pithtrain.kernels import (
-    fp8_channels_as_rows,
     fp8_fused_experts_supported,
     fp8_gemm_bwd,
     fp8_gemm_fwd,
-    fp8_gemm_nt,
-    fp8_group_indices,
     fp8_grouped_gemm,
     fp8_grouped_wgrad_empty,
     fp8_quant_act,
+    fp8_quant_grad,
     fp8_quant_grouped,
     fp8_quant_weight,
     fp8_quant_weight_grouped,
     k_grouped_fp8_gemm,
 )
+from pithtrain.operators.fp8_swiglu_mlp import fp8_swiglu_mlp
+from pithtrain.operators.linear import FP8Linear
+from pithtrain.operators.silu_mul import silu_mul
+from tests.kernels.cases import MIN_LOCAL, params, select
+from tests.kernels.common import (
+    BLOCK,
+    CHUNK,
+    DEV,
+    FP8,
+    Check,
+    assert_fp8_equal,
+    assert_scale_equal,
+    dq_channels,
+    fp8_quant_grad_reference,
+    fp8_quant_weight_reference,
+    gate_up_layout,
+    grouped_input,
+    half_ulp_bf16,
+    record,
+    row_chunks,
+)
 
-DEV = "cuda"
-BLOCK = 128
 
-
-def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
-    x, y = x.double(), y.double()
-    den = (x * x + y * y).sum()
-    if den == 0:
-        return 0.0
-    return (1 - 2 * (x * y).sum() / den).item()
-
-
-def e8m0_scale(amax: torch.Tensor, native: bool = False) -> torch.Tensor:
+@pytest.fixture(autouse=True)
+def no_tf32():
     """
-    2 ** ceil(log2(max(amax, 1e-4) / 448)) as an exact fp32 power of two, dividing by 448 as the
-    kernels do (a multiply by fp32(1 / 448)) and taking the power-of-two ceil on the bits. An
-    infinite amax gives inf, or with native 2^127 (SM100's saturating cvt).
+    Disable TF32 and empty the allocator cache around each test.
     """
-    raw_scale = amax.float().clamp(min=1e-4) * torch.tensor(1.0 / 448.0, dtype=torch.float32)
-    bits = raw_scale.view(torch.int32)
-    exponent_bump = torch.where((bits & 0x007FFFFF) != 0, 0x00800000, 0).to(torch.int32)
-    scale = ((bits & 0x7F800000) + exponent_bump).view(torch.float32)
-    return scale.clamp(max=2.0**127) if native else scale
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.cuda.empty_cache()
+    yield
+    torch.backends.cuda.matmul.allow_tf32 = previous
+    torch.cuda.empty_cache()
 
 
-def cast(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+# Bounds per output kind, about 3x the worst measured on the H200.
+FP8_REL = {"bf16": 2.0**-8, "fp32": 2.0**-20}
+FP8_COEF = {"bf16": 2.0**-11, "fp32": 2.0**-9}
+FP8_CALC_DIFF = {"bf16": 5e-6, "fp32": 3e-8}
+
+
+def dq_rows(fp8: torch.Tensor, scale: torch.Tensor, start: int, end: int) -> torch.Tensor:
     """
-    x times the exact reciprocal of the power-of-two scale, as the kernels compute it (an infinite
-    scale gives the reciprocal -inf).
+    Rows [start, end) of a 1x128 rowwise FP8 operand, dequantized to fp32.
     """
-    rcp = ((254 << 23) - scale.view(torch.int32)).view(torch.float32)
-    return (x * rcp).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    K = fp8.shape[1]
+    return fp8[start:end].float() * scale[start:end].repeat_interleave(BLOCK, dim=1)[:, :K]
 
 
-def nan_free_abs(x: torch.Tensor) -> torch.Tensor:
-    x_abs = x.abs()
-    return torch.where(torch.isnan(x_abs), torch.zeros_like(x_abs), x_abs)
-
-
-def nan_scale(scale: torch.Tensor, has_nan: torch.Tensor) -> torch.Tensor:
+def dq_weight(fp8: torch.Tensor, scale: torch.Tensor, group: int) -> torch.Tensor:
     """
-    The scale SM90's fp8_quant_grouped gives a block holding NaN (its amax is an unsigned max of the
-    |x| bit patterns, so the NaN wins): bits 0x80000000, whose exact reciprocal in cast is
-    0xFF000000.
+    One expert of a 128x128 blockwise FP8 weight (G, N, K), dequantized to fp32.
     """
-    return torch.where(has_nan, torch.tensor(-0.0, device=scale.device), scale)
+    N, K = fp8.shape[1:]
+    full = scale[group].repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+    return fp8[group].float() * full[:N, :K]
 
 
-def ref_rowwise(x: torch.Tensor, native: bool = False, nan_wins: bool = False) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+def check_m_grouped(case, what, out, a_pair, w_pair, counts, transposed=False):
     """
-    1x128 along each row: fp8 (M, K), scale (M, ceil(K / 128)). nan_wins: blocks holding NaN take
-    nan_scale instead of ignoring the NaN.
+    Check out[rows of g] against dq(a)[rows] @ dq(w[g])^T.
     """
-    M, K = x.shape
-    num_kblocks = -(-K // BLOCK)
-    x_padded = torch.zeros(M, num_kblocks * BLOCK, dtype=torch.float32, device=x.device)
-    x_padded[:, :K] = x.float()
-    x_blocks = x_padded.view(M, num_kblocks, BLOCK)
-    scale = e8m0_scale(nan_free_abs(x_blocks).amax(-1), native)
-    if nan_wins:
-        scale = nan_scale(scale, torch.isnan(x_blocks).any(-1))
-    q = cast(x_blocks, scale[..., None]).view(M, num_kblocks * BLOCK)[:, :K].contiguous()
-    return q, scale
+    check = Check(what, FP8_REL["bf16"])
+    w_dq, w_group = None, -1
+    for group, _, start, end in row_chunks(counts):
+        if group != w_group:
+            w_dq, w_group = dq_weight(*w_pair, group), group
+        a = dq_rows(*a_pair, start, end)
+        check.add(out[start:end], a @ w_dq.T, a.abs() @ w_dq.abs().T)
+    check.verify(case, FP8_COEF["bf16"], FP8_CALC_DIFF["bf16"])
 
 
-def ref_channelwise(x: torch.Tensor, native: bool = False, nan_wins: bool = False) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+def check_k_grouped(case, what, d, a_pair, b_pair, counts, N, K):
     """
-    128x1 along the rows (M a multiple of 128): fp8 (M, K), scale (K, M / 128).
+    Check d[g] against dq(a)_g @ dq(b)_g^T over the rows of group g.
     """
-    M, K = x.shape
-    x_blocks = x.float().reshape(M // BLOCK, BLOCK, K)
-    scale = e8m0_scale(nan_free_abs(x_blocks).amax(1), native)
-    if nan_wins:
-        scale = nan_scale(scale, torch.isnan(x_blocks).any(1))
-    q = cast(x_blocks, scale[:, None, :]).view(M, K)
-    return q, scale.T
+    check = Check(what, FP8_REL["fp32"])
+    group_start = 0
+    for group, count in enumerate(counts):
+        ref = torch.zeros(N, K, device="cuda", dtype=torch.float32)
+        absref = torch.zeros_like(ref)
+        for start in range(group_start, group_start + count, CHUNK):
+            end = min(start + CHUNK, group_start + count)
+            a = dq_channels(a_pair, counts, group_start, group, start, end, N)
+            b = dq_channels(b_pair, counts, group_start, group, start, end, K)
+            ref += a @ b.T
+            absref += a.abs() @ b.abs().T
+        check.add(d[group], ref, absref)
+        group_start += count
+    check.verify(case, FP8_COEF["fp32"], FP8_CALC_DIFF["fp32"])
 
 
-def ref_blockwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+@pytest.mark.parametrize(
+    "case", params("fp8_gemm", keep=lambda c: "group_sizes" in c["axes"] and FP8(c))
+)
+def test_fp8_expert_gemms(case: dict) -> None:
+    axes = case["axes"]
+    G, H, inter = axes["G"], axes["hidden"], axes["inter"]
+    counts = axes["group_sizes"]
+    ks = [-(-count // BLOCK) * BLOCK for count in counts]
+    assert sum(ks) == axes["fp8_rows"]
+    offs = torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).cuda()
+    ks_tensor = torch.tensor(ks, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(sum(counts) + G)
+    gu_widths = [2 * inter] if gate_up_layout(case) != "separate" else [inter]
+    M = sum(ks)
+
+    x = grouped_input(M, H, counts, ks, gen)
+    x_fp8, x_scale, x_ch, x_ch_scale = fp8_quant_grouped(x, offs)
+    del x
+    for n in gu_widths:
+        w = (torch.randn(G, n, H, device="cuda", generator=gen) * H**-0.5).to(torch.bfloat16)
+        w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight_grouped(w)
+        del w
+        out = fp8_grouped_gemm((x_fp8, x_scale), (w_fp8, w_scale), n, offs)
+        assert out.shape == (M, n) and out.dtype == torch.bfloat16
+        check_m_grouped(case, f"gate_up fwd n={n}", out, (x_fp8, x_scale), (w_fp8, w_scale), ks)
+        del out
+        dpre = grouped_input(M, n, counts, ks, gen)
+        dp_fp8, dp_scale, dp_ch, dp_ch_scale = fp8_quant_grouped(dpre, offs)
+        del dpre
+        dx = fp8_grouped_gemm((dp_fp8, dp_scale), (wt_fp8, wt_scale), H, offs)
+        assert dx.shape == (M, H)
+        check_m_grouped(case, f"gate_up dgrad n={n}", dx, (dp_fp8, dp_scale), (wt_fp8, wt_scale), ks)  # fmt: skip
+        del dx, dp_fp8, dp_scale, w_fp8, w_scale, wt_fp8, wt_scale
+        d = fp8_grouped_wgrad_empty(torch.Size((G, n, H)), torch.device("cuda"))
+        d.zero_()
+        k_grouped_fp8_gemm((dp_ch, dp_ch_scale), (x_ch, x_ch_scale), d, ks, ks_tensor)
+        check_k_grouped(case, f"gate_up wgrad n={n}", d, (dp_ch, dp_ch_scale), (x_ch, x_ch_scale), ks, n, H)  # fmt: skip
+        del d, dp_ch, dp_ch_scale
+    del x_fp8, x_scale, x_ch, x_ch_scale
+
+    h = grouped_input(M, inter, counts, ks, gen)
+    h_fp8, h_scale, h_ch, h_ch_scale = fp8_quant_grouped(h, offs)
+    del h
+    w = (torch.randn(G, H, inter, device="cuda", generator=gen) * inter**-0.5).to(torch.bfloat16)
+    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight_grouped(w)
+    del w
+    y = fp8_grouped_gemm((h_fp8, h_scale), (w_fp8, w_scale), H, offs)
+    assert y.shape == (M, H)
+    check_m_grouped(case, "down fwd", y, (h_fp8, h_scale), (w_fp8, w_scale), ks)
+    del y, h_fp8, h_scale
+
+    dy = grouped_input(M, H, counts, ks, gen)
+    dy_fp8, dy_scale, dy_ch, dy_ch_scale = fp8_quant_grouped(dy, offs)
+    del dy
+    dh = fp8_grouped_gemm((dy_fp8, dy_scale), (wt_fp8, wt_scale), inter, offs)
+    assert dh.shape == (M, inter)
+    check_m_grouped(case, "down dgrad", dh, (dy_fp8, dy_scale), (wt_fp8, wt_scale), ks)
+    del dh, dy_fp8, dy_scale
+    d = fp8_grouped_wgrad_empty(torch.Size((G, H, inter)), torch.device("cuda"))
+    d.zero_()
+    k_grouped_fp8_gemm((dy_ch, dy_ch_scale), (h_ch, h_ch_scale), d, ks, ks_tensor)
+    check_k_grouped(case, "down wgrad", d, (dy_ch, dy_ch_scale), (h_ch, h_ch_scale), ks, H, inter)
+
+
+def test_fp8_check_is_sharp() -> None:
     """
-    128x128 tiles of a 2D x: fp8 (R, C), scale (ceil(R / 128), ceil(C / 128)).
+    The FP8 GEMM check rejects a wrong-expert GEMM and an unquantized bf16 product.
     """
-    R, C = x.shape
-    num_rblocks, num_cblocks = -(-R // BLOCK), -(-C // BLOCK)
-    x_padded = torch.zeros(num_rblocks * BLOCK, num_cblocks * BLOCK, dtype=torch.float32, device=x.device)  # fmt: skip
-    x_padded[:R, :C] = x.float()
-    x_blocks = x_padded.view(num_rblocks, BLOCK, num_cblocks, BLOCK)
-    scale = e8m0_scale(x_blocks.abs().amax(dim=(1, 3)))
-    q = cast(x_blocks, scale[:, None, :, None]).view(num_rblocks * BLOCK, num_cblocks * BLOCK)[:R, :C].contiguous()  # fmt: skip
-    return q, scale
+    case = next(c for c in select("fp8_gemm") if "group_sizes" in c["axes"])
+    axes = case["axes"]
+    G, H, n = axes["G"], axes["hidden"], axes["inter"]
+    ks = [-(-count // BLOCK) * BLOCK for count in axes["group_sizes"]]
+    offs = torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).cuda()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    x = grouped_input(sum(ks), H, axes["group_sizes"], ks, gen)
+    w = (torch.randn(G, n, H, device="cuda", generator=gen) * H**-0.5).to(torch.bfloat16)
+    x_pair = fp8_quant_grouped(x, offs)[:2]
+    w_pair = fp8_quant_weight_grouped(w)[:2]
+    order = [(g + 1) % G for g in range(G)]
+    rolled = tuple(t[order].contiguous() for t in w_pair)
+    wrong = fp8_grouped_gemm(x_pair, rolled, n, offs)
+    with pytest.raises(AssertionError):
+        check_m_grouped(case, "wrong expert", wrong, x_pair, w_pair, ks)
+    unquantized = torch.cat([x[a:b] @ w[g].T for g, (a, b) in enumerate(zip([0] + offs.tolist()[:-1], offs.tolist()))])  # fmt: skip
+    with pytest.raises(AssertionError):
+        check_m_grouped(case, "unquantized", unquantized, x_pair, w_pair, ks)
 
 
-def to_kmajor(q: torch.Tensor, ks: list[int]) -> torch.Tensor:
+FP8_LINEAR_ROWS_PER_CHUNK = 4096
+FP8_LINEAR_ACCUM = 3e-4  # x sum |a_k b_k|, beyond the output's bf16 rounding
+FP8_LINEAR_CALC_DIFF = 3e-6  # bf16 rounding alone gives 1.39e-6
+FP8_LINEAR_BF16_CALC_DIFF = 2e-3  # from quantizing both operands to e4m3
+
+
+def fp8_linear_input(shape: tuple[int, int], seed: int, scale: float = 1.0) -> torch.Tensor:
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    return (torch.randn(*shape, device=DEV, generator=gen) * scale).to(torch.bfloat16)
+
+
+class FP8LinearStats:
     """
-    (M, K) per-channel FP8 to flat K-major per group: group g's (K, ks[g]) block row-major.
+    calc_diff and the worst elementwise excess accumulated over row chunks.
     """
-    parts, row = [], 0
-    for k in ks:
-        parts.append(q[row : row + k].T.contiguous().view(-1))
-        row += k
-    return torch.cat(parts) if parts else q.new_empty(0)
+
+    def __init__(self):
+        self.xy = self.xx = self.yy = 0.0
+        self.excess = 0.0
+
+    def add(self, out: torch.Tensor, ref: torch.Tensor, absref: torch.Tensor | None) -> None:
+        x, y = out.double(), ref.double()
+        self.xy += float((x * y).sum())
+        self.xx += float((x * x).sum())
+        self.yy += float((y * y).sum())
+        if absref is not None:
+            excess = ((x - y).abs() - half_ulp_bf16(y)).clamp(min=0) / (absref.double() + 1e-30)
+            self.excess = max(self.excess, float(excess.max()))
+
+    @property
+    def calc_diff(self) -> float:
+        den = self.xx + self.yy
+        return 0.0 if den == 0 else 1 - 2 * self.xy / den
 
 
-def dq_rowwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return q.float() * scale.repeat_interleave(BLOCK, dim=1)[:, : q.shape[1]]
+def compare_fp8_linear(
+    out: torch.Tensor, a: torch.Tensor, b: torch.Tensor, with_abs: bool
+) -> FP8LinearStats:
+    """
+    out (m, n) against a @ b.T in fp32 (a (m, k), b (n, k) fp32), in row chunks.
+    """
+    stats = FP8LinearStats()
+    for start in range(0, out.shape[0], FP8_LINEAR_ROWS_PER_CHUNK):
+        rows = slice(start, start + FP8_LINEAR_ROWS_PER_CHUNK)
+        ref = a[rows] @ b.T
+        absref = a[rows].abs() @ b.abs().T if with_abs else None
+        stats.add(out[rows], ref, absref)
+    return stats
 
 
-def dq_blockwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def check_fp8_linear(
+    case_id: str, name: str, out: torch.Tensor, exact: tuple, truth: tuple
+) -> None:
+    exact_stats = compare_fp8_linear(out, *exact, with_abs=True)
+    truth_stats = compare_fp8_linear(out, *truth, with_abs=False)
+    record(case_id, name, calc_diff=exact_stats.calc_diff, accum=exact_stats.excess, bf16_calc_diff=truth_stats.calc_diff)  # fmt: skip
+    assert exact_stats.excess <= FP8_LINEAR_ACCUM, f"{name}: elementwise excess {exact_stats.excess:.3g} > {FP8_LINEAR_ACCUM:.3g} x sum|ab|"  # fmt: skip
+    assert exact_stats.calc_diff <= FP8_LINEAR_CALC_DIFF, f"{name}: calc_diff {exact_stats.calc_diff:.3g} vs exact dequant"  # fmt: skip
+    assert truth_stats.calc_diff <= FP8_LINEAR_BF16_CALC_DIFF, f"{name}: calc_diff {truth_stats.calc_diff:.3g} vs bf16 product"  # fmt: skip
+
+
+@pytest.mark.parametrize("case", params("fp8_gemm", keep=lambda c: "projection" in c["axes"]))
+def test_fp8_linear(case: dict) -> None:
+    axes = case["axes"]
+    M, N, K = axes["M"], axes["N"], axes["K"]
+    x, w, dy = (
+        fp8_linear_input((M, K), 1),
+        fp8_linear_input((N, K), 2, 0.02),
+        fp8_linear_input((M, N), 3),
+    )
+
+    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(w)
+    ref_w, ref_w_scale = fp8_quant_weight_reference(w)
+    assert_fp8_equal(w_fp8, ref_w, "w_fp8")
+    assert_scale_equal(w_scale, ref_w_scale, "w_scale")
+    assert_fp8_equal(wt_fp8, ref_w.T.contiguous(), "wt_fp8")
+    assert_scale_equal(wt_scale, ref_w_scale.T.contiguous(), "wt_scale")
+
+    x_fp8, x_scale, _, _ = fp8_quant_act(x)
+    ref_x, ref_x_scale = fp8_quant_grad_reference(x)
+    assert_fp8_equal(x_fp8, ref_x, "x_fp8")
+    assert_scale_equal(x_scale, ref_x_scale, "x_scale")
+    del x_fp8, x_scale
+
+    y, xt_fp8, xt_scale = fp8_gemm_fwd(x, w_fp8, w_scale)
+    assert y.shape == (M, N) and y.dtype == torch.bfloat16
+    ref_xt, ref_xt_scale = fp8_quant_weight_reference(x.T)
+    assert_fp8_equal(xt_fp8, ref_xt, "xt_fp8")
+    assert_scale_equal(xt_scale, ref_xt_scale, "xt_scale")
+    w_dq = dequant_blockwise(ref_w, ref_w_scale)
+    check_fp8_linear(
+        case["id"], "y", y, (dequant_rowwise(ref_x, ref_x_scale), w_dq), (x.float(), w.float())
+    )
+    del y
+
+    dy_fp8, dy_scale, dyt_fp8, dyt_scale = fp8_quant_grad(dy)
+    ref_dy, ref_dy_scale = fp8_quant_grad_reference(dy)
+    ref_dyt, ref_dyt_scale = fp8_quant_grad_reference(dy.T)
+    assert_fp8_equal(dy_fp8, ref_dy, "dy_fp8")
+    assert_scale_equal(dy_scale, ref_dy_scale, "dy_scale")
+    assert_fp8_equal(dyt_fp8, ref_dyt, "dyt_fp8")
+    assert_scale_equal(dyt_scale, ref_dyt_scale, "dyt_scale")
+    del dy_fp8, dy_scale, dyt_fp8, dyt_scale
+
+    dx, dw = fp8_gemm_bwd(dy, wt_fp8, wt_scale, xt_fp8, xt_scale, K)
+    assert dx.shape == (M, K) and dx.dtype == torch.bfloat16
+    assert dw.shape == (N, K) and dw.dtype == torch.bfloat16
+    dy_dq = dequant_rowwise(ref_dy, ref_dy_scale)
+    check_fp8_linear(case["id"], "dx", dx, (dy_dq, w_dq.T.contiguous()), (dy.float(), w.float().T.contiguous()))  # fmt: skip
+    del dx, dy_dq, w_dq
+    xt_dq = dequant_blockwise(ref_xt, ref_xt_scale)
+    check_fp8_linear(case["id"], "dw", dw, (dequant_rowwise(ref_dyt, ref_dyt_scale), xt_dq), (dy.float().T.contiguous(), x.float().T.contiguous()))  # fmt: skip
+
+
+WGRAD_CASES = params(
+    "fp8_gemm", keep=lambda c: "projection" in c["axes"] and c["axes"]["M"] == MIN_LOCAL
+)
+
+
+@pytest.mark.parametrize("case", WGRAD_CASES)
+def test_wgrad_bf16_rounding(case: dict) -> None:
+    """
+    The fp32 sum of bf16 weight gradients over micro-batches stays within their bf16 roundings.
+    """
+    microbatches = 4
+    axes = case["axes"]
+    M, N, K = min(axes["M"], 4096), axes["N"], axes["K"]
+    w = fp8_linear_input((N, K), 2, 0.02)
+    _, _, wt_fp8, wt_scale = fp8_quant_weight(w)
+    main_grad = torch.zeros(N, K, dtype=torch.float32, device=DEV)
+    exact = torch.zeros(N, K, dtype=torch.float64, device=DEV)
+    bound = torch.zeros(N, K, dtype=torch.float64, device=DEV)
+    for step in range(microbatches):
+        x, dy = fp8_linear_input((M, K), 10 + step), fp8_linear_input((M, N), 20 + step)
+        _, xt_fp8, xt_scale = fp8_gemm_fwd(x, *quant_weight_pair(w))
+        _, dw = fp8_gemm_bwd(dy, wt_fp8, wt_scale, xt_fp8, xt_scale, K)
+        main_grad += dw.float()
+        ref_dyt, ref_dyt_scale = fp8_quant_grad_reference(dy.T)
+        term = dequant_rowwise(ref_dyt, ref_dyt_scale).double() @ dequant_blockwise(xt_fp8, xt_scale).double().T  # fmt: skip
+        absterm = dequant_rowwise(ref_dyt, ref_dyt_scale).abs().double() @ dequant_blockwise(xt_fp8, xt_scale).abs().double().T  # fmt: skip
+        exact += term
+        bound += half_ulp_bf16(term) + FP8_LINEAR_ACCUM * absterm
+    err = (main_grad.double() - exact).abs()
+    rel = float((main_grad.double() - exact).norm() / exact.norm())
+    record(case["id"], "wgrad_accumulated", rel_l2=rel, worst=float((err / (bound + 1e-30)).max()))
+    assert bool((err <= bound * 1.0001 + 1e-30).all()), f"accumulated wgrad error {float((err / bound).max()):.3g}x the per-term bf16 bound"  # fmt: skip
+
+
+def quant_weight_pair(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    w_fp8, w_scale, _, _ = fp8_quant_weight(w)
+    return w_fp8, w_scale
+
+
+FP8_SWIGLU_MLP_CALC_DIFF = 7.5e-3
+
+
+def fp8_swiglu_mlp_calc_diff(got: torch.Tensor, exact: torch.Tensor) -> float:
+    got = got.double()
+    return float(1 - 2 * (got * exact).sum() / (got.square().sum() + exact.square().sum()))
+
+
+@pytest.mark.parametrize(
+    "case", params("fp8_gemm", keep=lambda c: c["axes"].get("fp8_swiglu_mlp", False))
+)
+def test_fp8_swiglu_mlp(case: dict) -> None:
+    if not fp8_fused_experts_supported():
+        pytest.skip("the fused FP8 MLP needs fp8_fused_experts_supported()")
+    M, inter, hidden = case["axes"]["M"], case["axes"]["inter"], case["axes"]["hidden"]
+    gen = torch.Generator(device=DEV).manual_seed(M + inter + hidden)
+    layers = [FP8Linear(hidden, inter, bias=False), FP8Linear(hidden, inter, bias=False)]
+    layers.append(FP8Linear(inter, hidden, bias=False))
+    for layer in layers:
+        layer.to(device=DEV, dtype=torch.bfloat16)
+        with torch.no_grad():
+            fan_in = layer.weight.shape[1]
+            layer.weight.copy_(torch.randn(layer.weight.shape, device=DEV, generator=gen) * fan_in**-0.5)  # fmt: skip
+    gate, up, down = layers
+    x = torch.randn(M, hidden, device=DEV, generator=gen).to(torch.bfloat16)
+    dy = torch.randn(M, hidden, device=DEV, generator=gen).to(torch.bfloat16)
+
+    def run(fused: bool) -> list[torch.Tensor]:
+        for layer in layers:
+            layer.weight.grad = None
+        leaf = x.clone().requires_grad_(True)
+        if fused:
+            y = fp8_swiglu_mlp(gate, up, down, leaf)
+        else:
+            quantized = FP8Linear.quantize_input(leaf)
+            y = down(silu_mul(gate(leaf, quantized), up(leaf, quantized)))
+        y.backward(dy)
+        return [y.detach(), leaf.grad] + [layer.weight.grad for layer in layers]
+
+    names = ["y", "dx", "dw_gate", "dw_up", "dw_down"]
+    fused, unfused = run(True), run(False)
+    for name, a, b in zip(names, fused, unfused):
+        assert a.dtype == b.dtype and torch.equal(a, b), f"{name} differs from the unfused FP8 path"
+
+    xd = x.double().requires_grad_(True)
+    wd = [layer.weight.detach().double().requires_grad_(True) for layer in layers]
+    g, u = xd @ wd[0].T, xd @ wd[1].T
+    y = (g * torch.sigmoid(g) * u) @ wd[2].T
+    y.backward(dy.double())
+    exact = [y.detach(), xd.grad] + [w.grad for w in wd]
+    metrics = {name: fp8_swiglu_mlp_calc_diff(a, b) for name, a, b in zip(names, fused, exact)}
+    record(case["id"], "fp8_swiglu_mlp", **metrics)
+    for name, value in metrics.items():
+        assert value <= FP8_SWIGLU_MLP_CALC_DIFF, (
+            f"{name}: fp8_swiglu_mlp_calc_diff {value:.3g} against float64"
+        )
+
+
+def dequant_rowwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return q.float() * scale.repeat_interleave(BLOCK, dim=-1)[..., : q.shape[-1]]
+
+
+def dequant_blockwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     R, C = q.shape[-2:]
     full = scale.repeat_interleave(BLOCK, dim=-2).repeat_interleave(BLOCK, dim=-1)
     return q.float() * full[..., :R, :C]
-
-
-def dq_kmajor(data: torch.Tensor, scale: torch.Tensor, ks: list[int], ch: int) -> list:
-    """
-    Per group (ch, ks[g]) fp32 from fp8_quant_grouped's per-channel pair: K-major flat data with
-    (ch, M / 128) scales, or (M, ch) data with (M / 128, ch) scales.
-    """
-    out, row = [], 0
-    for k in ks:
-        if data.ndim == 1:
-            block = data[row * ch : (row + k) * ch].view(ch, k).float()
-            block_scale = scale[:, row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=1)  # fmt: skip
-            out.append(block * block_scale)
-        else:
-            block = data[row : row + k].float()
-            block_scale = scale[row // BLOCK : (row + k) // BLOCK].repeat_interleave(BLOCK, dim=0)
-            out.append((block * block_scale).T)
-        row += k
-    return out
-
-
-@functools.cache
-def kmajor_layout() -> bool:
-    """
-    Whether fp8_quant_grouped returns the per-channel FP8 K-major per group (flat), as on SM90.
-    """
-    x = torch.zeros(BLOCK, BLOCK, dtype=torch.bfloat16, device=DEV)
-    return fp8_quant_grouped(x, torch.tensor([BLOCK], dtype=torch.int32, device=DEV))[2].ndim == 1
-
-
-def offsets(ks: list[int]) -> torch.Tensor:
-    return torch.tensor(ks, dtype=torch.int64).cumsum(0).to(torch.int32).to(DEV)
-
-
-def make_input(M: int, K: int, kind: str = "randn", seed: int = 0, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:  # fmt: skip
-    gen = torch.Generator(device=DEV).manual_seed(seed)
-    x = torch.randn(M, K, device=DEV, generator=gen)
-    if kind == "scaled":  # per-row and per-column dynamic range over many binades
-        row_scale = torch.exp2(torch.randint(-20, 20, (M, 1), device=DEV, generator=gen).float())
-        col_scale = torch.exp2(torch.randint(-6, 6, (1, K), device=DEV, generator=gen).float())
-        x = x * row_scale * col_scale
-    elif kind == "outliers":
-        mask = torch.rand(M, K, device=DEV, generator=gen) < 1e-3
-        x = torch.where(mask, x * 1e4, x)
-        x[:, : min(K, 3)] = 0.0
-        x[5::97] = 0.0
-        x[7::131] *= 1e-30  # tiny rows (amax clamp)
-        x[11::127] *= 1e-39  # bf16 subnormals
-        x[13::89, ::17] = 448.0 * 2.0**-3  # amax exactly 448 * 2^k: a scale boundary
-    elif kind == "large":  # near the bf16 range, sign mixed
-        x = x * 1e36
-    elif kind == "negative":
-        x = -x.abs()
-    elif kind == "zeros":
-        x = torch.zeros_like(x)
-    return x.to(dtype)
-
-
-def same_output(got: torch.Tensor, want: torch.Tensor) -> bool:
-    """
-    Equal FP8 bytes, or equal scale values (strides unspecified).
-    """
-    if got.dtype == torch.float32:
-        return torch.equal(got.view(torch.int32), want.view(torch.int32))
-    return torch.equal(got.view(torch.uint8), want.view(torch.uint8))
-
-
-def assert_fp8_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
-    assert got.dtype == torch.float8_e4m3fn and got.shape == ref.shape, (name, got.shape)
-    got_bytes, ref_bytes = got.view(torch.uint8), ref.view(torch.uint8)
-    assert torch.equal(got_bytes, ref_bytes), f"{name}: {(got_bytes != ref_bytes).sum().item()} bytes differ"  # fmt: skip
-
-
-def assert_scale_equal(got: torch.Tensor, ref: torch.Tensor, name: str) -> None:
-    assert got.dtype == torch.float32 and got.shape == ref.shape, (name, got.shape, ref.shape)
-    assert torch.equal(got, ref), f"{name}: {(got != ref).sum().item()} scales differ"
-
-
-def test_fused_experts_supported() -> None:
-    assert fp8_fused_experts_supported() is True
-
-
-def blocks(n: int) -> int:
-    return -(-n // BLOCK)
-
-
-@pytest.mark.parametrize(
-    "size",
-    [
-        (4, 2880, 1024),  # odd N-blocks, even K-blocks: the guard runs it transposed
-        (2, 384, 256),
-        (3, 1408, 2048),
-        (4, 1024, 2880),
-        (4, 2880, 2880),
-        (2, 5760, 2880),
-        (2, 2880, 5760),
-        (8, 2816, 2048),
-        (8, 2048, 1408),
-        (8, 1536, 2048),
-        (8, 2048, 768),
-        (8, 1024, 2048),
-        (8, 2048, 512),
-        (2048, 1408),  # not a grouped weight
-    ],
-)
-def test_wgrad_buffer_layout(size: tuple) -> None:
-    buf = fp8_grouped_wgrad_empty(torch.Size(size), torch.device(DEV))
-    assert buf.dtype == torch.float32 and buf.device.type == "cuda"
-    assert buf.shape == size and buf.contiguous().shape == size
-    transposed = len(size) == 3 and blocks(size[1]) % 2 == 1 and blocks(size[2]) % 2 == 0
-    transposed = transposed and kmajor_layout()  # only SM90's k-grouped GEMM runs transposed
-    if transposed:
-        _, n, k = size
-        assert not buf.is_contiguous() and buf.stride() == (n * k, 1, n)
-        assert buf.transpose(1, 2).is_contiguous()
-    else:
-        assert buf.is_contiguous()
-
-
-def assert_fp8_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor, name: str) -> None:
-    """
-    Bytes equal to ref or to alt, element by element; a NaN may carry either sign.
-    """
-    assert got.dtype == torch.float8_e4m3fn and got.shape == ref.shape, (name, got.shape)
-    got_bytes = got.view(torch.uint8)
-    ok = torch.zeros_like(got_bytes, dtype=torch.bool)
-    for want in (ref.view(torch.uint8), alt.view(torch.uint8)):
-        ok |= (got_bytes == want) | (((want & 0x7F) == 0x7F) & ((got_bytes & 0x7F) == 0x7F))
-    assert bool(ok.all()), f"{name}: {(~ok).sum().item()} bytes differ"
-
-
-def assert_scale_either(got: torch.Tensor, ref: torch.Tensor, alt: torch.Tensor, name: str) -> None:
-    assert got.dtype == torch.float32 and got.shape == ref.shape, (name, got.shape, ref.shape)
-    bits = got.view(torch.int32)  # bit patterns: -0.0 (a NaN block's scale) is not +0.0
-    ok = (bits == ref.view(torch.int32)) | (bits == alt.view(torch.int32))
-    assert bool(ok.all()), f"{name}: {(~ok).sum().item()} scales differ"
-
-
-def check_grouped_input(x: torch.Tensor, ks: list[int], offs: torch.Tensor | None = None, nan_wins: bool = False) -> None:  # fmt: skip
-    """
-    fp8_quant_grouped against the reference in the output's per-channel layout, the SM100-native
-    E8M0 accepted element by element (it differs only in blocks whose amax is infinite).
-    """
-    M, K = x.shape
-    x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(x, offsets(ks) if offs is None else offs)
-    (row_q, row_scale), (row_q_alt, row_scale_alt) = ref_rowwise(x, nan_wins=nan_wins), ref_rowwise(x, native=True, nan_wins=nan_wins)  # fmt: skip
-    assert_fp8_either(x_fp8, row_q, row_q_alt, "x_fp8")
-    assert_scale_either(x_scale, row_scale, row_scale_alt, "x_scale")
-    (ch_q, ch_s), (ch_q_alt, ch_s_alt) = ref_channelwise(x, nan_wins=nan_wins), ref_channelwise(x, native=True, nan_wins=nan_wins)  # fmt: skip
-    if ch_fp8.ndim == 1:  # K-major per group
-        assert ch_fp8.shape == (M * K,)
-        ch_q, ch_q_alt = to_kmajor(ch_q, ks), to_kmajor(ch_q_alt, ks)
-    else:
-        assert ch_fp8.shape == (M, K)
-        ch_s, ch_s_alt = ch_s.T, ch_s_alt.T
-    assert_fp8_either(ch_fp8, ch_q, ch_q_alt, "x_ch_fp8")
-    assert_scale_either(ch_scale, ch_s, ch_s_alt, "x_ch_scale")
-
-
-BALANCED = [2048] * 16
-IMBALANCED = [0, 128, 384, 0, 0, 1024, 256, 128, 0, 2944, 128, 0, 640, 384, 128, 0]
-GROUPED_SHAPES = [
-    (BALANCED, 2048),
-    (BALANCED, 768),
-    (IMBALANCED, 2048),
-    (IMBALANCED, 768),
-    (IMBALANCED, 1408),
-    (IMBALANCED, 512),
-    ([256, 0, 512, 256], 200),  # K not a multiple of 128
-    ([128, 128, 0, 768], 136),
-    ([1024], 4096),
-    ([128], 128),
-    ([0, 0, 128], 8),
-    ([512, 512], 2880),
-    ([384, 0, 640], 5760),
-    ([128, 256], 100),  # K % 8 != 0
-]
-
-
-@pytest.mark.parametrize("kind", ["randn", "scaled", "outliers", "large", "negative"])
-@pytest.mark.parametrize("ks,K", GROUPED_SHAPES)
-def test_fp8_quant_grouped(ks: list[int], K: int, kind: str) -> None:
-    check_grouped_input(make_input(sum(ks), K, kind), ks)
-
-
-@pytest.mark.parametrize(
-    "M,K", [(128, 128), (128, 256), (256, 256), (256, 512), (384, 384), (128, 300), (256, 7168)]
-)
-def test_fp8_quant_grouped_one_group(M: int, K: int) -> None:
-    check_grouped_input(make_input(M, K), [M])
-    check_grouped_input(make_input(M, K), [128] * (M // 128))
-
-
-def test_fp8_quant_grouped_zeros() -> None:
-    x = torch.zeros(128, 256, dtype=torch.bfloat16, device=DEV)
-    check_grouped_input(x, [128])
-    x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(x, offsets([128]))
-    assert (x_fp8.float() == 0).all() and (ch_fp8.float() == 0).all()
-    assert torch.isfinite(x_scale).all() and torch.isfinite(ch_scale).all()
-
-
-def test_fp8_quant_grouped_many_groups() -> None:
-    gen = torch.Generator().manual_seed(1)
-    ks = (torch.randint(0, 6, (100,), generator=gen) * 128).tolist()
-    check_grouped_input(make_input(sum(ks), 512, "scaled"), ks)
-
-
-def test_fp8_quant_grouped_empty() -> None:
-    x = torch.empty(0, 2048, dtype=torch.bfloat16, device=DEV)
-    out = fp8_quant_grouped(x, torch.zeros(16, dtype=torch.int32, device=DEV))
-    shapes = [(0,), (2048, 0)] if kmajor_layout() else [(0, 2048), (0, 2048)]
-    assert [tuple(t.shape) for t in out] == [(0, 2048), (0, 16)] + shapes
-
-
-@pytest.mark.parametrize("ks,K", [([256, 0, 384], 768), ([128, 128], 200)])
-def test_fp8_quant_grouped_inf_nan(ks: list[int], K: int) -> None:
-    """
-    NaN is ignored by the amax; a block whose amax is infinite takes either E8M0 result.
-    """
-    x = make_input(sum(ks), K, seed=8)
-    inf, nan = float("inf"), float("nan")
-    x[3, 5], x[130, 7], x[131, K - 1], x[200, 129 % K] = inf, -inf, inf, -inf
-    x[9, 1], x[140, 2], x[sum(ks) - 1, K - 2] = nan, nan, nan
-    check_grouped_input(x, ks)
-
-
-# SM90's fp8_quant_grouped also takes bf16, fp16 or fp32 input with any strides and base alignment
-# and any N, and int32 or int64 offsets of any stride; SM100's takes bf16 contiguous with int32
-# offsets. These cases run where the per-channel output is K-major (SM90).
-FALLBACK_KS = [256, 0, 384, 128]
-FALLBACK_NS = [2048, 200, 100, 1004, 2047, 1]
-DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-
-
-def needs_sm90_inputs() -> None:
-    if not kmajor_layout():
-        pytest.skip(
-            "fp8_quant_grouped takes bf16 contiguous input with int32 offsets on this device"
-        )
-
-
-def make_view(M: int, N: int, view: str, dtype: torch.dtype, kind: str = "randn", seed: int = 0) -> torch.Tensor:  # fmt: skip
-    """
-    The values of make_input(M, N, kind) in a view of the given layout: contiguous, transposed
-    (unit stride along M), rowstrided (row pitch N + 64), colstrided (column stride 2), everyother
-    (every other row of a 2M-row tensor), broadcast (row 0 repeated, row stride 0) or misaligned<k>
-    (contiguous at a base k bytes past 16-byte alignment).
-    """
-    x = make_input(M, N, kind, seed, dtype)
-    if view == "contiguous":
-        return x
-    if view == "transposed":
-        return x.T.contiguous().T
-    if view == "broadcast":
-        return x[:1].expand(M, N)
-    if view == "rowstrided":
-        out = torch.full((M, N + 64), float("nan"), dtype=dtype, device=DEV)[:, :N]
-    elif view == "colstrided":
-        out = torch.full((M, 2 * N), float("nan"), dtype=dtype, device=DEV)[:, ::2]
-    elif view == "everyother":
-        out = torch.full((2 * M, N), float("nan"), dtype=dtype, device=DEV)[::2]
-    else:
-        offset = int(view.removeprefix("misaligned")) // x.element_size()
-        out = torch.full((M * N + 16,), float("nan"), dtype=dtype, device=DEV)[offset : offset + M * N].view(M, N)  # fmt: skip
-        assert out.data_ptr() % 16 != 0
-    out.copy_(x)
-    return out
-
-
-@pytest.mark.parametrize("kind", ["randn", "scaled", "outliers", "large", "negative", "zeros"])
-@pytest.mark.parametrize("dtype", ["fp32", "fp16"])
-@pytest.mark.parametrize("ks,K", [(IMBALANCED, 2048), ([256, 0, 512, 256], 200), ([128, 256], 100), ([128, 128], 2047)])  # fmt: skip
-def test_fp8_quant_grouped_dtypes(ks: list[int], K: int, dtype: str, kind: str) -> None:
-    """
-    fp32 is quantized from its own values (no bf16 rounding) and fp16 from its exact fp32 widening;
-    values past the fp16 range become inf, whose blocks follow the recipe too.
-    """
-    needs_sm90_inputs()
-    check_grouped_input(make_input(sum(ks), K, kind, 3, DTYPES[dtype]), ks)
-
-
-VIEWS = [
-    "transposed",
-    "rowstrided",
-    "colstrided",
-    "everyother",
-    "broadcast",
-    "misaligned2",
-    "misaligned4",
-    "misaligned8",
-]
-
-
-@pytest.mark.parametrize("N", FALLBACK_NS)
-@pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
-@pytest.mark.parametrize("view", VIEWS)
-def test_fp8_quant_grouped_views(view: str, dtype: str, N: int) -> None:
-    needs_sm90_inputs()
-    if view == "misaligned2" and dtype == "fp32":
-        pytest.skip("an fp32 tensor is 4-byte aligned")
-    x = make_view(sum(FALLBACK_KS), N, view, DTYPES[dtype], "scaled", N)
-    check_grouped_input(x, FALLBACK_KS)
-
-
-@pytest.mark.parametrize("N", [2048, 7])
-@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
-@pytest.mark.parametrize(
-    "ks", [[0, 0, 256, 0, 128], [128, 0, 0, 256, 0, 0], [384], [128, 0, 128, 0, 0, 128]]
-)
-@pytest.mark.parametrize("form", ["int32", "int64", "int32_strided", "int64_strided"])
-def test_fp8_quant_grouped_offsets(form: str, ks: list[int], dtype: str, N: int) -> None:
-    """
-    Offsets as int32 or int64, contiguous or every other element of a (G, 2) tensor, with leading,
-    middle and trailing empty groups (repeated offsets).
-    """
-    needs_sm90_inputs()
-    offs = offsets(ks).to(torch.int64 if form.startswith("int64") else torch.int32)
-    if form.endswith("strided"):
-        offs = torch.stack([offs, torch.full_like(offs, -1)], 1)[:, 0]
-        assert offs.stride(0) == 2
-    check_grouped_input(make_input(sum(ks), N, "scaled", 5, DTYPES[dtype]), ks, offs)
-
-
-@pytest.mark.parametrize("G", [1025, 1500])
-@pytest.mark.parametrize("dtype,N", [("fp32", 256), ("bf16", 100), ("fp16", 2048)])
-def test_fp8_quant_grouped_many_groups_inputs(G: int, dtype: str, N: int) -> None:
-    needs_sm90_inputs()
-    gen = torch.Generator().manual_seed(G)
-    ks = (torch.randint(0, 2, (G,), generator=gen) * 128).tolist()
-    ks[-1] = 128
-    check_grouped_input(make_input(sum(ks), N, "scaled", G, DTYPES[dtype]), ks, offsets(ks).long())
-
-
-@pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
-@pytest.mark.parametrize("view", ["contiguous", "transposed", "misaligned4"])
-def test_fp8_quant_grouped_nan_blocks(view: str, dtype: str) -> None:
-    """
-    NaN on SM90: a block holding NaN takes nan_scale on every path and dtype (the bf16 contiguous
-    path's behaviour); blocks with inf or only finite values follow the recipe. Covers +NaN and
-    -NaN among finite values, NaN with +inf / -inf, all-NaN, all-zero blocks and a scale boundary,
-    in rowwise and K-major blocks, negative zeros, and checks every layout against the contiguous
-    bf16 bytes; scales are compared as bit patterns.
-    """
-    needs_sm90_inputs()
-    ks, N = [256, 0, 384], 300
-    x = make_input(sum(ks), N, "randn", 9, torch.float32)
-    inf, nan = float("inf"), float("nan")
-    x[3, 5], x[4, 6], x[130, 7], x[131, N - 1] = nan, -nan, inf, -inf
-    x[130, 8], x[200, 129], x[200, 130] = nan, inf, nan
-    x[256:384, 128:256] = nan  # all-NaN blocks both ways
-    x[384:512, 0:128] = 0.0  # all-zero blocks
-    x[512:640, 0:128] = -0.0  # all negative-zero blocks
-    x[520, 130:140], x[5, 140:150] = -0.0, -0.0
-    x[600, :] = 448.0 * 2.0**-3  # amax exactly at a scale boundary
-    x[601, 256:] = -nan
-    x = x.to(DTYPES[dtype])
-    xv = make_view(sum(ks), N, view, DTYPES[dtype]).copy_(x) if view != "contiguous" else x
-    if view == "transposed":
-        xv = x.T.contiguous().T
-    check_grouped_input(xv, ks, nan_wins=True)
-    if dtype == "bf16":
-        got, want = fp8_quant_grouped(xv, offsets(ks)), fp8_quant_grouped(x, offsets(ks))
-        for g, w in zip(got, want):
-            assert same_output(g, w)
-
-
-# e4m3 midpoints at scale 1 and the value each rounds to under round-to-nearest-even (the even
-# mantissa), both signs: [1, 2) has step 1/8, [2, 4) step 1/4, [0.5, 1) step 1/16.
-E4M3_TIES = [
-    (1.0625, 1.0),
-    (1.1875, 1.25),
-    (2.125, 2.0),
-    (2.375, 2.5),
-    (0.53125, 0.5),
-    (0.59375, 0.625),
-]
-
-
-@pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
-@pytest.mark.parametrize("view", ["contiguous", "transposed", "misaligned4"])
-def test_fp8_quant_grouped_ties_to_even(view: str, dtype: str) -> None:
-    """
-    Exact e4m3 midpoints in blocks whose scale is forced to 1 (amax 300: 300 / 448 rounds up to
-    2^0), in rowwise and K-major blocks: each rounds to the even neighbour, for both signs.
-    """
-    needs_sm90_inputs()
-    ks, N = [128, 128], 256
-    x = torch.zeros(sum(ks), N)
-    x[:, 0], x[:, 128], x[0, :], x[128, :] = 300.0, 300.0, 300.0, 300.0  # every block's amax is 300
-    mids = torch.tensor([m for m, _ in E4M3_TIES] + [-m for m, _ in E4M3_TIES])
-    want = torch.tensor([r for _, r in E4M3_TIES] + [-r for _, r in E4M3_TIES])
-    x[1:128, 1:128] = mids.repeat(127 * 127 // len(mids) + 1)[: 127 * 127].view(127, 127)
-    x = x.to(DTYPES[dtype]).to(DEV)
-    assert torch.equal(x[1, 1 : 1 + len(mids)].float().cpu(), mids)  # exact in dtype
-    xv = make_view(sum(ks), N, view, DTYPES[dtype]).copy_(x) if view != "contiguous" else x
-    if view == "transposed":
-        xv = x.T.contiguous().T
-    check_grouped_input(xv, ks)
-    x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(xv, offsets(ks))
-    assert bool((x_scale == 1.0).all()) and bool((ch_scale == 1.0).all())
-    got_row = x_fp8[1, 1 : 1 + len(mids)].float().cpu()
-    assert torch.equal(got_row, want), (got_row, want)
-    ch_rows = ch_fp8[: N * ks[0]].view(N, ks[0])  # group 0's K-major block: column c, rows 0..127
-    got_col = ch_rows[1, 1 : 1 + len(mids)].float().cpu()
-    want_col = x[1 : 1 + len(mids), 1].float().cpu()
-    want_col = torch.tensor(
-        [dict((m, r) for m, r in zip(mids.tolist(), want.tolist()))[v] for v in want_col.tolist()]
-    )
-    assert torch.equal(got_col, want_col), (got_col, want_col)
-
-
-def test_fp8_quant_grouped_edges() -> None:
-    """
-    M == 0 or N == 0 returns empty outputs for any G (empty groups included); M > 0 with no groups,
-    or M past the int32 offsets, raises ValueError; an unsupported dtype raises TypeError.
-    """
-    needs_sm90_inputs()
-    for M, N, G, dtype in ((0, 2048, 0, torch.float32), (0, 100, 3, torch.float16), (256, 0, 2, torch.bfloat16), (256, 0, 0, torch.float32)):  # fmt: skip
-        x = torch.empty(M, N, dtype=dtype, device=DEV)
-        x_fp8, x_scale, ch_fp8, ch_scale = fp8_quant_grouped(
-            x, torch.full((G,), M, dtype=torch.int32, device=DEV)
-        )
-        assert x_fp8.shape == (M, N) and x_fp8.dtype == torch.float8_e4m3fn
-        assert x_scale.shape == (M, blocks(N)) and x_scale.dtype == torch.float32
-        assert ch_fp8.shape == (M * N,) and ch_fp8.dtype == torch.float8_e4m3fn
-        assert ch_scale.shape == (N, M // BLOCK) and ch_scale.dtype == torch.float32
-    for dtype in (torch.bfloat16, torch.float32):
-        with pytest.raises(ValueError):
-            fp8_quant_grouped(
-                torch.zeros(128, 256, dtype=dtype, device=DEV),
-                torch.empty(0, dtype=torch.int32, device=DEV),
-            )
-    huge = torch.zeros(1, 8, dtype=torch.bfloat16, device=DEV).expand(2**31, 8)
-    with pytest.raises(ValueError):
-        fp8_quant_grouped(huge, torch.tensor([2**31], dtype=torch.int64, device=DEV))
-    with pytest.raises(TypeError):
-        fp8_quant_grouped(torch.zeros(128, 256, dtype=torch.float64, device=DEV), offsets([128]))
-
-
-def test_fp8_quant_grouped_side_stream() -> None:
-    """
-    x and int64 strided offsets made on a side stream, quantized there while the default stream is
-    busy: the offset conversion and the kernel run on the current stream.
-    """
-    needs_sm90_inputs()
-    ks, N = [2048, 0, 1024, 1024], 1004
-    side = torch.cuda.Stream()
-    torch.cuda.synchronize()
-    with torch.cuda.stream(side):
-        torch.cuda._sleep(int(5e7))
-        x = make_input(sum(ks), N, "scaled", 4, torch.float32)
-        offs = torch.stack([offsets(ks).long(), offsets(ks).long()], 1)[:, 1]
-        out = fp8_quant_grouped(x, offs)
-    side.synchronize()
-    want = fp8_quant_grouped(x, offsets(ks))
-    check_grouped_input(x, ks)
-    for g, w in zip(out, want):
-        assert same_output(g, w)
-
-
-def test_fp8_quant_grouped_one_launch() -> None:
-    """
-    Every input class is one CuTe launch on SM90 and no scale-layout copy: inside the profiler every
-    CUDA kernel is a CuTe (Staged)RowwiseKmajor launch, except exactly one copy per call whose
-    offsets are converted to contiguous int32.
-    """
-    needs_sm90_inputs()
-    ks, M = [256, 0, 128], 384
-    gen = torch.Generator().manual_seed(1025)
-    many_ks = (torch.randint(0, 2, (1025,), generator=gen) * 128).tolist()
-    many_ks[-1] = 128
-    calls = [(make_view(M, 256, view, DTYPES[dtype]), offsets(ks)) for view in ("transposed", "rowstrided", "colstrided", "misaligned4") for dtype in ("bf16", "fp32")]  # fmt: skip
-    calls += [
-        (make_input(M, 100), offsets(ks)),
-        (make_input(M, 2047, dtype=torch.float16), offsets(ks)),
-    ]
-    calls += [(make_input(M, 256, dtype=torch.float32), offsets(ks))]
-    converted = [
-        (make_input(M, 256), offsets(ks).long()),
-        (make_input(M, 256), torch.stack([offsets(ks)] * 2, 1)[:, 0]),
-    ]
-    converted += [
-        (make_input(sum(many_ks), 100, dtype=torch.float32), offsets(many_ks).long())
-    ]  # G > 1024
-    for x, offs in calls + converted:  # compile outside the profiled region
-        fp8_quant_grouped(x, offs)
-    torch.cuda.synchronize()
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-        for x, offs in calls + converted:
-            fp8_quant_grouped(x, offs)
-        torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-    cute = [n for n in names if "RowwiseKmajor" in n]
-    others = [n for n in names if "RowwiseKmajor" not in n]
-    assert len(cute) == len(calls) + len(converted), names
-    assert not [n for n in names if "fp8cast_rowwise_colwise" in n], names
-    assert len(others) == len(converted) and all("copy" in n.lower() for n in others), others
-
-
-def ref_group_indices(offs: torch.Tensor, M: int) -> torch.Tensor:
-    rows = torch.arange(M, device=offs.device)
-    group_idx = torch.searchsorted(offs.contiguous(), rows, right=True).to(torch.int32)
-    return group_idx.clamp_(max=offs.shape[0] - 1)
-
-
-def check_group_indices(offs: torch.Tensor, M: int) -> None:
-    """
-    The hint is None where the device's grouped GEMM needs none (SM100), else exact.
-    """
-    group_idx = fp8_group_indices(offs, M)
-    if group_idx is None:
-        return
-    assert group_idx.dtype == torch.int32 and group_idx.shape == (M,)
-    assert torch.equal(group_idx, ref_group_indices(offs, M))
-
-
-@pytest.mark.parametrize("G", [1, 3, 8, 16, 32, 64, 128, 1024, 1025, 1500])
-@pytest.mark.parametrize("seed", [0, 1])
-def test_group_indices(G: int, seed: int) -> None:
-    # G <= 1024 int32 contiguous runs the one-launch kernel, G > 1024 the searchsorted fallback.
-    gen = torch.Generator().manual_seed(seed)
-    counts = torch.randint(0, 3000, (G,), generator=gen)
-    counts[torch.rand(G, generator=gen) < 0.3] = 0
-    ks = (counts + 127) // 128 * 128
-    offs = ks.cumsum(0).to(torch.int32).to(DEV)
-    M = int(offs[-1])
-    for rows in {M, max(M - 5, 0), M + 300}:  # exact, short, and past the last end (clamped)
-        check_group_indices(offs, rows)
-
-
-def test_group_indices_uncovered_offsets() -> None:
-    ks = [128, 0, 384, 256, 0, 0, 640]
-    offs = offsets(ks)
-    M = sum(ks)
-    check_group_indices(offs.to(torch.int64), M)
-    wide = torch.stack([offs, torch.zeros_like(offs)], 1).view(-1)
-    check_group_indices(wide[::2], M)  # non-contiguous
-
-
-def test_group_indices_empty() -> None:
-    offs = torch.tensor([0, 0, 0], dtype=torch.int32, device=DEV)
-    hint = fp8_group_indices(offs, 0)
-    assert hint is None or hint.shape == (0,)
-    check_group_indices(offs, 7)
-
-
-def test_group_indices_example() -> None:
-    offs = torch.tensor([128, 256, 384, 512], dtype=torch.int32, device=DEV)
-    ref = torch.arange(4, dtype=torch.int32, device=DEV).repeat_interleave(128)
-    hint = fp8_group_indices(offs, 512)
-    assert hint is None or torch.equal(hint, ref)
-
-
-@pytest.mark.parametrize(
-    "ks,n,K",
-    [
-        ([256, 0, 640, 128, 0, 384], 2816, 2048),  # deepseek-v2-lite gate_up
-        ([256, 0, 640, 128, 0, 384], 2048, 1408),  # deepseek-v2-lite down
-        ([512, 128, 0, 256], 1536, 2048),  # qwen3-30b-a3b gate_up
-        ([512, 128, 0, 256], 2048, 768),  # qwen3-30b-a3b down
-        ([0, 384, 128, 128], 1024, 2048),  # qwen3.5-35b-a3b gate_up
-        ([0, 384, 128, 128], 2048, 512),  # qwen3.5-35b-a3b down
-        ([256, 0, 384], 5760, 2880),  # gpt-oss-20b gate_up
-        ([256, 0, 384], 2880, 2880),  # gpt-oss-20b down
-        ([128], 256, 128),
-        ([0, 0, 128, 0], 256, 256),
-    ],
-)
-def test_m_grouped_gemm(ks: list[int], n: int, K: int) -> None:
-    G, M = len(ks), sum(ks)
-    offs = offsets(ks)
-    x = make_input(M, K, seed=1)
-    w = (make_input(G * n, K, seed=2).float() * 0.05).to(torch.bfloat16).view(G, n, K)
-    x_fp8, x_scale, _, _ = fp8_quant_grouped(x, offs)
-    w_fp8, w_scale, _, _ = fp8_quant_weight_grouped(w)
-    out = fp8_grouped_gemm((x_fp8, x_scale), (w_fp8, w_scale), n, offs)
-    group_idx = fp8_group_indices(offs, M)
-    hinted = fp8_grouped_gemm((x_fp8, x_scale), (w_fp8, w_scale), n, offs, group_indices=group_idx)  # fmt: skip
-    assert out.shape == (M, n) and out.dtype == torch.bfloat16
-    assert torch.equal(out, hinted)
-    x_dq, w_dq = dq_rowwise(x_fp8, x_scale), dq_blockwise(w_fp8, w_scale)
-    row = 0
-    for group, k in enumerate(ks):
-        if k:
-            ref = x_dq[row : row + k] @ w_dq[group].T
-            assert calc_diff(out[row : row + k], ref) < 1e-3, group
-        row += k
-
-
-def kgrouped_case(ks: list[int], N: int, K: int, NA: int | None = None, KB: int | None = None):
-    """
-    grad_output (M, N) and input (M, K) per-channel FP8 from fp8_quant_grouped, optionally
-    zero-padded to NA / KB channels, plus their dequantized per-group (N, k) / (K, k) fp32.
-    """
-    M = sum(ks)
-    offs = offsets(ks)
-    ops, refs = [], []
-    for ch, padded, seed in ((N, NA or N, 3), (K, KB or K, 4)):
-        x = torch.zeros(M, padded, dtype=torch.bfloat16, device=DEV)
-        x[:, :ch] = make_input(M, ch, seed=seed)
-        _, _, data, scale = fp8_quant_grouped(x, offs)
-        ops.append((data, scale))
-        refs.append([group_ref[:ch] for group_ref in dq_kmajor(data, scale, ks, padded)])
-    ks_t = torch.tensor(ks, dtype=torch.int32, device=DEV)
-    return ops[0], ops[1], ks_t, refs[0], refs[1]
-
-
-def check_kgrouped(d: torch.Tensor, ks: list[int], N: int, K: int, **pad) -> None:
-    a, b, ks_t, ref_a, ref_b = kgrouped_case(ks, N, K, **pad)
-    # large enough that overwriting d instead of accumulating into it fails the check below
-    d.copy_(100 * torch.randn(d.shape, device=DEV, generator=torch.Generator(DEV).manual_seed(5)))
-    d0 = d.clone()
-    ptr, stride = d.data_ptr(), d.stride()
-    k_grouped_fp8_gemm(a, b, d, ks, ks_t)
-    assert d.data_ptr() == ptr and d.stride() == stride
-    for group, k in enumerate(ks):
-        if k == 0:  # d0 has no subnormals, so even a reduce-add of zeros leaves it bit-identical
-            assert torch.equal(d[group], d0[group]), f"empty group {group} changed"
-            continue
-        prod = ref_a[group] @ ref_b[group].T
-        # a tolerance: DeepGEMM's reduce-add into fp32 d accumulates at its own precision
-        assert calc_diff(d[group] - d0[group], prod) < 1e-3, group
-
-
-def run_kgrouped_case(ks: list[int], N: int, K: int, NA: int | None, KB: int | None) -> None:
-    size = torch.Size((len(ks), N, K))
-    for d in (
-        fp8_grouped_wgrad_empty(size, torch.device(DEV)),
-        torch.empty(size, dtype=torch.float32, device=DEV),
-    ):
-        check_kgrouped(d, ks, N, K, NA=NA, KB=KB)
-    torch.cuda.synchronize()
-
-
-# A first operand with an odd 128-block count deadlocks DeepGEMM's SM90 2-CTA k-grouped GEMM unless
-# k_grouped_fp8_gemm guards it. Those cases run in a subprocess under a timeout, because a hung
-# kernel cannot be interrupted from Python.
-SUBPROCESS = r"""
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("fp8_gemm_verifier", sys.argv[1])
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-mod.run_kgrouped_case(*json.loads(sys.argv[2]))
-print("OK")
-"""
-
-RAGGED = [256, 0, 640, 128, 0, 384]
-# (ks, N, K, NA, KB): d is (G, N, K); NA / KB the channels a / b are laid out with (padded) or None
-KGROUPED_CASES = [
-    (RAGGED, 2816, 2048, None, None),  # deepseek-v2-lite gate_up
-    (RAGGED, 2048, 1408, None, None),  # deepseek-v2-lite down
-    (RAGGED, 1536, 2048, None, None),  # qwen3-30b-a3b gate_up
-    (RAGGED, 2048, 768, None, None),  # qwen3-30b-a3b down
-    (RAGGED, 1024, 2048, None, None),  # qwen3.5-35b-a3b gate_up
-    (RAGGED, 2048, 512, None, None),  # qwen3.5-35b-a3b down
-    ([1024, 0, 512, 2048, 128, 0, 768, 256], 256, 384, None, None),
-    ([128] * 40, 256, 384, None, None),
-    ([0, 0, 0], 256, 384, None, None),
-    ([256, 0, 384], 1024, 2880, None, None),  # even M-blocks: direct
-    # above DeepGEMM's 65536-row limit: split at group boundaries / inside a group
-    ([40960, 0, 30720, 128], 256, 128, None, None),
-    ([70016], 256, 128, None, None),
-    ([128, 66048, 0, 256], 256, 128, None, None),
-    # deadlock guard (odd first-operand block count)
-    ([512, 256, 384, 128], 2880, 2880, None, None),  # gpt-oss down: both odd, pads a
-    ([256, 128, 640], 2880, 1024, None, None),  # odd N blocks, even K blocks: transposed product
-    ([384, 128], 5760, 2880, None, None),  # gpt-oss gate_up: pads a
-    ([1024, 0, 512, 256], 1408, 2048, None, None),  # deepseek-v2-lite (11 blocks), empty group
-    ([256, 384], 2048, 1408, None, None),
-    ([640, 128, 0, 256], 768, 2048, None, None),
-    ([256, 0, 384], 384, 256, None, None),  # transposed, small
-    # padded operands (more channels than d), as the fused ops lay them out
-    ([256, 0, 384], 2880, 2880, 3072, None),  # a padded to a multiple of 256
-    ([256, 0, 384], 2880, 2880, None, 3072),  # transposed temporary
-    ([256, 0, 384], 2880, 2880, 3072, 3072),
-    ([256, 0, 384], 5760, 2880, 5888, 3072),
-    ([256, 0, 384], 2880, 1024, 2944, None),  # a padded to an odd block count
-    ([256, 0, 384], 2048, 768, None, 1024),
-    ([256, 0, 384], 1408, 2048, 1536, None),
-]
-
-
-def needs_guard(N: int, NA: int | None) -> bool:
-    return blocks(NA or N) % 2 == 1 and kmajor_layout()
-
-
-@pytest.mark.parametrize("ks,N,K,NA,KB", KGROUPED_CASES)
-def test_k_grouped_gemm(ks: list[int], N: int, K: int, NA: int | None, KB: int | None) -> None:
-    if (NA or KB) and not kmajor_layout():
-        pytest.skip(
-            "padded per-channel operands come only from the SM90 fused ops (K-major layout)"
-        )
-    if not needs_guard(N, NA):
-        run_kgrouped_case(ks, N, K, NA, KB)
-        return
-    args = json.dumps([ks, N, K, NA, KB])
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", SUBPROCESS, os.path.abspath(__file__), args],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"k_grouped_fp8_gemm hung for (N, K, NA, KB) = ({N}, {K}, {NA}, {KB}), {ks}")
-    assert result.returncode == 0 and "OK" in result.stdout, result.stdout[-2000:] + result.stderr[-4000:]  # fmt: skip
-
-
-# (M, K, N): the dense projections of the models plus M not a multiple of 128 (all multiples of 16)
-DENSE_SHAPES = [
-    (4096, 2048, 10944),  # deepseek-v2-lite dense MLP up
-    (1008, 10944, 2048),  # deepseek-v2-lite dense MLP down
-    (4096, 2048, 4096),  # qwen3 q_proj
-    (4096, 2048, 512),  # qwen3 k/v_proj
-    (1008, 2880, 4096),  # gpt-oss q_proj
-    (144, 4096, 2880),  # gpt-oss o_proj
-    (1008, 2000, 1040),
-    (144, 400, 272),
-    (16, 128, 16),
-]
-
-
-def dense_case(M: int, K: int, N: int):
-    x = make_input(M, K, seed=M + K + N)
-    w = (make_input(N, K, seed=N).float() * 0.02).to(torch.bfloat16)
-    dy = make_input(M, N, seed=K)
-    return x, w, dy
-
-
-@pytest.mark.parametrize("M,K,N", DENSE_SHAPES)
-def test_fp8_gemm_nt(M: int, K: int, N: int) -> None:
-    x, w, _ = dense_case(M, K, N)
-    a_fp8, a_scale, _, _ = fp8_quant_act(x)
-    w_fp8, w_scale, _, _ = fp8_quant_weight(w)
-    # bf16 output only: DeepGEMM's SM90 kernel asserts d is bf16 (every caller passes bf16)
-    out = fp8_gemm_nt(a_fp8, a_scale, w_fp8, w_scale, M, N, torch.device(DEV), torch.bfloat16)
-    assert out.shape == (M, N) and out.dtype == torch.bfloat16
-    ref = dq_rowwise(a_fp8, a_scale) @ dq_blockwise(w_fp8, w_scale).T
-    assert calc_diff(out, ref) < 1e-3
-
-
-@pytest.mark.parametrize("M,K,N", DENSE_SHAPES)
-def test_act_weight_gemm_and_dgrad_wgrad(M: int, K: int, N: int) -> None:
-    x, w, dy = dense_case(M, K, N)
-    w_fp8, w_scale, wt_fp8, wt_scale = fp8_quant_weight(w)
-
-    out, xt_fp8, xt_scale = fp8_gemm_fwd(x, w_fp8, w_scale)
-    assert out.shape == (M, N) and out.dtype == torch.bfloat16
-    x_q, x_ref_scale = ref_rowwise(x)
-    ref = dq_rowwise(x_q, x_ref_scale) @ dq_blockwise(w_fp8, w_scale).T
-    assert calc_diff(out, ref) < 1e-3
-    xt_q, xt_ref_scale = ref_blockwise(x.T)
-    assert_fp8_equal(xt_fp8, xt_q, "input_t_fp8")
-    assert_scale_equal(xt_scale, xt_ref_scale, "scale_input_t")
-
-    grad_input, weight_grad = fp8_gemm_bwd(dy, wt_fp8, wt_scale, xt_fp8, xt_scale, K)
-    assert grad_input.shape == (M, K) and grad_input.dtype == torch.bfloat16
-    assert weight_grad.shape == (N, K) and weight_grad.dtype == torch.bfloat16
-    dy_q, dy_scale = ref_rowwise(dy)
-    ref_gi = dq_rowwise(dy_q, dy_scale) @ dq_blockwise(wt_fp8, wt_scale).T
-    assert calc_diff(grad_input, ref_gi) < 1e-3
-    dyt_q, dyt_scale = ref_rowwise(dy.T.contiguous())
-    ref_wg = dq_rowwise(dyt_q, dyt_scale) @ dq_blockwise(xt_fp8, xt_scale).T
-    assert calc_diff(weight_grad, ref_wg) < 1e-3
-    assert calc_diff(grad_input, dy.float() @ w.float()) < 1e-2
-    assert calc_diff(weight_grad, dy.float().T @ x.float()) < 1e-2
-
-
-@pytest.mark.parametrize(
-    "M,inter,hidden", [(4096, 10944, 2048), (2048, 1408, 2048), (128, 256, 128)]
-)
-def test_fp8_channels_as_rows(M: int, inter: int, hidden: int) -> None:
-    """
-    The dense SwiGLU MLP's weight gradient: dg.T @ x from the per-channel pair of one group of all
-    M rows (as rows of inter channels) and fp8_quant_act's x.T.
-    """
-    dg = make_input(M, inter, seed=21)
-    x = make_input(M, hidden, seed=22)
-    one_group = torch.tensor([M], dtype=torch.int32, device=DEV)
-    _, _, ch_fp8, ch_scale = fp8_quant_grouped(dg, one_group)
-    a_fp8, a_scale = fp8_channels_as_rows(ch_fp8, ch_scale, M, inter)
-    assert a_fp8.shape == (inter, M) and a_scale.shape == (inter, M // BLOCK)
-    assert a_fp8.untyped_storage().data_ptr() == ch_fp8.untyped_storage().data_ptr()  # a view
-    ch_q, ch_s = ref_channelwise(dg)
-    assert_fp8_equal(a_fp8.contiguous(), ch_q.T.contiguous(), "a_fp8")
-    assert_scale_equal(a_scale.contiguous(), ch_s.contiguous(), "a_scale")
-    _, _, xt_fp8, xt_scale = fp8_quant_act(x)
-    out = fp8_gemm_nt(a_fp8, a_scale, xt_fp8, xt_scale, inter, hidden, torch.device(DEV), torch.bfloat16)  # fmt: skip
-    ref = dq_rowwise(ch_q.T.contiguous(), ch_s) @ dq_blockwise(xt_fp8, xt_scale).T
-    assert out.shape == (inter, hidden) and calc_diff(out, ref) < 1e-3

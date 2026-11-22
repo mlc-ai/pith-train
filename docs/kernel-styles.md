@@ -295,9 +295,10 @@ Code that appears in more than one file lives once, in the shared module for its
 
 ## 8. Tests
 
-- Every exported name has a pure-PyTorch verifier in `tests/kernels/test_<feature>.py` that imports
-  only `pithtrain.kernels` names. FP8 bytes and E8M0 scales are compared exactly; GEMMs with
-  `calc_diff` or tight tolerances. **(checked: coverage)**
+- Every exported name belongs to a family of the kernel-shape spec (`tests/kernels/cases.py`) and is
+  verified against plain PyTorch at the shapes training launches, by `tests/kernels/test_<module>.py`.
+  FP8 bytes and E8M0 scales are compared exactly; GEMMs within analytic or calibrated bounds.
+  **(checked: `tests/kernels/test_spec.py`)**
 - Never verify against an `_sm100` sibling, and never add an architecture override to run
   `_sm100` code on Hopper.
 - A style change adds no tests. Tests that only record a past refactor are not kept.
@@ -310,9 +311,11 @@ Code that appears in more than one file lives once, in the shared module for its
    unchanged once docstrings are set aside and parallel assignments are expanded back into
    separate statements. No GPU run is needed.
 3. **Anything the compilers see** (renames, extracted phases, moved helpers, removed dead code):
-   - the verifiers in `tests/kernels` of every feature that imports the changed module pass;
+   - `pytest tests/kernels` passes on a GPU (and `pytest tests/operators` when CP code changed),
+     and its results are posted on the PR;
    - every kernel those features launch, run against the code before the change on the same GPU,
-     gives bit-identical outputs and a median time within 5% (+3 us for very short kernels).
+     gives bit-identical outputs and a median time within 5% (+3 us for very short kernels);
+     `python -m benchmarks.kernels --base <ref>` times them side by side.
      Timings are taken with nothing else running on the node: kernels timed side by side with
      other jobs vary by more than that. A timing over the limit is retaken once before it counts;
      a real regression is fixed (usually an order change, 4.2, or a lost `const_expr`) or the

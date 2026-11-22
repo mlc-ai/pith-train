@@ -33,7 +33,7 @@ uv sync
 
 ## Getting Started
 
-Pretrain Qwen3-30B-A3B from scratch. Datasets and checkpoints are stored in the `workspace` folder by default. Other models like DeepSeek-V2-Lite follow the same steps. See [`examples`](examples) for available configurations.
+Pretrain Qwen3-30B-A3B from scratch. Datasets and checkpoints are stored in the `workspace` folder by default. Other models like Qwen3.5-35B-A3B follow the same steps. See [`examples`](examples) for available configurations.
 
 **1. Prepare the dataset**
 

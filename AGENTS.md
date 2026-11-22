@@ -33,19 +33,18 @@ Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (i
 ### Testing (pytest)
 
 ```bash
-# Kernel verifiers: every name in pithtrain.kernels.__all__ against PyTorch (one GPU)
-pytest tests/kernels -v
+# Kernel tests at the training shapes (tests/kernels/cases.py): cases generated from the model
+# configs and mesh rules at collection, every case on one GPU
+pytest tests/kernels
+python -m tests.kernels.cases     # each model's meshes and case counts per family
 
-# Single-GPU operator and layer tests
-pytest tests/test_deepgemm_fp8_linear_correctness.py -v
-pytest tests/test_grouped_linear_correctness.py -v
+# Operator, layer and framework tests
 pytest tests/test_ep_dedup_dispatch.py -v
-pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py -v
-pytest tests/operators -v              # operator-level tests (ring attention, CP sequence, gated delta rule)
-pytest tests/test_import_layers.py -v  # import layering, kernel naming, kernels interface and verifier coverage (CPU only, AST)
+pytest tests/operators -v              # ring attention and GDN under CP (the spec's CP cases on CP GPUs), CP sequence, dense GDN ops
+pytest tests/test_import_layers.py -v  # import layering, kernel naming, kernels interface (CPU only, AST)
 
 # Single test function
-pytest tests/kernels/test_fp8_gemm.py::test_name -v
+pytest tests/kernels/test_fp8_gemm.py::test_fp8_linear -k qwen3-30b-a3b
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
 bash tests/test_dualpipev.sh
@@ -57,6 +56,11 @@ bash tests/test_dualpipev.sh
 python3 -m benchmarks.operators.fp8.test_deepgemm
 # ring attention: multi-GPU launcher (torchrun), scenario = <model>-cp<N>-s<N>k
 bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
+
+# kernel benchmarks over the spec's cases: --base times them at a base git ref and at the working tree
+# on one GPU (per-op and work-weighted speedup; exit 1 past 5% slower per op name); without it, this tree
+python -m benchmarks.kernels --base upstream/main --family log_prob
+python -m benchmarks.kernels --out results.json
 
 # end-to-end training benchmark: one case per script
 torchrun --nproc-per-node=8 benchmarks/end2end/<case>/script.py
@@ -70,7 +74,7 @@ The `examples/` tree drives end-to-end workflows; each subdir has a `launch.sh` 
 # Tokenize a pretraining corpus (per-tokenizer; rerun when switching models)
 bash examples/tokenize_corpus/launch.sh dclm-qwen3
 
-# Pretrain (qwen3-30b-a3b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
+# Pretrain at 4K context (qwen3-30b-a3b | qwen3.5-35b-a3b | qwen3.5-27b | gpt-oss-20b | gpt-oss-120b)
 bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 
 # Download released HuggingFace weights (for training.hf_import_path) and export the newest checkpoint
@@ -149,7 +153,7 @@ Only what training code calls directly: autograd functions and custom ops with t
 - **Token Scatter** (`token_scatter.py`) — scatter of tokens by expert ahead of the grouped GEMM, padded index gather, per-row group ids
 - **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `log_prob.py`
 
-Operators import kernels only as `from pithtrain.kernels import <name>` and never branch on the architecture: where a fused path may be missing they call a capability query (`fp8_fused_experts_supported`, `bf16_experts_supported`, `gated_delta_rule_pinned_supported`, `gated_delta_rule_cp_supported`, `chunk_gdr_cp_supported`). Operators keep a PyTorch reference for correctness testing (operator-level tests in `tests/operators/` and `tests/`); every kernel they call is verified against a pure-PyTorch reference in `tests/kernels/test_<feature>.py`.
+Operators import kernels only as `from pithtrain.kernels import <name>` and never branch on the architecture: where a fused path may be missing they call a capability query (`fp8_fused_experts_supported`, `bf16_experts_supported`, `gated_delta_rule_pinned_supported`, `gated_delta_rule_cp_supported`, `chunk_gdr_cp_supported`). Every kernel they call is verified against a pure-PyTorch reference at the shapes training launches, in `tests/kernels/` (`tests/kernels/cases.py`); `tests/operators/` and `tests/` test operators and layers beyond those shapes.
 
 ### Kernels (`pithtrain/kernels/`)
 
@@ -157,13 +161,17 @@ Raw kernel code: CuTe-DSL kernels (SM90) and TIRx-lite kernels (SM100), their la
 
 **A black-box library used only through `__all__`.** The whole interface is `__all__` in `pithtrain/kernels/__init__.py`, which holds nothing but plain `from pithtrain.kernels.<module> import <names>` lines and `__all__` listing exactly those names, built with `__all__.append(...)` calls grouped under a comment per feature area. Importing the package never loads cutlass, QuACK or FA4: every module it imports keeps them inside the functions that run them (the pickers import their `_sm90` modules in the SM90 branch; the BF16 experts are reached through the pickers `bf16_expert_gemm.py` / `bf16_expert_slots.py`, whose functions import `bf16_expert_*_sm90` or `_sm100` on first call), and `tests/test_import_layers.py` checks it. Outside the package the only allowed import is `from pithtrain.kernels import <name in __all__>`, never a submodule (`pithtrain.kernels.fp8_gemm`, a picker, a plain file or an `_smXX` file); `tests/test_import_layers.py` enforces it, and that nothing outside `kernels/` branches on the architecture. The library owns the SM90 / SM100 choice: it exports no architecture query (`ARCH_MAJOR`, `is_sm90`, ... stay inside `arch.py`), and where a caller needs to know whether a fused path exists it calls a capability query named for the feature: `fp8_fused_experts_supported()`, `bf16_experts_supported(num_groups)`, `gated_delta_rule_pinned_supported(q, k, v, g, beta)`, `gated_delta_rule_cp_supported(q, k, v, g, beta)` and `chunk_gdr_cp_supported(q, k, v, g, beta)`. Optional hints return None where the device needs none (`fp8_group_indices`). The models merge `stage_compile_options()` (Inductor options per architecture: `triton.autotune_pointwise` off on SM90, nothing on SM100) into their compiled stages' `torch.compile` options.
 
-Every exported name has a docstring stating its contract (shapes, dtypes, contiguity, output and scale layout, in-place behaviour, SM90-only or not) and a pure-PyTorch verifier in `tests/kernels/test_<feature>.py` (`<feature>` = the stem of the module `__init__.py` imports the name from, without `_sm90` / `_sm100`). A verifier imports from pithtrain only `from pithtrain.kernels import ...`, writes its reference in plain PyTorch in the test, and covers the feature's forward and backward entry points across ragged, empty and non-multiple-of-128 shapes and the four models' sizes. FP8 quantization is compared exactly (the same e4m3 bytes and E8M0 scale values as the recipe: per 128-element block `scale` = the power of two at or above `max(amax, 1e-4) * fp32(1 / 448)` (at least 2^-126), `e4m3_satfinite(x * (1 / scale))` round to nearest even); GEMMs and other float outputs use `calc_diff` or tight tolerances. SM90-only features skip on their capability query. `tests/test_import_layers.py` checks that every name in `__all__` is exercised in `tests/kernels/`. Adding a kernel means: import it in `__init__.py` and list it in `__all__`, write its contract docstring, add its verifier.
+Every exported name has a docstring stating its contract (shapes, dtypes, contiguity, output and scale layout, in-place behaviour, SM90-only or not) and belongs to a family of the kernel-shape spec, which verifies it against plain PyTorch at the shapes training launches (below). FP8 quantization is compared exactly (the same e4m3 bytes and E8M0 scale values as the recipe: per 128-element block `scale` = the power of two at or above `max(amax, 1e-4) * fp32(1 / 448)` (at least 2^-126), `e4m3_satfinite(x * (1 / scale))` round to nearest even); GEMMs and other float outputs within analytic bounds where the arithmetic gives one, else about 3x the worst measured on the H200. Adding a kernel means: import it in `__init__.py` and list it in `__all__`, write its contract docstring, list it in a family of `tests/kernels/cases.py` and call it from that family's test.
 
-Launch-config tuning (`kernels/tuning.py`): a kernel family with several valid launch configs is a `Tunable` (today the BF16 expert GEMMs), whose launches ask `tunable.pick(key, rows)` for a config: one table lookup once tuned. `pretrain_lm.launch` calls `tune_kernels()` on every rank before the first step (installing the choices cached for this setup, so a repeated setup runs tuned from step 1) and after it; a key not in the cache runs its fixed default in the first step, the same on every rank, and the second call pools the keys all ranks used, splits their buckets across the ranks, times all candidates of a bucket on one GPU on synthetic inputs (dropping any whose results differ from the default's), pools the timings and installs the same choice on every rank, checked by a hash: of the candidates within `MARGIN` of the fastest, the default, else the lowest index. Choices are cached in a file every node sees (`~/.cache/pithtrain/tuning`, or `PITHTRAIN_TUNING_DIR`), named by the GPU and a fingerprint of the library versions, the candidates and the kernel module's source, so tuning is paid once per setup and redone when a kernel changes. `tune_kernels` has no verifier of its own: `tests/kernels/test_bf16_expert_gemm.py` runs a round and checks the GEMMs again (`VERIFIER_OF` in `tests/test_import_layers.py`).
+Training shapes come from one place, the kernel-shape spec (`tests/kernels/cases.py`, which generates the cases at test collection and states the rules in its docstring): per model (`examples/pretrain_lm/*/config.json`), contexts 4k / 8k at CP 1, 16k at CP 2 / 4, 32k at CP 4 / 8 and 64k at CP 8 / 16, micro-batch 1 / 2 / 4 at CP 1 and 1 under CP, EP 1 .. 16 dividing the expert count, expert routing balanced, log-normal, skewed, stress and boundary (both edges of every BF16 tuning bucket reached), one family per kernel module (`fp8_gemm`, `fp8_silu_mul_quant`, `bf16_expert_gemm`, `flash_attn_memoize`, `gated_delta_rule_pinned`, ...). `tests/kernels/test_<module>.py`, one per `pithtrain/kernels/<module>.py`, parametrizes from its family, with each kernel's reference in it and shared helpers in `tests/kernels/common.py` (the CP > 1 cases of ring attention and GDN: `tests/operators`), and `python -m benchmarks.kernels` times the same cases. Never hand-write production shapes into a test or benchmark, and never let a kernel-design agent pick its own; shipped scripts are not read. The smoke tier fails when a model or family lacks cases or a test, or an exported kernel is in no family.
+
+Kernel PRs (any change to `pithtrain/kernels/`) post the results of a GPU run of `pytest tests/kernels`, plus `pytest tests/operators` when CP code (ring attention, GDN CP, `cp_sequence`) changes, and of `python -m benchmarks.kernels --base main` over the families the change touches (no regression: no op failing that ran on main, no op name more than 5% slower work-weighted). A kernel-design agent reads `tests/kernels/cases.py`, must pass `pytest tests/kernels` and the `--base` A/B against main, and may add cases but never remove a spec case.
+
+Launch-config tuning (`kernels/tuning.py`): a kernel family with several valid launch configs is a `Tunable` (today the BF16 expert GEMMs), whose launches ask `tunable.pick(key, rows)` for a config: one table lookup once tuned. `pretrain_lm.launch` calls `tune_kernels()` on every rank before the first step (installing the choices cached for this setup, so a repeated setup runs tuned from step 1) and after it; a key not in the cache runs its fixed default in the first step, the same on every rank, and the second call pools the keys all ranks used, splits their buckets across the ranks, times all candidates of a bucket on one GPU on synthetic inputs (dropping any whose results differ from the default's), pools the timings and installs the same choice on every rank, checked by a hash: of the candidates within `MARGIN` of the fastest, the default, else the lowest index. Choices are cached in a file every node sees (`~/.cache/pithtrain/tuning`, or `PITHTRAIN_TUNING_DIR`), named by the GPU and a fingerprint of the library versions, the candidates and the kernel module's source, so tuning is paid once per setup and redone when a kernel changes. The spec's boundary routing puts every expert at both edges of each tuning bucket training reaches, so every bucket's default config is verified.
 
 Scale-layout contract: every 1x128 FP8 scale has logical shape `(rows, ceil(K / 128))` fp32 with unspecified strides (MN-major on SM90, the layout DeepGEMM's SM90 GEMMs read without a transpose, `fp8_scale_layout.py`; on SM100 column-major from `fp8_quant_act` / `fp8_quant_grad`, the layout `act_scale_like` gives there, and row-major from the grouped and fused quantizations). Callers pass scales to this library's GEMMs as returned and never read their strides (`act_scale_like` gives the device's layout for fakes). 128x128 weight scales are row-major on both.
 
-SM100: `tests/kernels` runs on a B200 as well as on an H200, every case of the same files on both. The checks that depend on the device read the layout an output has, never the architecture: fp8_quant_grouped's per-channel pair (and the fused ops' copy of it) is K-major per group on SM90 and `(M, K)` with scale `(M / 128, K)` on SM100, the layout DeepGEMM's SM100 k-grouped GEMM (`k_grouped_fp8_gemm_tn_contiguous`) reads; cases only the K-major layout has (padded wgrad operands, the SM90 k-grouped deadlock guard and its transposed wgrad buffer) run only there, and optional hints may be None. Known SM100 difference, accepted by every FP8 verifier: in a 128-element block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf (reciprocal -inf, bytes -/+448) while SM100's native `cvt.rp.satfinite.ue8m0x2.f32` saturates the scale to 2^127 (bytes +/-0); inf inputs mean training has already diverged, so either result is accepted element by element in such blocks only, and every other block must match exactly. Do not add an architecture override to test `_sm100` code on Hopper.
+SM100: the kernel tests (`tests/kernels`) cover SM90 only (bounds calibrated on the H200). Device-dependent layouts are read from the output, never from the architecture: fp8_quant_grouped's per-channel pair (and the fused ops' copy of it) is K-major per group on SM90 and `(M, K)` with scale `(M / 128, K)` on SM100, the layout DeepGEMM's SM100 k-grouped GEMM (`k_grouped_fp8_gemm_tn_contiguous`) reads. Known SM100 difference: in a 128-element block whose amax is infinite the SM90 E8M0 arithmetic gives scale inf (reciprocal -inf, bytes -/+448) while SM100's native `cvt.rp.satfinite.ue8m0x2.f32` saturates the scale to 2^127 (bytes +/-0); inf inputs mean training has already diverged. Do not add an architecture override to run `_sm100` code on Hopper.
 
 SM100 TIRx kernels: each `<feature>_sm100.py` is a TIRx-lite kernel (`tirx_kernels.tirx_lite`, compiled by `tvm_tirx`):
 
@@ -176,7 +184,7 @@ SM100 TIRx kernels: each `<feature>_sm100.py` is a TIRx-lite kernel (`tirx_kerne
 | `bf16_expert_*` | `bf16_expert_gemm_sm100`, `bf16_expert_slots_sm100` | why `bf16_experts_supported()` is true on SM100 |
 | `segment_sum`, `group_bias_add`, `scatter_by_expert` | `segment_sum_sm100`, `group_bias_add_sm100`, `token_scatter_sm100` | segment_sum is not CUDA-graph safe; scatter placement is atomic-ordered (a PyTorch path past 1024 groups) |
 | `clamped_swiglu_*`, `silu_mul_*` | `clamped_swiglu_sm100`, `silu_mul_sm100` | the same bits as SM90 |
-| `cross_entropy_fwd_bwd`, `log_prob_*` | `cross_entropy_sm100`, `log_prob_sm100` | log_prob through custom ops inside torch.compile regions |
+| `log_prob_*` | `log_prob_sm100` | log_prob through custom ops inside torch.compile regions |
 | `causal_conv1d_*` | `causal_conv1d_sm100` | |
 | `ep_dispatch_send_idx` / `_recv_idx` | `ep_dispatch_sm100` | a PyTorch path past its bin limits |
 | `chunk_gdr_*_pinned` | `gated_delta_rule_pinned_sm100` | generated port of the GDN prefill kernels; beta floored at 2^-20 (see the picker) |
@@ -191,8 +199,8 @@ Naming (SM90 and SM100 are the only supported targets):
 3. `<feature>_sm90.py` never imports its `_sm100` sibling (the TIRx kernels run only on sm_100a); it imports another feature's `_sm90` file only along the edges listed in `SM90_CROSS_EDGES` in `tests/test_import_layers.py`.
 4. Kernels both architectures run unchanged are plain `<feature>.py` (`fp8_gemm`, `flash_attn_memoize`, ...).
 5. Only `kernels/arch.py` checks the device capability (`ARCH_MAJOR`, `NATIVE_E8M0`, `SM_COUNT`). Each feature has one picker, `kernels/<feature>.py`, that dispatches with `match ARCH_MAJOR:`: `case 9:` runs `_sm90`, `case 10:` runs `_sm100`, and `case _:` raises `NotImplementedError` naming the compute capability (a new architecture gets its own `case`, e.g. `case 11:` for SM110); `__init__.py` re-exports the picker's contract names. `operators/`, `models/`, `modules/`, tests, benchmarks and tools import those names from the package (`from pithtrain.kernels import ...`), never a picker module, a plain file or an `_smXX` file.
-6. Shared helpers only SM90 code uses carry the suffix: `cute_ptx_sm90.py` (inline-PTX `dsl_user_op`s), `cute_compile_sm90.py` (fake tensors / stream, `TORCH2CUTE`), `fp8_e8m0_scale_sm90.py` (E8M0 scale math), `row_slice_sm90.py` (the row-slice machinery of the cluster row kernels, cross-entropy and log-probability). Arch-neutral shared leaves stay unsuffixed: `arch.py`, `host_transfer.py` (pinned host buffers), `fp8_scale_layout.py`.
-7. Tests mirror the feature names without suffix: `tests/kernels/test_<feature>.py`, one per feature `__init__.py` imports from, verified against PyTorch through the interface (never against an `_sm100` sibling); an SM90-only feature's file skips on its capability query.
+6. Shared helpers only SM90 code uses carry the suffix: `cute_ptx_sm90.py` (inline-PTX `dsl_user_op`s), `cute_compile_sm90.py` (fake tensors / stream, `TORCH2CUTE`), `fp8_e8m0_scale_sm90.py` (E8M0 scale math), `row_slice_sm90.py` (the row-slice machinery of the cluster row kernels, log-probability). Arch-neutral shared leaves stay unsuffixed: `arch.py`, `host_transfer.py` (pinned host buffers), `fp8_scale_layout.py`.
+7. Kernel tests mirror the kernel modules, `tests/kernels/test_<module>.py` (the module's name without `_sm90` / `_sm100`), verified against PyTorch through the interface (never against an `_sm100` sibling); no test file is named for an architecture.
 8. A feature stays one file per architecture, forward and backward together. Split it into `<feature>_fwd_sm90.py` / `<feature>_bwd_sm90.py` only when one direction becomes its own pipeline or the file passes about 1.5k lines.
 9. No `_name` defined anywhere in `kernels/` (module level, classes, methods, attributes, locals, parameters, import aliases; reads of a library's own `_` hooks such as QuACK's are fine): every kernel module lists what it exports in a literal `__all__`, and a kernel module imports from a sibling only names in that sibling's `__all__` (`tests/test_import_layers.py` checks both). Docstrings are plain text wrapped at 100 columns, with the opening and closing `"""` each on its own line (one-line docstrings too).
 
@@ -202,7 +210,7 @@ SM90-only features have no `_sm100` file, because SM100 runs no kernel there: `g
 
 Every `_sm90` module that loads cutlass is imported lazily, inside the SM90 branch of its picker or inside the wrapper function of an SM90-only feature: QuACK patches CuTe-DSL globally when imported and cutlass is expensive to import, so importing `pithtrain.kernels` or a picker on SM100 never imports either.
 
-Bit-exactness contracts: each `_sm90` kernel produces exactly the FP8 bytes and E8M0 scale values of the PyTorch implementation of the recipe (the SM90 branch of the E8M0 scale, `cvt.rn.satfinite` e4m3), which its `tests/kernels` verifier checks; its `_sm100` sibling computes the same values. Scale strides differ by architecture as the scale-layout contract above says; each picker's docstring says so.
+Bit-exactness contracts: each `_sm90` kernel produces exactly the FP8 bytes and E8M0 scale values of the PyTorch implementation of the recipe (the SM90 branch of the E8M0 scale, `cvt.rn.satfinite` e4m3), which the spec's tests check on the H200; its `_sm100` sibling computes the same values. Scale strides differ by architecture as the scale-layout contract above says; each picker's docstring says so.
 
 ### Training Orchestration (`pithtrain/tasks/pretrain_lm.py`)
 
@@ -225,8 +233,8 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 - `F.grouped_mm` may write NaN to padding rows (beyond `grouped_mm_offs[-1]`). Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 GEMM and FP8 layer tests use normalized squared-error (`calc_diff`), threshold typically `< 1e-3`; FP8 quantization verifiers compare bytes and scale values exactly, and scales by logical value only (strides are unspecified).
-- Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`).
-- Kernel verifiers call only `pithtrain.kernels` names and compare against a PyTorch reference written in the test, never against a picker's `_sm100` sibling. Do not add an architecture override to run `_sm100` code on Hopper.
+- Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`); the spec's CP tests in `tests/operators` spawn their ranks themselves (CP 16 one pytest per node, `tests/kernels/cases.py`) and skip when there are too few GPUs.
+- Kernel tests call `pithtrain.kernels` names (or the operator training calls) and compare against a PyTorch reference written in the test, never against another pithtrain kernel or a picker's `_sm100` sibling.
 
 ## Config Base Classes
 

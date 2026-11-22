@@ -508,7 +508,7 @@ COMPILED: dict = {}
 
 
 def compile_kernel(N: int, num_groups: int) -> Callable:
-    M, num_kmajor_elems, num_row_tiles = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    M, num_kmajor_elems, num_row_tiles = cute.sym_int(), cute.sym_int64(), cute.sym_int()
     num_col_tiles = (N + TILE - 1) // TILE
     x, offs, tok = fake(cutlass.BFloat16, (M, N), (N, 1)), fake(Int32, (num_groups,), (1,), 4), fake(cutlass.Float8E4M3FN, (M, N), (N, 1))
     tok_scale = fake(cutlass.Float32, (M, num_col_tiles), (1, cute.sym_int64()))
@@ -523,7 +523,7 @@ def allocate_outputs(x: torch.Tensor, M: int, N: int) -> tuple[torch.Tensor, tor
 
 
 def compile_staged_kernel(N: int, num_groups: int, kind: str, transposed: bool) -> Callable:
-    M, num_kmajor_elems, num_row_tiles = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    M, num_kmajor_elems, num_row_tiles = cute.sym_int(), cute.sym_int64(), cute.sym_int()
     num_col_tiles = (N + TILE - 1) // TILE
     dtype = STAGED_TYPES[kind]
     x, offs, tok = fake(dtype, (M, N), (cute.sym_int64(), cute.sym_int64()), dtype.width // 8), fake(Int32, (num_groups,), (1,), 4), fake(cutlass.Float8E4M3FN, (M, N), (N, 1))
