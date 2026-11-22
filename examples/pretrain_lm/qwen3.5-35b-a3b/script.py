@@ -1,4 +1,4 @@
-"""Pretrain Qwen3.5-35B-A3B on a single 8-GPU H200/B200 node with 8-way expert parallelism."""
+"""Pretrain Qwen3.5-35B-A3B at 4K context on one 8-GPU H200 node: pp 1, ep 8, micro-batch 1."""
 
 from functools import partial
 from pathlib import Path
@@ -24,7 +24,7 @@ training.lr = 3.0e-4
 training.max_steps = 4096
 training.micro_batch_size = 1
 training.global_batch_size = 1024
-training.sequence_length = 2048
+training.sequence_length = 4096
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
 training.fp8 = False

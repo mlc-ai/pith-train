@@ -1,3 +1,5 @@
+"""Pretrain GPT-OSS-20B at 4K context on one 8-GPU H200 node: pp 1, ep 2, micro-batch 2."""
+
 from functools import partial
 from pathlib import Path
 
@@ -10,7 +12,7 @@ cfg.dataset = Path("workspace/datasets/dclm-baseline/toktxt/gpt-oss")
 
 cfg.distributed.context_parallel_size = 1
 cfg.distributed.pipeline_parallel_size = 1
-cfg.distributed.expert_parallel_size = 8
+cfg.distributed.expert_parallel_size = 2
 
 cfg.training.model = Path("examples/pretrain_lm/gpt-oss-20b")
 cfg.training.optimizer = make_muon_optimizer
@@ -18,9 +20,9 @@ kwargs = dict(start_lr=1.0e-5, warmup_ratio=0.03, final_lr=1.0e-5)
 cfg.training.scheduler = partial(make_wsd_scheduler, **kwargs)
 cfg.training.lr = 3.0e-4
 cfg.training.max_steps = 4096
-cfg.training.micro_batch_size = 1
+cfg.training.micro_batch_size = 2
 cfg.training.global_batch_size = 1024
-cfg.training.sequence_length = 2048
+cfg.training.sequence_length = 4096
 cfg.training.moe_load_balance_type = "global-batch"
 cfg.training.moe_load_balance_coef = 1e-3
 cfg.training.save_interval = 256
