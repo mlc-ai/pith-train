@@ -61,6 +61,9 @@ class DenseFSDPCfg(SlottedDefault):
     prefetch_forward_copy_out: bool = False
     """Prefetch one forward bucket including its copy-out on a separate CUDA stream."""
 
+    prefetch_backward_copy_out: bool = False
+    """Stage a prefetched backward bucket's copy-out before its consumer runs."""
+
     reuse_single_weight_gather_buffers: bool = False
     """Use the all-gather output directly for one-parameter buckets."""
 
@@ -183,6 +186,19 @@ def log_bucket_sizes(
     logger.info("Dense FSDP buckets (AG/RS MiB) | %s", ", ".join(payloads))
 
 
+def allocate_gather_outputs(group, gather) -> None:
+    # Allocate on the compute stream so reshard can recycle the same storage.
+    world_size = group._all_gather_process_group.size()
+    for param, sizes, dtypes in zip(
+        group.fsdp_params,
+        gather.param_all_gather_input_numels,
+        gather.param_all_gather_input_dtypes,
+        strict=True,
+    ):
+        param.init_all_gather_outputs(sizes, dtypes, world_size, group.device)
+        param.alloc_all_gather_outputs()
+
+
 def prefetch_forward_copy_out(units: list[nn.Module]) -> None:
     stream = torch.cuda.Stream()
 
@@ -197,17 +213,7 @@ def prefetch_forward_copy_out(units: list[nn.Module]) -> None:
             gather = group._all_gather_result
             if gather is None or not gather.param_all_gather_input_numels:
                 return
-            # Weight storage allocated on the compute stream can be recycled in backward.
-            for param, sizes, dtypes in zip(
-                group.fsdp_params,
-                gather.param_all_gather_input_numels,
-                gather.param_all_gather_input_dtypes,
-                strict=True,
-            ):
-                param.init_all_gather_outputs(
-                    sizes, dtypes, group._all_gather_process_group.size(), group.device
-                )
-                param.alloc_all_gather_outputs()
+            allocate_gather_outputs(group, gather)
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 following.unshard()
@@ -230,6 +236,51 @@ def prefetch_forward_copy_out(units: list[nn.Module]) -> None:
 
     for current, following in zip(units, units[1:]):
         connect(current, following)
+
+
+def prefetch_backward_copy_out(units: list[nn.Module]) -> None:
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+
+    stream = torch.cuda.Stream()
+
+    def install(unit: nn.Module) -> None:
+        (group,) = unit._get_fsdp_state()._fsdp_param_groups
+        unshard = group.unshard
+        wait_for_unshard = group.wait_for_unshard
+        ready = torch.cuda.Event()
+        pending = False
+
+        def unshard_with_copy_out(async_op: bool = False):
+            nonlocal pending
+            unshard(async_op=async_op)
+            gather = group._all_gather_result
+            if (
+                group._training_state != TrainingState.PRE_BACKWARD
+                or gather is None
+                or gather.all_gather_work is not None
+                or not gather.param_all_gather_input_numels
+            ):
+                return
+
+            allocate_gather_outputs(group, gather)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                wait_for_unshard()
+                ready.record()
+            pending = True
+
+        def wait_for_copy_out():
+            nonlocal pending
+            if pending:
+                torch.cuda.current_stream().wait_event(ready)
+                pending = False
+            wait_for_unshard()
+
+        group.unshard = unshard_with_copy_out
+        group.wait_for_unshard = wait_for_copy_out
+
+    for unit in units:
+        install(unit)
 
 
 def reuse_single_weight_gather_buffer(unit: nn.Module) -> None:
@@ -474,6 +525,8 @@ def shard_dense_model(
             module.set_modules_to_backward_prefetch(order[max(0, i - cfg.prefetch) : i][::-1])
     if cfg.prefetch_forward_copy_out:
         prefetch_forward_copy_out(order)
+    if cfg.prefetch_backward_copy_out:
+        prefetch_backward_copy_out(order)
     model.set_gradient_divide_factor(1.0)
     if cfg.reduce_scatter_buffers != 1:
         model.set_reduce_scatter_max_input_buffers(cfg.reduce_scatter_buffers)

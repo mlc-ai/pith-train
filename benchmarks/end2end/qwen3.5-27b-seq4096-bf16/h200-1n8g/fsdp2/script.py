@@ -36,6 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--keep-head-gathered", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--prefetch-forward-copy-out", action="store_true")
+    parser.add_argument("--prefetch-backward-copy-out", action="store_true")
     parser.add_argument("--fuse-gather-copy-in", action="store_true")
     parser.add_argument("--reuse-single-weight-gather-buffers", action="store_true")
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
@@ -111,6 +112,7 @@ if __name__ == "__main__":
     train.dense_fsdp.keep_head_gathered = args.keep_head_gathered
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.prefetch_forward_copy_out = args.prefetch_forward_copy_out
+    train.dense_fsdp.prefetch_backward_copy_out = args.prefetch_backward_copy_out
     train.dense_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
     train.dense_fsdp.overwrite_wgrad = args.overwrite_wgrad
