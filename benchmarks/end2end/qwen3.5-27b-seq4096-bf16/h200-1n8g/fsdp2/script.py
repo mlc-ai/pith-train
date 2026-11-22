@@ -37,6 +37,8 @@ if __name__ == "__main__":
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--bf16-sharded-gradients", action="store_true")
     parser.add_argument("--reduce-at-step-end", action="store_true")
+    parser.add_argument("--overlap-microbatch-reductions", action="store_true")
+    parser.add_argument("--prefetch-data-during-optimizer", action="store_true")
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
     parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument(
@@ -86,6 +88,8 @@ if __name__ == "__main__":
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
     train.dense_fsdp.bf16_sharded_gradients = args.bf16_sharded_gradients
     train.dense_fsdp.reduce_at_step_end = args.reduce_at_step_end
+    train.dense_fsdp.overlap_microbatch_reductions = args.overlap_microbatch_reductions
+    train.dense_fsdp.prefetch_data_during_optimizer = args.prefetch_data_during_optimizer
     train.dense_fsdp.reduce_scatter_buffers = args.reduce_scatter_buffers
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
     train.dense_fsdp.activation_checkpoint = args.checkpoint

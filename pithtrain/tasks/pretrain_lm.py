@@ -137,7 +137,13 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
+def train_step(
+    cfg: PretrainLMCfg,
+    dataset: ConcatDataset,
+    step: int,
+    *,
+    prefetched_batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
@@ -171,11 +177,17 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     cp_size = distributed.cp_size
     dense_fsdp = cfg.training.dense_fsdp
     if dense_fsdp is not None:
-        batches = get_batch_tensors(cfg, dataset, step, device)
+        batches = prefetched_batches
+        if batches is None:
+            batches = get_batch_tensors(cfg, dataset, step, device)
         delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
+        finalize_once = len(batches) > 1 and (
+            delay_reduce or dense_fsdp.overlap_microbatch_reductions
+        )
         retain = dense_fsdp.keep_gathered_across_microbatches and len(batches) > 1
         if delay_reduce:
             model.set_requires_gradient_sync(False)
+        if finalize_once:
             model.set_is_last_backward(False)
         if retain:
             for group in model.retained_decoder_units:
@@ -185,6 +197,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             if i == len(batches) - 1:
                 if delay_reduce:
                     model.set_requires_gradient_sync(True)
+                if finalize_once:
                     model.set_is_last_backward(True)
                 if retain:
                     for group in model.retained_decoder_units:
@@ -238,6 +251,13 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         scheduler.step()
     for param in upcast_params:
         param.grad_dtype = torch.bfloat16
+    next_batches = None
+    if (
+        dense_fsdp is not None
+        and dense_fsdp.prefetch_data_during_optimizer
+        and step + 1 < cfg.training.max_steps
+    ):
+        next_batches = get_batch_tensors(cfg, dataset, step + 1, device)
     if training.fp8:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
@@ -317,6 +337,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
+    return next_batches
 
 
 @record
@@ -345,8 +366,9 @@ def launch(cfg: PretrainLMCfg) -> None:
     # Install the cached kernel launch configs now; tune the ones the first step lacked after it.
     tune_kernels()
     first_step = step
+    prefetched_batches = None
     while step < cfg.training.max_steps:
-        train_step(cfg, dataset, step)
+        prefetched_batches = train_step(cfg, dataset, step, prefetched_batches=prefetched_batches)
         if step == first_step:
             tune_kernels()
         step += 1

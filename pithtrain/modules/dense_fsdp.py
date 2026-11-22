@@ -62,6 +62,12 @@ class DenseFSDPCfg(SlottedDefault):
     reduce_at_step_end: bool = False
     """Accumulate unsharded gradients across microbatches and reduce them in the last backward."""
 
+    overlap_microbatch_reductions: bool = False
+    """Wait for pending reduce-scatters only on the optimizer step's final backward."""
+
+    prefetch_data_during_optimizer: bool = False
+    """Prepare the next batch while the current optimizer kernels run."""
+
     reduce_scatter_buffers: int = 1
     """Maximum number of in-flight reduce-scatter staging buffers."""
 
