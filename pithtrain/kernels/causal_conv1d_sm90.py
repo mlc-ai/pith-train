@@ -649,7 +649,8 @@ class ConvBwdTma:
 
 class ConvFwdTma:
     """
-    Forward on the TMA ring, one CTA per 64-channel tile over all S outputs (B == 1, S % 8 == 0).
+    Forward on the TMA ring for one sequence (S % 8 == 0). Each CTA owns a 64-channel
+    tile and a span of output rows. Split dispatch requires equal spans of whole stages.
     Stage s covers outputs [s * stage_rows, + stage_rows) and loads x rows
     [s * stage_rows + offset - (K - 1), + stage_rows + K - 1). Two consumer groups take alternate
     stages. Consumer thread: channel group (warp % 2) * 4 + lane % 4, token block
@@ -657,8 +658,9 @@ class ConvFwdTma:
     a warp writes 4 channels x 128 contiguous bytes of the channels-first y.
     """
 
-    def __init__(self, C: int, K: int, is_w_fp32: bool) -> None:
+    def __init__(self, C: int, K: int, is_w_fp32: bool, sequence_splits: int) -> None:
         self.C, self.K, self.is_w_fp32 = C, K, is_w_fp32
+        self.sequence_splits = sequence_splits
         self.stage_rows, self.tokens = FWD_TMA_ROWS, FWD_TMA_ROWS // 16
         self.box_rows = self.stage_rows + K - 1
         self.box_bytes = self.box_rows * TMA_CHANNELS * 2
@@ -670,25 +672,29 @@ class ConvFwdTma:
     def __call__(self, mX: cute.Tensor, mW: cute.Tensor, mY: cute.Tensor, S: Int32, offset: Int32, stream) -> None:
         box = cute.make_layout((self.box_rows, TMA_CHANNELS), stride=(TMA_CHANNELS, 1))
         atom_x, _ = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), mX, box, (self.box_rows, TMA_CHANNELS))
-        self.kernel(atom_x, mW, mY, S, offset).launch(grid=[self.C // TMA_CHANNELS, 1, 1], block=[32 + TMA_CONSUMERS * FWD_TMA_GROUPS, 1, 1], stream=stream)
+        self.kernel(atom_x, mW, mY, S, offset).launch(grid=[self.C // TMA_CHANNELS, self.sequence_splits, 1], block=[32 + TMA_CONSUMERS * FWD_TMA_GROUPS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, atom_x: cute.CopyAtom, mW: cute.Tensor, mY: cute.Tensor, S: Int32, offset: Int32) -> None:
         tidx, _, _ = cute.arch.thread_idx()
-        bx, _, _ = cute.arch.block_idx()
+        bx, by, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(tidx // 32)
         smem = cutlass.memory.SmemAllocator()
         slots, full0, empty0 = self.ring.allocate(smem)
         if tidx == 0:
             init_ring(full0, empty0, self.ring.num_slots)
         cute.arch.sync_threads()
-        num_stages = (S + self.stage_rows - 1) // self.stage_rows
+        rows_per_stage_across_spans = self.stage_rows * self.sequence_splits
+        num_stages = (S + rows_per_stage_across_spans - 1) // rows_per_stage_across_spans
+        row_base = Int32(0)
+        if cutlass.const_expr(self.sequence_splits > 1):
+            row_base = by * num_stages * self.stage_rows
         tile_chan0 = bx * TMA_CHANNELS
         if warp == self.producer_warp:
             if tidx == 0:
-                self.load_loop(atom_x, slots, full0, empty0, num_stages, tile_chan0, offset)
+                self.load_loop(atom_x, slots, full0, empty0, num_stages, tile_chan0, offset + row_base)
         else:
-            self.compute_loop(mW, mY, slots, full0, empty0, num_stages, tile_chan0, S, tidx - 32)
+            self.compute_loop(mW, mY, slots, full0, empty0, num_stages, tile_chan0, S, row_base, tidx - 32)
 
     @cute.jit
     def load_loop(self, atom_x: cute.CopyAtom, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, tile_chan0: Int32, offset: Int32) -> None:
@@ -702,7 +708,7 @@ class ConvFwdTma:
             tma_load_rows(slots + slot_idx * self.ring.slot_bytes, x_desc, tile_chan0, stage_idx * self.stage_rows + offset - (self.K - 1), full)
 
     @cute.jit
-    def compute_loop(self, mW: cute.Tensor, mY: cute.Tensor, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, tile_chan0: Int32, S: Int32, consumer_idx: Int32) -> None:
+    def compute_loop(self, mW: cute.Tensor, mY: cute.Tensor, slots: Int32, full0: Int32, empty0: Int32, num_stages: Int32, tile_chan0: Int32, S: Int32, row_base: Int32, consumer_idx: Int32) -> None:
         group, group_thread = consumer_idx // TMA_CONSUMERS, consumer_idx % TMA_CONSUMERS
         lane, group_warp = group_thread % 32, group_thread // 32
         group_idx, block_idx = (group_warp % 2) * 4 + lane % 4, (group_warp // 2) * 8 + lane // 4
@@ -717,7 +723,7 @@ class ConvFwdTma:
             for i in cutlass.range_constexpr(self.tokens + self.K - 1):
                 rows.append(lds_v4(slot_addr + ((local0 + i) * TMA_CHANNELS + group_idx * 8) * 2))
             release_slot(empty0 + 8 * slot_idx)
-            self.store_y(mY.iterator.toint(), rows, weights, stage_idx * self.stage_rows + local0, S, chan0)
+            self.store_y(mY.iterator.toint(), rows, weights, row_base + stage_idx * self.stage_rows + local0, S, chan0)
 
     def store_y(self, y_base: Int64, rows: list, weights: list, out_start: Int32, S: Int32, chan0: Int32) -> None:
         """
@@ -762,9 +768,9 @@ def rows_of(dtype: type, C: int) -> object:
     return fake(dtype, (cute.sym_int(), C), (C, 1))
 
 
-def compile_fwd_tma(C: int, K: int, is_w_fp32: bool) -> Callable:
+def compile_fwd_tma(C: int, K: int, is_w_fp32: bool, sequence_splits: int) -> Callable:
     w = flat(Float32 if is_w_fp32 else cutlass.BFloat16)
-    return cute.compile(ConvFwdTma(C, K, is_w_fp32), rows_of(cutlass.BFloat16, C), w, flat(cutlass.BFloat16), Int32(1), Int32(0), fake_stream(), options="--enable-tvm-ffi")
+    return cute.compile(ConvFwdTma(C, K, is_w_fp32, sequence_splits), rows_of(cutlass.BFloat16, C), w, flat(cutlass.BFloat16), Int32(1), Int32(0), fake_stream(), options="--enable-tvm-ffi")
 
 
 def compile_bwd_tma(C: int, K: int, is_w_fp32: bool) -> Callable:
@@ -826,7 +832,8 @@ def causal_conv1d_fwd_sm90(x: torch.Tensor, w: torch.Tensor, offset: int) -> tor
         return y
     w = kernel_weights(w)
     if is_tma_fwd(x, K, S):
-        key = ("conv_fwd_tma", C, K, w.dtype == torch.float32)
+        sequence_splits = 4 if S == 4096 and offset == 0 and w.shape == (10240, 1, 4) and w.dtype == torch.bfloat16 else 1
+        key = ("conv_fwd_tma", C, K, w.dtype == torch.float32, sequence_splits)
         fn = COMPILED.get(key)
         if fn is None:
             fn = COMPILED[key] = compile_fwd_tma(*key[1:])
