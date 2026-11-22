@@ -45,6 +45,9 @@ class DenseFSDPCfg(SlottedDefault):
     keep_last_groups: int = 0
     """Keep this many final decoder buckets materialized until backward."""
 
+    keep_gathered_across_microbatches: bool = False
+    """Keep the selected final buckets unsharded through intermediate backward passes."""
+
     skip_embedding_backward_gather: bool = False
     """Skip gathering the embedding weight in backward when it is its own bucket."""
 
@@ -52,6 +55,9 @@ class DenseFSDPCfg(SlottedDefault):
     """Explicit lookahead in buckets in both directions. Zero uses FSDP's implicit prefetch."""
 
     reduce_dtype: Literal["fp32", "bf16"] = "fp32"
+
+    bf16_sharded_gradients: bool = False
+    """Accumulate reduced shards in BF16 and upcast once before AdamW."""
 
     reduce_at_step_end: bool = False
     """Accumulate unsharded gradients across microbatches and reduce them in the last backward."""
@@ -140,6 +146,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.blocks_per_group must be positive")
     if cfg.keep_last_groups < 0:
         raise ValueError("dense_fsdp.keep_last_groups must be nonnegative")
+    if cfg.keep_gathered_across_microbatches and not cfg.keep_last_groups:
+        raise ValueError("Keeping buckets across microbatches requires keep_last_groups > 0")
     if cfg.edge_sharding not in ("separate", "root"):
         raise ValueError("dense_fsdp.edge_sharding must be separate or root")
     if cfg.edge_sharding == "root" and cfg.skip_embedding_backward_gather:
@@ -148,12 +156,17 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.prefetch must be nonnegative")
     if cfg.reduce_dtype not in ("fp32", "bf16"):
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
+    if cfg.bf16_sharded_gradients and cfg.reduce_dtype != "bf16":
+        raise ValueError("BF16 sharded gradients require BF16 reduction")
     if cfg.activation_checkpoint not in ("none", "selective", "full", "offload"):
         raise ValueError(
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
         )
 
     reduce_dtype = torch.float32 if cfg.reduce_dtype == "fp32" else torch.bfloat16
+    if cfg.bf16_sharded_gradients:
+        for param in model.parameters():
+            param.grad_dtype = torch.bfloat16
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=reduce_dtype,
@@ -213,6 +226,10 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
             mesh=mesh,
             reshard_after_forward=reshard,
             mp_policy=mp,
+        )
+    if cfg.keep_gathered_across_microbatches:
+        model.retained_decoder_units = tuple(
+            group[0] for group in decoder_groups[-cfg.keep_last_groups :]
         )
 
     # One FSDP state per communication bucket, even when several blocks share it.

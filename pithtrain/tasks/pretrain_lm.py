@@ -173,14 +173,22 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     if dense_fsdp is not None:
         batches = get_batch_tensors(cfg, dataset, step, device)
         delay_reduce = dense_fsdp.reduce_at_step_end and len(batches) > 1
+        retain = dense_fsdp.keep_gathered_across_microbatches and len(batches) > 1
         if delay_reduce:
             model.set_requires_gradient_sync(False)
             model.set_is_last_backward(False)
+        if retain:
+            for group in model.retained_decoder_units:
+                group.set_reshard_after_backward(False, recurse=False)
         losses, counts = [], []
         for i, (tokens, labels) in enumerate(batches):
-            if delay_reduce and i == len(batches) - 1:
-                model.set_requires_gradient_sync(True)
-                model.set_is_last_backward(True)
+            if i == len(batches) - 1:
+                if delay_reduce:
+                    model.set_requires_gradient_sync(True)
+                    model.set_is_last_backward(True)
+                if retain:
+                    for group in model.retained_decoder_units:
+                        group.set_reshard_after_backward(True, recurse=False)
             loss, detached = objective((model(tokens),), (labels,))
             loss.backward()
             losses.append(detached)
@@ -209,6 +217,15 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         num_tokens = local_count * dp_size * cp_size
 
     # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
+    upcast_params = []
+    if dense_fsdp is not None and dense_fsdp.bf16_sharded_gradients:
+        for param in model.parameters():
+            if param.grad is not None:
+                grad = param.grad.to(torch.float32)
+                param.grad = None
+                param.grad_dtype = torch.float32
+                param.grad = grad
+                upcast_params.append(param)
     scale_grads_(local_grads(model), 1.0 / num_tokens)
 
     gradient_norm = clip_grad_norm(
@@ -219,6 +236,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+    for param in upcast_params:
+        param.grad_dtype = torch.bfloat16
     if training.fp8:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
