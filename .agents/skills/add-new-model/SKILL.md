@@ -39,7 +39,7 @@ Phases 1-4 are modeling + training correctness. Phases 5-6 are real-weight infer
 |-------|------|-------------------|
 | 0 | Analyze HF's reference implementation | Have class/attribute/shape/config inventory |
 | 1 | Write `pithtrain/models/<model>.py` | Imports cleanly; `reference_forward` runs |
-| 2 | Wire into `pithtrain/modules/training.py` + `tests/test_dualpipev.py` + example config; regenerate the kernel-shape spec | Example config mirrors upstream; imports clean; spec current, smoke tier passes |
+| 2 | Wire into `pithtrain/modules/training.py` + `tests/test_dualpipev.py` + example config; bring it into the kernel-shape spec (`tests/kernels/README.md`) | Example config mirrors upstream; imports clean; README current, kernel smoke tier passes |
 | 3 | Single-GPU sanity test | pp=1/ep=1 `test_dualpipev.py` passes (loss `allclose` 1e-3, grad `calc_diff` < 1e-2, weight sync `torch.equal`) |
 | 4 | FSDP scaling (pp=1/ep=1 -> 2/2) | All 4 configs pass |
 | 5 | *(If needed)* Checkpoint converter + round-trip | `hf import -> save -> dcp2hf -> transformers.load` succeeds |
@@ -125,13 +125,12 @@ No new reference file needed - the changes are small and mechanical.
 3. Add the model config and HF ID to the `models` list at the bottom of `tests/test_dualpipev.py`.
 4. Write `examples/pretrain_lm/<model>/config.json`. Mirror upstream HF's `config.json` field-by-field - including every nested block (`rope_scaling`, `quantization_config`, etc.). See `reference/conventions.md` (example-config) for the diff command and the three layered defaults you need to reconcile.
 
-5. Regenerate the kernel-shape spec, so every kernel the model launches is tested and benchmarked at its training shapes (see `docs/kernel-validation.md`):
-   - If the config's `model_type` is new, add an extractor for it in `tools/kernel_cases/models.py` (projections, attention, experts, linear attention, dense SwiGLU widths).
-   - `python -m tools.kernel_cases --write`, then review the new `<family>/<model>/...` cases in `tools/kernel_cases/kernel_cases.json` (routing, T, EP / CP points).
-   - `python -m pytest tests/test_kernel_cases.py` (CPU): it fails until the spec is current, the model has cases in every family its architecture uses, and each family's test consumes them.
-   - On one GPU, `python -m pytest tests/spec -m smoke -k <model>`; a kernel failure is a finding to report (an `xfail` with its reason), not a bound to loosen.
+5. Bring the model into the kernel-shape spec, so every kernel it launches is tested and benchmarked at its training shapes (`tests/kernels/README.md`); the cases are generated from the config at test collection:
+   - If the config's `model_type` is new, add an extractor for it in `tests/kernels/cases.py` (projections, attention, experts, linear attention, dense SwiGLU widths).
+   - `python -m tests.kernels.cases --summary`, then paste `python -m tests.kernels.cases --readme` into the Models section of `tests/kernels/README.md` and review the model's shapes, mesh table and case counts.
+   - On one GPU, `python -m pytest tests/kernels -m smoke` (the spec's own checks fail until the README is current, the model has cases in every family its architecture uses and each family's test consumes them), then `python -m pytest tests/kernels -m "smoke or spec" -k <model>`; a kernel failure is a finding to report (an `xfail` with its reason), not a bound to loosen.
 
-**Gate:** `python -c "import tests.test_dualpipev"` imports cleanly, the example-config diff is either empty or has a documented reason for each remaining difference, `tests/test_kernel_cases.py` passes, and the spec smoke tier for the model passes (or its failures are reported).
+**Gate:** `python -c "import tests.test_dualpipev"` imports cleanly, the example-config diff is either empty or has a documented reason for each remaining difference, and `pytest tests/kernels -m smoke` and the model's spec tier pass (or their failures are reported).
 
 ---
 

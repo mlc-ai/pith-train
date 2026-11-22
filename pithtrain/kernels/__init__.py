@@ -1,7 +1,7 @@
 """
 PithTrain's kernel library. __all__ is its whole interface: code outside this package imports names
 from pithtrain.kernels, never a submodule. Each name's docstring is its contract, verified against
-PyTorch in tests/kernels/test_<feature>.py. The library picks the SM90 or SM100 implementation
+PyTorch at the training shapes in tests/kernels (tests/kernels/README.md). The library picks the SM90 or SM100 implementation
 itself; callers that need to know whether a fused path exists use the capability queries
 fp8_fused_experts_supported, bf16_experts_supported, gated_delta_rule_pinned_supported,
 gated_delta_rule_cp_supported and chunk_gdr_cp_supported. Importing the package never loads cutlass,

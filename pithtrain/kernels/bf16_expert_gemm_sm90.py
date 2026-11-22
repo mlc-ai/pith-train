@@ -336,7 +336,7 @@ The candidate that is fastest most often across kinds and sizes; every launch ru
 CANDIDATES = (Config(128, 128, 2, True), Config(128, 192, 1, True), Config(128, 192, 2, False), Config(128, 192, 2, True), Config(128, 256, 1, False), Config(128, 256, 2, False), Config(256, 192, 1, False), Config(256, 192, 2, False))
 """
 The configs tune_kernels() chooses among, for every kind and shape; each compiles and computes every
-kind correctly (tests/kernels/test_bf16_expert_gemm.py loads each in turn).
+kind correctly (tune_kernels drops any whose results differ from the default's).
 """
 
 

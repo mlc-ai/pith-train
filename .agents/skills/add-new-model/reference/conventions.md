@@ -125,7 +125,7 @@ if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:   # fused FP8 
 return not training.fp8 and bf16_experts_supported(num_local_experts)  # BF16 CuTe experts
 ```
 
-`tests/test_import_layers.py` fails on any other import or an architecture check. A new kernel the model needs goes into `pithtrain/kernels/` with a contract docstring, an entry in `__all__` and a pure-PyTorch verifier in `tests/kernels/test_<feature>.py` (AGENTS.md, "Kernels").
+`tests/test_import_layers.py` fails on any other import or an architecture check. A new kernel the model needs goes into `pithtrain/kernels/` with a contract docstring, an entry in `__all__` and a place in a family of the kernel-shape spec, `tests/kernels/cases.py`, whose `tests/kernels/test_<family>.py` verifies it at the model's training shapes (AGENTS.md, "Kernels").
 
 ### Verifying layout correctness after conversion
 
