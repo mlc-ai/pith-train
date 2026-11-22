@@ -39,6 +39,7 @@ if __name__ == "__main__":
     parser.add_argument("--fuse-gather-copy-in", action="store_true")
     parser.add_argument("--reuse-single-weight-gather-buffers", action="store_true")
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--overwrite-wgrad", action="store_true")
     parser.add_argument("--reuse-gradient-shards", action="store_true")
     parser.add_argument(
         "--reduce-at-step-end",
@@ -111,6 +112,7 @@ if __name__ == "__main__":
     train.dense_fsdp.prefetch_forward_copy_out = args.prefetch_forward_copy_out
     train.dense_fsdp.reuse_single_weight_gather_buffers = args.reuse_single_weight_gather_buffers
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
+    train.dense_fsdp.overwrite_wgrad = args.overwrite_wgrad
     train.dense_fsdp.reuse_gradient_shards = args.reuse_gradient_shards
     train.dense_fsdp.reduce_at_step_end = args.reduce_at_step_end
     train.dense_fsdp.overlap_microbatch_reductions = args.overlap_microbatch_reductions

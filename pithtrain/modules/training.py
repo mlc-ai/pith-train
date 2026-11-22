@@ -426,7 +426,7 @@ def setup_model(
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
-        install_wgrad_accumulation(model)
+        install_wgrad_accumulation(model, overwrite=cfg.dense_fsdp.overwrite_wgrad)
         training.model = model
         return
 

@@ -65,6 +65,9 @@ class DenseFSDPCfg(SlottedDefault):
 
     reduce_dtype: Literal["fp32", "bf16"] = "fp32"
 
+    overwrite_wgrad: bool = False
+    """Write the first weight gradient directly into the FP32 buffer before each reduction."""
+
     reuse_gradient_shards: bool = False
     """Zero the dense model's FP32 gradient shards in place after AdamW."""
 
@@ -300,6 +303,8 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
     if cfg.reduce_at_step_end < 0:
         raise ValueError("dense_fsdp.reduce_at_step_end must be nonnegative")
+    if cfg.overwrite_wgrad and cfg.reduce_at_step_end:
+        raise ValueError("Overwriting wgrad requires reduction after every backward")
     if cfg.activation_checkpoint not in ("none", "selective", "full", "offload"):
         raise ValueError(
             "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
