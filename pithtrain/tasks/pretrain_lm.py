@@ -270,6 +270,7 @@ def train_step(
         memory += [
             stats["reserved_bytes.all.peak"] / gib,
             stats["num_alloc_retries"] - initial_memory["num_alloc_retries"],
+            stats["num_alloc_retries"],
             stats["num_device_alloc"] - initial_memory["num_device_alloc"],
             stats["num_device_free"] - initial_memory["num_device_free"],
             stats["allocated_bytes.all.current"] / gib,
@@ -308,11 +309,20 @@ def train_step(
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         if dense_fsdp is not None:
-            peak_reserved, retries, allocs, frees, allocated, reserved, inactive, peak_inactive = (
-                peak_gpu_stats[1:].tolist()
-            )
+            (
+                peak_reserved,
+                retries,
+                total_retries,
+                allocs,
+                frees,
+                allocated,
+                reserved,
+                inactive,
+                peak_inactive,
+            ) = peak_gpu_stats[1:].tolist()
             statements.append("peak-gpu-reserved %.2f GB" % peak_reserved)
             statements.append("cuda-alloc-retries %d" % retries)
+            statements.append("cuda-alloc-retries-total %d" % total_retries)
             statements.append("cuda-device-allocs %d" % allocs)
             statements.append("cuda-device-frees %d" % frees)
             statements.append("cuda-allocated %.2f GiB" % allocated)
