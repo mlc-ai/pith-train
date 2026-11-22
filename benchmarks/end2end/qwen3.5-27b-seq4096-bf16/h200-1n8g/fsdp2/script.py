@@ -34,6 +34,7 @@ if __name__ == "__main__":
     parser.add_argument("--keep-gathered-across-microbatches", action="store_true")
     parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
+    parser.add_argument("--prefetch-forward-copy-out", action="store_true")
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument(
         "--bf16-sharded-gradients", action=argparse.BooleanOptionalAction, default=False
@@ -90,6 +91,7 @@ if __name__ == "__main__":
     train.dense_fsdp.keep_gathered_across_microbatches = args.keep_gathered_across_microbatches
     train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
     train.dense_fsdp.prefetch = args.prefetch
+    train.dense_fsdp.prefetch_forward_copy_out = args.prefetch_forward_copy_out
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
     train.dense_fsdp.bf16_sharded_gradients = args.bf16_sharded_gradients
     train.dense_fsdp.reduce_at_step_end = args.reduce_at_step_end

@@ -54,6 +54,9 @@ class DenseFSDPCfg(SlottedDefault):
     prefetch: int = 0
     """Explicit lookahead in buckets in both directions. Zero uses FSDP's implicit prefetch."""
 
+    prefetch_forward_copy_out: bool = False
+    """Prefetch one forward bucket including its copy-out on a separate CUDA stream."""
+
     reduce_dtype: Literal["fp32", "bf16"] = "fp32"
 
     bf16_sharded_gradients: bool = False
@@ -148,6 +151,41 @@ def log_bucket_sizes(
         for (name, numel), count in sizes.items()
     )
     logger.info("Dense FSDP buckets (AG/RS MiB) | %s", ", ".join(payloads))
+
+
+def prefetch_forward_copy_out(groups: list[list[nn.Module]]) -> None:
+    stream = torch.cuda.Stream()
+
+    def connect(current: list[nn.Module], following: list[nn.Module], first: bool) -> None:
+        event = torch.cuda.Event()
+        pending = False
+
+        def prefetch(_module, _inputs):
+            nonlocal pending
+            if first:
+                # The sharded weights may have been updated by the optimizer on this stream.
+                stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                following[0].unshard()
+                event.record()
+            pending = True
+
+        def wait(_module, _inputs):
+            nonlocal pending
+            if pending:
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_event(event)
+                # FSDP releases these allocations after the consumer finishes issuing work.
+                for block in following:
+                    for param in block.parameters():
+                        param.record_stream(current_stream)
+                pending = False
+
+        current[0].register_forward_pre_hook(prefetch)
+        following[0].register_forward_pre_hook(wait, prepend=True)
+
+    for i, (current, following) in enumerate(zip(groups, groups[1:])):
+        connect(current, following, i == 0)
 
 
 def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCfg) -> None:
@@ -252,22 +290,28 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
 
     # One FSDP state per communication bucket, even when several blocks share it.
     order = [group[0] for group in decoder_groups]
+    forward_groups = decoder_groups
     if cfg.edge_sharding == "separate":
         fully_shard(model.embed_tokens, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
         fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=True, mp_policy=mp)
         if cfg.skip_embedding_backward_gather:
             model.embed_tokens.set_unshard_in_backward(False)
         order = [model.embed_tokens, *order, model.lm_head]
+        forward_groups = [[model.embed_tokens], *decoder_groups, [model.lm_head]]
     fully_shard(model, mesh=mesh, reshard_after_forward=False, mp_policy=mp)
 
     if cfg.edge_sharding == "root" and cfg.prefetch:
-        model.set_modules_to_forward_prefetch(order[: cfg.prefetch])
+        if not cfg.prefetch_forward_copy_out:
+            model.set_modules_to_forward_prefetch(order[: cfg.prefetch])
         model.set_modules_to_backward_prefetch(order[-cfg.prefetch :][::-1])
     for i, module in enumerate(order):
         module.set_gradient_divide_factor(1.0)
         if cfg.prefetch:
-            module.set_modules_to_forward_prefetch(order[i + 1 : i + 1 + cfg.prefetch])
+            if not cfg.prefetch_forward_copy_out:
+                module.set_modules_to_forward_prefetch(order[i + 1 : i + 1 + cfg.prefetch])
             module.set_modules_to_backward_prefetch(order[max(0, i - cfg.prefetch) : i][::-1])
+    if cfg.prefetch_forward_copy_out:
+        prefetch_forward_copy_out(forward_groups)
     model.set_gradient_divide_factor(1.0)
     if cfg.reduce_scatter_buffers != 1:
         model.set_reduce_scatter_max_input_buffers(cfg.reduce_scatter_buffers)
