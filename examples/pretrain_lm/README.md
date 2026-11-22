@@ -20,11 +20,7 @@ bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 bash examples/pretrain_lm/launch.sh qwen3.5-35b-a3b
 ```
 
-The launch script auto-detects available GPUs and works with both single-node and multi-node (SLURM) setups. Run the multi-node models under `srun` with one task per node:
-
-```bash
-srun -N 2 --ntasks-per-node=1 -W 0 examples/pretrain_lm/launch.sh qwen3.5-27b
-```
+The launch script auto-detects available GPUs and works with both single-node and multi-node (SLURM) setups.
 
 Training starts from random weights. To start from released weights instead, download them with [convert_checkpoint](../convert_checkpoint/) and set `training.hf_import_path` to `workspace/checkpoints/<model>/hf-import` in `script.py`.
 
