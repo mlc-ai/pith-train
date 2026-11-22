@@ -1,12 +1,11 @@
 """Benchmark the Qwen3.5 dense FSDP2 pathway on H200 GPUs."""
 
 import argparse
+import os
 from functools import partial
 from pathlib import Path
 
-from pithtrain.modules.dense_fsdp import DenseFSDPCfg
-from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
-from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
+import torch
 
 
 def reshard(value: str) -> bool | int:
@@ -32,6 +31,12 @@ if __name__ == "__main__":
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--unfused-adamw", action="store_true")
     args = parser.parse_args()
+
+    # PithTrain's kernel imports query the current GPU.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    from pithtrain.modules.dense_fsdp import DenseFSDPCfg
+    from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
+    from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
     cfg = PretrainLMCfg()
     train = cfg.training
