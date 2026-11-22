@@ -95,3 +95,38 @@ The raw reports are logs/kernels-{delta-shared,attention-shared,head}-1263562.ns
 The same job timed microbatch 2 at 32.10 ms for DeltaNet, 32.84 ms for attention, 100.03 ms for the unchunked head and 115.45 ms for the 1,024-token chunked head. The two head loss values agreed to 2e-6. The data favor the existing in-place fused CE path at both measured microbatch sizes.
 
 On the exact attention geometry at microbatch 1, FA3 took 1.539 ms, FA4 2.203 ms and PyTorch Flash SDPA 3.115 ms. The FLA 0.6.0 Triton comparator took 1.656 ms with scale=1, while the selected CuTe DeltaNet took 1.182 ms at its standard 1/sqrt(128) scale. Those two timing results compare launch paths. Their output magnitudes use different scales.
+
+## Measured BF16 and FP8 training-step shares
+
+Job 1263636 ran one hybrid cycle on one H200 using the stock dense DualPipeV/FSDP2 training entry point. It kept the 27B widths, all embedding and output weights, 4K sequences, microbatch 1, two microbatches per step and Muon plus AdamW. The table covers step 3 after two warmups. The shorter model gives the head and optimizer more weight than the 64-layer, eight-GPU run.
+
+Each share is summed GPU kernel time divided by the outer Nsight training-step NVTX duration. That duration was 685.95 ms for BF16 and 660.43 ms for FP8. PithTrain reported 685 ms and 659 ms, respectively. CUDA copies and launch gaps contribute to the wall time.
+
+| CUDA family | BF16 launches | BF16 ms | BF16 share | FP8 launches | FP8 ms | FP8 share |
+|---|---:|---:|---:|---:|---:|---:|
+| Causal convolution | 18 | 1.089 | 0.16% | 18 | 1.082 | 0.16% |
+| Pinned GDR forward | 12 | 2.013 | 0.29% | 12 | 2.018 | 0.31% |
+| Pinned GDR backward | 24 | 5.293 | 0.77% | 24 | 5.354 | 0.81% |
+| Fused SiLU multiply | 16 | 2.083 | 0.30% | 16 | 2.106 | 0.32% |
+| Fused cross-entropy launches | 6 | 2.320 | 0.34% | 6 | 2.308 | 0.35% |
+| FlashAttention-4 | 12 | 5.043 | 0.74% | 12 | 5.200 | 0.79% |
+| FP8 activation quantization | — | — | — | 32 | 1.246 | 0.19% |
+| FP8 output-gradient quantization | — | — | — | 50 | 2.318 | 0.35% |
+| FP8 FSDP weight preparation | — | — | — | 52 | 4.505 | 0.68% |
+| DeepGEMM | — | — | — | 168 | 59.315 | 8.98% |
+| cuBLAS | 675 | 437.304 | 63.75% | 549 | 335.234 | 50.76% |
+| Inductor | 204 | 5.836 | 0.85% | 212 | 6.376 | 0.97% |
+| Other ATen CUDA | 1808 | 195.538 | 28.51% | 1858 | 201.895 | 30.57% |
+
+Of the cuBLAS duration, 250.05 ms in BF16 and 251.82 ms in FP8 were launched after the last model backward NVTX range. Those launches are the optimizer GEMMs. That accounts for 36.5% and 38.1% of the respective step spans.
+
+The FP8 trace recorded 168 regular DeepGEMM launches. There are 25 FP8 projections across the four layers, each with forward, dgrad and wgrad, plus nine recomputed projection forwards per microbatch. It recorded 32 activation quantization launches and 50 output-gradient quantization launches.
+
+| FP8 weight kernel | Launches per step | GPU time |
+|---|---:|---:|
+| ShardTile | 25 | 1.889 ms |
+| ShardAmaxMulti | 1 | 1.326 ms |
+| PackTranspose | 25 | 1.280 ms |
+| ScalesMulti | 1 | 0.010 ms |
+
+The captures are logs/kernel-step-{bf16,fp8}-1263636.nsys-rep. Both SQLite exports passed integrity checks and contained the full NVTX range for step 3. Slurm recorded a kill signal at the process restart after both traces and both sets of four step logs were written. The eight-GPU baseline job 1263388 hit an OOM after its warmup step.
