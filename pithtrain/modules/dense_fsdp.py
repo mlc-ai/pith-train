@@ -62,9 +62,13 @@ class DenseFSDPCfg(SlottedDefault):
     separate_reduce_scatter: bool = False
     """Use a dedicated communicator for reduce-scatter to allow backward all-gather overlap."""
 
-    activation_checkpoint: Literal["none", "selective", "full"] = "none"
+    activation_checkpoint: Literal["none", "selective", "full", "offload"] = "none"
 
     compile_blocks: bool = False
+
+    compile_mode: Literal[
+        "default", "max-autotune-no-cudagraphs", "max-autotune", "reduce-overhead"
+    ] = "default"
 
 
 def checkpoint_policy(ctx, op, *args, **kwargs):
@@ -80,6 +84,33 @@ def checkpoint_policy(ctx, op, *args, **kwargs):
 
 def selective_checkpoint_contexts():
     return create_selective_checkpoint_contexts(checkpoint_policy)
+
+
+def offload_saved_activations(layer, forward):
+    """Keep parameter storages on device and stage large saved activations in pinned memory."""
+
+    def call(*args, **kwargs):
+        parameter_storages = {p.untyped_storage().data_ptr() for p in layer.parameters()}
+
+        def pack(tensor):
+            if (
+                not tensor.is_cuda
+                or tensor.numel() * tensor.element_size() < 1024**2
+                or tensor.untyped_storage().data_ptr() in parameter_storages
+            ):
+                return tensor.detach(), None
+            host = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            host.copy_(tensor.detach(), non_blocking=True)
+            return host, tensor.device
+
+        def unpack(saved):
+            tensor, device = saved
+            return tensor if device is None else tensor.to(device, non_blocking=True)
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            return forward(*args, **kwargs)
+
+    return call
 
 
 def log_bucket_sizes(
@@ -117,8 +148,10 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         raise ValueError("dense_fsdp.prefetch must be nonnegative")
     if cfg.reduce_dtype not in ("fp32", "bf16"):
         raise ValueError("dense_fsdp.reduce_dtype must be fp32 or bf16")
-    if cfg.activation_checkpoint not in ("none", "selective", "full"):
-        raise ValueError("dense_fsdp.activation_checkpoint must be none, selective or full")
+    if cfg.activation_checkpoint not in ("none", "selective", "full", "offload"):
+        raise ValueError(
+            "dense_fsdp.activation_checkpoint must be none, selective, full or offload"
+        )
 
     reduce_dtype = torch.float32 if cfg.reduce_dtype == "fp32" else torch.bfloat16
     mp = MixedPrecisionPolicy(
@@ -126,8 +159,12 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
+    if cfg.compile_blocks:
+        from torch._inductor import list_mode_options
+
+        compile_options = list_mode_options(cfg.compile_mode) | stage_compile_options()
     for layer in model.layers:
-        if cfg.activation_checkpoint != "none":
+        if cfg.activation_checkpoint in ("selective", "full"):
             ctx = (
                 {"context_fn": selective_checkpoint_contexts}
                 if cfg.activation_checkpoint == "selective"
@@ -141,8 +178,10 @@ def shard_dense_model(model: Qwen35TextModel, mesh: DeviceMesh, cfg: DenseFSDPCf
                 layer.forward,
                 fullgraph=True,
                 dynamic=False,
-                options=stage_compile_options() or None,
+                options=compile_options or None,
             )
+        if cfg.activation_checkpoint == "offload":
+            layer.forward = offload_saved_activations(layer, layer.forward)
 
     decoder_groups = [
         list(group)

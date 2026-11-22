@@ -37,8 +37,17 @@ if __name__ == "__main__":
     parser.add_argument("--reduce-at-step-end", action="store_true")
     parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
     parser.add_argument("--separate-reduce-scatter", action="store_true")
-    parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
+    parser.add_argument(
+        "--checkpoint", choices=("none", "selective", "full", "offload"), default="none"
+    )
     parser.add_argument("--compile-blocks", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "max-autotune-no-cudagraphs", "max-autotune", "reduce-overhead"),
+        default="default",
+    )
+    parser.add_argument("--nsys-start", type=int)
+    parser.add_argument("--nsys-stop", type=int)
     parser.add_argument("--unfused-adamw", action="store_true")
     args = parser.parse_args()
 
@@ -58,6 +67,8 @@ if __name__ == "__main__":
     train.global_batch_size = args.batch
     train.micro_batch_size = args.micro_batch
     train.max_steps = args.steps
+    train.nsys_start = args.nsys_start
+    train.nsys_stop = args.nsys_stop
     train.lr = 1e-5
     train.optimizer = partial(make_adamw_optimizer, fused=not args.unfused_adamw)
     train.scheduler = make_constant_scheduler
@@ -75,4 +86,5 @@ if __name__ == "__main__":
     train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
     train.dense_fsdp.activation_checkpoint = args.checkpoint
     train.dense_fsdp.compile_blocks = args.compile_blocks
+    train.dense_fsdp.compile_mode = args.compile_mode
     launch(cfg)
