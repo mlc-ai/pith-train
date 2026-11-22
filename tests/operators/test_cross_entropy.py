@@ -1,11 +1,11 @@
 """
-cross_entropy_fwd_bwd and the CrossEntropy operator at the cross_entropy cases, against float64.
+The CrossEntropy operator (log_prob_fwd / log_prob_bwd) at the log_prob cases with ignore_index and
+a grad_output other than 1, against float64: loss within LOSS_REL, gradient within one bf16 rounding.
 """
 
 import pytest
 import torch
 
-from pithtrain.kernels import cross_entropy_fwd_bwd
 from pithtrain.operators.cross_entropy import cross_entropy
 from tests.kernels.cases import params
 from tests.kernels.common import (
@@ -50,24 +50,10 @@ def grad_ratio(grad: torch.Tensor, logits: torch.Tensor, target: torch.Tensor, s
     return worst, dot / norm - 1.0
 
 
-@pytest.mark.parametrize("case", params("cross_entropy"))
-def test_cross_entropy_kernel(case: dict) -> None:
-    logits, target = log_prob_inputs(case)
-    want, count = exact_ce(logits, target)
-    grad_buffer = logits.clone()
-    loss, grad = cross_entropy_fwd_bwd(grad_buffer, target, IGNORE)
-    assert grad.data_ptr() == grad_buffer.data_ptr(), "row-contiguous logits are overwritten in place"  # fmt: skip
-    loss_rel = abs(loss.item() - want) / abs(want)
-    ratio, bias = grad_ratio(grad, logits, target, 1.0 / count)
-    record(case["id"], "kernel", loss_rel=loss_rel, grad_ratio=ratio, grad_bias=bias)
-    assert loss_rel <= LOSS_REL, f"loss {float(loss)} vs {want}: rel {loss_rel:.3g}"
-    assert ratio <= 1.0, f"gradient error {ratio:.3g}x one bf16 rounding"
-
-
 GRAD_OUTPUT = 1.0 / 3.0
 
 
-@pytest.mark.parametrize("case", params("cross_entropy"))
+@pytest.mark.parametrize("case", params("log_prob"))
 def test_cross_entropy_op_grad_output(case: dict) -> None:
     logits, target = log_prob_inputs(case)
     want, count = exact_ce(logits, target)

@@ -59,7 +59,7 @@ bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
 
 # kernel benchmarks over the spec's cases: --base times them at a base git ref and at the working tree
 # on one GPU (per-op and work-weighted speedup; exit 1 past 5% slower per op name); without it, this tree
-python -m benchmarks.kernels --base upstream/main --family cross_entropy
+python -m benchmarks.kernels --base upstream/main --family log_prob
 python -m benchmarks.kernels --out results.json
 
 # end-to-end training benchmark: one case per script
@@ -184,7 +184,7 @@ SM100 TIRx kernels: each `<feature>_sm100.py` is a TIRx-lite kernel (`tirx_kerne
 | `bf16_expert_*` | `bf16_expert_gemm_sm100`, `bf16_expert_slots_sm100` | why `bf16_experts_supported()` is true on SM100 |
 | `segment_sum`, `group_bias_add`, `scatter_by_expert` | `segment_sum_sm100`, `group_bias_add_sm100`, `token_scatter_sm100` | segment_sum is not CUDA-graph safe; scatter placement is atomic-ordered (a PyTorch path past 1024 groups) |
 | `clamped_swiglu_*`, `silu_mul_*` | `clamped_swiglu_sm100`, `silu_mul_sm100` | the same bits as SM90 |
-| `cross_entropy_fwd_bwd`, `log_prob_*` | `cross_entropy_sm100`, `log_prob_sm100` | log_prob through custom ops inside torch.compile regions |
+| `log_prob_*` | `log_prob_sm100` | log_prob through custom ops inside torch.compile regions |
 | `causal_conv1d_*` | `causal_conv1d_sm100` | |
 | `ep_dispatch_send_idx` / `_recv_idx` | `ep_dispatch_sm100` | a PyTorch path past its bin limits |
 | `chunk_gdr_*_pinned` | `gated_delta_rule_pinned_sm100` | generated port of the GDN prefill kernels; beta floored at 2^-20 (see the picker) |
@@ -199,7 +199,7 @@ Naming (SM90 and SM100 are the only supported targets):
 3. `<feature>_sm90.py` never imports its `_sm100` sibling (the TIRx kernels run only on sm_100a); it imports another feature's `_sm90` file only along the edges listed in `SM90_CROSS_EDGES` in `tests/test_import_layers.py`.
 4. Kernels both architectures run unchanged are plain `<feature>.py` (`fp8_gemm`, `flash_attn_memoize`, ...).
 5. Only `kernels/arch.py` checks the device capability (`ARCH_MAJOR`, `NATIVE_E8M0`, `SM_COUNT`). Each feature has one picker, `kernels/<feature>.py`, that dispatches with `match ARCH_MAJOR:`: `case 9:` runs `_sm90`, `case 10:` runs `_sm100`, and `case _:` raises `NotImplementedError` naming the compute capability (a new architecture gets its own `case`, e.g. `case 11:` for SM110); `__init__.py` re-exports the picker's contract names. `operators/`, `models/`, `modules/`, tests, benchmarks and tools import those names from the package (`from pithtrain.kernels import ...`), never a picker module, a plain file or an `_smXX` file.
-6. Shared helpers only SM90 code uses carry the suffix: `cute_ptx_sm90.py` (inline-PTX `dsl_user_op`s), `cute_compile_sm90.py` (fake tensors / stream, `TORCH2CUTE`), `fp8_e8m0_scale_sm90.py` (E8M0 scale math), `row_slice_sm90.py` (the row-slice machinery of the cluster row kernels, cross-entropy and log-probability). Arch-neutral shared leaves stay unsuffixed: `arch.py`, `host_transfer.py` (pinned host buffers), `fp8_scale_layout.py`.
+6. Shared helpers only SM90 code uses carry the suffix: `cute_ptx_sm90.py` (inline-PTX `dsl_user_op`s), `cute_compile_sm90.py` (fake tensors / stream, `TORCH2CUTE`), `fp8_e8m0_scale_sm90.py` (E8M0 scale math), `row_slice_sm90.py` (the row-slice machinery of the cluster row kernels, log-probability). Arch-neutral shared leaves stay unsuffixed: `arch.py`, `host_transfer.py` (pinned host buffers), `fp8_scale_layout.py`.
 7. Kernel tests mirror the kernel modules, `tests/kernels/test_<module>.py` (the module's name without `_sm90` / `_sm100`), verified against PyTorch through the interface (never against an `_sm100` sibling); no test file is named for an architecture.
 8. A feature stays one file per architecture, forward and backward together. Split it into `<feature>_fwd_sm90.py` / `<feature>_bwd_sm90.py` only when one direction becomes its own pipeline or the file passes about 1.5k lines.
 9. No `_name` defined anywhere in `kernels/` (module level, classes, methods, attributes, locals, parameters, import aliases; reads of a library's own `_` hooks such as QuACK's are fine): every kernel module lists what it exports in a literal `__all__`, and a kernel module imports from a sibling only names in that sibling's `__all__` (`tests/test_import_layers.py` checks both). Docstrings are plain text wrapped at 100 columns, with the opening and closing `"""` each on its own line (one-line docstrings too).

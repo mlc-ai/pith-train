@@ -379,7 +379,6 @@ FAMILIES = {
     'bf16_expert_slots': dict(shapes=['moe_experts'], kernels=['bf16_expert_group_slots', 'bf16_expert_gather_rows', 'bf16_expert_gather_sum', 'bf16_expert_segment_sum']),
     'causal_conv1d': dict(shapes=['causal_conv1d'], kernels=['causal_conv1d_fwd', 'causal_conv1d_bwd', 'causal_conv1d_empty']),
     'clamped_swiglu': dict(shapes=['moe_experts'], kernels=['clamped_swiglu_fwd', 'clamped_swiglu_bwd']),
-    'cross_entropy': dict(shapes=['cross_entropy'], kernels=['cross_entropy_fwd_bwd']),
     'ep_dispatch': dict(shapes=['moe_experts'], kernels=['ep_dispatch_send_idx', 'ep_dispatch_recv_idx']),
     'flash_attn_memoize': dict(shapes=['attention'], kernels=['memoized_launch']),
     'fp8_clamped_swiglu_quant': dict(shapes=['moe_experts'], kernels=['fp8_clamped_swiglu_rowwise', 'fp8_clamped_swiglu_kmajor', 'fp8_clamped_swiglu_bwd']),

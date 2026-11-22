@@ -2,7 +2,7 @@
 Times the kernels at the cases of tests/kernels/cases.py, for this tree alone or against a base git
 ref (--base), each op over cold-L2 single launches and weighted by its work times its layers.
 
-    python -m benchmarks.kernels --base upstream/main --family cross_entropy --out ab.json
+    python -m benchmarks.kernels --base upstream/main --family log_prob --out ab.json
     python -m benchmarks.kernels --base upstream/main --family fp8_silu_mul_quant
     python -m benchmarks.kernels --base-dir . --family weight_quant      (the noise floor)
     python -m benchmarks.kernels --out results.json                       (this tree alone)
@@ -348,11 +348,10 @@ def causal_conv1d_ops(axes: dict, gen: torch.Generator) -> dict:
     }
 
 
-def cross_entropy_ops(axes: dict, gen: torch.Generator) -> dict:
+def log_prob_ops(axes: dict, gen: torch.Generator) -> dict:
     """
-    The cross_entropy op forward and backward and the fused kernel, each timed with a logits copy.
+    The CrossEntropy operator (log_prob_fwd / log_prob_bwd) forward and backward, with a logits copy.
     """
-    from pithtrain.kernels import cross_entropy_fwd_bwd
     from pithtrain.operators.cross_entropy import cross_entropy
 
     rows, vocab = axes["rows"], axes["vocab"]
@@ -367,11 +366,7 @@ def cross_entropy_ops(axes: dict, gen: torch.Generator) -> dict:
         leaf = work.detach().requires_grad_()
         cross_entropy(leaf, target, -100).backward(grad)
 
-    def kernel():
-        work.copy_(logits)
-        cross_entropy_fwd_bwd(work, target, -100)
-
-    return {"cross_entropy[op fwd+bwd](+copy)": mem(op, logits), "cross_entropy_fwd_bwd(+copy)": mem(kernel, logits)}  # fmt: skip
+    return {"cross_entropy[op fwd+bwd](+copy)": mem(op, logits)}
 
 
 OPS = dict(
@@ -383,7 +378,7 @@ OPS = dict(
     flash_attn_memoize=flash_attn_memoize_ops,
     gated_delta_rule_pinned=gated_delta_rule_pinned_ops,
     causal_conv1d=causal_conv1d_ops,
-    cross_entropy=cross_entropy_ops,
+    log_prob=log_prob_ops,
 )
 
 

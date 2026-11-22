@@ -7,7 +7,6 @@ from pithtrain.kernels.bf16_expert_slots import bf16_expert_gather_rows, bf16_ex
 from pithtrain.kernels.bf16_expert_support import bf16_experts_supported
 from pithtrain.kernels.causal_conv1d import causal_conv1d_bwd, causal_conv1d_fwd, causal_conv1d_empty
 from pithtrain.kernels.clamped_swiglu import clamped_swiglu_bwd, clamped_swiglu_fwd
-from pithtrain.kernels.cross_entropy import cross_entropy_fwd_bwd
 from pithtrain.kernels.ep_dispatch import ep_dispatch_recv_idx, ep_dispatch_send_idx
 from pithtrain.kernels.flash_attn_memoize import memoized_launch
 from pithtrain.kernels.fp8_clamped_swiglu_quant import fp8_clamped_swiglu_bwd, fp8_clamped_swiglu_kmajor, fp8_clamped_swiglu_rowwise
@@ -73,7 +72,6 @@ __all__.append("causal_conv1d_fwd")
 __all__.append("causal_conv1d_empty")
 __all__.append("clamped_swiglu_bwd")
 __all__.append("clamped_swiglu_fwd")
-__all__.append("cross_entropy_fwd_bwd")
 __all__.append("group_bias_add")
 __all__.append("segment_sum")
 __all__.append("silu_mul_bwd")
