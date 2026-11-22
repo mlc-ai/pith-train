@@ -1,12 +1,15 @@
 #!/bin/bash
 # Pretrain a Mixture-of-Experts (MoE) language model.
 #
-# Usage:
+# Every example pretrains at 4K context, sized for 8x H200 nodes.
+#
+# Usage (one node: deepseek-v2-lite, gpt-oss-20b, qwen3-30b-a3b, qwen3.5-35b-a3b):
 #   bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 #   bash examples/pretrain_lm/launch.sh deepseek-v2-lite
 #
-# For multi-node training with SLURM:
-#   srun -W 0 examples/pretrain_lm/launch.sh qwen3-30b-a3b
+# For multi-node training with SLURM (qwen3.5-27b: two nodes, gpt-oss-120b: four):
+#   srun -N 2 --ntasks-per-node=1 -W 0 examples/pretrain_lm/launch.sh qwen3.5-27b
+#   srun -N 4 --ntasks-per-node=1 -W 0 examples/pretrain_lm/launch.sh gpt-oss-120b
 
 set -euo pipefail
 export OMP_NUM_THREADS=8

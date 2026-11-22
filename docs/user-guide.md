@@ -20,15 +20,16 @@ uv sync
 
 ## Supported models
 
-| Model | Total / active params | Example dir | Default mesh | GPUs |
+| Model | Total / active params | Example dir | Default mesh | GPUs (8×H200 nodes) |
 |---|---|---|---|---|
-| DeepSeek-V2-Lite | ~16B / ~2.4B | `deepseek-v2-lite` | `pp=1, ep=8` | 8 (1 node) |
-| Qwen3-30B-A3B | ~30B / ~3B | `qwen3-30b-a3b` | `pp=1, ep=8` | 8 (1 node, H200/B200) |
-| Qwen3.5-35B-A3B | ~35B / ~3B | `qwen3.5-35b-a3b` | `pp=1, ep=8` | 8 (1 node, H200/B200) |
-| GPT-OSS-20B | ~21B / ~3.6B | `gpt-oss-20b` | `pp=1, ep=8` | 8 (1 node) |
-| GPT-OSS-120B | ~117B / ~5B | `gpt-oss-120b` | `pp=4, ep=8` | 32 (4 nodes) |
+| DeepSeek-V2-Lite | ~16B / ~2.4B | `deepseek-v2-lite` | `pp=4, ep=1`, micro-batch 4, FP8 | 8 (1 node) |
+| Qwen3-30B-A3B | ~30B / ~3B | `qwen3-30b-a3b` | `pp=2, ep=4`, micro-batch 2 | 8 (1 node) |
+| Qwen3.5-35B-A3B | ~35B / ~3B | `qwen3.5-35b-a3b` | `pp=1, ep=8`, micro-batch 1 | 8 (1 node) |
+| Qwen3.5-27B | ~27B dense | `qwen3.5-27b` | `pp=8, ep=1`, micro-batch 1 | 16 (2 nodes) |
+| GPT-OSS-20B | ~21B / ~3.6B | `gpt-oss-20b` | `pp=1, ep=2`, micro-batch 2 | 8 (1 node) |
+| GPT-OSS-120B | ~117B / ~5B | `gpt-oss-120b` | `pp=4, ep=8`, micro-batch 2 | 32 (4 nodes) |
 
-Example dirs live under `examples/pretrain_lm/<dir>/`. The default meshes are starting points — see [Scaling](#scaling-a-run) to change them. DeepSeek-V2-Lite and GPT-OSS-20B fit any single 8-GPU node. **Qwen3-30B-A3B and Qwen3.5-35B-A3B at the default `pp=1, ep=8` need a high-memory single node — 8×H200 (141 GB) or 8×B200 (180 GB); they do not fit 8×H100 (80 GB), where you should instead use two nodes with `pp=2, ep=8` (16 GPUs).** **GPT-OSS-120B requires multiple nodes.**
+Example dirs live under `examples/pretrain_lm/<dir>/`. Every example pretrains at 4K context (`sequence_length = 4096`, 1024 sequences per step) with no context parallelism, and its default mesh is sized for 8×H200 nodes (141 GB per GPU): each peaks between about 98 and 121 GB there. The meshes are starting points — see [Scaling](#scaling-a-run) to change them. **On 80 GB GPUs (8×H100) the single-node defaults do not fit as shipped:** lower `micro_batch_size`, or add nodes and raise `pp` or `ep`, and check the mesh with `tools.memory_estimator` first. **Qwen3.5-27B needs two H200 nodes and GPT-OSS-120B four.**
 
 ## End-to-end workflow
 
@@ -101,7 +102,7 @@ The hard constraints: **`pp` must divide your total GPU count**, and `cp` and `e
 **Multi-node (SLURM).** The same launcher works under `srun` — it reads `SLURM_*` env vars to build the `torchrun` rendezvous automatically:
 
 ```bash
-srun -W 0 examples/pretrain_lm/launch.sh qwen3-30b-a3b
+srun -N 4 --ntasks-per-node=1 -W 0 examples/pretrain_lm/launch.sh gpt-oss-120b
 ```
 
 **Sizing memory before you launch.** Use the estimator to check a mesh fits before spending GPU time:
@@ -142,7 +143,7 @@ Set `training.fp8 = True` to train in FP8 (128-element block scaling via DeepGEM
 
 **`world_size not divisible by pp_size`**, or **`stage_size (world_size // pp_size) not divisible by cp_size`/`ep_size`.** Adjust the mesh so `pp` divides your GPU count and `cp` and `ep` each divide the stage size (see [Scaling](#scaling-a-run)).
 
-**Out of memory.** `micro_batch_size` is already 1 in the examples; from there, increase `ep` (or `pp`, or add nodes for more DP), shorten `sequence_length`, or enable FP8. Run `tools.memory_estimator` to find a mesh that fits.
+**Out of memory.** Lower `micro_batch_size` first (several examples use 2 or 4); from 1, increase `ep` (or `pp`, or add nodes for more DP), shorten `sequence_length`, or enable FP8. Run `tools.memory_estimator` to find a mesh that fits.
 
 **`deep_gemm` import error.** The FP8 path needs DeepGEMM installed. Either install it or set `training.fp8 = False`.
 

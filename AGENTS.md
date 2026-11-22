@@ -77,7 +77,7 @@ The `examples/` tree drives end-to-end workflows; each subdir has a `launch.sh` 
 # Tokenize a pretraining corpus (per-tokenizer; rerun when switching models)
 bash examples/tokenize_corpus/launch.sh dclm-qwen3
 
-# Pretrain (qwen3-30b-a3b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
+# Pretrain at 4K context (qwen3-30b-a3b | qwen3.5-35b-a3b | qwen3.5-27b | deepseek-v2-lite | gpt-oss-20b | gpt-oss-120b)
 bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 
 # Download released HuggingFace weights (for training.hf_import_path) and export the newest checkpoint
