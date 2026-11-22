@@ -24,9 +24,16 @@ if __name__ == "__main__":
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--micro-batch", type=int, default=1)
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--blocks-per-group", type=int, default=1)
+    parser.add_argument("--group-by-attention-type", action="store_true")
+    parser.add_argument("--edge-sharding", choices=("separate", "root"), default="separate")
     parser.add_argument("--reshard", type=reshard, default=True)
+    parser.add_argument("--keep-last-group", action="store_true")
+    parser.add_argument("--skip-embedding-backward-gather", action="store_true")
     parser.add_argument("--prefetch", type=int, default=0)
     parser.add_argument("--reduce-dtype", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--reduce-scatter-buffers", type=int, default=1)
+    parser.add_argument("--separate-reduce-scatter", action="store_true")
     parser.add_argument("--checkpoint", choices=("none", "selective", "full"), default="none")
     parser.add_argument("--compile-blocks", action="store_true")
     parser.add_argument("--unfused-adamw", action="store_true")
@@ -52,9 +59,16 @@ if __name__ == "__main__":
     train.optimizer = partial(make_adamw_optimizer, fused=not args.unfused_adamw)
     train.scheduler = make_constant_scheduler
     train.dense_fsdp = DenseFSDPCfg()
+    train.dense_fsdp.blocks_per_group = args.blocks_per_group
+    train.dense_fsdp.group_by_attention_type = args.group_by_attention_type
+    train.dense_fsdp.edge_sharding = args.edge_sharding
     train.dense_fsdp.reshard_after_forward = args.reshard
+    train.dense_fsdp.keep_last_group = args.keep_last_group
+    train.dense_fsdp.skip_embedding_backward_gather = args.skip_embedding_backward_gather
     train.dense_fsdp.prefetch = args.prefetch
     train.dense_fsdp.reduce_dtype = args.reduce_dtype
+    train.dense_fsdp.reduce_scatter_buffers = args.reduce_scatter_buffers
+    train.dense_fsdp.separate_reduce_scatter = args.separate_reduce_scatter
     train.dense_fsdp.activation_checkpoint = args.checkpoint
     train.dense_fsdp.compile_blocks = args.compile_blocks
     launch(cfg)
