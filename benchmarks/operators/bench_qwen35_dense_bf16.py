@@ -15,7 +15,11 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.qwen35 import Qwen35DecoderLayer
-from pithtrain.models.qwen35_moe import Qwen35MoeRMSNorm, Qwen35MoeRotaryEmbedding
+from pithtrain.models.qwen35_moe import (
+    Qwen35MoeGatedDeltaNet,
+    Qwen35MoeRMSNorm,
+    Qwen35MoeRotaryEmbedding,
+)
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule import gated_delta_rule
@@ -74,6 +78,7 @@ def measure(name, forward, leaves, tokens, flops_per_token, args, backward=True)
     for _ in range(args.warmup):
         out = iteration()
     torch.cuda.synchronize()
+    out = out.detach()
     sanity = float(out) if out.ndim == 0 else float(out.float().square().mean())
     del out
     if not math.isfinite(sanity) or any(
@@ -114,7 +119,7 @@ def measure(name, forward, leaves, tokens, flops_per_token, args, backward=True)
                     else None,
                     "sanity": sanity,
                     "flops_per_token": flops_per_token,
-                    "main_grad": args.main_grad,
+                    "main_grad": args.main_grad and name != "head-torch",
                 }
             ),
             flush=True,
@@ -171,10 +176,16 @@ def cases(args, config):
         ),
         (3, "attention", attn_projection + attn_core),
     ]:
-        variants = {name, f"{name}-eager", f"{name}-compiled", f"{name}-mix"}
+        variants = {name, f"{name}-eager", f"{name}-compiled", f"{name}-mix", f"{name}-shared"}
+        if idx == 0:
+            variants.update(("delta-no-checkpoint", "delta-fused-gates"))
         if not (variants.intersection(args.cases) or "all" in args.cases):
             continue
         layer = Qwen35DecoderLayer(config, idx).cuda().bfloat16()
+        if idx == 0:
+            delta = layer.linear_attn
+            fused_gates = delta.project_gates
+            delta.project_gates = Qwen35MoeGatedDeltaNet.project_gates.__get__(delta)
         configure_main_grad(layer, args.main_grad)
         x = random_tensor(b, s, h)
         pos = tuple(t.unsqueeze(0) for t in Qwen35MoeRotaryEmbedding(config).cuda()(s))
@@ -190,6 +201,32 @@ def cases(args, config):
             compiled = torch.compile(layer.reference_forward, fullgraph=True)
             run(f"{name}-compiled", lambda: compiled(x, pos), leaves, mix_flops + mlp_flops)
         run(f"{name}-mix", lambda: layer.forward_stage1(x, pos)[0], leaves, mix_flops)
+        if idx == 0:
+            run(
+                "delta-no-checkpoint",
+                lambda: layer(x, pos, checkpoint_delta=False),
+                leaves,
+                mix_flops + mlp_flops,
+            )
+            if "delta-fused-gates" in args.cases or "all" in args.cases:
+                compare_gate_gradients(delta, fused_gates, x)
+            delta.project_gates = fused_gates
+            run("delta-fused-gates", stages, leaves, mix_flops + mlp_flops)
+        run(f"{name}-shared", lambda: layer(x, pos), leaves, mix_flops + mlp_flops)
+
+    if {"all", "gates-separate", "gates-fused"}.intersection(args.cases):
+        x = random_tensor(b * s, h)
+        a, beta = random_tensor(gv, h), random_tensor(gv, h)
+
+        def separate_gates():
+            return F.softplus(F.linear(x, a).float()) * F.linear(x, beta).sigmoid().float()
+
+        def fused_gates():
+            a_out, beta_out = F.linear(x, torch.cat((a, beta))).chunk(2, dim=-1)
+            return F.softplus(a_out.float()) * beta_out.sigmoid().float()
+
+        run("gates-separate", separate_gates, (x, a, beta), 12 * h * gv)
+        run("gates-fused", fused_gates, (x, a, beta), 12 * h * gv)
 
     if {"all", "delta-core", "fla"}.intersection(args.cases):
         q, k = [
@@ -358,6 +395,23 @@ def cases(args, config):
                 args,
                 False,
             )
+
+
+def compare_gate_gradients(delta, fused_gates, x):
+    reference, actual = delta.project_gates(x), fused_gates(x)
+    for observed, expected in zip(actual, reference):
+        torch.testing.assert_close(observed, expected)
+    upstream = tuple(torch.randn_like(tensor) for tensor in reference)
+    leaves = (x, delta.in_proj_a.weight, delta.in_proj_b.weight)
+    expected = torch.autograd.grad(reference, leaves, upstream)
+    observed = torch.autograd.grad(actual, leaves, upstream)
+    errors = [
+        float((want.float() - got.float()).norm() / want.float().norm())
+        for want, got in zip(expected, observed)
+    ]
+    if max(errors) >= 0.01:
+        raise AssertionError(f"Fused gate relative gradient L2 errors: {errors}")
+    print(json.dumps({"case": "delta-fused-gates", "relative_gradient_l2": errors}), flush=True)
 
 
 def main():
