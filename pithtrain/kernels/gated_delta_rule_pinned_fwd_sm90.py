@@ -142,6 +142,23 @@ def multiply_a(mma: cute.TiledMma, thr: cute.ThrMma, ld_A: cute.TiledCopy, ldt_B
     cute.arch.barrier()
 
 
+@cute.jit
+def causal_scores(mma, thr, ld_A, ld_B, s_q, s_k, s_gcum):
+    acc_s = cute.make_rmem_tensor(thr.partition_shape_C((BT, BT)), Float32)
+    acc_s.fill(0.0)
+    gemm(mma, acc_s, thr.make_fragment_A(thr.partition_A(s_q)), thr.make_fragment_B(thr.partition_B(s_k)), ld_A.partition_S(s_q), ld_B.partition_S(s_k), ld_A, ld_B)
+    coords = thr.partition_C(cute.make_identity_tensor((BT, BT)))
+    for elem in cutlass.range_constexpr(cute.size(acc_s)):
+        row, col = coords[elem]
+        value = Float32(0.0)
+        if row >= col:
+            value = acc_s[elem] * cute.math.exp2(s_gcum[row] - s_gcum[col], fastmath=True)
+        acc_s[elem] = value
+    r_p = cute.make_fragment_like(acc_s, BFloat16)
+    r_p.store(acc_s.load().to(BFloat16))
+    return r_p
+
+
 class WyRepresentation:
     """
     One CTA per (chunk, value head), four warps: the chunk-local log2 cumsum of g, A = (I + L)^-1
@@ -159,14 +176,14 @@ class WyRepresentation:
         self.H, self.HV, self.ragged = H, HV, ragged
 
     @cute.jit
-    def __call__(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, stream):
+    def __call__(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, stream, mQ=None, mP=None):
         mma_bf16, mma_tf32 = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16)), cute.make_tiled_mma(warp.MmaTF32Op((16, 8, 8)), (1, 1, 1), permutation_mnk=(16, 16, 8))
         chunk_layout, a_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM), (0, 1)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT), (0, 1))
         num_chunks = (mG.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mG.shape[0] // BT
-        self.kernel(mK, mV, mG, mBeta, mGcum, mA, mW, mU, mma_bf16, mma_tf32, chunk_layout, a_layout).launch(grid=[num_chunks, self.HV, 1], block=[WY_THREADS, 1, 1], stream=stream)
+        self.kernel(mK, mV, mG, mBeta, mGcum, mA, mW, mU, mma_bf16, mma_tf32, chunk_layout, a_layout, mQ, mP).launch(grid=[num_chunks, self.HV, 1], block=[WY_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mma_bf16: cute.TiledMma, mma_tf32: cute.TiledMma, chunk_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout):
+    def kernel(self, mK: cute.Tensor, mV: cute.Tensor, mG: cute.Tensor, mBeta: cute.Tensor, mGcum: cute.Tensor, mA: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mma_bf16: cute.TiledMma, mma_tf32: cute.TiledMma, chunk_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout, mQ, mP):
         tidx, _, _ = cute.arch.thread_idx()
         chunk_idx, head_idx, _ = cute.arch.block_idx()
         key_head_idx = head_idx // (self.HV // self.H)
@@ -178,7 +195,7 @@ class WyRepresentation:
         s_gcum, s_beta, s_a = smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(Float32, cute.make_layout(BT), 16), smem.allocate_tensor(BFloat16, a_layout, 1024)
         s_k, s_k_again, s_v = cute.make_tensor(cute.recast_ptr(s_inverse.iterator, dtype=BFloat16), chunk_layout), cute.make_tensor(cute.recast_ptr(s_l.iterator, dtype=BFloat16), chunk_layout), cute.make_tensor(cute.recast_ptr(s_v_region.iterator, dtype=BFloat16), chunk_layout)
         load, store_128, store_64 = chunk_copies(WY_THREADS, tidx)
-        ld_A, ld_B, _, ldt_B, _, _, _ = operand_copies(mma_bf16, tidx)
+        ld_A, ld_B, _, ldt_B, st_C, _, _ = operand_copies(mma_bf16, tidx)
         thr = mma_bf16.get_slice(tidx)
         gK, gV, gA = cute.local_tile(mK[None, key_head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0)), cute.local_tile(mV[None, head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0)), cute.local_tile(mA[None, head_idx, None], (BT, BT), (chunk_idx, 0))
 
@@ -192,11 +209,30 @@ class WyRepresentation:
         else:
             cute.copy(load, load.partition_S(gK), load.partition_D(s_k))
             cute.arch.cp_async_commit_group()
-            cute.copy(load, load.partition_S(gV), load.partition_D(s_v))
+            if const_expr(mQ is not None):
+                gQ = cute.local_tile(mQ[None, key_head_idx, None], (BT, HEAD_DIM), (chunk_idx, 0))
+                cute.copy(load, load.partition_S(gQ), load.partition_D(s_v))
+            else:
+                cute.copy(load, load.partition_S(gV), load.partition_D(s_v))
             cute.arch.cp_async_commit_group()
         self.cumsum_gate(mG, mBeta, mGcum, s_gcum, s_beta, tidx, chunk_idx * BT, head_idx)
-        cute.arch.cp_async_wait_group(1)
-        cute.arch.barrier()
+        if const_expr(mP is not None):
+            # Q occupies the V region until the score MMA has consumed it.
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            r_p = causal_scores(mma_bf16, thr, ld_A, ld_B, s_v, s_k, s_gcum)
+            s_p = cute.make_tensor(cute.recast_ptr(s_l.iterator, dtype=BFloat16), a_layout)
+            cute.copy(st_C, st_C.retile(r_p), st_C.partition_D(s_p))
+            cute.arch.barrier()
+            cute.copy(load, load.partition_S(gV), load.partition_D(s_v))
+            cute.arch.cp_async_commit_group()
+            gP = cute.local_tile(mP[None, head_idx, None], (BT, BT), (chunk_idx, 0))
+            cute.copy(store_64, store_64.partition_S(s_p), store_64.partition_D(gP))
+            # L reuses the score buffer.
+            cute.arch.barrier()
+        else:
+            cute.arch.cp_async_wait_group(1)
+            cute.arch.barrier()
         self.compute_l(mma_bf16, thr, ld_A, ld_B, s_k, s_l, s_gcum, s_beta)
         self.invert_diagonal_blocks(s_l, s_inverse, tidx)
         self.merge_blocks(mma_tf32, s_l, s_inverse, tidx)
@@ -377,22 +413,24 @@ class ChunkStateOutput:
         self.recurrence_threads, self.output_threads = STATE_THREADS, STATE_THREADS
 
     @cute.jit
-    def __call__(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mO: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, stream):
+    def __call__(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mO: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, stream, mP=None):
         mma = cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (4, 1, 1), permutation_mnk=(64, 16, 16))
         layouts = (cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, STATE_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (BT, HEAD_DIM, 2), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV, STATE_STAGES), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, HEAD_DIM), (STATE_BV, HEAD_DIM, 2), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (STATE_BV, BT, 2), (0, 1, 2)), cute.tile_to_shape(get_smem_layout_atom(BFloat16, STATE_BV), (BT, STATE_BV), (0, 1)))
-        self.kernel(mQ, mK, mW, mU, mGcum, mO, mH0, mHt, mma, *layouts).launch(grid=[HEAD_DIM // STATE_BV, self.HV, 1], block=[self.recurrence_threads + self.output_threads, 1, 1], stream=stream)
+        p_layout = cute.tile_to_shape(get_smem_layout_atom(BFloat16, BT), (BT, BT, 2), (0, 1, 2)) if const_expr(mP is not None) else None
+        self.kernel(mQ, mK, mW, mU, mGcum, mO, mH0, mHt, mma, *layouts, mP, p_layout).launch(grid=[HEAD_DIM // STATE_BV, self.HV, 1], block=[self.recurrence_threads + self.output_threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mO: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, mma: cute.TiledMma, ring_layout: cute.ComposedLayout, q_layout: cute.ComposedLayout, u_layout: cute.ComposedLayout, h_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout, o_layout: cute.ComposedLayout):
+    def kernel(self, mQ: cute.Tensor, mK: cute.Tensor, mW: cute.Tensor, mU: cute.Tensor, mGcum: cute.Tensor, mO: cute.Tensor, mH0: cute.Tensor, mHt: cute.Tensor, mma: cute.TiledMma, ring_layout: cute.ComposedLayout, q_layout: cute.ComposedLayout, u_layout: cute.ComposedLayout, h_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout, o_layout: cute.ComposedLayout, mP, p_layout):
         tidx, _, _ = cute.arch.thread_idx()
         col_tile, head_idx, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
         s_k, s_w, s_q, s_u, s_h, s_vnew, s_vscaled, s_o, s_gcum = smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, ring_layout, 1024), smem.allocate_tensor(BFloat16, q_layout, 1024), smem.allocate_tensor(BFloat16, u_layout, 1024), smem.allocate_tensor(BFloat16, h_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, v_layout, 1024), smem.allocate_tensor(BFloat16, o_layout, 1024), smem.allocate_tensor(Float32, cute.make_layout((BT, STATE_STAGES), stride=(1, BT)), 16)
+        s_p = smem.allocate_tensor(BFloat16, p_layout, 1024) if const_expr(mP is not None) else None
         buffers = (s_k, s_w, s_q, s_u, s_h, s_vnew, s_vscaled, s_o, s_gcum)
         if tidx < self.recurrence_threads:
             self.recurrence_loop(mK, mW, mU, mGcum, mH0, mHt, mma, buffers, tidx, col_tile, head_idx)
         else:
-            self.output_loop(mQ, mO, mma, buffers, tidx - self.recurrence_threads, col_tile, head_idx, (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT)
+            self.output_loop(mQ, mO, mma, buffers, tidx - self.recurrence_threads, col_tile, head_idx, (mGcum.shape[0] + BT - 1) // BT if const_expr(self.ragged) else mGcum.shape[0] // BT, mP, s_p)
 
     @cute.jit
     def issue_chunk(self, load: cute.TiledCopy, load_u: cute.TiledCopy, load_gate: cute.TiledCopy, sources: tuple, targets: tuple, chunk: int, stage: int, tidx, tail: tuple):
@@ -498,7 +536,7 @@ class ChunkStateOutput:
                 mHt[head_idx, h_coords[elem][0], col_tile * STATE_BV + h_coords[elem][1]] = acc_h[elem]
 
     @cute.jit
-    def output_loop(self, mQ: cute.Tensor, mO: cute.Tensor, mma: cute.TiledMma, buffers: tuple, tidx, col_tile, head_idx, num_chunks):
+    def output_loop(self, mQ: cute.Tensor, mO: cute.Tensor, mma: cute.TiledMma, buffers: tuple, tidx, col_tile, head_idx, num_chunks, mP, s_p):
         s_k, _, s_q, _, s_h, s_vnew, _, s_o, s_gcum = buffers
         key_head_idx = head_idx // (self.HV // self.H)
         threads = self.output_threads
@@ -509,7 +547,13 @@ class ChunkStateOutput:
         ld_A, ld_B, _, _, st_C, _, _ = operand_copies(mma, tidx)
         gQ, gO = cute.local_tile(mQ[None, key_head_idx, None], (BT, HEAD_DIM), (None, 0)), cute.local_tile(mO[None, head_idx, None], (BT, STATE_BV), (None, col_tile))
         t_q_src, t_q_dst = load.partition_S(gQ), load.partition_D(s_q)
-        s_coords, o_coords = thr.partition_C(cute.make_identity_tensor((BT, BT))), thr.partition_C(cute.make_identity_tensor((BT, STATE_BV)))
+        o_coords = thr.partition_C(cute.make_identity_tensor((BT, STATE_BV)))
+        if const_expr(mP is not None):
+            atom_load = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), BFloat16, num_bits_per_copy=128)
+            load_p = cute.make_tiled_copy_tv(atom_load, cute.make_ordered_layout((threads // 8, 8), order=(1, 0)), cute.make_layout((1, 8))).get_slice(tidx)
+            gP = cute.local_tile(mP[None, head_idx, None], (BT, BT), (None, 0))
+            t_p_src, t_p_dst = load_p.partition_S(gP), load_p.partition_D(s_p)
+            cute.copy(load_p, t_p_src[None, None, None, 0], t_p_dst[None, None, None, 0])
         if const_expr(self.ragged):
             T = mQ.shape[0]
             rows_q, rows_o = load.partition_D(cute.make_identity_tensor((BT, HEAD_DIM))), store_o.partition_D(cute.make_identity_tensor((BT, STATE_BV)))
@@ -524,28 +568,23 @@ class ChunkStateOutput:
                     copy_rows(load, t_q_src[None, None, None, chunk + 1], t_q_dst[None, None, None, 1 - parity], rows_q, T - (chunk + 1) * BT, True)
                 else:
                     cute.copy(load, t_q_src[None, None, None, chunk + 1], t_q_dst[None, None, None, 1 - parity])
+                    if const_expr(mP is not None):
+                        cute.copy(load_p, t_p_src[None, None, None, chunk + 1], t_p_dst[None, None, None, 1 - parity])
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(1)
             cute.arch.barrier(barrier_id=BAR_FULL + parity, number_of_threads=self.recurrence_threads + threads)
             s_q_n, s_k_n, s_h_n, s_vnew_n = s_q[None, None, parity], s_k[None, None, stage], s_h[None, None, parity], s_vnew[None, None, parity]
             acc_o = cute.make_rmem_tensor(thr.partition_shape_C((BT, STATE_BV)), Float32)
             acc_o.fill(0.0)
-            r_q = thr.make_fragment_A(thr.partition_A(s_q_n))
-            gemm(mma, acc_o, r_q, thr.make_fragment_B(thr.partition_B(s_h_n)), ld_A.partition_S(s_q_n), ld_B.partition_S(s_h_n), ld_A, ld_B)
-            acc_s = cute.make_rmem_tensor(thr.partition_shape_C((BT, BT)), Float32)
-            acc_s.fill(0.0)
-            gemm(mma, acc_s, r_q, thr.make_fragment_B(thr.partition_B(s_k_n)), ld_A.partition_S(s_q_n), ld_B.partition_S(s_k_n), ld_A, ld_B)
-            for elem in cutlass.range_constexpr(cute.size(acc_s)):
-                row, col = s_coords[elem]
-                value = Float32(0.0)
-                if row >= col:
-                    value = acc_s[elem] * cute.math.exp2(s_gcum[row, stage] - s_gcum[col, stage], fastmath=True)
-                acc_s[elem] = value
-            r_p = cute.make_fragment_like(acc_s, BFloat16)  # P stays in registers as the A operand
-            r_p.store(acc_s.load().to(BFloat16))
+            gemm(mma, acc_o, thr.make_fragment_A(thr.partition_A(s_q_n)), thr.make_fragment_B(thr.partition_B(s_h_n)), ld_A.partition_S(s_q_n), ld_B.partition_S(s_h_n), ld_A, ld_B)
             acc_intra = cute.make_rmem_tensor(thr.partition_shape_C((BT, STATE_BV)), Float32)
             acc_intra.fill(0.0)
-            gemm_rs(mma, acc_intra, reshape_acc_to_frgA(r_p), thr.make_fragment_B(thr.partition_B(s_vnew_n)), ld_B.partition_S(s_vnew_n), ld_B)
+            if const_expr(mP is not None):
+                s_p_n = s_p[None, None, parity]
+                gemm(mma, acc_intra, thr.make_fragment_A(thr.partition_A(s_p_n)), thr.make_fragment_B(thr.partition_B(s_vnew_n)), ld_A.partition_S(s_p_n), ld_B.partition_S(s_vnew_n), ld_A, ld_B)
+            else:
+                r_p = causal_scores(mma, thr, ld_A, ld_B, s_q_n, s_k_n, s_gcum[None, stage])
+                gemm_rs(mma, acc_intra, reshape_acc_to_frgA(r_p), thr.make_fragment_B(thr.partition_B(s_vnew_n)), ld_B.partition_S(s_vnew_n), ld_B)
             for elem in cutlass.range_constexpr(cute.size(acc_o)):
                 acc_o[elem] = acc_o[elem] * cute.math.exp2(s_gcum[o_coords[elem][0], stage], fastmath=True)
             cute.arch.barrier_arrive(barrier_id=BAR_EMPTY + parity, number_of_threads=self.recurrence_threads + threads)
@@ -563,21 +602,23 @@ class ChunkStateOutput:
 COMPILED: dict[tuple, object] = {}
 
 
-def compile_wy(H: int, HV: int, ragged: bool = False) -> object:
+def compile_wy(H: int, HV: int, ragged: bool = False, with_scores: bool = False) -> object:
     T = cute.sym_int()
     key_shape, value_shape, gate_shape = (T, H, HEAD_DIM), (T, HV, HEAD_DIM), (T, HV)
     key_stride, value_stride, gate_stride = (H * HEAD_DIM, HEAD_DIM, 1), (HV * HEAD_DIM, HEAD_DIM, 1), (HV, 1)
     keys, values, gate, beta, a_matrix = fake(BFloat16, key_shape, key_stride), fake(BFloat16, value_shape, value_stride), fake(Float32, gate_shape, gate_stride, 4), fake(BFloat16, gate_shape, gate_stride, 2), fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1))
-    return cute.compile(WyRepresentation(H, HV, ragged), keys, values, gate, beta, gate, a_matrix, values, values, fake_stream(), options="--enable-tvm-ffi")
+    score_args = (keys, a_matrix) if with_scores else ()
+    return cute.compile(WyRepresentation(H, HV, ragged), keys, values, gate, beta, gate, a_matrix, values, values, fake_stream(), *score_args, options="--enable-tvm-ffi")
 
 
-def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bool = False) -> object:
+def compile_state_output(H: int, HV: int, has_h0: bool, has_ht: bool, ragged: bool = False, with_scores: bool = False) -> object:
     T = cute.sym_int()
     keys, values, gate, state = fake(BFloat16, (T, H, HEAD_DIM), (H * HEAD_DIM, HEAD_DIM, 1)), fake(BFloat16, (T, HV, HEAD_DIM), (HV * HEAD_DIM, HEAD_DIM, 1)), fake(Float32, (T, HV), (HV, 1), 4), fake(Float32, (HV, HEAD_DIM, HEAD_DIM), (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1))
-    return cute.compile(ChunkStateOutput(H, HV, has_h0, has_ht, ragged), keys, keys, values, values, gate, values, state if has_h0 else None, state if has_ht else None, fake_stream(), options="--enable-tvm-ffi")
+    score_args = (fake(BFloat16, (T, HV, BT), (HV * BT, BT, 1)),) if with_scores else ()
+    return cute.compile(ChunkStateOutput(H, HV, has_h0, has_ht, ragged), keys, keys, values, values, gate, values, state if has_h0 else None, state if has_ht else None, fake_stream(), *score_args, options="--enable-tvm-ffi")
 
 
-def wy_representation(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def wy_representation(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, *, score_args: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     WyRepresentation, B == 1: fresh (g_cum, A, w, u); its ragged variant (compiled on the first
     such call) when T is not a multiple of BT.
@@ -587,14 +628,16 @@ def wy_representation(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: t
     ragged = T % BT != 0
     g_cum, A = torch.empty(1, T, HV, device=k.device, dtype=torch.float32), torch.empty(1, T, HV, BT, device=k.device, dtype=k.dtype)
     w, u = k.new_empty(1, T, HV, HEAD_DIM), torch.empty_like(v)
-    key = ("wy_representation", H, HV, k.device.index, ragged)
+    with_scores = score_args is not None
+    key = ("wy_representation", H, HV, k.device.index, ragged, with_scores)
     if key not in COMPILED:
-        COMPILED[key] = compile_wy(H, HV, ragged)
-    COMPILED[key](k[0], v[0], g[0], beta[0], g_cum[0], A[0], w[0], u[0])
+        COMPILED[key] = compile_wy(H, HV, ragged, with_scores)
+    score_views = (score_args[0][0], score_args[1][0]) if with_scores else ()
+    COMPILED[key](k[0], v[0], g[0], beta[0], g_cum[0], A[0], w[0], u[0], *score_views)
     return g_cum, A, w, u
 
 
-def state_output(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_cum: torch.Tensor, h0: torch.Tensor | None = None) -> torch.Tensor:
+def state_output(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_cum: torch.Tensor, h0: torch.Tensor | None = None, *, scores: torch.Tensor | None = None) -> torch.Tensor:
     """
     ChunkStateOutput, B == 1: a fresh o, the state starting at h0, fp32 (HV, K, V) contiguous, when
     one is passed, else at zero.
@@ -604,10 +647,12 @@ def state_output(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u: torch.Ten
     ragged = T % BT != 0
     out = torch.empty_like(u)
     has_h0, has_ht = h0 is not None, False
-    key = ("chunk_state_output", H, HV, k.device.index, has_h0, has_ht, ragged)
+    with_scores = scores is not None
+    key = ("chunk_state_output", H, HV, k.device.index, has_h0, has_ht, ragged, with_scores)
     if key not in COMPILED:
-        COMPILED[key] = compile_state_output(H, HV, has_h0, has_ht, ragged)
-    COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], out[0], h0, None)
+        COMPILED[key] = compile_state_output(H, HV, has_h0, has_ht, ragged, with_scores)
+    score_views = (scores[0],) if with_scores else ()
+    COMPILED[key](q[0], k[0], w[0], u[0], g_cum[0], out[0], h0, None, *score_views)
     return out
 
 
@@ -627,5 +672,12 @@ def chunk_gdr_fwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     absolute error within 2e-2 of the reference's largest magnitude. Deterministic. Only where
     gated_delta_rule_pinned_supported is True.
     """
+    _, T, H, _ = k.shape
+    HV = v.shape[2]
+    if T == 4096 and (H, HV) in ((16, 48), (32, 96)):
+        scores = q.new_empty((1, T, HV, BT))
+        g_cum, A, w, u = wy_representation(k, v, g, beta, score_args=(q, scores))
+        return state_output(q, k, w, u, g_cum, scores=scores), g_cum, A
+
     g_cum, A, w, u = wy_representation(k, v, g, beta)
     return state_output(q, k, w, u, g_cum), g_cum, A
