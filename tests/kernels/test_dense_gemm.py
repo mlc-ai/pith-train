@@ -14,7 +14,7 @@ from pithtrain.kernels import (
     fp8_quant_grad,
     fp8_quant_weight,
 )
-from tests.kernels.cases import params
+from tests.kernels.cases import MIN_LOCAL, params
 from tests.kernels.fp8_reference import (
     assert_fp8_equal,
     assert_scale_equal,
@@ -152,7 +152,7 @@ def test_fp8_linear(case: dict) -> None:
     check(case["id"], "dw", dw, (dequant_rowwise(ref_dyt, ref_dyt_scale), xt_dq), (dy.float().T.contiguous(), x.float().T.contiguous()))  # fmt: skip
 
 
-WGRAD_CASES = [c for c in params("dense_gemm") if c.values[0]["tier"] == "smoke"]
+WGRAD_CASES = params("dense_gemm", keep=lambda c: c["axes"]["M"] == MIN_LOCAL)
 
 
 @pytest.mark.parametrize("case", WGRAD_CASES)

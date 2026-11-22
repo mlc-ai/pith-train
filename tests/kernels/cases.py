@@ -7,23 +7,20 @@ the expert count (EP 1 for dense models); gpt-oss (no ring attention) CP 1 only.
 B = mbs sequences of context / CP tokens, the experts T = mbs x context / CP tokens per EP rank;
 expert routing is balanced, log-normal, skewed, stress, and boundary (both edges of every BF16
 tuning bucket reached). Shipped scripts are not read. Each family names its kernels and is consumed
-by tests/kernels/test_<family>.py; `python -m tests.kernels.cases` prints each model's meshes and
+by tests/kernels/test_<family>.py (CP > 1 by tests/operators); `python -m tests.kernels.cases` prints each model's meshes and
 the case counts.
 
-Tiers (pytest -m): smoke (default; one or two cases per family and model, and test_spec.py's
-checks), spec (every shape), stress (past balanced training); multigpu (ring attention, GDN under
-CP; in no other tier, and a skip for missing GPUs fails). Shard a tier over a node's GPUs with
-CUDA_VISIBLE_DEVICES=i pytest tests/kernels -m "smoke or spec or stress" --shard i/8. CP 16 runs one
-pytest per node, eight ranks each:
-    srun -N 2 --ntasks-per-node 1 --gres gpu:8 bash -c 'WORLD_SIZE=16 LOCAL_WORLD_SIZE=8 \
-      NODE_RANK=$SLURM_NODEID MASTER_ADDR=<first node> pytest tests/kernels -m multigpu -k cp16'
+pytest tests/kernels runs every case on one GPU. The CP > 1 cases of ring_attention and
+gated_delta_rule run as operator tests in tests/operators on CP GPUs (skipping on fewer); CP 16 runs
+one pytest per node, joined by WORLD_SIZE=16 LOCAL_WORLD_SIZE=8 NODE_RANK MASTER_ADDR.
 
 Tolerances: analytic where the arithmetic gives one (bit-exact, one bf16 rounding, an accumulation
-term), else about 3x the worst error measured over the smoke, spec and stress tiers (H200), listed
-in each test module; a bound that must grow to pass a new case is a finding, not a fix.
+term), else about 3x the worst error measured over every case (H200), listed in each test module;
+a bound that must grow to pass a new case is a finding, not a fix.
 
-Kernel changes and agents take their shapes from here, never pick their own, and post a GPU run of
-the tiers (multigpu when CP code changes) and of python -m benchmarks.kernels --base upstream/main. They may add cases (a rule or edge case here or in a test), never remove spec cases.
+Kernel changes and agents take their shapes from here, never pick their own, and post a GPU run
+of pytest tests/kernels (plus tests/operators when CP code changes) and of python -m
+benchmarks.kernels --base upstream/main. They may add cases, never remove spec cases.
 """
 
 from __future__ import annotations
@@ -695,7 +692,6 @@ def moe_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
             def make(T=T, ep=ep, routing=routing, counts=counts):
                 return dict(
                     axes=expert_axes(model, T, ep, routing, counts),
-                    tier="stress" if routing == "stress" else "spec",
                     weight=dict(flops_fwd=flops_per_row * sum(counts), layers=experts.layers),
                 )
 
@@ -716,14 +712,10 @@ def moe_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
                     rows = sum(counts)
                     return dict(
                         axes=expert_axes(model, rows // experts.top_k, ep, "boundary", counts),
-                        tier="spec",
                         weight=dict(flops_fwd=flops_per_row * rows, layers=experts.layers),
                     )
 
                 collect.add(f"ep{ep}-rows{avg}-boundary", None, make)
-    smoke_T = min(T for T, _ in pairs)
-    smoke_ep = max(ep for T, ep in pairs if T == smoke_T and ep <= 8)
-    collect.cases[f"T{k(smoke_T)}-ep{smoke_ep}-lognormal"]["tier"] = "smoke"
     return collect.cases
 
 
@@ -738,7 +730,6 @@ def dense_gemm_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
             def make(T=T, proj=proj):
                 return dict(
                     axes=dict(projection=proj.name, M=T, N=proj.n, K=proj.k),
-                    tier="smoke" if T == Ts[0] else "spec",
                     weight=dict(flops_fwd=2 * T * proj.n * proj.k, layers=proj.layers),
                 )
 
@@ -752,7 +743,7 @@ def weight_quant_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
     collect = Collector()
     for proj in model.projections:
         if proj.layers:
-            make = lambda proj=proj: dict(axes=dict(weight_name=proj.name, G=0, N=proj.n, K=proj.k), tier="spec")  # fmt: skip
+            make = lambda proj=proj: dict(axes=dict(weight_name=proj.name, G=0, N=proj.n, K=proj.k))  # fmt: skip
             for mesh in meshes:
                 collect.add(proj.name, mesh, make)
     if model.experts is not None:
@@ -760,11 +751,10 @@ def weight_quant_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
         for ep in sorted({m.ep for m in meshes}):
             G = experts.num_experts // ep
             for name, N, K in (("gate_up", 2 * experts.inter, experts.hidden), ("down", experts.hidden, experts.inter)):  # fmt: skip
-                make = lambda G=G, name=name, N=N, K=K, ep=ep: dict(axes=dict(weight_name=name, G=G, ep=ep, N=N, K=K), tier="spec")  # fmt: skip
+                make = lambda G=G, name=name, N=N, K=K, ep=ep: dict(axes=dict(weight_name=name, G=G, ep=ep, N=N, K=K))  # fmt: skip
                 for mesh in meshes:
                     if mesh.ep == ep:
                         collect.add(f"experts-{name}-ep{ep}", mesh, make)
-    next(iter(collect.cases.values()))["tier"] = "smoke"
     return collect.cases
 
 
@@ -794,8 +784,7 @@ def attention_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
                     pairs = Sq * Skv // (2 if causal else 1)
                     flops = 2 * B * att.num_heads * pairs * (att.head_dim + att.v_head_dim)
                     axes = dict(kind=kind, B=B, Sq=Sq, Skv=Skv, causal=causal, window=window, sinks=sinks, **heads)  # fmt: skip
-                    tier = "smoke" if B == 1 and max(Sq, Skv) == MIN_LOCAL else "spec"
-                    return dict(axes=axes, tier=tier, weight=dict(flops_fwd=flops, layers=layers))
+                    return dict(axes=axes, weight=dict(flops_fwd=flops, layers=layers))
 
                 label = f"{kind}-B{B}-q{k(Sq)}-kv{k(Skv)}" + (f"-w{window}" if window is not None else "")  # fmt: skip
                 collect.add(label, mesh, make)
@@ -815,7 +804,7 @@ def attention_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
                 pairs = sum((b - a) * (b - a) // 2 for a, b in zip(cu, cu[1:]))
                 flops = 2 * att.num_heads * pairs * (att.head_dim + att.v_head_dim)
                 axes = dict(kind="varlen", B=1, Sq=context, Skv=context, causal=True, window=window, sinks=sinks, cu_seqlens=cu, **heads)  # fmt: skip
-                return dict(axes=axes, tier="spec", weight=dict(flops_fwd=flops, layers=layers))
+                return dict(axes=axes, weight=dict(flops_fwd=flops, layers=layers))
 
             collect.add(f"varlen-{k(context)}" + (f"-w{window}" if window is not None else ""), None, make)  # fmt: skip
     return collect.cases
@@ -826,7 +815,7 @@ def ring_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
     heads = attention_heads(model)
     for mesh in meshes:
         if mesh.cp > 1:
-            make = lambda mesh=mesh: dict(axes=dict(cp=mesh.cp, B=mesh.mbs, S_local=mesh.s_local, seq=mesh.context, **heads), tier="smoke" if mesh.cp == 2 else "spec")  # fmt: skip
+            make = lambda mesh=mesh: dict(axes=dict(cp=mesh.cp, B=mesh.mbs, S_local=mesh.s_local, seq=mesh.context, **heads))  # fmt: skip
             collect.add(f"cp{mesh.cp}-B{mesh.mbs}-S{k(mesh.s_local)}", mesh, make)
     return collect.cases
 
@@ -836,9 +825,8 @@ def gdn_cases(model: Model, meshes: list[Mesh]) -> tuple[OrderedDict, OrderedDic
     rule, conv = Collector(), Collector()
     for mesh in meshes:
         B, T_local, cp = mesh.mbs, mesh.s_local, mesh.cp
-        tier = "smoke" if B == 1 and T_local == MIN_LOCAL and cp in (1, 4) else "spec"
-        make_rule = lambda B=B, T_local=T_local, cp=cp, tier=tier: dict(axes=dict(cp=cp, mbs=B, T_local=T_local, H=gdn.num_key_heads * B, HV=gdn.num_value_heads * B, K=gdn.key_dim, V=gdn.value_dim), tier=tier, weight=dict(layers=gdn.layers))  # fmt: skip
-        make_conv = lambda B=B, T_local=T_local, cp=cp, tier=tier: dict(axes=dict(cp=cp, B=B, T_local=T_local, C=gdn.conv_channels, width=gdn.conv_kernel), tier=tier, weight=dict(layers=gdn.layers))  # fmt: skip
+        make_rule = lambda B=B, T_local=T_local, cp=cp: dict(axes=dict(cp=cp, mbs=B, T_local=T_local, H=gdn.num_key_heads * B, HV=gdn.num_value_heads * B, K=gdn.key_dim, V=gdn.value_dim), weight=dict(layers=gdn.layers))  # fmt: skip
+        make_conv = lambda B=B, T_local=T_local, cp=cp: dict(axes=dict(cp=cp, B=B, T_local=T_local, C=gdn.conv_channels, width=gdn.conv_kernel), weight=dict(layers=gdn.layers))  # fmt: skip
         label = f"cp{cp}-mbs{B}-T{k(T_local)}"
         rule.add(label, mesh, make_rule)
         conv.add(label, mesh, make_conv)
@@ -849,7 +837,7 @@ def cross_entropy_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
     collect = Collector()
     for mesh in meshes:
         T = mesh.tokens_per_gpu
-        make = lambda T=T: dict(axes=dict(rows=T, vocab=model.vocab, hidden=model.hidden), tier="smoke" if T == MIN_LOCAL else "spec")  # fmt: skip
+        make = lambda T=T: dict(axes=dict(rows=T, vocab=model.vocab, hidden=model.hidden))  # fmt: skip
         collect.add(f"rows{k(T)}", mesh, make)
     return collect.cases
 
@@ -862,7 +850,7 @@ def swiglu_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
         for mesh in meshes:
             T = mesh.tokens_per_gpu
             # DeepSeekV2MLP runs the fused FP8 operator (pithtrain/models/deepseek_v2.py)
-            make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type == "deepseek_v2"), tier="smoke" if T == MIN_LOCAL else "spec", weight=dict(layers=layers))  # fmt: skip
+            make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type == "deepseek_v2"), weight=dict(layers=layers))  # fmt: skip
             collect.add(f"{name}-M{k(T)}", mesh, make)
     return collect.cases
 
@@ -877,7 +865,7 @@ def pointwise_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
             axes = dict(T=T, B=mesh.mbs, S_local=mesh.s_local, hidden=model.hidden, Hq=att.num_heads, Hkv=att.num_kv_heads, D=att.head_dim)  # fmt: skip
             if model.experts is not None:
                 axes.update(E=model.experts.num_experts, top_k=model.experts.top_k)
-            return dict(axes=axes, tier="smoke" if T == MIN_LOCAL else "spec")
+            return dict(axes=axes)
 
         collect.add(f"T{k(T)}-B{mesh.mbs}", mesh, make)
     return collect.cases
@@ -906,7 +894,7 @@ def model_cases(model: Model) -> list[dict]:
     cases = []
     for family, collected in per_family.items():
         for label, case in collected.items():
-            row = dict(id=f"{family}/{model.name}/{label}", family=family, model=model.name, tier=case["tier"], axes=case["axes"], meshes=case["meshes"])  # fmt: skip
+            row = dict(id=f"{family}/{model.name}/{label}", family=family, model=model.name, axes=case["axes"], meshes=case["meshes"])  # fmt: skip
             if "weight" in case:
                 row["weight"] = case["weight"]
             cases.append(row)
@@ -930,29 +918,20 @@ def all_cases() -> tuple[dict, ...]:
     return tuple(case for model in load_models() for case in model_cases(model))
 
 
-TIER_ORDER = {"smoke": 0, "spec": 1, "stress": 2}
-
-
-def select(family: str, tier: str = "stress", model: str | None = None) -> list[dict]:
+def select(family: str, model: str | None = None) -> list[dict]:
     """
-    The cases of a family up to tier: "smoke" gives the smoke cases, "spec" smoke and spec, "stress"
-    every case.
+    The cases of a family, of one model or all.
     """
-    limit = TIER_ORDER[tier]
-    return [c for c in all_cases() if c["family"] == family and TIER_ORDER[c["tier"]] <= limit and model in (None, c["model"])]  # fmt: skip
+    return [c for c in all_cases() if c["family"] == family and model in (None, c["model"])]
 
 
-def params(family: str, keep=None, multigpu: bool = False, tier: str = "stress") -> list:
+def params(family: str, keep=None) -> list:
     """
-    The family's cases up to tier as pytest params of one argument (the case dict), id = the case
-    id, keeping those for which keep(case) is true, each marked with its tier so pytest -m selects
-    it; or, with multigpu, marked multigpu instead, so the single-GPU tiers (-m "smoke or spec or
-    stress") never select a test that needs several GPUs and -m multigpu selects all of them.
+    The family's cases (those keep accepts) as pytest params of one argument, id = the case id.
     """
     import pytest
 
-    marks = {"smoke": pytest.mark.smoke, "spec": pytest.mark.spec, "stress": pytest.mark.stress}
-    return [pytest.param(c, id=c["id"], marks=[pytest.mark.multigpu if multigpu else marks[c["tier"]]]) for c in select(family, tier) if keep is None or keep(c)]  # fmt: skip
+    return [pytest.param(c, id=c["id"]) for c in select(family) if keep is None or keep(c)]
 
 
 def seed_of(case: dict) -> int:
@@ -961,18 +940,16 @@ def seed_of(case: dict) -> int:
 
 def main() -> int:
     """
-    Per model its meshes (context / CP x mbs) and EP degrees and its cases per family; then per
-    family the cases per tier.
+    Per model its meshes (context / CP x mbs), EP degrees and cases per family; then per family.
     """
     for model in load_models():
         meshes = ", ".join(f"{k(c)}/cp{cp}x{mbs}" for c, cp, mbs in mesh_rows(model))
         families = Counter(c["family"] for c in model_cases(model))
         print(f"{model.name}: meshes {meshes}; EP {', '.join(map(str, allowed_ep(model)))}")
         print("  " + ", ".join(f"{family} {n}" for family, n in families.items()))
-    counts = Counter((c["family"], c["tier"]) for c in all_cases())
+    counts = Counter(c["family"] for c in all_cases())
     for family in FAMILIES:
-        tiers = {tier: counts[(family, tier)] for tier in TIER_ORDER if counts[(family, tier)]}
-        print(f"{family}: {sum(tiers.values())} ({', '.join(f'{t} {n}' for t, n in tiers.items())})")  # fmt: skip
+        print(f"{family}: {counts[family]}")
     print(f"total: {len(all_cases())}")
     return 0
 

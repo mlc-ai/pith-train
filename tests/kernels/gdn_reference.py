@@ -90,3 +90,50 @@ def chunked_reference(q, k, v, g, beta, do, chunk: int = BT) -> tuple[torch.Tens
     ref = torch.cat(out, 0).unsqueeze(0)
     ref.backward(do.double())
     return ref.detach(), {name: leaf.grad for name, leaf in zip(GRADS, leaves)}
+
+
+NAMES = ("o", "dq", "dk", "dv", "dg", "dbeta")
+TOKEN_HEADS_PER_BLOCK = 1 << 21
+"""
+Sequence length x value heads the fp64 reference holds at once.
+"""
+
+
+def reference_by_heads(q, k, v, g, beta, do, keep=slice(None), key_grads=False):
+    """
+    The fp64 reference's [o, dq, dk, dv, dg, dbeta] for B = 1, a block of value heads at a time.
+    """
+    S, H, HV = q.shape[1], q.shape[2], v.shape[2]
+    group = HV // H
+    block = max(group, min(HV, TOKEN_HEADS_PER_BLOCK // S) // group * group)
+    outs = [[] for _ in NAMES]
+    for start in range(0, HV, block):
+        values, keys = slice(start, start + block), slice(start // group, (start + block) // group)
+        ref, grads = chunked_reference(q[:, :, keys], k[:, :, keys], *(t[:, :, values] for t in (v, g, beta, do)))  # fmt: skip
+        dq, dk = grads["dq"], grads["dk"]
+        if key_grads:
+            dq, dk = (x.view(1, S, -1, group, x.shape[-1]).sum(3) for x in (dq, dk))
+        for out, x in zip(outs, (ref, dq, dk, grads["dv"], grads["dg"], grads["dbeta"])):
+            out.append(x[:, keep].float())
+        del ref, grads, dq, dk
+    return [torch.cat(parts, 2) for parts in outs]
+
+
+def errors(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float, bool]:
+    """
+    (calc_diff, max abs error / the reference's max magnitude, all finite).
+    """
+    scale = float(ref.abs().max())
+    err = float((got.float() - ref).abs().max())
+    return calc_diff(got, ref), err / scale if scale else err, bool(torch.isfinite(got).all())  # fmt: skip
+
+
+def failures_of(label: str, got: list, ref: list) -> list[str]:
+    failures = []
+    for name, x, y in zip(NAMES, got, ref):
+        assert x.shape == y.shape, (label, name, x.shape, y.shape)
+        diff, rel_max, finite = errors(x, y)
+        print(f"MEASURED {label} {name} calc_diff={diff:.3e} max_abs/ref_max={rel_max:.3e}")
+        if not (finite and diff < BOUNDS[name] and rel_max <= MAX_ABS):
+            failures.append(f"{label} {name}: calc_diff {diff:.2e} (bound {BOUNDS[name]:.0e}), max abs {rel_max:.2e} of ref max (bound {MAX_ABS:.0e}), finite {finite}")  # fmt: skip
+    return failures

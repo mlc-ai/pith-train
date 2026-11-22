@@ -1,5 +1,5 @@
 """
-Static smoke checks of the kernel-shape spec (tests/kernels/cases.py): the mesh rules, cases and a
+Static checks of the kernel-shape spec (tests/kernels/cases.py): the mesh rules, cases and a
 test for every model and family, every exported kernel in a family, and expert routing coverage.
 """
 
@@ -26,7 +26,6 @@ from tests.kernels.cases import (
     tuning_bucket,
 )
 
-pytestmark = pytest.mark.smoke
 MODELS = {model.name: model for model in load_models()}
 KERNELS = REPO_ROOT / "pithtrain" / "kernels"
 
@@ -51,9 +50,8 @@ def test_every_model_has_cases(config: Path) -> None:
     name = config.parent.name
     assert name in MODELS, f"{name} has no cases"
     for family in families_of(MODELS[name]):
-        found = select(family, "spec", model=name)
+        found = select(family, model=name)
         assert found, f"{name}: no {family} cases"
-        assert any(case["tier"] == "smoke" for case in found), f"{name}: no smoke {family} case"
 
 
 def exported_kernels() -> list[str]:
@@ -87,10 +85,10 @@ def imported_sources(path: Path, seen: set[Path]) -> list[str]:
 
 @pytest.mark.parametrize("family", list(FAMILIES))
 def test_every_family_has_a_test(family: str) -> None:
-    tests = sorted((REPO_ROOT / "tests" / "kernels").glob(f"test_{family}*.py"))
-    assert tests, f"no tests/kernels/test_{family}.py consumes the {family} cases"
-    for test in tests:
-        assert f'params("{family}"' in test.read_text(), f"{test.name} does not parametrize from params({family!r})"  # fmt: skip
+    tests = [path for folder in ("kernels", "operators") for path in sorted((REPO_ROOT / "tests" / folder).glob("test_*.py")) if f'params("{family}"' in path.read_text()]  # fmt: skip
+    assert tests, (
+        f"no test in tests/kernels or tests/operators parametrizes from params({family!r})"
+    )
     reached = "\n".join(
         text for test in tests for text in [test.read_text(), *imported_sources(test, set())]
     )
@@ -122,7 +120,7 @@ MOE_MODELS = sorted(name for name, model in MODELS.items() if model.experts is n
 @pytest.mark.parametrize("name", MOE_MODELS)
 def test_moe_cases_reach_the_routes(name: str) -> None:
     experts = MODELS[name].experts
-    found = [case["axes"] for case in select("moe_experts", "stress", model=name)]
+    found = [case["axes"] for case in select("moe_experts", model=name)]
     assert any(a["empty_groups"] for a in found), "no case with an empty expert"
     split = module_constant(KERNELS / "fp8_gemm.py", "K_GROUPED_MAX_ROWS")
     assert any(a["max_rows"] > split for a in found), f"no group past {split} rows (SM90 k-grouped split)"  # fmt: skip
@@ -138,7 +136,7 @@ def test_moe_cases_reach_the_routes(name: str) -> None:
 
 
 def test_moe_routing_is_consistent() -> None:
-    for case in select("moe_experts", "stress"):
+    for case in select("moe_experts"):
         a = case["axes"]
         sizes = a["group_sizes"]
         assert len(sizes) == a["G"] and sum(sizes) == a["rows"], case["id"]

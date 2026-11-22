@@ -311,8 +311,8 @@ Code that appears in more than one file lives once, in the shared module for its
    unchanged once docstrings are set aside and parallel assignments are expanded back into
    separate statements. No GPU run is needed.
 3. **Anything the compilers see** (renames, extracted phases, moved helpers, removed dead code):
-   - `pytest tests/kernels -m "smoke or spec or stress"` passes on a GPU (and `-m multigpu` when
-     CP code changed), and its results are posted on the PR;
+   - `pytest tests/kernels` passes on a GPU (and `pytest tests/operators` when CP code changed),
+     and its results are posted on the PR;
    - every kernel those features launch, run against the code before the change on the same GPU,
      gives bit-identical outputs and a median time within 5% (+3 us for very short kernels);
      `python -m benchmarks.kernels --base <ref>` times them side by side.

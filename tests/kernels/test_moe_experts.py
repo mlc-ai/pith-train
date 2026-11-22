@@ -600,12 +600,11 @@ def test_fp8_expert_activation(case: dict) -> None:
         check.verify(case)
 
 
-@pytest.mark.smoke
 def test_fp8_check_is_sharp() -> None:
     """
     The FP8 GEMM check rejects a wrong-expert GEMM and an unquantized bf16 product.
     """
-    case = select("moe_experts", "smoke")[0]
+    case = select("moe_experts")[0]
     axes = case["axes"]
     G, H, n = axes["G"], axes["hidden"], axes["inter"]
     ks = [-(-count // BLOCK) * BLOCK for count in axes["group_sizes"]]

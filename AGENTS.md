@@ -34,20 +34,17 @@ Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (i
 
 ```bash
 # Kernel tests at the training shapes (tests/kernels/cases.py): cases generated from the model
-# configs and mesh rules at collection; smoke tier by default (one GPU), the spec's own checks included
+# configs and mesh rules at collection, every case on one GPU
 pytest tests/kernels
-pytest tests/kernels -m "smoke or spec or stress" --shard 0/8   # all single-GPU tiers, shard 0 of 8
-pytest tests/kernels -m multigpu -k "not cp8 and not cp16"     # ring attention and GDN at CP 2 / 4
-pytest tests/kernels -m multigpu -k cp8                         # CP 8 (CP 16: two nodes, see cases.py)
-python -m tests.kernels.cases --summary                         # each model's meshes and case counts per family and tier
+python -m tests.kernels.cases     # each model's meshes and case counts per family
 
 # Operator, layer and framework tests
 pytest tests/test_ep_dedup_dispatch.py -v
-pytest tests/operators -v              # ring attention (varlen, FP8 kv_b), CP sequence, dense GDN ops
+pytest tests/operators -v              # ring attention and GDN under CP (the spec's CP cases on CP GPUs), CP sequence, dense GDN ops
 pytest tests/test_import_layers.py -v  # import layering, kernel naming, kernels interface (CPU only, AST)
 
 # Single test function
-pytest tests/kernels/test_dense_gemm.py::test_fp8_linear -k qwen3-30b-a3b -m "smoke or spec"
+pytest tests/kernels/test_dense_gemm.py::test_fp8_linear -k qwen3-30b-a3b
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
 bash tests/test_dualpipev.sh
@@ -63,7 +60,7 @@ bash benchmarks/operators/bench_ring_attention.sh qwen3-30b-a3b-cp4-s32k
 # kernel benchmarks over the spec's cases: --base times them at a base git ref and at the working tree
 # on one GPU (per-op and work-weighted speedup; exit 1 past 5% slower per op name); without it, this tree
 python -m benchmarks.kernels --base upstream/main --family cross_entropy
-python -m benchmarks.kernels --tier spec --out results.json
+python -m benchmarks.kernels --out results.json
 
 # end-to-end training benchmark: one case per script
 torchrun --nproc-per-node=8 benchmarks/end2end/<case>/script.py
@@ -166,9 +163,9 @@ Raw kernel code: CuTe-DSL kernels (SM90) and TIRx-lite kernels (SM100), their la
 
 Every exported name has a docstring stating its contract (shapes, dtypes, contiguity, output and scale layout, in-place behaviour, SM90-only or not) and belongs to a family of the kernel-shape spec, which verifies it against plain PyTorch at the shapes training launches (below). FP8 quantization is compared exactly (the same e4m3 bytes and E8M0 scale values as the recipe: per 128-element block `scale` = the power of two at or above `max(amax, 1e-4) * fp32(1 / 448)` (at least 2^-126), `e4m3_satfinite(x * (1 / scale))` round to nearest even); GEMMs and other float outputs within analytic bounds where the arithmetic gives one, else about 3x the worst measured on the H200. Adding a kernel means: import it in `__init__.py` and list it in `__all__`, write its contract docstring, list it in a family of `tests/kernels/cases.py` and call it from that family's test.
 
-Training shapes come from one place, the kernel-shape spec (`tests/kernels/cases.py`, which generates the cases at test collection and states the rules in its docstring): per model (`examples/pretrain_lm/*/config.json`), contexts 4k / 8k at CP 1, 16k at CP 2 / 4, 32k at CP 4 / 8 and 64k at CP 8 / 16, micro-batch 1 / 2 / 4 at CP 1 and 1 under CP, EP 1 .. 16 dividing the expert count, expert routing balanced, log-normal, skewed, stress and boundary (both edges of every BF16 tuning bucket reached), one family per kernel group (`moe_experts`, `dense_gemm`, `attention`, `ring_attention`, `gated_delta_rule`, ...). `tests/kernels/test_<family>.py` parametrizes from it (tiers `smoke` / `spec` / `stress`, plus `multigpu`), and `python -m benchmarks.kernels` times the same cases. Never hand-write production shapes into a test or benchmark, and never let a kernel-design agent pick its own; shipped scripts are not read. The smoke tier fails when a model or family lacks cases or a test, or an exported kernel is in no family.
+Training shapes come from one place, the kernel-shape spec (`tests/kernels/cases.py`, which generates the cases at test collection and states the rules in its docstring): per model (`examples/pretrain_lm/*/config.json`), contexts 4k / 8k at CP 1, 16k at CP 2 / 4, 32k at CP 4 / 8 and 64k at CP 8 / 16, micro-batch 1 / 2 / 4 at CP 1 and 1 under CP, EP 1 .. 16 dividing the expert count, expert routing balanced, log-normal, skewed, stress and boundary (both edges of every BF16 tuning bucket reached), one family per kernel group (`moe_experts`, `dense_gemm`, `attention`, `ring_attention`, `gated_delta_rule`, ...). `tests/kernels/test_<family>.py` parametrizes from it (the CP > 1 cases of ring attention and GDN: `tests/operators`), and `python -m benchmarks.kernels` times the same cases. Never hand-write production shapes into a test or benchmark, and never let a kernel-design agent pick its own; shipped scripts are not read. The smoke tier fails when a model or family lacks cases or a test, or an exported kernel is in no family.
 
-Kernel PRs (any change to `pithtrain/kernels/`) post the results of a GPU run: `pytest tests/kernels -m "smoke or spec or stress"`, plus `-m multigpu` when CP code (ring attention, GDN CP, `cp_sequence`) changes, and `python -m benchmarks.kernels --base upstream/main` over the families the change touches (no regression: no op failing that ran on main, no op name more than 5% slower work-weighted). A kernel-design agent reads `tests/kernels/cases.py`, must pass `pytest tests/kernels -m "smoke or spec"` and the `--base` A/B against main, and may add cases but never remove a spec case.
+Kernel PRs (any change to `pithtrain/kernels/`) post the results of a GPU run of `pytest tests/kernels`, plus `pytest tests/operators` when CP code (ring attention, GDN CP, `cp_sequence`) changes, and of `python -m benchmarks.kernels --base main` over the families the change touches (no regression: no op failing that ran on main, no op name more than 5% slower work-weighted). A kernel-design agent reads `tests/kernels/cases.py`, must pass `pytest tests/kernels` and the `--base` A/B against main, and may add cases but never remove a spec case.
 
 Launch-config tuning (`kernels/tuning.py`): a kernel family with several valid launch configs is a `Tunable` (today the BF16 expert GEMMs), whose launches ask `tunable.pick(key, rows)` for a config: one table lookup once tuned. `pretrain_lm.launch` calls `tune_kernels()` on every rank before the first step (installing the choices cached for this setup, so a repeated setup runs tuned from step 1) and after it; a key not in the cache runs its fixed default in the first step, the same on every rank, and the second call pools the keys all ranks used, splits their buckets across the ranks, times all candidates of a bucket on one GPU on synthetic inputs (dropping any whose results differ from the default's), pools the timings and installs the same choice on every rank, checked by a hash: of the candidates within `MARGIN` of the fastest, the default, else the lowest index. Choices are cached in a file every node sees (`~/.cache/pithtrain/tuning`, or `PITHTRAIN_TUNING_DIR`), named by the GPU and a fingerprint of the library versions, the candidates and the kernel module's source, so tuning is paid once per setup and redone when a kernel changes. The spec's boundary routing puts every expert at both edges of each tuning bucket training reaches, so every bucket's default config is verified.
 
@@ -236,7 +233,7 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 - `F.grouped_mm` may write NaN to padding rows (beyond `grouped_mm_offs[-1]`). Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 GEMM and FP8 layer tests use normalized squared-error (`calc_diff`), threshold typically `< 1e-3`; FP8 quantization verifiers compare bytes and scale values exactly, and scales by logical value only (strides are unspecified).
-- Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`); the spec's `multigpu` tests spawn their ranks themselves (CP 16 one pytest per node, `tests/kernels/cases.py`) and fail, not skip, when there are too few GPUs.
+- Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`); the spec's CP tests in `tests/operators` spawn their ranks themselves (CP 16 one pytest per node, `tests/kernels/cases.py`) and skip when there are too few GPUs.
 - Kernel tests call `pithtrain.kernels` names (or the operator training calls) and compare against a PyTorch reference written in the test, never against another pithtrain kernel or a picker's `_sm100` sibling.
 
 ## Config Base Classes

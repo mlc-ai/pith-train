@@ -6,8 +6,8 @@ weighted by its work (FLOPs, or elements read when memory-bound) times its layer
     python -m benchmarks.kernels --base upstream/main --family cross_entropy --out ab.json
     python -m benchmarks.kernels --base upstream/main --family moe_experts --op 'quant|silu'
     python -m benchmarks.kernels --base-dir . --family weight_quant      (the noise floor)
-    python -m benchmarks.kernels --tier spec --out results.json           (this tree alone)
-    python -m benchmarks.kernels --tier spec --shard 3/8 --out shard3.json   (one per GPU)
+    python -m benchmarks.kernels --out results.json                       (this tree alone)
+    python -m benchmarks.kernels --shard 3/8 --out shard3.json            (one per GPU)
     python -m benchmarks.kernels --merge shard*.json --out results.json
 
 --base exits 1 when an op that runs at the base fails here, or an op name is more than 5% slower
@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from tests.kernels.cases import TIER_ORDER, all_cases, select
+from tests.kernels.cases import all_cases, select
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEV = "cuda"
@@ -360,11 +360,11 @@ def environment() -> dict:
     return dict(gpu=props.name, sm_count=props.multi_processor_count, capability=f"{props.major}.{props.minor}", torch=torch.__version__, versions=versions, git_sha=sha, date=time.strftime("%Y-%m-%dT%H:%M:%S"))  # fmt: skip
 
 
-def cases_of(families: list[str], tier: str, model: str | None, shard: str | None) -> list[dict]:
+def cases_of(families: list[str], model: str | None, shard: str | None) -> list[dict]:
     """
-    The cases of families up to tier, split by shard "I/N" into every N-th case starting at I.
+    The cases of families, split by shard "I/N" into every N-th case starting at I.
     """
-    cases = [c for family in families for c in select(family, tier, model=model)]
+    cases = [c for family in families for c in select(family, model=model)]
     if shard is not None:
         index, count = (int(part) for part in shard.split("/"))
         cases = cases[index::count]
@@ -411,14 +411,14 @@ def run(args) -> dict:
     torch.backends.cuda.matmul.allow_tf32 = False
     timer, pattern = Timer(args.warmup, args.reps), re.compile(args.op) if args.op else None
     results = []
-    for case in cases_of(args.family or FAMILIES, args.tier, args.model, args.shard):
+    for case in cases_of(args.family or FAMILIES, args.model, args.shard):
         for op, timing in time_case(case, timer, pattern).items():
             row = dict(case=case["id"], op=op, layers=layers_of(case), **timing)
             if "median_us" in row and not row["memory_bound"] and row["work"]:
                 row["tflops"] = row["work"] / row["median_us"] / 1e6
             results.append(row)
             print(f"{case['id']:<52} {op:<36} " + (f"{row['median_us']:10.1f} us" if "median_us" in row else row["error"]), flush=True)  # fmt: skip
-    return dict(meta=dict(environment(), tier=args.tier, warmup=args.warmup, reps=args.reps), results=results)  # fmt: skip
+    return dict(meta=dict(environment(), warmup=args.warmup, reps=args.reps), results=results)  # fmt: skip
 
 
 def merge(paths: list[Path]) -> dict:
@@ -525,7 +525,7 @@ def regressions(rows: list[dict], summary: dict) -> list[str]:
 def ab(args) -> int:
     sides = dict(base=Worker(args.base_dir.resolve() if args.base_dir else base_tree(args.base)), head=Worker(REPO_ROOT))  # fmt: skip
     rows = []
-    for case in cases_of(args.family or FAMILIES, args.tier, args.model, args.shard):
+    for case in cases_of(args.family or FAMILIES, args.model, args.shard):
         request = dict(case=case["id"], op=args.op, warmup=args.warmup, reps=args.reps)
         timings = dict(base=defaultdict(list), head=defaultdict(list))
         for r in range(args.rounds):  # base, head, head, base, ...
@@ -546,7 +546,7 @@ def ab(args) -> int:
     problems = regressions(rows, summary)
     print("".join(f"REGRESSION {line}\n" for line in problems) + f"{len(problems)} regressions")
     if args.out:
-        meta = dict(base=args.base or str(args.base_dir), base_pithtrain=sides["base"].pithtrain, head_pithtrain=sides["head"].pithtrain, rounds=args.rounds, tier=args.tier)  # fmt: skip
+        meta = dict(base=args.base or str(args.base_dir), base_pithtrain=sides["base"].pithtrain, head_pithtrain=sides["head"].pithtrain, rounds=args.rounds)  # fmt: skip
         args.out.write_text(json.dumps(dict(meta=meta, summary=summary, results=rows, regressions=problems), indent=1) + "\n")  # fmt: skip
     return 1 if problems else 0
 
@@ -555,7 +555,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
     parser.add_argument("--family", action="append", choices=FAMILIES)
     parser.add_argument("--model")
-    parser.add_argument("--tier", default="spec", choices=list(TIER_ORDER))
     parser.add_argument("--op", help="time only the ops whose name matches this regex")
     parser.add_argument("--shard", help="I/N: every N-th case starting at I")
     parser.add_argument("--warmup", type=int, default=5)
