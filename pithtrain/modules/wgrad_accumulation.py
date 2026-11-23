@@ -4,7 +4,7 @@ Weight-gradient accumulation into a layer-owned fp32 buffer.
 BF16Linear, GroupedLinear and FP8GroupedLinear add their weight gradient straight into the fp32
 main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into the
 fp32 .grad of FSDP2: the GEMM accumulates in fp32, so no gradient of a micro-batch is rounded to
-bf16 and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
+bf16 and no bf16 temporary is allocated. setup_model enables it on FSDP parameter groups.
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
@@ -49,8 +49,7 @@ __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumul
 
 def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> None:
     """
-    Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
-    after fully_shard.
+    Give each BF16Linear, GroupedLinear and FP8GroupedLinear weight managed by FSDP a main_grad.
     """
     seen_groups = set()
     for module in model.modules():

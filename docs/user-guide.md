@@ -71,7 +71,6 @@ A run is configured by editing `script.py` — there are no command-line flags t
 | `distributed.pipeline_parallel_size` (PP) | Pipeline stages across ranks. |
 | `distributed.expert_parallel_size` (EP) | MoE experts distributed across ranks. |
 | `distributed.context_parallel_size` (CP) | Shards the sequence (long context). |
-| `distributed.hsdp_replica` | Number of FSDP replicas. `1` shards over the whole group (lowest memory); `N > 1` shards within a replica and all-reduces across the `N`. |
 | `training.micro_batch_size` | Sequences per micro-batch (per rank). |
 | `training.global_batch_size` | Total sequences per step; gradient-accumulated over micro-batches. |
 | `training.sequence_length` | Tokens per sequence. |

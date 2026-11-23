@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import random
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Optional
@@ -11,9 +10,9 @@ import numpy as np
 import torch
 import torch.distributed.fsdp
 import torch.nn as nn
-from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
@@ -42,9 +41,8 @@ from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
 
-from .distributed import DistributedCfg
-
 __all__ = [
+    "PrepareModel",
     "TrainingCfg",
     "is_muon_param",
     "make_muon_optimizer",
@@ -60,6 +58,15 @@ __all__ = [
 ]
 
 PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
+
+type PrepareModel = Callable[[Qwen35TextModel], None]
+"""
+Prepare the dense model in place before its weights are allocated. The hook may wrap layer
+forwards for recompute and must not allocate weights. With more than one data-parallel
+rank, it must use FSDP2 or HSDP to reduce gradients across those ranks. When using FSDP, call
+fully_shard on the root last. On a single data-parallel rank the hook may leave the model
+unsharded. FP32 weight-gradient buffers are installed only for FSDP parameter groups.
+"""
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -300,31 +307,14 @@ def weight_generator(seed: int, name: str, device: torch.device, *index: int) ->
     return torch.Generator(device=device).manual_seed(int(state))
 
 
-def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
-    """
-    The (replica, shard) layout FSDP2 reads as replicate-then-shard; each shard group is a
-    contiguous block of the mesh.
-    """
-    size = mesh.size()
-    assert size % hsdp_replica == 0, f"{size=} not divisible by {hsdp_replica=}"
-    return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
-
-
-def apply_fsdp(model, hsdp_replica: int = 1):
+def apply_fsdp(model):
     """
     Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
     gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
     """
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
-    if hsdp_replica > 1:
-        # A separate name: _unflatten takes the flattened dim away from its mesh, and setup_model
-        # reads the default flattening for the load-balance group.
-        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten("hsdp_stage")
-        attn_fsdp_mesh = split_replicas(attn_fsdp_mesh, hsdp_replica)
-        expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
-    else:
-        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
+    attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
@@ -370,11 +360,67 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
+@torch.no_grad()
+def init_dense_weights(model: Qwen35TextModel, module_config, cfg: TrainingCfg) -> None:
+    """
+    Copy the local slices of the original CPU initialization into the prepared model. Drawing
+    the full tensors preserves the seeded values, including the constructor's 1D parameters.
+    """
+    initial = Qwen35TextModel(module_config)
+    init_weights(
+        initial, module_config.num_hidden_layers, cfg.init_std, cfg.seed, pipeline_chunks=False
+    )
+    weights = dict(initial.named_parameters())
+    for name, param in model.named_parameters():
+        weight = weights[name]
+        if isinstance(param, DTensor):
+            shape, offsets = compute_local_shape_and_global_offset(
+                param.shape, param.device_mesh, param.placements
+            )
+            slices = tuple(slice(offset, offset + size) for offset, size in zip(offsets, shape))
+            param.to_local().copy_(weight[slices])
+        else:
+            param.copy_(weight)
+
+
+def dense_grad_norm_group(model: Qwen35TextModel) -> torch.distributed.ProcessGroup | None:
+    """
+    Use one complete set of gradient shards for the norm. HSDP has the same reduced gradients
+    in every replica, so no reduction across replicas is needed.
+    """
+    shard_group = None
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        for group in fully_shard.state(module)._fsdp_param_groups:
+            mesh = group.mesh_info
+            shards = mesh.shard_process_group
+            replicas = (
+                mesh.mesh.size(mesh.replicate_mesh_dim)
+                if mesh.replicate_mesh_dim is not None
+                else 1
+            )
+            if shards.size() * replicas != distributed.dp_size:
+                raise ValueError(
+                    f"prepare_model must reduce gradients across all {distributed.dp_size} "
+                    "data-parallel ranks with its FSDP mesh"
+                )
+            if shard_group is None:
+                shard_group = shards
+            elif shard_group != shards and (
+                torch.distributed.get_process_group_ranks(shard_group)
+                != torch.distributed.get_process_group_ranks(shards)
+            ):
+                raise ValueError(
+                    "prepare_model must use the same FSDP shard group for the dense gradient norm"
+                )
+    return shard_group
+
+
 def setup_model(
     cfg: TrainingCfg,
-    distributed_cfg: DistributedCfg,
     *,
-    shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
+    prepare_model: PrepareModel | None = None,
 ) -> None:
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
@@ -398,34 +444,36 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    if shard_dense_model is not None:
+    if prepare_model is not None:
         if module_config.model_type != "qwen3_5_text" or cfg.fp8 or cfg.moe_load_balance_coef:
-            raise ValueError("Direct FSDP2 training requires BF16 dense Qwen3.5")
+            raise ValueError("Direct dense training requires BF16 dense Qwen3.5")
         if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
-            raise ValueError("Direct FSDP2 training requires PP, CP and EP all 1")
-        mesh = distributed.attn_mesh["dp"]
-        if distributed_cfg.hsdp_replica > 1:
-            mesh = split_replicas(mesh, distributed_cfg.hsdp_replica)
+            raise ValueError("Direct dense training requires PP, CP and EP all 1")
         # The HF loader fills every parameter shard when there is no resumable DCP location.
         from_hf = cfg.hf_import_path is not None and cfg.save_location is None
-        with torch.device("meta") if from_hf else nullcontext():
+        with torch.device("meta"):
             model = Qwen35TextModel(module_config)
         if any(param.dtype != torch.float32 for param in model.parameters()):
             raise ValueError("Dense BF16 training requires FP32 master parameters")
-        if not from_hf:
-            init_weights(
-                model,
-                module_config.num_hidden_layers,
-                cfg.init_std,
-                cfg.seed,
-                pipeline_chunks=False,
+        prepare_model(model)
+        if distributed.dp_size > 1 and not isinstance(model, FSDPModule):
+            raise ValueError(
+                f"prepare_model must fully_shard the root model or gradients will not be "
+                f"reduced across the {distributed.dp_size} data-parallel ranks"
             )
-        shard_dense_model(model, mesh)
-        if from_hf:
-            model.to_empty(device=distributed.device)
-            model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
+        grad_norm_group = dense_grad_norm_group(model)
+        if distributed.dp_size > 1 and grad_norm_group is None:
+            raise ValueError(
+                f"prepare_model installed no FSDP parameter groups to reduce gradients across "
+                f"the {distributed.dp_size} data-parallel ranks"
+            )
+        model.to_empty(device=distributed.device)
+        model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
+        if not from_hf:
+            init_dense_weights(model, module_config, cfg)
         install_wgrad_accumulation(model, overwrite=True)
         training.model = model
+        training.dense_grad_norm_group = grad_norm_group
         return
 
     if module_config.model_type == "deepseek_v2":
@@ -446,7 +494,7 @@ def setup_model(
 
     modules = nn.Sequential(*modules)
     init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
-    apply_fsdp(modules, distributed_cfg.hsdp_replica)
+    apply_fsdp(modules)
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
@@ -458,8 +506,7 @@ def setup_model(
     local_seq_len = cfg.sequence_length // cp_size
 
     if cfg.moe_load_balance_coef > 0:
-        # With hsdp_replica 1 this reuses the flat dp x cp mesh apply_fsdp built,
-        # adding no communicator.
+        # Reuse the flat dp x cp mesh apply_fsdp built.
         lb_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
         for i in range(2):
             for layer in modules[i].layers.values():
@@ -583,13 +630,13 @@ def reload_training_state() -> None:
 def setup_training(
     cfg: object,
     *,
-    shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
+    prepare_model: PrepareModel | None = None,
 ) -> None:
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, cfg.distributed, shard_dense_model=shard_dense_model)
+    setup_model(cfg.training, prepare_model=prepare_model)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)

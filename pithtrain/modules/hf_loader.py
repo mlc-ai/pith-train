@@ -42,8 +42,8 @@ def _plan_copies(
 
 def load_hf_into_model(hf_root: Path, model: nn.Module) -> None:
     """
-    Copy the HuggingFace safetensors weights under hf_root into model's live DTensor parameters.
-    Only Shard(0) params are supported.
+    Copy HuggingFace safetensors weights under hf_root into live model parameters. The loader
+    supports unsharded parameters and FSDP parameters sharded along dim 0.
     """
     stdout = logging.stdout
     hf_root = Path(hf_root)

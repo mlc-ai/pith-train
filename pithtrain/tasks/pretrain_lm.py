@@ -1,14 +1,15 @@
 import gc
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.cuda
 import wandb
-from torch.distributed import DeviceMesh
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed.fsdp import FSDPModule
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
@@ -27,7 +28,7 @@ from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
-from pithtrain.modules.training import TrainingCfg, setup_training
+from pithtrain.modules.training import PrepareModel, TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
@@ -171,10 +172,17 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     cp_size = distributed.cp_size
-    if isinstance(model, Qwen35TextModel):
+    dense = isinstance(model, Qwen35TextModel)
+    if dense:
         losses, counts = [], []
+        amp = (
+            nullcontext()
+            if isinstance(model, FSDPModule)
+            else torch.autocast("cuda", torch.bfloat16)
+        )
         for tokens, labels in get_batch_tensors(cfg, dataset, step, device):
-            loss, detached = objective((model(tokens),), (labels,))
+            with amp:
+                loss, detached = objective((model(tokens),), (labels,))
             loss.backward()
             losses.append(detached)
             counts.append((labels != -100).sum())
@@ -203,9 +211,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
     scale_grads_(local_grads(model), 1.0 / num_tokens)
-    gradient_norm = clip_grad_norm(
-        model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
-    )
+    grad_norm_group = training.dense_grad_norm_group if dense else None
+    gradient_norm = clip_grad_norm(model, max_norm=1.0, norm_type=2, group=grad_norm_group)
 
     for optimizer, scheduler in zip(optimizers, schedulers):
         optimizer.step()
@@ -296,12 +303,12 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 def launch(
     cfg: PretrainLMCfg,
     *,
-    shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
+    prepare_model: PrepareModel | None = None,
 ) -> None:
     setup_logging(cfg)
     setup_distributed(cfg)
     dataset = setup_dataset(cfg)
-    setup_training(cfg, shard_dense_model=shard_dense_model)
+    setup_training(cfg, prepare_model=prepare_model)
     logger = logging.stdout
     logger.info("launch(cfg=%s)" % cfg)
     step = find_checkpoint(cfg.training.save_location)

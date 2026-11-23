@@ -208,7 +208,7 @@ def _entry():
     t.model = scratch
 
     torch.manual_seed(0)
-    setup_model(cfg.training, cfg.distributed)
+    setup_model(cfg.training)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
     main(scratch)
