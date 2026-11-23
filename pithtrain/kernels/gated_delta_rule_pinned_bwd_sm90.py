@@ -1547,10 +1547,10 @@ def state_gradient(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, do: torch.
     do, into the given buffer when one is passed. From dht, fp32 (HV, K, V), the gradient of the
     final state, when one is passed, else from zero.
     """
-    return _state_gradient("state_gradient", q, k, w, do, dv_local, g_cum, du, dht)
+    return run_state_gradient("state_gradient", q, k, w, do, dv_local, g_cum, du, dht)
 
 
-def _state_gradient(name, q, k, w, do, dv_local, g_cum, du, dht):
+def run_state_gradient(name, q, k, w, do, dv_local, g_cum, du, dht):
     T, H, HV = k.shape[1], k.shape[2], do.shape[2]
     dh = k.new_empty(1, (T + BT - 1) // BT, HV, HEAD_DIM, HEAD_DIM)
     du = torch.empty_like(do) if du is None else du
@@ -1572,10 +1572,10 @@ def chunk_gradients(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, v_new: to
     """
     (dq, dk, dv, dg, dbeta), the backward's outputs; dv into the given buffer when one is passed.
     """
-    return _chunk_gradients("chunk_gradients", q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv)
+    return run_chunk_gradients("chunk_gradients", q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv)
 
 
-def _chunk_gradients(name, q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv):
+def run_chunk_gradients(name, q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv):
     T, H, HV = k.shape[1], k.shape[2], v.shape[2]
     dq, dk = q.new_empty(1, T, HV, HEAD_DIM), k.new_empty(1, T, HV, HEAD_DIM)
     dv = torch.empty_like(v) if dv is None else dv
@@ -1621,7 +1621,7 @@ def chunk_gdr_bwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
     # The reverse recurrence reuses U for dU, then ChunkGradients reuses dV-local.
     if dense_b2 and all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (q, k, w, do, dv_local, g_cum)):
-        dh, du = _state_gradient("state_gradient_loader", q, k, w, do, dv_local, g_cum, u, None)
+        dh, du = run_state_gradient("state_gradient_loader", q, k, w, do, dv_local, g_cum, u, None)
     else:
         dh, du = state_gradient(q, k, w, do, dv_local, g_cum, du=u)
     name = "chunk_gradients"
@@ -1629,6 +1629,4 @@ def chunk_gdr_bwd_pinned_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (du, do, v_new, h, dh, k, q, v, A)
     ):
         name = "chunk_gradients_epilogue"
-    return _chunk_gradients(name, q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv_local)
-
-
+    return run_chunk_gradients(name, q, k, v, v_new, do, du, h, dh, g_cum, beta, A, dv_local)
