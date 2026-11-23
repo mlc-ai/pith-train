@@ -26,7 +26,6 @@ from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35 import Qwen35Model, Qwen35TextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeRotaryEmbedding
 from pithtrain.modules import imbalance
-from pithtrain.modules.dense_fsdp import DenseFSDPCfg, shard_dense_model
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
     install_raw_fp8_param_gather,
@@ -227,9 +226,6 @@ class TrainingCfg(SlottedDefault):
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
     """
 
-    dense_fsdp: DenseFSDPCfg | None = None
-    """Enable the direct FSDP2/autograd path for dense Qwen3.5 with PP, CP and EP all 1."""
-
     init_std: float = 0.02
 
     nsys_start: Optional[int] = None
@@ -377,6 +373,8 @@ def apply_fsdp(model, hsdp_replica: int = 1):
 def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
+    *,
+    shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
 ) -> None:
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
@@ -400,11 +398,11 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    if cfg.dense_fsdp is not None:
+    if shard_dense_model is not None:
         if module_config.model_type != "qwen3_5_text" or cfg.fp8 or cfg.moe_load_balance_coef:
-            raise ValueError("dense_fsdp requires BF16 dense Qwen3.5")
+            raise ValueError("Direct FSDP2 training requires BF16 dense Qwen3.5")
         if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
-            raise ValueError("dense_fsdp requires PP, CP and EP all 1")
+            raise ValueError("Direct FSDP2 training requires PP, CP and EP all 1")
         mesh = distributed.attn_mesh["dp"]
         if distributed_cfg.hsdp_replica > 1:
             mesh = split_replicas(mesh, distributed_cfg.hsdp_replica)
@@ -422,11 +420,11 @@ def setup_model(
                 cfg.seed,
                 pipeline_chunks=False,
             )
-        shard_dense_model(model, mesh, cfg.dense_fsdp, trace_recompute=cfg.nsys_start is not None)
+        shard_dense_model(model, mesh)
         if from_hf:
             model.to_empty(device=distributed.device)
             model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
-        install_wgrad_accumulation(model, overwrite=cfg.dense_fsdp.overwrite_wgrad)
+        install_wgrad_accumulation(model, overwrite=True)
         training.model = model
         return
 
@@ -582,12 +580,16 @@ def reload_training_state() -> None:
     training.offloaded = False
 
 
-def setup_training(cfg: object) -> None:
+def setup_training(
+    cfg: object,
+    *,
+    shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
+) -> None:
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, cfg.distributed)
+    setup_model(cfg.training, cfg.distributed, shard_dense_model=shard_dense_model)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)

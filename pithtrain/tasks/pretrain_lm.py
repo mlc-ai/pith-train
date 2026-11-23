@@ -1,19 +1,20 @@
 import gc
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import torch
 import torch.cuda
 import wandb
+from torch.distributed import DeviceMesh
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
 from pithtrain.kernels import tune_kernels
+from pithtrain.models.qwen35 import Qwen35TextModel
 from pithtrain.modules.checkpoint import (
     find_checkpoint,
     load_checkpoint,
@@ -138,13 +139,7 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(
-    cfg: PretrainLMCfg,
-    dataset: ConcatDataset,
-    step: int,
-    *,
-    prefetched_batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     start = cfg.training.nsys_start
     if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
@@ -166,19 +161,9 @@ def train_step(
     step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
-    dense_fsdp = cfg.training.dense_fsdp
-    initial_memory = torch.cuda.memory_stats() if dense_fsdp is not None else None
-    profile_start, profile_stop = cfg.training.nsys_start, cfg.training.nsys_stop
-    trace_range = (
-        torch.cuda.nvtx.range
-        if dense_fsdp is not None
-        and profile_start is not None
-        and step >= profile_start
-        and (profile_stop is None or step < profile_stop)
-        else nullcontext
-    )
-
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
+    dense = isinstance(model, Qwen35TextModel)
+    initial_memory = torch.cuda.memory_stats() if dense else None
     model.train()
 
     dp_size = distributed.dp_size
@@ -187,40 +172,11 @@ def train_step(
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     cp_size = distributed.cp_size
-    if dense_fsdp is not None:
-        batches = prefetched_batches
-        if batches is None:
-            batches = get_batch_tensors(cfg, dataset, step, device)
-        deferred_units = ()
-        if len(batches) > 1 and dense_fsdp.reduce_at_step_end:
-            deferred_units = (
-                (model,)
-                if dense_fsdp.reduce_at_step_end is True
-                else model.deferred_gradient_sync_units
-            )
-        finalize_once = len(batches) > 1 and (
-            deferred_units or dense_fsdp.overlap_microbatch_reductions
-        )
-        retained_units = model.retained_fsdp_units if len(batches) > 1 else ()
-        for unit in deferred_units:
-            unit.set_requires_gradient_sync(False, recurse=unit is model)
-        if finalize_once:
-            model.set_is_last_backward(False)
-        for unit in retained_units:
-            unit.set_reshard_after_backward(False, recurse=False)
+    if dense:
         losses, counts = [], []
-        for i, (tokens, labels) in enumerate(batches):
-            if i == len(batches) - 1:
-                for unit in deferred_units:
-                    unit.set_requires_gradient_sync(True, recurse=unit is model)
-                if finalize_once:
-                    model.set_is_last_backward(True)
-                for unit in retained_units:
-                    unit.set_reshard_after_backward(True, recurse=False)
-            with trace_range("dense/forward+loss"):
-                loss, detached = objective((model(tokens),), (labels,))
-            with trace_range("dense/backward"):
-                loss.backward()
+        for tokens, labels in get_batch_tensors(cfg, dataset, step, device):
+            loss, detached = objective((model(tokens),), (labels,))
+            loss.backward()
             losses.append(detached)
             counts.append((labels != -100).sum())
 
@@ -246,27 +202,16 @@ def train_step(
         # Pretraining gives each DP/CP rank the same number of valid tokens.
         num_tokens = local_count * dp_size * cp_size
 
-    with trace_range("dense/normalize+clip"):
-        # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
-        scale_grads_(local_grads(model), 1.0 / num_tokens)
+    # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
+    scale_grads_(local_grads(model), 1.0 / num_tokens)
+    gradient_norm = clip_grad_norm(
+        model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
+    )
 
-        gradient_norm = clip_grad_norm(
-            model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
-        )
-
-    with trace_range("dense/optimizer"):
-        release_grads = dense_fsdp is None or not dense_fsdp.reuse_gradient_shards
-        for optimizer, scheduler in zip(optimizers, schedulers):
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=release_grads)
-            scheduler.step()
-    next_batches = None
-    if (
-        dense_fsdp is not None
-        and dense_fsdp.prefetch_data_during_optimizer
-        and step + 1 < cfg.training.max_steps
-    ):
-        next_batches = get_batch_tensors(cfg, dataset, step + 1, device)
+    for optimizer, scheduler in zip(optimizers, schedulers):
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
     if training.fp8:
         precompute_fp8_param_scales()
     MoELoadBalanceLossTracker.reset()
@@ -322,7 +267,7 @@ def train_step(
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
-        if dense_fsdp is not None:
+        if initial_memory is not None:
             (
                 peak_reserved,
                 retries,
@@ -382,15 +327,18 @@ def train_step(
 
     # Collect here so cyclic collection never fires mid-forward or mid-backward.
     gc.collect()
-    return next_batches
 
 
 @record
-def launch(cfg: PretrainLMCfg) -> None:
+def launch(
+    cfg: PretrainLMCfg,
+    *,
+    shard_dense_model: Callable[[Qwen35TextModel, DeviceMesh], None] | None = None,
+) -> None:
     setup_logging(cfg)
     setup_distributed(cfg)
     dataset = setup_dataset(cfg)
-    setup_training(cfg)
+    setup_training(cfg, shard_dense_model=shard_dense_model)
     logger = logging.stdout
     logger.info("launch(cfg=%s)" % cfg)
     step = find_checkpoint(cfg.training.save_location)
@@ -411,9 +359,8 @@ def launch(cfg: PretrainLMCfg) -> None:
     # Install the cached kernel launch configs now; tune the ones the first step lacked after it.
     tune_kernels()
     first_step = step
-    prefetched_batches = None
     while step < cfg.training.max_steps:
-        prefetched_batches = train_step(cfg, dataset, step, prefetched_batches=prefetched_batches)
+        train_step(cfg, dataset, step)
         if step == first_step:
             tune_kernels()
         step += 1
