@@ -11,8 +11,7 @@ import torch
 import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
@@ -62,10 +61,10 @@ PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeM
 type PrepareModel = Callable[[Qwen35TextModel], None]
 """
 Prepare the dense model in place before its weights are allocated. The hook may wrap layer
-forwards for recompute and must not allocate weights. With more than one data-parallel
-rank, it must use FSDP2 or HSDP to reduce gradients across those ranks. When using FSDP, call
-fully_shard on the root last. On a single data-parallel rank the hook may leave the model
-unsharded. FP32 weight-gradient buffers are installed only for FSDP parameter groups.
+forwards for recompute and must not allocate weights. Use FSDP2 on a 1-D mesh spanning the
+data-parallel ranks and call fully_shard on the root last. With a single data-parallel rank,
+the hook may leave the model unsharded. FP32 weight-gradient buffers are installed only for
+FSDP parameter groups.
 """
 
 
@@ -374,47 +373,12 @@ def init_dense_weights(model: Qwen35TextModel, module_config, cfg: TrainingCfg) 
     for name, param in model.named_parameters():
         weight = weights[name]
         if isinstance(param, DTensor):
-            shape, offsets = compute_local_shape_and_global_offset(
-                param.shape, param.device_mesh, param.placements
+            shard = distribute_tensor(
+                weight, param.device_mesh, param.placements, src_data_rank=None
             )
-            slices = tuple(slice(offset, offset + size) for offset, size in zip(offsets, shape))
-            param.to_local().copy_(weight[slices])
+            param.to_local().copy_(shard.to_local())
         else:
             param.copy_(weight)
-
-
-def dense_grad_norm_group(model: Qwen35TextModel) -> torch.distributed.ProcessGroup | None:
-    """
-    Use one complete set of gradient shards for the norm. HSDP has the same reduced gradients
-    in every replica, so no reduction across replicas is needed.
-    """
-    shard_group = None
-    for module in model.modules():
-        if not isinstance(module, FSDPModule):
-            continue
-        for group in fully_shard.state(module)._fsdp_param_groups:
-            mesh = group.mesh_info
-            shards = mesh.shard_process_group
-            replicas = (
-                mesh.mesh.size(mesh.replicate_mesh_dim)
-                if mesh.replicate_mesh_dim is not None
-                else 1
-            )
-            if shards.size() * replicas != distributed.dp_size:
-                raise ValueError(
-                    f"prepare_model must reduce gradients across all {distributed.dp_size} "
-                    "data-parallel ranks with its FSDP mesh"
-                )
-            if shard_group is None:
-                shard_group = shards
-            elif shard_group != shards and (
-                torch.distributed.get_process_group_ranks(shard_group)
-                != torch.distributed.get_process_group_ranks(shards)
-            ):
-                raise ValueError(
-                    "prepare_model must use the same FSDP shard group for the dense gradient norm"
-                )
-    return shard_group
 
 
 def setup_model(
@@ -461,11 +425,14 @@ def setup_model(
                 f"prepare_model must fully_shard the root model or gradients will not be "
                 f"reduced across the {distributed.dp_size} data-parallel ranks"
             )
-        grad_norm_group = dense_grad_norm_group(model)
-        if distributed.dp_size > 1 and grad_norm_group is None:
+        if any(
+            isinstance(param, DTensor)
+            and (param.device_mesh.ndim != 1 or param.device_mesh.size() != distributed.dp_size)
+            for param in model.parameters()
+        ):
             raise ValueError(
-                f"prepare_model installed no FSDP parameter groups to reduce gradients across "
-                f"the {distributed.dp_size} data-parallel ranks"
+                f"prepare_model requires a 1-D mesh spanning all {distributed.dp_size} "
+                "data-parallel ranks. HSDP and other mesh layouts are unsupported."
             )
         model.to_empty(device=distributed.device)
         model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
@@ -473,7 +440,6 @@ def setup_model(
             init_dense_weights(model, module_config, cfg)
         install_wgrad_accumulation(model, overwrite=True)
         training.model = model
-        training.dense_grad_norm_group = grad_norm_group
         return
 
     if module_config.model_type == "deepseek_v2":

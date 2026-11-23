@@ -47,11 +47,6 @@ GroupedLinear: type[grouped_linear.GroupedLinear | grouped_linear.FP8GroupedLine
 
 model: DualPipeV | Qwen35TextModel
 
-dense_grad_norm_group: torch.distributed.ProcessGroup | None
-"""
-The dense model's FSDP shard group for gradient clipping. None for a single unsharded rank.
-"""
-
 optimizers: tuple[Optimizer, ...]
 """
 One per parameter class under Muon.

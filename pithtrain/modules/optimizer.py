@@ -209,16 +209,10 @@ def scale_grads_(grads: list[torch.Tensor], scale: torch.Tensor) -> None:
 
 
 @torch.no_grad()
-def clip_grad_norm(
-    model: torch.nn.Module,
-    max_norm: float,
-    norm_type: float = 2.0,
-    *,
-    group: dist.ProcessGroup | None = None,
-) -> torch.Tensor:
+def clip_grad_norm(model: torch.nn.Module, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
     """
     Clip the gradients in place to max_norm and return the total norm before clipping as a 0-d
-    tensor. Reduce over the given group or the world by default.
+    tensor. Collective over the world.
 
     Without a host sync: the gradients are always multiplied, by 1.0 (bit-preserving) when no
     clipping is due or the norm is NaN.
@@ -230,7 +224,7 @@ def clip_grad_norm(
         return torch.tensor(0.0, device=device)
     local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
     local_norm_sq = local_norm**norm_type
-    dist.all_reduce(local_norm_sq, op=dist.ReduceOp.SUM, group=group)
+    torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
     total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
     clip_coef = (max_norm / total_norm).clamp(max=1.0)
     clip_coef = torch.where(clip_coef < 1.0, clip_coef, torch.ones_like(clip_coef))

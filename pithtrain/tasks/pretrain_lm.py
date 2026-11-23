@@ -172,8 +172,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     cp_size = distributed.cp_size
-    dense = isinstance(model, Qwen35TextModel)
-    if dense:
+    if isinstance(model, Qwen35TextModel):
         losses, counts = [], []
         amp = (
             nullcontext()
@@ -211,8 +210,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     # FSDP reduces with a plain sum. Normalize by the global token count before clipping.
     scale_grads_(local_grads(model), 1.0 / num_tokens)
-    grad_norm_group = training.dense_grad_norm_group if dense else None
-    gradient_norm = clip_grad_norm(model, max_norm=1.0, norm_type=2, group=grad_norm_group)
+    gradient_norm = clip_grad_norm(model, max_norm=1.0, norm_type=2)
 
     for optimizer, scheduler in zip(optimizers, schedulers):
         optimizer.step()

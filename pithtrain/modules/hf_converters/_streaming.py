@@ -41,7 +41,7 @@ def generic_plan_param(
     canon_keys = _expand_localized_fqn(local_fqn, named_modules)
     moe = find_moe(local_fqn, named_modules)
     if isinstance(param, DTensor):
-        local = param._local_tensor
+        local = param.detach().to_local()
         shard_dim = param.device_mesh.ndim - 1
         dp_rank = param.device_mesh.get_local_rank(shard_dim)
         dp_size = param.device_mesh.size(shard_dim)

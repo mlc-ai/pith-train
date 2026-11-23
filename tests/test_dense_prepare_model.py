@@ -1,10 +1,11 @@
 """
-Check dense setup without FSDP on one GPU and HSDP gradient clipping on four GPUs.
+Check unsharded dense training on one GPU and the FSDP hook contract on two GPUs.
 
     torchrun --nproc-per-node=1 tests/test_dense_prepare_model.py
-    torchrun --nproc-per-node=4 tests/test_dense_prepare_model.py
+    torchrun --nproc-per-node=2 tests/test_dense_prepare_model.py
 """
 
+from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -18,11 +19,11 @@ from pithtrain.contexts import distributed, training
 from pithtrain.modules.dataset import SyntheticDataset
 from pithtrain.modules.distributed import setup_distributed
 from pithtrain.modules.logging import setup_logging
-from pithtrain.modules.optimizer import clip_grad_norm, local_grads
 from pithtrain.modules.training import (
     make_adamw_optimizer,
     make_constant_scheduler,
     setup_training,
+    weight_generator,
 )
 from pithtrain.tasks.pretrain_lm import PretrainLMCfg, train_step
 
@@ -35,7 +36,6 @@ def check_unsharded(cfg):
     setup_training(cfg, prepare_model=check_meta)
     model = training.model
     assert not isinstance(model, FSDPModule)
-    assert training.dense_grad_norm_group is None
     assert model.lm_head.main_grad is None
     assert all(not isinstance(param, DTensor) for param in model.parameters())
 
@@ -46,37 +46,28 @@ def check_unsharded(cfg):
     print("[PASS] unsharded dense training")
 
 
-def check_hsdp(cfg):
-    replicas = 2
-    with pytest.raises(ValueError, match="gradients will not be reduced across the 4"):
+def check_sharded(cfg):
+    with pytest.raises(ValueError, match="gradients will not be reduced across the 2"):
         setup_training(cfg, prepare_model=check_meta)
 
-    def prepare_model(model):
+    def shard(model, *, mesh):
         check_meta(model)
-        dp_mesh = distributed.attn_mesh["dp"]
-        mesh = DeviceMesh(
-            dp_mesh.device_type,
-            dp_mesh.mesh.reshape(replicas, -1),
-            mesh_dim_names=("replica", "shard"),
-        )
         fully_shard(model, mesh=mesh)
 
-    setup_training(cfg, prepare_model=prepare_model)
-    model = training.model
-    group = training.dense_grad_norm_group
-    assert group.size() == 2
-    for param in model.parameters():
-        param.grad = torch.full_like(param, group.rank() + 1)
-    # The old norm summed over the world and divided by the replica count.
-    power = torch.nn.utils.get_total_norm(local_grads(model)) ** 2.0
-    torch.distributed.all_reduce(power)
-    expected = ((power / replicas) ** 0.5).clamp(min=1e-6)
-    actual = clip_grad_norm(model, max_norm=1.0, group=group)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    for grad in local_grads(model):
-        torch.testing.assert_close(grad, torch.full_like(grad, (group.rank() + 1) / actual))
+    dp_mesh = distributed.attn_mesh["dp"]
+    hsdp_mesh = DeviceMesh("cuda", [[0, 1]], mesh_dim_names=("replica", "shard"))
+    for mesh in (distributed.attn_mesh["cp"], hsdp_mesh):
+        with pytest.raises(ValueError, match="HSDP and other mesh layouts are unsupported"):
+            setup_training(cfg, prepare_model=partial(shard, mesh=mesh))
+
+    setup_training(cfg, prepare_model=partial(shard, mesh=dp_mesh))
+    weight = training.model.lm_head.weight
+    assert isinstance(weight, DTensor)
+    generator = weight_generator(cfg.training.seed, "lm_head.weight", torch.device("cpu"))
+    expected = torch.empty(weight.shape).normal_(std=cfg.training.init_std, generator=generator)
+    torch.testing.assert_close(weight.detach().full_tensor().cpu(), expected, rtol=0, atol=0)
     if distributed.rank == 0:
-        print(f"[PASS] HSDP clipping matches legacy norm {actual.item().hex()} bitwise")
+        print("[PASS] dense FSDP mesh validation and seeded weights")
 
 
 def main():
@@ -108,8 +99,8 @@ def main():
         if distributed.dp_size == 1:
             check_unsharded(cfg)
         else:
-            assert distributed.dp_size == 4
-            check_hsdp(cfg)
+            assert distributed.dp_size == 2
+            check_sharded(cfg)
 
 
 if __name__ == "__main__":
