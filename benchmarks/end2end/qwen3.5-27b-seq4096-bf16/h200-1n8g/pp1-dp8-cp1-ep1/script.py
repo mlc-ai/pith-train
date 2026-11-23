@@ -16,6 +16,14 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
 
 def customize(model: nn.Module) -> None:
+    """
+    Recompute: selective activation checkpointing saves matmul, Gated DeltaNet and FA4 forward
+    outputs; the first 52 blocks replay the rest of each block, the last 12 replay only the MLP.
+
+    Sharding: FSDP2 over all data-parallel ranks, in groups of two decoder blocks plus the
+    embedding, the LM head and the root, with BF16 parameters and FP32 gradient reduction. The
+    gradient divide factor is 1.0 because the training step normalizes by the global token count.
+    """
     model = cast(Qwen35TextModel, model)
     saved_ops = [
         torch.ops.aten.mm.default,
