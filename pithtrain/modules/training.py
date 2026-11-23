@@ -90,13 +90,9 @@ def make_muon_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple
     return Muon(muon_params, **kwargs), AdamW(adamw_params, **kwargs)
 
 
-def make_adamw_optimizer(
-    cfg: TrainingCfg, *, weight_decay: float = 0.1, fused: bool = True
-) -> tuple[Optimizer, ...]:
+def make_adamw_optimizer(cfg: TrainingCfg, *, weight_decay: float = 0.1) -> tuple[Optimizer, ...]:
     kwargs = dict(lr=cfg.lr, weight_decay=weight_decay)
-    return (
-        AdamW(training.model.parameters(), fused=fused, foreach=None if fused else True, **kwargs),
-    )
+    return (AdamW(training.model.parameters(), fused=True, **kwargs),)
 
 
 def make_wsd_scheduler(

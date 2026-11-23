@@ -57,7 +57,7 @@ distributed.expert_parallel_size = 1
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3.5-27b")
-training.optimizer = partial(make_adamw_optimizer, fused=True)
+training.optimizer = make_adamw_optimizer
 training.scheduler = make_constant_scheduler
 training.customize = customize
 training.lr = 1e-5
