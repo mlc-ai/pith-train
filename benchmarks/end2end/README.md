@@ -9,9 +9,6 @@ benchmarks/end2end/<model>-seq<N>-<dtype>/h200-<nodes>n<gpus>g/pp<P>-dp<D>-cp<C>
 `P`, `C` and `E` are the pipeline, context and expert parallel sizes, and `D` is the attention data
 parallel size, the GPU count divided by P × C.
 
-The [Qwen3.5-27B FSDP2 benchmark](qwen3.5-27b-seq4096-bf16/h200-1n8g/pp1-dp8-cp1-ep1/script.py)
-runs on eight H200 GPUs with pure data parallelism.
-
 ## Results
 
 Measured in November 2026, BF16 on H200. Throughput is the median of steps 7 to 12; memory is peak
@@ -32,6 +29,7 @@ per token from Megatron's `num_floating_point_operations`.
 | qwen3-30b-a3b | 1 | `pp2-dp4-cp1-ep4` | 2 | 14,731 | 34.4% | 100.3 |
 | qwen3-30b-a3b | 2 | `pp2-dp8-cp1-ep4` | 2 | 14,713 | 34.3% | 85.5 |
 | qwen3-30b-a3b | 4 | `pp1-dp32-cp1-ep8` | 2 | 14,317 | 33.4% | 90.7 |
+| qwen3.5-27b | 1 | `pp1-dp8-cp1-ep1` | 2 | 2,859 | 45.4% | 125.4 |
 | qwen3.5-35b-a3b | 1 | `pp1-dp8-cp1-ep8` | 1 | 14,358 | 27.6% | 99.4 |
 | qwen3.5-35b-a3b | 2 | `pp2-dp8-cp1-ep8` | 2 | 14,907 | 28.7% | 94.4 |
 | qwen3.5-35b-a3b | 4 | `pp2-dp16-cp1-ep8` | 2 | 14,475 | 27.9% | 86.2 |

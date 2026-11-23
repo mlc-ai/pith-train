@@ -41,7 +41,7 @@ from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
 
 __all__ = [
-    "PrepareModel",
+    "Customize",
     "TrainingCfg",
     "is_muon_param",
     "make_muon_optimizer",
@@ -58,14 +58,7 @@ __all__ = [
 
 PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
 
-type PrepareModel = Callable[[Qwen35TextModel], None]
-"""
-Prepare the dense model in place before its weights are allocated. The hook may wrap layer
-forwards for recompute and must not allocate weights. Use FSDP2 on a 1-D mesh spanning the
-data-parallel ranks and call fully_shard on the root last. With a single data-parallel rank,
-the hook may leave the model unsharded. FP32 weight-gradient buffers are installed only for
-FSDP parameter groups.
-"""
+type Customize = Callable[[nn.Module], None]
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -179,6 +172,15 @@ class TrainingCfg(SlottedDefault):
     """
     Builds one scheduler per optimizer from this config: make_wsd_scheduler,
     make_constant_scheduler or your own.
+    """
+
+    customize: Customize | None = None
+    """
+    Customize the dense model in place before its weights are allocated. The hook may wrap layer
+    forwards for recompute and must not allocate weights. Use FSDP2 on a 1-D mesh spanning the
+    data-parallel ranks and call fully_shard on the root last. With a single data-parallel rank,
+    the hook may leave the model unsharded. FP32 weight-gradient buffers are installed only for
+    FSDP parameter groups.
     """
 
     model: Path
@@ -381,11 +383,7 @@ def init_dense_weights(model: Qwen35TextModel, module_config, cfg: TrainingCfg) 
             param.copy_(weight)
 
 
-def setup_model(
-    cfg: TrainingCfg,
-    *,
-    prepare_model: PrepareModel | None = None,
-) -> None:
+def setup_model(cfg: TrainingCfg) -> None:
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
@@ -408,7 +406,7 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    if prepare_model is not None:
+    if cfg.customize is not None:
         if module_config.model_type != "qwen3_5_text" or cfg.fp8 or cfg.moe_load_balance_coef:
             raise ValueError("Direct dense training requires BF16 dense Qwen3.5")
         if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
@@ -419,10 +417,10 @@ def setup_model(
             model = Qwen35TextModel(module_config)
         if any(param.dtype != torch.float32 for param in model.parameters()):
             raise ValueError("Dense BF16 training requires FP32 master parameters")
-        prepare_model(model)
+        cfg.customize(model)
         if distributed.dp_size > 1 and not isinstance(model, FSDPModule):
             raise ValueError(
-                f"prepare_model must fully_shard the root model or gradients will not be "
+                f"customize must fully_shard the root model or gradients will not be "
                 f"reduced across the {distributed.dp_size} data-parallel ranks"
             )
         if any(
@@ -431,7 +429,7 @@ def setup_model(
             for param in model.parameters()
         ):
             raise ValueError(
-                f"prepare_model requires a 1-D mesh spanning all {distributed.dp_size} "
+                f"customize requires a 1-D mesh spanning all {distributed.dp_size} "
                 "data-parallel ranks. HSDP and other mesh layouts are unsupported."
             )
         model.to_empty(device=distributed.device)
@@ -593,16 +591,12 @@ def reload_training_state() -> None:
     training.offloaded = False
 
 
-def setup_training(
-    cfg: object,
-    *,
-    prepare_model: PrepareModel | None = None,
-) -> None:
+def setup_training(cfg: object) -> None:
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, prepare_model=prepare_model)
+    setup_model(cfg.training)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)

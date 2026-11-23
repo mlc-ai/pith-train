@@ -1,8 +1,8 @@
 """
 Check unsharded dense training on one GPU and the FSDP hook contract on two GPUs.
 
-    torchrun --nproc-per-node=1 tests/test_dense_prepare_model.py
-    torchrun --nproc-per-node=2 tests/test_dense_prepare_model.py
+    torchrun --nproc-per-node=1 tests/test_dense_customize.py
+    torchrun --nproc-per-node=2 tests/test_dense_customize.py
 """
 
 from functools import partial
@@ -33,7 +33,8 @@ def check_meta(model):
 
 
 def check_unsharded(cfg):
-    setup_training(cfg, prepare_model=check_meta)
+    cfg.training.customize = check_meta
+    setup_training(cfg)
     model = training.model
     assert not isinstance(model, FSDPModule)
     assert model.lm_head.main_grad is None
@@ -47,20 +48,22 @@ def check_unsharded(cfg):
 
 
 def check_sharded(cfg):
+    cfg.training.customize = check_meta
     with pytest.raises(ValueError, match="gradients will not be reduced across the 2"):
-        setup_training(cfg, prepare_model=check_meta)
+        setup_training(cfg)
 
-    def shard(model, *, mesh):
+    def shard(model, *, mesh=None):
         check_meta(model)
         fully_shard(model, mesh=mesh)
 
-    dp_mesh = distributed.attn_mesh["dp"]
     hsdp_mesh = DeviceMesh("cuda", [[0, 1]], mesh_dim_names=("replica", "shard"))
     for mesh in (distributed.attn_mesh["cp"], hsdp_mesh):
+        cfg.training.customize = partial(shard, mesh=mesh)
         with pytest.raises(ValueError, match="HSDP and other mesh layouts are unsupported"):
-            setup_training(cfg, prepare_model=partial(shard, mesh=mesh))
+            setup_training(cfg)
 
-    setup_training(cfg, prepare_model=partial(shard, mesh=dp_mesh))
+    cfg.training.customize = shard
+    setup_training(cfg)
     weight = training.model.lm_head.weight
     assert isinstance(weight, DTensor)
     generator = weight_generator(cfg.training.seed, "lm_head.weight", torch.device("cpu"))

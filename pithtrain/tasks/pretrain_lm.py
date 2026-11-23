@@ -28,7 +28,7 @@ from pithtrain.modules.hf_loader import load_hf_into_model
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm, local_grads, scale_grads_
-from pithtrain.modules.training import PrepareModel, TrainingCfg, setup_training
+from pithtrain.modules.training import TrainingCfg, setup_training
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
@@ -298,15 +298,11 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
 
 @record
-def launch(
-    cfg: PretrainLMCfg,
-    *,
-    prepare_model: PrepareModel | None = None,
-) -> None:
+def launch(cfg: PretrainLMCfg) -> None:
     setup_logging(cfg)
     setup_distributed(cfg)
     dataset = setup_dataset(cfg)
-    setup_training(cfg, prepare_model=prepare_model)
+    setup_training(cfg)
     logger = logging.stdout
     logger.info("launch(cfg=%s)" % cfg)
     step = find_checkpoint(cfg.training.save_location)
