@@ -161,9 +161,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     step_start_time = time.time()
 
     torch.cuda.memory.reset_peak_memory_stats()
+
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
-    dense = isinstance(model, Qwen35TextModel)
-    initial_memory = torch.cuda.memory_stats() if dense else None
     model.train()
 
     dp_size = distributed.dp_size
@@ -172,7 +171,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     assert global_batch_size % (micro_batch_size * dp_size) == 0
 
     cp_size = distributed.cp_size
-    if dense:
+    if isinstance(model, Qwen35TextModel):
         losses, counts = [], []
         for tokens, labels in get_batch_tensors(cfg, dataset, step, device):
             loss, detached = objective((model(tokens),), (labels,))
@@ -222,24 +221,9 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
     elapsed = elapsed_tensor.item()
 
-    gib = 1024**3
-    memory = [torch.cuda.max_memory_allocated() / gib]
-    if initial_memory is not None:
-        stats = torch.cuda.memory_stats()
-        memory += [
-            stats["reserved_bytes.all.peak"] / gib,
-            stats["num_alloc_retries"] - initial_memory["num_alloc_retries"],
-            stats["num_alloc_retries"],
-            stats["num_device_alloc"] - initial_memory["num_device_alloc"],
-            stats["num_device_free"] - initial_memory["num_device_free"],
-            stats["allocated_bytes.all.current"] / gib,
-            stats["reserved_bytes.all.current"] / gib,
-            stats["inactive_split_bytes.all.current"] / gib,
-            stats["inactive_split_bytes.all.peak"] / gib,
-        ]
-    peak_gpu_stats = torch.tensor(memory, device=device)
-    torch.distributed.all_reduce(peak_gpu_stats, op=torch.distributed.ReduceOp.MAX)
-    peak_gpu_mem = peak_gpu_stats[0]
+    peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+    peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
+    torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
 
     # The tracked values include the coefficient; dividing it out logs E * dot(f, p), where 1.0
     # is perfect balance (the Megatron-LM convention).
@@ -267,27 +251,6 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
-        if initial_memory is not None:
-            (
-                peak_reserved,
-                retries,
-                total_retries,
-                allocs,
-                frees,
-                allocated,
-                reserved,
-                inactive,
-                peak_inactive,
-            ) = peak_gpu_stats[1:].tolist()
-            statements.append("peak-gpu-reserved %.2f GB" % peak_reserved)
-            statements.append("cuda-alloc-retries %d" % retries)
-            statements.append("cuda-alloc-retries-total %d" % total_retries)
-            statements.append("cuda-device-allocs %d" % allocs)
-            statements.append("cuda-device-frees %d" % frees)
-            statements.append("cuda-allocated %.2f GiB" % allocated)
-            statements.append("cuda-reserved %.2f GiB" % reserved)
-            statements.append("cuda-inactive-split %.2f GiB" % inactive)
-            statements.append("peak-cuda-inactive-split %.2f GiB" % peak_inactive)
         logger.info(" | ".join(statements))
         activate_wandb(cfg)
         if logging.wandb is not None:
