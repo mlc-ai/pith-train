@@ -49,8 +49,6 @@ def shard_model(model: Qwen35TextModel, mesh: DeviceMesh) -> None:
         blocks[0].set_gradient_divide_factor(1.0)
 
     fully_shard(model.embed_tokens, mesh=mesh, mp_policy=mp, reshard_after_forward=True)
-    # Embedding backward needs the token indices and weight shape only.
-    model.embed_tokens.set_unshard_in_backward(False)
     model.embed_tokens.set_gradient_divide_factor(1.0)
 
     fully_shard(model.lm_head, mesh=mesh, mp_policy=mp, reshard_after_forward=True)
