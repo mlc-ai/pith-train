@@ -46,7 +46,7 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition, layer_sizes
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["Qwen35MoeGatedDeltaNet", "Qwen35MoeModel", "Qwen35MoeTopKRouter"]
+__all__ = ["Qwen35MoeGatedDeltaNet", "Qwen35MoeTextStage", "Qwen35MoeTopKRouter"]
 
 
 def pipeline_layer_sizes(num_layers: int, stage_count: int) -> list[int]:
@@ -578,7 +578,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen35MoeModel(nn.Module):
+class Qwen35MoeTextStage(nn.Module):
     # Dense Qwen3.5 uses the same attention, positional encoding and pipeline partition.
     decoder_layer_class = Qwen35MoeDecoderLayer
 

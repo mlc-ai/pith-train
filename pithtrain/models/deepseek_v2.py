@@ -39,7 +39,7 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["DeepSeekV2MoEGate", "DeepSeekV2Model"]
+__all__ = ["DeepSeekV2MoEGate", "DeepSeekV2Stage"]
 
 
 class DeepSeekV2RotaryEmbedding(nn.Module):
@@ -458,7 +458,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         return hidden_states
 
 
-class DeepSeekV2Model(nn.Module):
+class DeepSeekV2Stage(nn.Module):
     def __init__(self, config: DeepseekV2Config, phase: int):
         super().__init__()
         match phase:

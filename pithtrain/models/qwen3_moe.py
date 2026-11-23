@@ -36,7 +36,7 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["Qwen3MoeGate", "Qwen3MoeModel"]
+__all__ = ["Qwen3MoeGate", "Qwen3MoeStage"]
 
 
 class Qwen3MoeRotaryEmbedding(nn.Module):
@@ -396,7 +396,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen3MoeModel(nn.Module):
+class Qwen3MoeStage(nn.Module):
     def __init__(self, config: Qwen3MoeConfig, phase: int):
         super().__init__()
         match phase:

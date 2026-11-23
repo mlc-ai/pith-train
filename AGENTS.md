@@ -117,9 +117,12 @@ Properties worth remembering: `cp` and `ep` each need only divide the stage size
 
 Replayed routes follow the loader's zigzag order. Each linear-attention layer converts them to contiguous order through `Qwen35MoeDecoderLayer.resolve_replay`.
 
-### Model Layer Protocol (`pithtrain/models/interface.py`)
+### Pipeline Stage and Layer Protocols (`pithtrain/models/interface.py`)
 
-Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+Each DualPipeV chunk implements `StageProtocol`. Its layers expose `forward_stage1`, `forward_stage3`,
+and `forward_stage5`. The `Stage` suffix names one pipeline chunk, and `Model` names a whole model.
+Supported models include DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), and
+GPT-OSS 20B/120B (`gpt_oss.py`).
 
 ### Tensor Layouts & Sequence Packing
 

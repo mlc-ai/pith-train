@@ -18,11 +18,11 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model
-from pithtrain.models.gpt_oss import GptOssModel
-from pithtrain.models.qwen3_moe import Qwen3MoeModel
-from pithtrain.models.qwen35 import Qwen35Model, Qwen35TextModel
-from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeRotaryEmbedding
+from pithtrain.models.deepseek_v2 import DeepSeekV2Stage
+from pithtrain.models.gpt_oss import GptOssStage
+from pithtrain.models.qwen3_moe import Qwen3MoeStage
+from pithtrain.models.qwen35 import Qwen35TextModel, Qwen35TextStage
+from pithtrain.models.qwen35_moe import Qwen35MoeRotaryEmbedding, Qwen35MoeTextStage
 from pithtrain.modules import imbalance
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
@@ -56,7 +56,7 @@ __all__ = [
     "setup_training",
 ]
 
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
+PIPELINE_STAGES = (DeepSeekV2Stage, GptOssStage, Qwen3MoeStage, Qwen35MoeTextStage, Qwen35TextStage)
 
 type Customize = Callable[[nn.Module], None]
 
@@ -322,7 +322,7 @@ def apply_fsdp(model):
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
     # the expert parameters stay out of the layer's group.
     for i in range(2):
-        assert isinstance(model[i], PIPELINE_STAGE_MODELS)
+        assert isinstance(model[i], PIPELINE_STAGES)
         # Embeddings, final norm and LM head run once per step, so they reshard after forward.
         for name, child in model[i].named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
@@ -437,15 +437,15 @@ def setup_model(cfg: TrainingCfg) -> None:
         return
 
     if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
+        ModelClass = DeepSeekV2Stage
     elif module_config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
+        ModelClass = Qwen3MoeStage
     elif module_config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
+        ModelClass = GptOssStage
     elif module_config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen35MoeModel
+        ModelClass = Qwen35MoeTextStage
     elif module_config.model_type == "qwen3_5_text":
-        ModelClass = Qwen35Model
+        ModelClass = Qwen35TextStage
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 

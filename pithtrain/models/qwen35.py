@@ -9,15 +9,15 @@ from pithtrain.kernels import stage_compile_options
 from pithtrain.models.qwen35_moe import (
     Qwen35MoeAttention,
     Qwen35MoeGatedDeltaNet,
-    Qwen35MoeModel,
     Qwen35MoeRMSNorm,
     Qwen35MoeRotaryEmbedding,
+    Qwen35MoeTextStage,
 )
 from pithtrain.operators.cp_sequence import contiguous_to_zigzag, zigzag_to_contiguous
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.silu_mul import silu_mul
 
-__all__ = ["Qwen35Model", "Qwen35TextModel"]
+__all__ = ["Qwen35TextModel", "Qwen35TextStage"]
 
 
 class Qwen35MLP(nn.Module):
@@ -110,7 +110,7 @@ class Qwen35DecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen35Model(Qwen35MoeModel):
+class Qwen35TextStage(Qwen35MoeTextStage):
     """Reuse hybrid attention and pipeline plumbing; no routed or shared experts are created."""
 
     decoder_layer_class = Qwen35DecoderLayer

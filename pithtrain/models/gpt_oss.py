@@ -40,7 +40,7 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["GptOssExperts", "GptOssModel", "GptOssTopKRouter"]
+__all__ = ["GptOssExperts", "GptOssStage", "GptOssTopKRouter"]
 
 EDGE_LAYER_COST = 3.5
 """
@@ -472,11 +472,11 @@ class GptOssDecoderLayer(nn.Module):
         return hidden_states
 
 
-class GptOssModel(nn.Module):
+class GptOssStage(nn.Module):
     def __init__(self, config: GptOssConfig, phase: int):
         super().__init__()
         if distributed.cp_size > 1:
-            raise NotImplementedError("GptOssModel doesn't support context parallelism.")
+            raise NotImplementedError("GptOssStage doesn't support context parallelism.")
 
         match phase:
             case 0:

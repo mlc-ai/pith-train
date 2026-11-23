@@ -62,10 +62,12 @@ class LayerProtocol(Protocol):
     def reference_forward(self, hidden_states, rotary_posemb) -> Tensor: ...
 ```
 
-Stages 2 and 4 (dispatch/combine) are framework-owned. The layer doesn't implement them; it hands the scheduler the routing metadata (the `RoutingInfo` returned by `forward_stage1`) and the scheduler drives the all-to-alls. The model-level contract is just:
+Stages 2 and 4 (dispatch/combine) are framework-owned. The layer returns `RoutingInfo` from
+`forward_stage1`, and the scheduler drives the all-to-alls. One pipeline chunk implements the
+following interface.
 
 ```python
-class ModelProtocol(Protocol):
+class StageProtocol(Protocol):
     stage_index: int
     stage_count: int
     layers: Dict[str, LayerProtocol]
