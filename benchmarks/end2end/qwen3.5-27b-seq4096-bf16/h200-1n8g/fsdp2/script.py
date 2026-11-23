@@ -1,4 +1,9 @@
-"""Benchmark dense Qwen3.5 with FSDP2 on eight H200 GPUs."""
+"""
+Benchmark dense Qwen3.5 with FSDP2 on eight H200 GPUs.
+
+The recipe, not the framework, decides how to shard and recompute the model, as one plain function
+on PyTorch's public APIs.
+"""
 
 from __future__ import annotations
 
