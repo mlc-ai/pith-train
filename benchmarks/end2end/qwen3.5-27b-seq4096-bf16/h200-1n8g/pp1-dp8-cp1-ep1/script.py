@@ -45,14 +45,12 @@ def customize(model: nn.Module) -> None:
         else:
             layer.forward_stage3 = partial(selective_checkpoint, layer.forward_stage3)
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    # Two layers per FSDP group.
     for layers in batched(model.layers, 2):
         fully_shard(list(layers), mp_policy=mp, reshard_after_forward=True)
         layers[0].set_gradient_divide_factor(1.0)
     for module in (model.embed_tokens, model.lm_head):
         fully_shard(module, mp_policy=mp, reshard_after_forward=True)
         module.set_gradient_divide_factor(1.0)
-    # The root owns the final norm and drives FSDP's implicit prefetch.
     fully_shard(model, mp_policy=mp, reshard_after_forward=False)
     model.set_gradient_divide_factor(1.0)
 
