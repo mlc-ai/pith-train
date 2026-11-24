@@ -93,7 +93,7 @@ Record in a scratch doc (not a committed file): class names, attribute names, ex
 4. Checklist for the model class:
    - [ ] Layers built via `layer_partition(config.num_hidden_layers, stage_count, stage_index)` from `pithtrain/pipeline/dualpipev.py`
    - [ ] `forward` delegates to `model_forward(self, hidden_states, self.chunk_record, cu_seqlens)`; the engine records each stage into `self.chunk_record` (a `ChunkRecord` from `pithtrain/pipeline/execution.py`) for the pipeline backward, which the engine drives via `model_backward`.
-   - [ ] `forward_posemb`, `forward_prolog`, `forward_epilog`, and `reference_forward` implemented per `ModelProtocol`.
+   - [ ] `forward_posemb`, `forward_prolog`, `forward_epilog`, and `reference_forward` implemented per `StageProtocol`.
 
 **Gate:** file imports cleanly (`python -c "from pithtrain.models.<model> import <Model>"`).
 

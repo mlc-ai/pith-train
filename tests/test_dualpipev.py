@@ -18,11 +18,11 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
-from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
-from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
-from pithtrain.models.qwen35 import Qwen35Model
-from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
+from pithtrain.models.deepseek_v2 import DeepSeekV2MoEGate, DeepSeekV2Stage
+from pithtrain.models.gpt_oss import GptOssExperts, GptOssStage, GptOssTopKRouter
+from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeStage
+from pithtrain.models.qwen35 import Qwen35TextStage
+from pithtrain.models.qwen35_moe import Qwen35MoeTextStage, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.wgrad_accumulation import (
@@ -87,7 +87,7 @@ def records_empty(model: DualPipeV) -> bool:
     return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record))  # fmt: skip
 
 
-def reference_step(chunks, model: DeepSeekV2Model):
+def reference_step(chunks, model: DeepSeekV2Stage):
     outputs, losses = [], []
     for i, (micro_x, micro_labels, cu_seqlens) in enumerate(chunks):
         training.current_microbatch = i
@@ -303,20 +303,22 @@ def main(model_name: str):
         config = config.text_config
 
     if config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
+        ModelClass = DeepSeekV2Stage
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
+        ModelClass = Qwen3MoeStage
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
+        ModelClass = GptOssStage
         keep = min(config.num_hidden_layers, 8)
         if getattr(config, "layer_types", None) is not None:
             config.layer_types = config.layer_types[:keep]
         config.num_hidden_layers = keep
         config.vocab_size = 8192
     elif config.model_type in ("qwen3_5_moe_text", "qwen3_5_text"):
-        ModelClass = Qwen35MoeModel if config.model_type == "qwen3_5_moe_text" else Qwen35Model
+        ModelClass = (
+            Qwen35MoeTextStage if config.model_type == "qwen3_5_moe_text" else Qwen35TextStage
+        )
         keep = min(config.num_hidden_layers, 8)
         if getattr(config, "layer_types", None) is not None:
             config.layer_types = config.layer_types[:keep]

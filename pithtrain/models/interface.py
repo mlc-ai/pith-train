@@ -2,7 +2,7 @@ from typing import Dict, List, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
-__all__ = ["AllToAllSplits", "LayerProtocol", "MLPProtocol", "ModelProtocol", "RoutingInfo"]
+__all__ = ["AllToAllSplits", "LayerProtocol", "MLPProtocol", "RoutingInfo", "StageProtocol"]
 
 
 class AllToAllSplits(NamedTuple):
@@ -86,7 +86,7 @@ class LayerProtocol(Protocol):
         """
 
 
-class ModelProtocol(Protocol):
+class StageProtocol(Protocol):
     stage_index: int
     stage_count: int
     hidden_size: int

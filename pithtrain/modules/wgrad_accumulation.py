@@ -4,7 +4,7 @@ Weight-gradient accumulation into a layer-owned fp32 buffer.
 BF16Linear, GroupedLinear and FP8GroupedLinear add their weight gradient straight into the fp32
 main_grad buffer instead of writing a bf16 gradient per micro-batch that autograd then adds into the
 fp32 .grad of FSDP2: the GEMM accumulates in fp32, so no gradient of a micro-batch is rounded to
-bf16 and no bf16 temporary is allocated. setup_model enables it for every run, BF16 or FP8.
+bf16 and no bf16 temporary is allocated. setup_model enables it on FSDP parameter groups.
 
 install_wgrad_accumulation connects these layers to FSDP2 after fully_shard by extending two methods
 of each parameter group:
@@ -47,16 +47,19 @@ from pithtrain.operators.main_grad import MAIN_GRADS
 __all__ = ["install_raw_main_grad", "install_side_grads", "install_wgrad_accumulation"]
 
 
-def install_wgrad_accumulation(model: nn.Module) -> None:
+def install_wgrad_accumulation(model: nn.Module, *, overwrite: bool = False) -> None:
     """
-    Give every BF16Linear, GroupedLinear and FP8GroupedLinear weight in the model a main_grad,
-    after fully_shard.
+    Give each BF16Linear, GroupedLinear and FP8GroupedLinear weight managed by FSDP a main_grad.
     """
+    seen_groups = set()
     for module in model.modules():
         if not isinstance(module, FSDPModule):
             continue
         for group in fully_shard.state(module)._fsdp_param_groups:
             assert isinstance(group, FSDPParamGroup)
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
             pairs = []
             for fsdp_param in group.fsdp_params:
                 assert isinstance(fsdp_param, FSDPParam)
@@ -65,6 +68,10 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                     continue
                 if not isinstance(owner, (BF16Linear, GroupedLinear, FP8GroupedLinear)):
                     continue
+                if overwrite:
+                    if not isinstance(owner, BF16Linear):
+                        raise ValueError("Overwriting wgrad requires single-use BF16 linears")
+                    owner.overwrite_main_grad = True
                 size, device = fsdp_param._orig_size, fsdp_param.device
                 if isinstance(owner, FP8GroupedLinear):
                     # Laid out as the k-grouped FP8 wgrad accumulates in place (transposed where
@@ -75,10 +82,12 @@ def install_wgrad_accumulation(model: nn.Module) -> None:
                 owner.main_grad.untyped_storage().resize_(0)
                 pairs.append((fsdp_param, owner.main_grad))
             if pairs:
-                _attach_main_grads(group, pairs)
+                _attach_main_grads(group, pairs, overwrite=overwrite)
 
 
-def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]]) -> None:
+def _attach_main_grads(
+    group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch.Tensor]], *, overwrite: bool = False
+) -> None:
     """
     Make the group allocate main_grad at the start of backward and reduce it in place of a .grad.
     """
@@ -88,7 +97,8 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
         for _, main_grad in pairs:
             if main_grad.untyped_storage().size() == 0:
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
-                main_grad.zero_()
+                if not overwrite:
+                    main_grad.zero_()
         orig_pre_backward(*args)
 
     def post_backward(*args: Any) -> None:
@@ -102,7 +112,9 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
                 if param.grad is not None:
                     main_grad.add_(param.grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
-                # grad_dtype of the parameter is fp32 (the reduce dtype) or None, so it takes fp32.
+                # A precision ablation may round at reduce-scatter copy-in, after the FP32 GEMM.
+                if fsdp_param.unsharded_grad_dtype != torch.float32:
+                    param.grad_dtype = None
                 param.grad = main_grad.contiguous()
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.

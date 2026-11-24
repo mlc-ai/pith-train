@@ -30,7 +30,7 @@ from torch.autograd import Variable
 
 from pithtrain.contexts import distributed, training
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
+from pithtrain.models.interface import AllToAllSplits, LayerProtocol, RoutingInfo, StageProtocol
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
 
 __all__ = [
@@ -457,7 +457,7 @@ class PrologRecord:
     outs: Optional[PrologOuts] = None
 
 
-def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:  # fmt: skip
+def prolog_f(module: StageProtocol, hidden_states: torch.Tensor, record: PrologRecord) -> torch.Tensor:  # fmt: skip
     nvtx.range_push("prolog_f")
     hidden_states = module.forward_prolog(hidden_states)
     record.outs = PrologOuts(hidden_states)
@@ -465,7 +465,7 @@ def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: PrologR
     return hidden_states
 
 
-def prolog_b(module: ModelProtocol, record: PrologRecord, grad_tensors: tuple):
+def prolog_b(module: StageProtocol, record: PrologRecord, grad_tensors: tuple):
     nvtx.range_push("prolog_b")
 
     run_backward(record.outs, grad_tensors)
@@ -482,7 +482,7 @@ class EpilogRecord:
     args: Optional[EpilogArgs] = None
 
 
-def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor, record: EpilogRecord) -> torch.Tensor:  # fmt: skip
+def epilog_f(module: StageProtocol, hidden_states: torch.Tensor, record: EpilogRecord) -> torch.Tensor:  # fmt: skip
     """
     The loss backward fills the grad of the detached input saved in record, the gradient handed to
     the decoder layers.
@@ -703,7 +703,7 @@ def layer_backward(
 
 
 def model_forward(
-    module: ModelProtocol,
+    module: StageProtocol,
     hidden_states: torch.Tensor,
     chunk_record: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor] = None,
@@ -733,7 +733,7 @@ def model_forward(
 
 
 def model_backward(
-    module: ModelProtocol,
+    module: StageProtocol,
     output_grads: Optional[List[torch.Tensor]],
     loss: Optional[torch.Tensor],
     chunk_record: ChunkRecord,

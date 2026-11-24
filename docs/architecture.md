@@ -62,10 +62,12 @@ class LayerProtocol(Protocol):
     def reference_forward(self, hidden_states, rotary_posemb) -> Tensor: ...
 ```
 
-Stages 2 and 4 (dispatch/combine) are framework-owned. The layer doesn't implement them; it hands the scheduler the routing metadata (the `RoutingInfo` returned by `forward_stage1`) and the scheduler drives the all-to-alls. The model-level contract is just:
+Stages 2 and 4 (dispatch/combine) are framework-owned. The layer returns `RoutingInfo` from
+`forward_stage1`, and the scheduler drives the all-to-alls. One pipeline chunk implements the
+following interface.
 
 ```python
-class ModelProtocol(Protocol):
+class StageProtocol(Protocol):
     stage_index: int
     stage_count: int
     layers: Dict[str, LayerProtocol]
@@ -109,7 +111,7 @@ Each view puts its high-traffic axis innermost, so the CP group and the EP group
 
 Which rank reads which data is `dp_rank`, and only `dp_rank`. `ep_rank` names the experts a rank hosts and the all-to-all peers of that rank, and says nothing about data. The transition between the two regions costs no communication: the MoE layer flattens `(B, S, hidden)` into a batch of tokens and routes each one independently, so it does not care whether the tokens on a rank arrived by a batch split (DP) or a sequence split (CP).
 
-What FSDP shards over. There are two parameter classes. The **expt** parameters are the routed expert weights, unique per EP rank and replicated across the `dp` axis of the expert view, so FSDP shards them over that axis. The **attn** parameters are everything else (attention, router, shared experts, embeddings, `norm`, `lm_head`), replicated across the whole stage, so FSDP shards them over the flattened `dp x cp`. That is two `fully_shard` calls per layer, and the FSDP2 module walk stops at an already-sharded submodule, so the two parameter classes land in disjoint reduction groups. (That is `hsdp_replica=1`, the default. Above 1, both replica groups split into that many replicas, and FSDP shards within one and all-reduces across them; raise it when one replica already holds the model.) The per-parameter-class mesh selection is in `apply_fsdp` in `pithtrain/modules/training.py`.
+What FSDP shards over. There are two parameter classes. The **expt** parameters are the routed expert weights, unique per EP rank and replicated across the `dp` axis of the expert view, so FSDP shards them over that axis. The **attn** parameters are everything else (attention, router, shared experts, embeddings, `norm`, `lm_head`), replicated across the whole stage, so FSDP shards them over the flattened `dp x cp`. That is two `fully_shard` calls per layer, and the FSDP2 module walk stops at an already-sharded submodule, so the two parameter classes land in disjoint reduction groups. The per-parameter-class mesh selection is in `apply_fsdp` in `pithtrain/modules/training.py`.
 
 Gradients. The two classes reduce over groups of different size, yet either *sum* is already the true global gradient. The attn group is the whole stage. The expert replica group covers all the data too, because every member already receives the tokens of a whole EP group through the all-to-all. So `apply_fsdp` puts every parameter on a plain-sum reduction (`set_gradient_divide_factor(1.0)`), and the training step applies the one and only normalization, dividing by the global token count. An average, which is the FSDP2 default, would instead leave expert gradients `ep_size` times too large.
 

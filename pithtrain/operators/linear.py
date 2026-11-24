@@ -228,14 +228,20 @@ class FP8Linear(nn.Linear):
 
 # Inductor has no single-GEMM lowering for addmm with out_dtype, so the fused GEMM is its own op.
 wgrad_accumulate_library = torch.library.Library("pithtrain", "FRAGMENT")
-wgrad_accumulate_library.define("wgrad_accumulate_(Tensor(a!) main_grad, Tensor a, Tensor b) -> ()")
+wgrad_accumulate_library.define(
+    "wgrad_accumulate_(Tensor(a!) main_grad, Tensor a, Tensor b, bool overwrite=False) -> ()"
+)
 
 
-def wgrad_accumulate_cuda(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
-    torch.addmm(main_grad, a, b, out_dtype=torch.float32, out=main_grad)
+def wgrad_accumulate_cuda(
+    main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor, overwrite: bool = False
+) -> None:
+    torch.addmm(main_grad, a, b, beta=0 if overwrite else 1, out_dtype=torch.float32, out=main_grad)
 
 
-def wgrad_accumulate_meta(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+def wgrad_accumulate_meta(
+    main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor, overwrite: bool = False
+) -> None:
     return None
 
 
@@ -245,8 +251,10 @@ addmm_dtype_out_fallback = fallback_handler(torch.ops.aten.addmm.dtype_out, add_
 
 
 @register_lowering(torch.ops.pithtrain.wgrad_accumulate_.default, type_promotion_kind=None)
-def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any) -> None:
-    addmm_dtype_out_fallback(main_grad, a, b, torch.float32, beta=1, alpha=1, out=main_grad)
+def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any, overwrite: bool = False) -> None:
+    addmm_dtype_out_fallback(
+        main_grad, a, b, torch.float32, beta=0 if overwrite else 1, alpha=1, out=main_grad
+    )
 
 
 class BF16LinearFunc(torch.autograd.Function):
@@ -256,23 +264,27 @@ class BF16LinearFunc(torch.autograd.Function):
         input: torch.Tensor,
         weight: torch.Tensor,
         main_grad: torch.Tensor,
+        overwrite: bool,
     ) -> torch.Tensor:
         ctx.save_for_backward(input, weight)
         # Kept off the saved tensors: other micro-batches update main_grad in place meanwhile.
         ctx.main_grad = main_grad
+        ctx.overwrite = overwrite
         return F.linear(input, weight)
 
     @staticmethod
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, None, None]:
+    ) -> Tuple[torch.Tensor, None, None, None]:
         input, weight = ctx.saved_tensors
         main_grad = ctx.main_grad
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
         input_2d = input.reshape(-1, input.shape[-1])
         grad_input = (grad_output_2d @ weight).view(*input.shape)
-        torch.ops.pithtrain.wgrad_accumulate_(main_grad, grad_output_2d.t(), input_2d)
-        return grad_input, None, None
+        torch.ops.pithtrain.wgrad_accumulate_(
+            main_grad, grad_output_2d.t(), input_2d, ctx.overwrite
+        )
+        return grad_input, None, None, None
 
 
 class BF16Linear(nn.Linear):
@@ -281,6 +293,7 @@ class BF16Linear(nn.Linear):
     """
 
     main_grad: Optional[torch.Tensor] = None
+    overwrite_main_grad: bool = False
 
     @staticmethod
     def quantize_input(x: torch.Tensor) -> None:
@@ -289,5 +302,5 @@ class BF16Linear(nn.Linear):
     def forward(self, input: torch.Tensor, quantized_input: None = None) -> torch.Tensor:
         if self.main_grad is None or not torch.is_grad_enabled():
             return F.linear(input, self.weight, self.bias)
-        output = BF16LinearFunc.apply(input, self.weight, self.main_grad)
+        output = BF16LinearFunc.apply(input, self.weight, self.main_grad, self.overwrite_main_grad)
         return output if self.bias is None else output + self.bias

@@ -1,7 +1,7 @@
 """
 Static memory profiling: model parameters, FSDP sharding, and optimizer states.
 
-Replicates the layer distribution logic from Qwen3MoeModel and the FSDP sharding
+Replicates the layer distribution logic from Qwen3MoeStage and the FSDP sharding
 topology from apply_fsdp, without importing any PithTrain code.
 """
 

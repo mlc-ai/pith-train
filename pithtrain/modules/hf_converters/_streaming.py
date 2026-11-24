@@ -29,7 +29,7 @@ class CopyOp(NamedTuple):
 
 def generic_plan_param(
     local_fqn: str,
-    param: DTensor,
+    param: torch.Tensor,
     weight_map: Dict[str, str],
     named_modules: Dict[str, nn.Module],
     remap: Callable[[str], str] = lambda k: k,
@@ -38,12 +38,15 @@ def generic_plan_param(
     Plan a dense param, or a stacked-expert param whose HF checkpoint stores one tensor per expert
     (Qwen3, DeepSeek-V2). ``remap`` maps a canonical key to its HF key.
     """
-    local = param._local_tensor
     canon_keys = _expand_localized_fqn(local_fqn, named_modules)
     moe = find_moe(local_fqn, named_modules)
-    shard_dim = param.device_mesh.ndim - 1
-    dp_rank = param.device_mesh.get_local_rank(shard_dim)
-    dp_size = param.device_mesh.size(shard_dim)
+    if isinstance(param, DTensor):
+        local = param.detach().to_local()
+        shard_dim = param.device_mesh.ndim - 1
+        dp_rank = param.device_mesh.get_local_rank(shard_dim)
+        dp_size = param.device_mesh.size(shard_dim)
+    else:
+        local, dp_rank, dp_size = param.detach(), 0, 1
 
     if moe is None:
         (canon,) = canon_keys

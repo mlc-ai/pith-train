@@ -10,20 +10,19 @@ import numpy as np
 import torch
 import torch.distributed.fsdp
 import torch.nn as nn
-from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model
-from pithtrain.models.gpt_oss import GptOssModel
-from pithtrain.models.qwen3_moe import Qwen3MoeModel
-from pithtrain.models.qwen35 import Qwen35Model
-from pithtrain.models.qwen35_moe import Qwen35MoeModel
+from pithtrain.models.deepseek_v2 import DeepSeekV2Stage
+from pithtrain.models.gpt_oss import GptOssStage
+from pithtrain.models.qwen3_moe import Qwen3MoeStage
+from pithtrain.models.qwen35 import Qwen35TextModel, Qwen35TextStage
+from pithtrain.models.qwen35_moe import Qwen35MoeRotaryEmbedding, Qwen35MoeTextStage
 from pithtrain.modules import imbalance
 from pithtrain.modules.fp8_param_gather import (
     install_fp8_param_gather,
@@ -41,9 +40,8 @@ from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
 
-from .distributed import DistributedCfg
-
 __all__ = [
+    "Customize",
     "TrainingCfg",
     "is_muon_param",
     "make_muon_optimizer",
@@ -58,7 +56,9 @@ __all__ = [
     "setup_training",
 ]
 
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
+PIPELINE_STAGES = (DeepSeekV2Stage, GptOssStage, Qwen3MoeStage, Qwen35MoeTextStage, Qwen35TextStage)
+
+type Customize = Callable[[nn.Module], None]
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -170,6 +170,14 @@ class TrainingCfg(SlottedDefault):
     make_constant_scheduler or your own.
     """
 
+    customize: Customize | None = None
+    """
+    Transform the model in place before its weights are allocated, for example to add activation
+    checkpointing or to shard it with FSDP2. The model is on the meta device when this runs, so
+    the hook must not allocate or initialize weights. Weights are materialized and loaded after
+    it returns.
+    """
+
     model: Path
     """
     A HuggingFace model directory. Only its config.json is read; the weights come from the
@@ -253,7 +261,14 @@ class TrainingCfg(SlottedDefault):
     """
 
 
-def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed: int = 0) -> None:
+def init_weights(
+    model: nn.Module,
+    num_layers: int,
+    init_std: float = 0.02,
+    seed: int = 0,
+    *,
+    pipeline_chunks: bool = True,
+) -> None:
     """
     Initialize this rank's V-chunks (an nn.Sequential of two models) in place, before FSDP shards
     them. Every parameter of 2 or more dims draws from N(0, init_std), except o_proj and down_proj,
@@ -269,7 +284,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02, seed
     for chunk_name, param in model.named_parameters():
         if param.dim() < 2:
             continue
-        name = chunk_name.split(".", 1)[1]  # drop the V-chunk index
+        name = chunk_name.split(".", 1)[1] if pipeline_chunks else chunk_name
         std = output_std if "o_proj" in name or "down_proj" in name else init_std
         # Routed experts are stacked (local experts, ...), the local ones of this EP rank.
         if ".experts." in name and param.dim() == 3:
@@ -288,31 +303,14 @@ def weight_generator(seed: int, name: str, device: torch.device, *index: int) ->
     return torch.Generator(device=device).manual_seed(int(state))
 
 
-def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
-    """
-    The (replica, shard) layout FSDP2 reads as replicate-then-shard; each shard group is a
-    contiguous block of the mesh.
-    """
-    size = mesh.size()
-    assert size % hsdp_replica == 0, f"{size=} not divisible by {hsdp_replica=}"
-    return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
-
-
-def apply_fsdp(model, hsdp_replica: int = 1):
+def apply_fsdp(model):
     """
     Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
     gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
     """
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
-    if hsdp_replica > 1:
-        # A separate name: _unflatten takes the flattened dim away from its mesh, and setup_model
-        # reads the default flattening for the load-balance group.
-        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten("hsdp_stage")
-        attn_fsdp_mesh = split_replicas(attn_fsdp_mesh, hsdp_replica)
-        expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
-    else:
-        attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
+    attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
     mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
@@ -323,7 +321,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
     # the expert parameters stay out of the layer's group.
     for i in range(2):
-        assert isinstance(model[i], PIPELINE_STAGE_MODELS)
+        assert isinstance(model[i], PIPELINE_STAGES)
         # Embeddings, final norm and LM head run once per step, so they reshard after forward.
         for name, child in model[i].named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
@@ -358,10 +356,29 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
-def setup_model(
-    cfg: TrainingCfg,
-    distributed_cfg: DistributedCfg,
-) -> None:
+@torch.no_grad()
+def init_dense_weights(model: Qwen35TextModel, module_config, cfg: TrainingCfg) -> None:
+    """
+    Copy the local slices of the original CPU initialization into the prepared model. Drawing
+    the full tensors preserves the seeded values, including the constructor's 1D parameters.
+    """
+    initial = Qwen35TextModel(module_config)
+    init_weights(
+        initial, module_config.num_hidden_layers, cfg.init_std, cfg.seed, pipeline_chunks=False
+    )
+    weights = dict(initial.named_parameters())
+    for name, param in model.named_parameters():
+        weight = weights[name]
+        if isinstance(param, DTensor):
+            shard = distribute_tensor(
+                weight, param.device_mesh, param.placements, src_data_rank=None
+            )
+            param.to_local().copy_(shard.to_local())
+        else:
+            param.copy_(weight)
+
+
+def setup_model(cfg: TrainingCfg) -> None:
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
@@ -384,16 +401,50 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
+    if cfg.customize is not None:
+        if module_config.model_type != "qwen3_5_text" or cfg.fp8 or cfg.moe_load_balance_coef:
+            raise ValueError("Direct dense training requires BF16 dense Qwen3.5")
+        if (distributed.pp_size, distributed.cp_size, distributed.ep_size) != (1, 1, 1):
+            raise ValueError("Direct dense training requires PP, CP and EP all 1")
+        # The HF loader fills every parameter shard when there is no resumable DCP location.
+        from_hf = cfg.hf_import_path is not None and cfg.save_location is None
+        with torch.device("meta"):
+            model = Qwen35TextModel(module_config)
+        if any(param.dtype != torch.float32 for param in model.parameters()):
+            raise ValueError("Dense BF16 training requires FP32 master parameters")
+        cfg.customize(model)
+        if distributed.dp_size > 1 and not isinstance(model, FSDPModule):
+            raise ValueError(
+                f"customize must fully_shard the root model or gradients will not be "
+                f"reduced across the {distributed.dp_size} data-parallel ranks"
+            )
+        if any(
+            isinstance(param, DTensor)
+            and (param.device_mesh.ndim != 1 or param.device_mesh.size() != distributed.dp_size)
+            for param in model.parameters()
+        ):
+            raise ValueError(
+                f"customize requires a 1-D mesh spanning all {distributed.dp_size} "
+                "data-parallel ranks. HSDP and other mesh layouts are unsupported."
+            )
+        model.to_empty(device=distributed.device)
+        model.rotary_emb = Qwen35MoeRotaryEmbedding(module_config).to(distributed.device)
+        if not from_hf:
+            init_dense_weights(model, module_config, cfg)
+        install_wgrad_accumulation(model, overwrite=True)
+        training.model = model
+        return
+
     if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
+        ModelClass = DeepSeekV2Stage
     elif module_config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
+        ModelClass = Qwen3MoeStage
     elif module_config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
+        ModelClass = GptOssStage
     elif module_config.model_type == "qwen3_5_moe_text":
-        ModelClass = Qwen35MoeModel
+        ModelClass = Qwen35MoeTextStage
     elif module_config.model_type == "qwen3_5_text":
-        ModelClass = Qwen35Model
+        ModelClass = Qwen35TextStage
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
@@ -402,7 +453,7 @@ def setup_model(
 
     modules = nn.Sequential(*modules)
     init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
-    apply_fsdp(modules, distributed_cfg.hsdp_replica)
+    apply_fsdp(modules)
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
     install_side_grads(modules)  # after the main_grad installs: its post_backward runs first
@@ -414,8 +465,7 @@ def setup_model(
     local_seq_len = cfg.sequence_length // cp_size
 
     if cfg.moe_load_balance_coef > 0:
-        # With hsdp_replica 1 this reuses the flat dp x cp mesh apply_fsdp built,
-        # adding no communicator.
+        # Reuse the flat dp x cp mesh apply_fsdp built.
         lb_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
         for i in range(2):
             for layer in modules[i].layers.values():
@@ -542,6 +592,6 @@ def setup_training(cfg: object) -> None:
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, cfg.distributed)
+    setup_model(cfg.training)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)

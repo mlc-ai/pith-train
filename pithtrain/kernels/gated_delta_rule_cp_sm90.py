@@ -30,7 +30,7 @@ from flash_attn.cute.ampere_helpers import gemm, get_smem_layout_atom
 
 from pithtrain.kernels.cute_compile_sm90 import fake, fake_stream
 from pithtrain.kernels.gated_delta_rule_pinned_bwd_sm90 import bwd_prologue, chunk_gradients, state_final, state_gradient, state_gradient_initial, state_recompute
-from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import BT, HEAD_DIM, copy_rows, operand_copies, state_output, wy_representation
+from pithtrain.kernels.gated_delta_rule_pinned_fwd_sm90 import CHUNK_ROWS as BT, HEAD_DIM, copy_gdr_rows, make_gdr_mma_copies, compute_gdr_state_output, compute_gdr_wy
 
 __all__ = ["StateMerge", "TransitionChain", "gdr_cp_bwd_local_sm90", "gdr_cp_bwd_output_sm90", "gdr_cp_bwd_states_sm90", "gdr_cp_fwd_local_sm90", "gdr_cp_fwd_output_sm90", "gdr_cp_merge_sm90", "gated_delta_rule_cp_supported_sm90"]
 
@@ -125,7 +125,7 @@ class TransitionChain:
             cute.arch.cp_async_commit_group()
 
         thr, thr_tf32 = mma.get_slice(tidx), mma_tf32.get_slice(tidx)
-        _, _, ldt_A, ldt_B, _, _, _ = operand_copies(mma, tidx)
+        _, _, ldt_A, ldt_B, _, _, _ = make_gdr_mma_copies(mma, tidx)
         c_coords = thr.partition_C(cute.make_identity_tensor((HEAD_DIM, HEAD_DIM // 2)))
         acc_m = cute.make_rmem_tensor(thr_tf32.partition_shape_C((HEAD_DIM, CHAIN_BV)), Float32)
         for step in cutlass.range(num_chunks, unroll=1):
@@ -188,8 +188,8 @@ class TransitionChain:
         if const_expr(self.ragged):
             T = mGcum.shape[0]
             valid = T - chunk * BT
-            copy_rows(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage], rows_wide, valid, True)
-            copy_rows(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage], rows_wide, valid, True)
+            copy_gdr_rows(load, t_k_src[None, None, None, chunk], t_k_dst[None, None, None, stage], rows_wide, valid, True)
+            copy_gdr_rows(load, t_w_src[None, None, None, chunk], t_w_dst[None, None, None, stage], rows_wide, valid, True)
             if tidx < BT:
                 if tidx < valid:
                     cute.copy(load_gate, t_g_src[None, None, chunk], t_g_dst[None, None, stage])
@@ -325,7 +325,7 @@ def gdr_cp_fwd_local_sm90(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, bet
     """
     _, T, H, _ = k.shape
     HV = v.shape[2]
-    g_cum, A, w, u = wy_representation(k, v, g, beta)
+    g_cum, A, w, u = compute_gdr_wy(k, v, g, beta)
     hm = torch.empty(HV, HEAD_DIM, 2 * HEAD_DIM, device=k.device, dtype=torch.float32)
     if transition:
         state_final(k, w, u, g_cum, hm[:, :, :HEAD_DIM])
@@ -349,7 +349,7 @@ def gdr_cp_fwd_output_sm90(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, u:
     """
     o from ChunkStateOutput starting at h0, fp32 (HV, K, V), or at zero when h0 is None.
     """
-    return state_output(q, k, w, u, g_cum, h0)
+    return compute_gdr_state_output(q, k, w, u, g_cum, h0)
 
 
 def gdr_cp_bwd_local_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g_cum: torch.Tensor, beta: torch.Tensor, A: torch.Tensor, do: torch.Tensor, transition: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -29,7 +29,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from pithtrain.contexts import distributed, training
 from pithtrain.contexts.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.contexts.weight_grad_store import WeightGradStore
-from pithtrain.models.interface import ModelProtocol
+from pithtrain.models.interface import StageProtocol
 from pithtrain.pipeline.execution import (
     ChunkRecord,
     ExecutionCtx,
@@ -681,13 +681,13 @@ class DualPipeV(nn.Module):
 
 
 def overlapped_forward_backward(
-    module0: ModelProtocol,
+    module0: StageProtocol,
     inputs0: List[torch.Tensor],
     objective0: Optional[Callable],
     objective_inputs0: Optional[Tuple[torch.Tensor, ...]],
     chunk_record0: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor],
-    module1: ModelProtocol,
+    module1: StageProtocol,
     loss1: Optional[torch.Tensor],
     outputs1: Optional[List[torch.Tensor]],
     output_grads1: Optional[List[torch.Tensor]],

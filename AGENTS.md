@@ -113,7 +113,7 @@ Key files:
 
 **MoE parallel folding** ([arXiv:2504.14960](https://arxiv.org/abs/2504.14960) section 3.2): attention and the experts get independent parallelism over the same ranks. `setup_device_mesh` builds two device meshes, `attn_mesh` as `(pp, dp, cp)` and `expt_mesh` as `(pp, dp, ep)`, which factor the `world_size // pp` ranks of one pipeline stage two different ways, so `dp * cp == ep * expt_dp == world_size // pp`. PP is the one axis the two views share, and it stays outermost in each. PP/CP/EP are configured through `DistributedCfg`; both DP degrees are derived.
 
-Properties worth remembering: `cp` and `ep` each need only divide the stage size, not each other, so EP may span CP; both the CP group and the EP group are contiguous rank blocks, so each stays on NVLink independently; and **`dp_rank` alone decides which data a rank loads**, while `ep_rank` names only the experts a rank hosts. FSDP shards the expert parameters (the routed expert weights) over `expt_mesh["dp"]` and the attention parameters (everything else) over the flattened `attn_mesh["dp", "cp"]`, with a plain-sum gradient reduction on both, so the single divide by the global token count in the training step is the only normalization. `DistributedCfg.hsdp_replica` above 1 splits both of those groups into that many replicas, sharding within one and all-reducing across them. A process group is published only for axes that a collective runs over directly (`pp`, `cp`, `ep`); both `dp` axes reduce through FSDP, which takes a mesh.
+Properties worth remembering: `cp` and `ep` each need only divide the stage size, not each other, so EP may span CP; both the CP group and the EP group are contiguous rank blocks, so each stays on NVLink independently; and **`dp_rank` alone decides which data a rank loads**, while `ep_rank` names only the experts a rank hosts. FSDP shards the expert parameters (the routed expert weights) over `expt_mesh["dp"]` and the attention parameters (everything else) over the flattened `attn_mesh["dp", "cp"]`, with a plain-sum gradient reduction on both, so the single divide by the global token count in the training step is the only normalization. A process group is published only for axes that a collective runs over directly (`pp`, `cp`, `ep`); both `dp` axes reduce through FSDP, which takes a mesh.
 
 `setup_default_process_group` also installs a fail-fast excepthook and passes `DistributedCfg.timeout` (default 15 min) as the collective timeout, so a failed rank does not make peers wait. Both belong to creating the world, so a process that inherits one from its host keeps whatever that host chose.
 
@@ -121,9 +121,12 @@ Properties worth remembering: `cp` and `ep` each need only divide the stage size
 
 Replayed routes follow the loader's zigzag order. Each linear-attention layer converts them to contiguous order through `Qwen35MoeDecoderLayer.resolve_replay`.
 
-### Model Layer Protocol (`pithtrain/models/interface.py`)
+### Pipeline Stage and Layer Protocols (`pithtrain/models/interface.py`)
 
-Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+Each DualPipeV chunk implements `StageProtocol`. Its layers expose `forward_stage1`, `forward_stage3`,
+and `forward_stage5`. The `Stage` suffix names one pipeline chunk, and `Model` names a whole model.
+Supported models include DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), and
+GPT-OSS 20B/120B (`gpt_oss.py`).
 
 ### Tensor Layouts & Sequence Packing
 

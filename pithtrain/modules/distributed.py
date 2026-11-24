@@ -48,16 +48,6 @@ class DistributedCfg(SlottedDefault):
     Timeout of every collective, passed to init_process_group.
     """
 
-    hsdp_replica: int = 1
-    """
-    Number of replicas each FSDP shard group is split into.
-
-    At 1, FSDP shards the attention parameters over the dp x cp stage and the expert parameters
-    over the dp axis of the expert view. Above 1, both groups split into this many replicas (both
-    must divide by it): FSDP shards within one replica and all-reduces across them, trading memory
-    for a cheaper gradient reduction.
-    """
-
 
 def setup_torch_runtime() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
