@@ -115,7 +115,12 @@ class ModelProtocol(Protocol):
     its checkpoint key, but the epilog runs it, after the decoder layers.
     """
 
-    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
+    def reference_forward(
+        self,
+        hidden_states: torch.Tensor,
+        next_tokens: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]: ...
 
     def forward_posemb(
         self, S: int, cu_seqlens: Optional[torch.Tensor] = None
@@ -142,7 +147,7 @@ class ModelProtocol(Protocol):
         """
         With an mtp_layer: the final norm of the trunk hidden states, and the input of the MTP
         layer built from them and the next tokens. The MTP layer gets no gradient path into the
-        trunk, the embedding or the head (DeepSeek-V3's detached heads).
+        trunk, the embedding or the head (Megatron's mtp_detach_heads).
         """
 
     def forward_mtp_heads(

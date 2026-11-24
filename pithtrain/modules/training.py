@@ -425,9 +425,9 @@ def setup_model(
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
         modules[1].rotary_emb = modules[0].rotary_emb
-        # The MTP layer of the last stage embeds the next tokens with the first stage's embedding.
-        if modules[1].mtp_layer is not None:
-            modules[1].mtp_embed = modules[0].forward_prolog
+    # The MTP layer of the last stage embeds the next tokens with the first stage's embedding.
+    if modules[1].mtp_layer is not None:
+        modules[1].mtp_embed = modules[0].forward_prolog
 
     local_seq_len = cfg.sequence_length // cp_size
 

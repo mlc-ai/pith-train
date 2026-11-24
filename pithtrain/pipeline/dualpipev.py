@@ -115,7 +115,7 @@ class Microbatch:
     """
     One micro-batch of work for DualPipeV.step. Every pipeline rank gets the same list, so each
     sizes its receive buffers and reads cu_seqlens without a broadcast; only the first rank uses the
-    values of model_inputs and objective_inputs.
+    values of model_inputs, objective_inputs and epilog_inputs.
     """
 
     model_inputs: Tuple[torch.Tensor, ...]

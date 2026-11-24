@@ -71,7 +71,9 @@ def criterion(outputs, targets) -> torch.Tensor:
     The MSE of each output against its target, summed: one pair, or two with an MTP layer.
     """
     if isinstance(outputs, torch.Tensor):
-        outputs, targets = (outputs,), (targets,)
+        outputs = (outputs,)
+    if isinstance(targets, torch.Tensor):
+        targets = (targets,)
     assert len(outputs) == len(targets)
     losses = [F.mse_loss(output.float(), target.float()) for output, target in zip(outputs, targets)]  # fmt: skip
     return sum(losses).clone()
