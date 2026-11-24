@@ -39,7 +39,7 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["DeepSeekV2MoEGate", "DeepSeekV2Model"]
+__all__ = ["DeepSeekV2DecoderLayer", "DeepSeekV2MoE", "DeepSeekV2MoEGate", "DeepSeekV2Model"]
 
 
 class DeepSeekV2RotaryEmbedding(nn.Module):

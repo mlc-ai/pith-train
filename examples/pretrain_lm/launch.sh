@@ -3,7 +3,7 @@
 #
 # Every example pretrains at 4K context, sized for 8x H200 nodes.
 #
-# Usage (one node: gpt-oss-20b, qwen3-30b-a3b, qwen3.5-35b-a3b):
+# Usage (one node: gpt-oss-20b, qwen3-30b-a3b, qwen3.5-35b-a3b, glm-4.7-flash):
 #   bash examples/pretrain_lm/launch.sh qwen3-30b-a3b
 #   bash examples/pretrain_lm/launch.sh qwen3.5-35b-a3b
 #

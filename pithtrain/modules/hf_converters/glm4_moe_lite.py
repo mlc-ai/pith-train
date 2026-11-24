@@ -15,7 +15,8 @@ from typing import Dict
 
 import torch
 
-_LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
+# hf_loader strips the ``model.`` prefix from every HF key.
+_LAYER_KEY = re.compile(r"^layers\.(\d+)\.")
 
 
 class Glm4MoeLiteConverter:

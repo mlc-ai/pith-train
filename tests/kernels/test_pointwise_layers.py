@@ -40,9 +40,9 @@ def model_config(name: str):
 
 
 def family(config) -> str:
-    return {"deepseek_v2": "deepseek_v2", "qwen3_moe": "qwen3_moe", "gpt_oss": "gpt_oss"}.get(
-        config.model_type, "qwen35"
-    )
+    # GLM-4.7-Flash is DeepSeek-V2's decoder with another router (make_gate, weights_of).
+    families = {"deepseek_v2": "deepseek_v2", "glm4_moe_lite": "deepseek_v2", "qwen3_moe": "qwen3_moe", "gpt_oss": "gpt_oss"}  # fmt: skip
+    return families.get(config.model_type, "qwen35")
 
 
 def compiled(fn):
@@ -215,6 +215,8 @@ def test_rope(case: dict) -> None:
 
 def make_gate(config) -> nn.Module:
     match family(config):
+        case "deepseek_v2" if config.model_type == "glm4_moe_lite":
+            from pithtrain.models.glm4_moe_lite import Glm4MoeLiteTopkRouter as Gate
         case "deepseek_v2":
             from pithtrain.models.deepseek_v2 import DeepSeekV2MoEGate as Gate
         case "qwen3_moe":
@@ -242,6 +244,13 @@ def weights_of(config, logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     match family(config):
         case "gpt_oss":
             return logits.gather(-1, idx).softmax(-1)
+        case "deepseek_v2" if config.model_type == "glm4_moe_lite":
+            # The correction bias (zero here) steers the choice only; the weights are the sigmoid
+            # scores of the chosen experts, normalized.
+            weights = logits.sigmoid().gather(-1, idx)
+            if config.norm_topk_prob:
+                weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+            return weights * config.routed_scaling_factor
         case "deepseek_v2":
             assert config.topk_method == "greedy"
             return logits.softmax(-1).gather(-1, idx) * config.routed_scaling_factor

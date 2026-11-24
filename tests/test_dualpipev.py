@@ -26,6 +26,7 @@ from pithtrain.models.qwen35 import Qwen35Model
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.training import frozen_param_dtype
 from pithtrain.modules.wgrad_accumulation import (
     install_raw_main_grad,
     install_side_grads,
@@ -208,6 +209,14 @@ def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
     return result
 
 
+def keep_frozen_fp32(module: nn.Module) -> None:
+    # As in training, a frozen parameter (GLM-4.7's correction bias) stays fp32 under the cast
+    # and in the forward (frozen_param_dtype); both copies read the same values.
+    for param in module.parameters():
+        if not param.requires_grad:
+            param.data = param.data.float()
+
+
 def apply_fsdp(model, dtype):
     # Mirrors modules.training.apply_fsdp: expert parameters shard over the dp axis of the expert
     # view, attention parameters over the flattened dp x cp stage of the attention view.
@@ -218,6 +227,7 @@ def apply_fsdp(model, dtype):
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
+        param_dtype_override_fn=frozen_param_dtype,
     )
     # FSDP recommends sharding from the bottom up.
     for i in range(2):
@@ -391,6 +401,7 @@ def main(model_name: str):
     distributed.cp_rank = 0
     full_modules = ModelClass(config, phase=-1)
     full_modules.to(dtype=dtype)
+    keep_frozen_fp32(full_modules)
     full_modules.apply(fill_weights)
 
     if distributed.rank == 0:
@@ -439,6 +450,7 @@ def main(model_name: str):
 
     local_modules = nn.Sequential(*local_modules)
     local_modules.to(dtype=dtype)
+    keep_frozen_fp32(local_modules)
     local_modules[0].load_state_dict(local_full_modules[0].state_dict())
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
     local_modules.zero_grad()

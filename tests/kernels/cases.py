@@ -128,9 +128,15 @@ def deepseek_v2(cfg: dict) -> dict:
     )
     L, dense = cfg["num_hidden_layers"], cfg["first_k_dense_replace"]
     shared = cfg["n_shared_experts"] * cfg["moe_intermediate_size"]
-    assert cfg.get("q_lora_rank") is None, "q_lora_rank adds q_a / q_b projections"
-    projections = (
-        Projection("q_proj", heads * (nope + rope), H, L),
+    q_lora = cfg.get("q_lora_rank")
+    if q_lora is None:
+        q_projections = (Projection("q_proj", heads * (nope + rope), H, L),)
+    else:  # GLM-4.7-Flash: the query through a low-rank pair
+        q_projections = (
+            Projection("q_a_proj", q_lora, H, L),
+            Projection("q_b_proj", heads * (nope + rope), q_lora, L),
+        )
+    projections = q_projections + (
         Projection("kv_a_proj_with_mqa", lora + rope, H, L),
         Projection("kv_b_proj", heads * (nope + vdim), lora, L),
         Projection("o_proj", H, heads * vdim, L),
@@ -293,6 +299,7 @@ def qwen3_5(cfg: dict, moe: bool) -> dict:
 
 EXTRACTORS = {
     "deepseek_v2": deepseek_v2,
+    "glm4_moe_lite": deepseek_v2,  # DeepSeek-V2's decoder with another router
     "qwen3_moe": qwen3_moe,
     "gpt_oss": gpt_oss,
     "qwen3_5_moe_text": lambda cfg: qwen3_5(cfg, moe=True),
@@ -690,7 +697,7 @@ def swiglu_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
         for mesh in meshes:
             T = mesh.tokens_per_gpu
             # DeepSeekV2MLP runs the fused FP8 operator
-            make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type == "deepseek_v2"), weight=dict(layers=layers))  # fmt: skip
+            make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type in ("deepseek_v2", "glm4_moe_lite")), weight=dict(layers=layers))  # fmt: skip
             collect.add(f"{name}-M{k(T)}", mesh, make)
     return collect.cases
 

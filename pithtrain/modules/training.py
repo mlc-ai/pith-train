@@ -180,8 +180,8 @@ class TrainingCfg(SlottedDefault):
     hf_import_path: Optional[Path] = None
     """
     A HuggingFace safetensors directory to stream the initial weights from. Used only when
-    save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS (MXFP4) and
-    Qwen3.5 dense/MoE.
+    save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS (MXFP4), Qwen3.5
+    dense/MoE and GLM-4.7-Flash.
     """
 
     save_interval: Optional[int] = None

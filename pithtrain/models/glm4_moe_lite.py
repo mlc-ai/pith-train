@@ -43,9 +43,9 @@ class Glm4MoeLiteTopkRouter(nn.Module):
         self.router_replay = None
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)  # fmt: skip
         # A buffer in HF, updated there by its own bias schedule and frozen at inference. A
-        # parameter here, so the checkpoint, the HF import and the weight sync carry it; frozen,
-        # as Megatron trains this model with a bias update rate of 0, and read in fp32 like HF's
-        # (apply_fsdp keeps a frozen parameter in its stored dtype).
+        # parameter here, so the checkpoint and the HF import carry it; frozen, as there is no
+        # bias schedule here (slime's GLM recipes set Megatron's update rate to 0), and read in
+        # fp32 like HF's (apply_fsdp keeps a frozen parameter in its stored dtype).
         self.e_score_correction_bias = nn.Parameter(torch.zeros(self.n_routed_experts), requires_grad=False)  # fmt: skip
 
     def forward(
