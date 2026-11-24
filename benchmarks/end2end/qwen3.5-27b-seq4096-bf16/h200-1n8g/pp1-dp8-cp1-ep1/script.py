@@ -18,10 +18,10 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 def customize(model: nn.Module) -> None:
     """
     Recompute: selective activation checkpointing saves the matmul, Gated DeltaNet and FA4 forward
-    outputs. The first 52 of 64 blocks replay the rest of each block, the fewest that fit in
+    outputs. The first 52 of 64 layers replay the rest of each layer, the fewest that fit in
     memory; the last 12 replay only the MLP.
 
-    Sharding: FSDP2 over all data-parallel ranks, in groups of two decoder blocks plus the
+    Sharding: FSDP2 over all data-parallel ranks, in groups of two decoder layers plus the
     embedding, the LM head and the root, with BF16 parameters and FP32 gradient reduction. The
     gradient divide factor is 1.0 because the training step normalizes by the global token count.
     """
@@ -45,10 +45,10 @@ def customize(model: nn.Module) -> None:
         else:
             layer.forward_stage3 = partial(selective_checkpoint, layer.forward_stage3)
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    # Shard two blocks per FSDP group: half the collectives of per-block groups, two blocks live.
-    for blocks in batched(model.layers, 2):
-        fully_shard(list(blocks), mp_policy=mp, reshard_after_forward=True)
-        blocks[0].set_gradient_divide_factor(1.0)
+    # Two layers per FSDP group.
+    for layers in batched(model.layers, 2):
+        fully_shard(list(layers), mp_policy=mp, reshard_after_forward=True)
+        layers[0].set_gradient_divide_factor(1.0)
     for module in (model.embed_tokens, model.lm_head):
         fully_shard(module, mp_policy=mp, reshard_after_forward=True)
         module.set_gradient_divide_factor(1.0)
