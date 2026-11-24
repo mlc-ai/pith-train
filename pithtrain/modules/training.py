@@ -172,11 +172,10 @@ class TrainingCfg(SlottedDefault):
 
     customize: Customize | None = None
     """
-    Customize the dense model in place before its weights are allocated. The hook may wrap layer
-    forwards for recompute and must not allocate weights. Use FSDP2 on a 1-D mesh spanning the
-    data-parallel ranks and call fully_shard on the root last. With a single data-parallel rank,
-    the hook may leave the model unsharded. FP32 weight-gradient buffers are installed only for
-    FSDP parameter groups.
+    Transform the model in place before its weights are allocated, for example to add activation
+    checkpointing or to shard it with FSDP2. The model is on the meta device when this runs, so
+    the hook must not allocate or initialize weights. Weights are materialized and loaded after
+    it returns.
     """
 
     model: Path
