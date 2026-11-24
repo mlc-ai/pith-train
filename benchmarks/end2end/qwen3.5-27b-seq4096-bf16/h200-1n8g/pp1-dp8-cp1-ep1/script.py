@@ -48,7 +48,6 @@ def customize(model: nn.Module) -> None:
     # Shard two blocks per FSDP group: half the collectives of per-block groups, two blocks live.
     for blocks in batched(model.layers, 2):
         fully_shard(list(blocks), mp_policy=mp, reshard_after_forward=True)
-        # Both blocks share one FSDP group, so setting the factor on the first covers the pair.
         blocks[0].set_gradient_divide_factor(1.0)
     for module in (model.embed_tokens, model.lm_head):
         fully_shard(module, mp_policy=mp, reshard_after_forward=True)
