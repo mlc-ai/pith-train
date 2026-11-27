@@ -18,13 +18,14 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
+from pithtrain.models.glm4_moe_lite import Glm4MoeLiteModel, Glm4MoeLiteTopkRouter
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35 import Qwen35Model
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.training import frozen_param_dtype
 from pithtrain.modules.wgrad_accumulation import (
     install_raw_main_grad,
     install_side_grads,
@@ -47,12 +48,14 @@ def fill_weights(module: nn.Module):
         # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
-    elif isinstance(
-        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
-    ):
+    elif isinstance(module, (Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
+    elif isinstance(module, Glm4MoeLiteTopkRouter):
+        nn.init.xavier_uniform_(module.weight, gain=1.0)
+        # Non-zero, so the choice of experts departs from the plain top-k of the scores.
+        nn.init.normal_(module.e_score_correction_bias, std=0.1)
     elif isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -63,19 +66,24 @@ def calculate_difference(x: torch.Tensor, y: torch.Tensor) -> float:
     return cos_diff
 
 
-def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    output = output.to(torch.float32)
-    target = target.to(torch.float32)
-    return F.mse_loss(output, target).clone()
+def criterion(outputs, targets) -> torch.Tensor:
+    """
+    The MSE of each output against its target, summed: one pair, or two with an MTP layer.
+    """
+    if isinstance(outputs, torch.Tensor):
+        outputs = (outputs,)
+    if isinstance(targets, torch.Tensor):
+        targets = (targets,)
+    assert len(outputs) == len(targets)
+    losses = [F.mse_loss(output.float(), target.float()) for output, target in zip(outputs, targets)]  # fmt: skip
+    return sum(losses).clone()
 
 
 def objective(
     model_outputs: Tuple[torch.Tensor, ...],
     objective_inputs: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    (output,) = model_outputs
-    (target,) = objective_inputs
-    loss = criterion(output, target)
+    loss = criterion(model_outputs, objective_inputs)
     return loss, loss.detach()
 
 
@@ -83,15 +91,19 @@ def records_empty(model: DualPipeV) -> bool:
     records = []
     for chunk in model.chunk_records[0] + model.chunk_records[1]:
         records += [chunk.prolog, chunk.epilog]
-        records += [getattr(layer, field.name) for layer in chunk.layers for field in fields(layer)]
-    return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record))  # fmt: skip
+        layers = list(chunk.layers)
+        if chunk.epilog is not None and chunk.epilog.mtp is not None:
+            layers.append(chunk.epilog.mtp)
+        records += [getattr(layer, field.name) for layer in layers for field in fields(layer)]
+    # The MTP layer's records are checked through the stage records above.
+    return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record) if field.name != "mtp")  # fmt: skip
 
 
-def reference_step(chunks, model: DeepSeekV2Model):
+def reference_step(chunks, model: nn.Module):
     outputs, losses = [], []
     for i, (micro_x, micro_labels, cu_seqlens) in enumerate(chunks):
         training.current_microbatch = i
-        micro_y = model.reference_forward(micro_x, cu_seqlens)
+        micro_y = model.reference_forward(*micro_x, cu_seqlens=cu_seqlens)
         loss = criterion(micro_y, micro_labels)
         loss.backward()
         outputs.append(micro_y)
@@ -203,6 +215,14 @@ def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
     return result
 
 
+def keep_frozen_fp32(module: nn.Module) -> None:
+    # As in training, a frozen parameter (GLM-4.7's correction bias) stays fp32 under the cast
+    # and in the forward (frozen_param_dtype); both copies read the same values.
+    for param in module.parameters():
+        if not param.requires_grad:
+            param.data = param.data.float()
+
+
 def apply_fsdp(model, dtype):
     # Mirrors modules.training.apply_fsdp: expert parameters shard over the dp axis of the expert
     # view, attention parameters over the flattened dp x cp stage of the attention view.
@@ -213,6 +233,7 @@ def apply_fsdp(model, dtype):
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
+        param_dtype_override_fn=frozen_param_dtype,
     )
     # FSDP recommends sharding from the bottom up.
     for i in range(2):
@@ -250,6 +271,10 @@ def apply_fsdp(model, dtype):
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
+        if model[i].mtp_layer is not None:
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_input")  # fmt: skip
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_norm")  # fmt: skip
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].lm_head, "forward_shared")  # fmt: skip
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
     # Plain-sum reduction, as in modules.training.apply_fsdp.
     for module in model.modules():
@@ -302,10 +327,7 @@ def main(model_name: str):
     if config.model_type in ("qwen3_5", "qwen3_5_moe"):
         config = config.text_config
 
-    if config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
-        config.num_hidden_layers = min(config.num_hidden_layers, 8)
-    elif config.model_type == "qwen3_moe":
+    if config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
@@ -324,8 +346,14 @@ def main(model_name: str):
         if config.model_type == "qwen3_5_moe_text":
             config.num_experts = 32
         config.vocab_size = 8192
+    elif config.model_type == "glm4_moe_lite":
+        ModelClass = Glm4MoeLiteModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
+        config.vocab_size = 8192
     else:
         raise ValueError(f"Unsupported model: {model_name}")
+    # GLM-4.7's MTP layer takes the next tokens as a second input and adds a second output.
+    mtp = getattr(config, "num_nextn_predict_layers", 0) == 1
 
     torch.distributed.barrier()
     torch.manual_seed(1234)
@@ -357,8 +385,9 @@ def main(model_name: str):
 
         chunks = []
         for j, seqlen in enumerate(seqlens):
-            chunk_x = torch.randint(0, vocab_size, (micro_batch_size, seqlen))
-            chunk_l = label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype)
+            num_inputs = 2 if mtp else 1
+            chunk_x = tuple(torch.randint(0, vocab_size, (micro_batch_size, seqlen)) for _ in range(num_inputs))  # fmt: skip
+            chunk_l = tuple(label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype) for _ in range(num_inputs))  # fmt: skip
             chunk_cu = None
             if packed:
                 # Ragged batches vary the document count as well as the token count. CP documents
@@ -382,6 +411,7 @@ def main(model_name: str):
     distributed.cp_rank = 0
     full_modules = ModelClass(config, phase=-1)
     full_modules.to(dtype=dtype)
+    keep_frozen_fp32(full_modules)
     full_modules.apply(fill_weights)
 
     if distributed.rank == 0:
@@ -430,8 +460,12 @@ def main(model_name: str):
 
     local_modules = nn.Sequential(*local_modules)
     local_modules.to(dtype=dtype)
+    keep_frozen_fp32(local_modules)
     local_modules[0].load_state_dict(local_full_modules[0].state_dict())
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
+    if local_modules[1].mtp_layer is not None:
+        # As setup_model: the MTP layer embeds the next tokens with the first stage's embedding.
+        local_modules[1].mtp_embed = local_modules[0].forward_prolog
     local_modules.zero_grad()
     apply_fsdp(local_modules, dtype)
     install_wgrad_accumulation(local_modules)
@@ -449,8 +483,7 @@ def main(model_name: str):
     def collect(model_outputs, objective_inputs):
         # Check before step cleanup can hide retained activations.
         assert records_empty(dualpipev_model), "a forward-only step kept activations mid-step"
-        (output,), (target,) = model_outputs, objective_inputs
-        return None, criterion(output, target)
+        return None, criterion(model_outputs, objective_inputs)
 
     for step_index, chunks in enumerate(chunk_steps):
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P shapes;
@@ -459,9 +492,10 @@ def main(model_name: str):
         local_chunks = chunks[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
         microbatches = [
             Microbatch(
-                model_inputs=(shard(x, cu_seqlens),),
+                model_inputs=(shard(x[0], cu_seqlens),),
                 cu_seqlens=cu_seqlens,
-                objective_inputs=(shard(labels, cu_seqlens),),
+                objective_inputs=tuple(shard(label, cu_seqlens) for label in labels),
+                epilog_inputs=tuple(shard(tokens, cu_seqlens) for tokens in x[1:]),
             )
             for x, labels, cu_seqlens in local_chunks
         ]
@@ -513,6 +547,9 @@ def main(model_name: str):
     failed = False
 
     for (param_name, param), param_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):  # fmt: skip
+        if not param.requires_grad:
+            # GLM-4.7's e_score_correction_bias is frozen on both sides.
+            continue
         if param.grad is None:
             print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, param_name))
             failed = True
@@ -566,12 +603,20 @@ def main(model_name: str):
             # BF16 noise on every dense weight.
             if param_name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 param_eps = 0.3
-        # DeepSeek-V2 under FP8: with so few rows per expert on this small fixture, a 1-ulp BF16
-        # perturbation of the embedding alone moves the FP8 gradients by up to 0.11 on dense
-        # weights and 0.29 on experts, also on one GPU with pp=ep=cp=1. A broken dense layer or
+        # GLM-4.7 under FP8: with so few rows per expert on this small fixture, the FP8 rounding of
+        # the operands moves the routed experts' gradients far past the BF16 noise, 0.14-0.16 at
+        # pp1/ep1, pp2/ep1, pp1/ep2 and pp2/ep2 alike (about 3x below). A broken dense layer or
         # accumulation reads about 1.
-        if training.fp8 and config.model_type == "deepseek_v2":
-            param_eps = max(param_eps, 0.6 if ".experts." in param_name else 0.05)
+        if training.fp8 and config.model_type == "glm4_moe_lite":
+            param_eps = max(param_eps, 0.5 if ".experts." in param_name else 0.05)
+        # GLM-4.7: the eager reference and the staged copy round differently and send a few percent
+        # of the tokens to another expert set, as in every model here; the diff weighs a flipped
+        # token by its routing weight squared, and the sigmoid router's top-k normalization gives
+        # the expert that flips the weight of any other (softmax: half), so the flips read about
+        # 0.02 on the routed experts (with replayed routes 7e-4, the noise floor). A broken expert
+        # path reads about 1.
+        if config.model_type == "glm4_moe_lite" and ".experts." in param_name:
+            param_eps = max(param_eps, 3e-2)
         if diff > param_eps:
             failed = True
             print(
@@ -623,12 +668,12 @@ def main(model_name: str):
 @record
 def entry() -> None:
     models = []
-    models.append("examples/pretrain_lm/deepseek-v2-lite/config.json")
     models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-27b/config.json")
+    models.append("examples/pretrain_lm/glm-4.7-flash/config.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)

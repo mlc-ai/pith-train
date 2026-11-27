@@ -85,6 +85,7 @@ def setup_wandb(cfg: LoggingCfg) -> None:
     # Define the metrics for monitoring.
     logging.wandb.define_metric("train/step", hidden=True)
     logging.wandb.define_metric("train/cross-entropy-loss", step_metric="train/step")
+    logging.wandb.define_metric("train/mtp-loss", step_metric="train/step")
     logging.wandb.define_metric("train/load-balance-loss", step_metric="train/step")
     logging.wandb.define_metric("train/learning-rate", step_metric="train/step")
     logging.wandb.define_metric("train/gradient-norm", step_metric="train/step")

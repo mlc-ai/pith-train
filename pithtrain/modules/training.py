@@ -19,7 +19,7 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model
+from pithtrain.models.glm4_moe_lite import Glm4MoeLiteModel
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen35 import Qwen35Model
@@ -58,7 +58,7 @@ __all__ = [
     "setup_training",
 ]
 
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
+PIPELINE_STAGE_MODELS = (Glm4MoeLiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -179,8 +179,8 @@ class TrainingCfg(SlottedDefault):
     hf_import_path: Optional[Path] = None
     """
     A HuggingFace safetensors directory to stream the initial weights from. Used only when
-    save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS (MXFP4) and
-    Qwen3.5 dense/MoE.
+    save_location holds no checkpoint. Supports Qwen3, GPT-OSS (MXFP4), Qwen3.5 dense/MoE and
+    GLM-4.7-Flash.
     """
 
     save_interval: Optional[int] = None
@@ -298,11 +298,21 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
+def frozen_param_dtype(param: nn.Parameter) -> torch.dtype | None:
+    """
+    The forward dtype of a parameter under FSDP2's mixed precision: the default for a trained one,
+    its stored dtype for a frozen one. GLM-4.7's fp32 router bias (e_score_correction_bias) only
+    chooses the experts, and rounded to bf16 it chooses differently for a fifth of the tokens.
+    """
+    return None if param.requires_grad else param.dtype
+
+
 def apply_fsdp(model, hsdp_replica: int = 1):
     """
     Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
-    gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
+    gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8. A frozen
+    parameter keeps its stored dtype in the forward (frozen_param_dtype).
     """
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     if hsdp_replica > 1:
@@ -318,6 +328,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
+        param_dtype_override_fn=frozen_param_dtype,
     )
     install_lean_hooks()
     # FSDP2 shards submodules before their parents; the walk stops at a sharded submodule, so
@@ -342,6 +353,10 @@ def apply_fsdp(model, hsdp_replica: int = 1):
             register_fsdp_forward_method(layer, "forward_stage1")
             register_fsdp_forward_method(layer, "forward_stage3")
             register_fsdp_forward_method(layer, "forward_stage5")
+        if model[i].mtp_layer is not None:
+            register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_input")
+            register_fsdp_forward_method(model[i].mtp_layer, "forward_mtp_norm")
+            register_fsdp_forward_method(model[i].lm_head, "forward_shared")
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
 
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
@@ -384,9 +399,7 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
-    elif module_config.model_type == "qwen3_moe":
+    if module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
     elif module_config.model_type == "gpt_oss":
         ModelClass = GptOssModel
@@ -394,6 +407,8 @@ def setup_model(
         ModelClass = Qwen35MoeModel
     elif module_config.model_type == "qwen3_5_text":
         ModelClass = Qwen35Model
+    elif module_config.model_type == "glm4_moe_lite":
+        ModelClass = Glm4MoeLiteModel
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
@@ -410,6 +425,9 @@ def setup_model(
     # The two V-chunks build identical read-only rotary caches; share one to save memory.
     if hasattr(modules[0], "rotary_emb") and hasattr(modules[1], "rotary_emb"):
         modules[1].rotary_emb = modules[0].rotary_emb
+    # The MTP layer of the last stage embeds the next tokens with the first stage's embedding.
+    if modules[1].mtp_layer is not None:
+        modules[1].mtp_embed = modules[0].forward_prolog
 
     local_seq_len = cfg.sequence_length // cp_size
 

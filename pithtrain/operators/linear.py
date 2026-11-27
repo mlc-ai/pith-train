@@ -291,3 +291,14 @@ class BF16Linear(nn.Linear):
             return F.linear(input, self.weight, self.bias)
         output = BF16LinearFunc.apply(input, self.weight, self.main_grad)
         return output if self.bias is None else output + self.bias
+
+    def forward_shared(
+        self, input: torch.Tensor, detached_input: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        The projection of input, and of detached_input with the parameters detached: the second
+        output gives a gradient to its input, none to the parameters. One call, so under FSDP the
+        two share one all-gather and one pre-backward.
+        """
+        bias = None if self.bias is None else self.bias.detach()
+        return self.forward(input), F.linear(detached_input, self.weight.detach(), bias)

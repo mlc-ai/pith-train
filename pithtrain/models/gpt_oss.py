@@ -473,6 +473,8 @@ class GptOssDecoderLayer(nn.Module):
 
 
 class GptOssModel(nn.Module):
+    mtp_layer = None
+
     def __init__(self, config: GptOssConfig, phase: int):
         super().__init__()
         if distributed.cp_size > 1:

@@ -1,5 +1,5 @@
 """
-Dense FP8 SwiGLU MLP of DeepSeek-V2 (shared experts and dense layers) as one custom op, so it runs
+Dense FP8 SwiGLU MLP of GLM-4.7-Flash (shared experts and dense layers) as one custom op, so it runs
 inside the compiled stage 1. It quantizes x once for gate_proj and up_proj, and its backward
 quantizes the SwiGLU gradients straight from dh without writing them in BF16. Every GEMM operand is
 bit-identical to the unfused FP8Linear -> silu_mul -> FP8Linear path. Rows must be a multiple of

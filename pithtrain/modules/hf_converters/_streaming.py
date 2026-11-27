@@ -36,7 +36,7 @@ def generic_plan_param(
 ) -> List[CopyOp]:
     """
     Plan a dense param, or a stacked-expert param whose HF checkpoint stores one tensor per expert
-    (Qwen3, DeepSeek-V2). ``remap`` maps a canonical key to its HF key.
+    (Qwen3, GLM-4.7-Flash). ``remap`` maps a canonical key to its HF key.
     """
     local = param._local_tensor
     canon_keys = _expand_localized_fqn(local_fqn, named_modules)

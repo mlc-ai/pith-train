@@ -2,7 +2,7 @@
 
 Model-specific postprocessing (stacked experts, layout transposes) lives in
 ``hf_converters._registry.CONVERTERS``. The generic path here handles
-un-quantized, un-transposed HF checkpoints (Qwen3, DeepSeek-V2).
+un-quantized, un-transposed HF checkpoints (Qwen3, GLM-4.7-Flash).
 """
 
 import json

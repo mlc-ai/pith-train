@@ -578,6 +578,7 @@ class Qwen35MoeDecoderLayer(nn.Module):
 class Qwen35MoeModel(nn.Module):
     # Dense Qwen3.5 uses the same attention, positional encoding and pipeline partition.
     decoder_layer_class = Qwen35MoeDecoderLayer
+    mtp_layer = None
 
     def __init__(self, config: Qwen3_5MoeTextConfig, phase: int):
         super().__init__()

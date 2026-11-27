@@ -35,7 +35,9 @@ from pithtrain.pipeline.execution import (
     ExecutionCtx,
     clear_layer_records,
     create_chunk_record,
+    decoder_layers,
     deferred_dispatch,
+    epilog_b,
     epilog_f,
     finish_dispatch,
     layer_backward,
@@ -113,7 +115,7 @@ class Microbatch:
     """
     One micro-batch of work for DualPipeV.step. Every pipeline rank gets the same list, so each
     sizes its receive buffers and reads cu_seqlens without a broadcast; only the first rank uses the
-    values of model_inputs and objective_inputs.
+    values of model_inputs, objective_inputs and epilog_inputs.
     """
 
     model_inputs: Tuple[torch.Tensor, ...]
@@ -129,6 +131,12 @@ class Microbatch:
     """
 
     objective_inputs: Any
+
+    epilog_inputs: Tuple[torch.Tensor, ...] = ()
+    """
+    Inputs the last stage takes besides the hidden states, passed positionally after them: the
+    next tokens of a model with a multi-token-prediction layer. Empty for the other models.
+    """
 
 
 class DualPipeV(nn.Module):
@@ -168,15 +176,7 @@ class DualPipeV(nn.Module):
         if self.num_chunks_allocated == num_chunks:
             return
         self.chunk_records = tuple(
-            [
-                create_chunk_record(
-                    len(module.layers),
-                    module.stage_index == 0,
-                    module.stage_index == module.stage_count - 1,
-                )
-                for _ in range(num_chunks)
-            ]
-            for module in self.module
+            [create_chunk_record(module) for _ in range(num_chunks)] for module in self.module
         )
         self.num_chunks_allocated = num_chunks
 
@@ -192,6 +192,7 @@ class DualPipeV(nn.Module):
             [],
         )
         self.objective_inputs: Optional[List[Any]] = None
+        self.epilog_inputs: Optional[List[Tuple[torch.Tensor, ...]]] = None
         self.loss_chunks: List[Optional[torch.Tensor]] = []
         self.objective_output_chunks: List[Any] = []
         self.objective: Optional[Callable] = None
@@ -249,7 +250,8 @@ class DualPipeV(nn.Module):
             self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
         )
         training.current_microbatch = chunk_id
-        outputs = self.module[phase](*inputs, cu_seqlens=cu_seqlens)
+        epilog_inputs = self.epilog_inputs[chunk_id] if is_last_stage else ()
+        outputs = self.module[phase](*inputs, *epilog_inputs, cu_seqlens=cu_seqlens)
         self.module[phase].chunk_record = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage:
@@ -328,9 +330,11 @@ class DualPipeV(nn.Module):
         if is_last_stage0:
             objective_inputs0 = self.objective_inputs[chunk_id0]
             objective0 = self.objective
+            epilog_inputs0 = self.epilog_inputs[chunk_id0]
         else:
             objective_inputs0 = None
             objective0 = None
+            epilog_inputs0 = ()
 
         chunk_id1 = self.current_b_chunk_id[phase1]
         self.current_b_chunk_id[phase1] += 1
@@ -363,6 +367,7 @@ class DualPipeV(nn.Module):
             objective_inputs0,
             self.chunk_records[phase0][chunk_id0],
             cu_seqlens0,
+            epilog_inputs0,
             module1,
             loss1,
             outputs1,
@@ -575,6 +580,7 @@ class DualPipeV(nn.Module):
         if self.is_first_pp_rank:
             self.input_chunks = ([tuple(microbatch.model_inputs) for microbatch in microbatches], [])  # fmt: skip
             self.objective_inputs = [microbatch.objective_inputs for microbatch in microbatches]
+            self.epilog_inputs = [microbatch.epilog_inputs for microbatch in microbatches]
             self.objective = objective
 
         # Step 1: nF0
@@ -687,6 +693,7 @@ def overlapped_forward_backward(
     objective_inputs0: Optional[Tuple[torch.Tensor, ...]],
     chunk_record0: ChunkRecord,
     cu_seqlens: Optional[torch.Tensor],
+    epilog_inputs0: Tuple[torch.Tensor, ...],
     module1: ModelProtocol,
     loss1: Optional[torch.Tensor],
     outputs1: Optional[List[torch.Tensor]],
@@ -701,11 +708,11 @@ def overlapped_forward_backward(
     The two modules may differ by one layer. Records are filled in chunk_record0 and consumed from
     chunk_record1 in place. Returns (outputs0, loss0, objective_output0, input_grads1).
     """
-    assert abs(len(module0.layers) - len(module1.layers)) <= 1
-    assert len(chunk_record1.layers) == len(module1.layers)
-    num_layers = min(len(module0.layers), len(module1.layers))
-    module0_layers = list(module0.layers.values())
-    module1_layers = list(module1.layers.values())
+    module0_layers = decoder_layers(module0)
+    module1_layers = decoder_layers(module1)
+    assert abs(len(module0_layers) - len(module1_layers)) <= 1
+    assert len(chunk_record1.layers) == len(module1_layers)
+    num_layers = min(len(module0_layers), len(module1_layers))
 
     (hidden_states,) = inputs0
     layer_idx0 = 0
@@ -714,12 +721,7 @@ def overlapped_forward_backward(
     ctx = ExecutionCtx(comm_stream=comm_stream)
 
     if loss1 is not None:
-        nvtx.range_push("loss1.backward()")
-        loss1.backward()
-        loss1.detach_()
-        nvtx.range_pop()
-        output_grads1 = [chunk_record1.epilog.args.hidden_states.grad]
-        chunk_record1.epilog.args = None
+        output_grads1 = [epilog_b(module1, loss1, chunk_record1.epilog)]
         loss1 = None
     assert output_grads1 is not None
 
@@ -789,7 +791,7 @@ def overlapped_forward_backward(
 
             # Fuse module0's stage 5 of the previous layer with stage 1 of this one, except at the
             # first and last boundaries when module0 has the extra layer.
-            if len(module0_layers) <= len(module1.layers) or (layer_idx - 1 > 0 and layer_idx < num_layers - 1):  # fmt: skip
+            if len(module0_layers) <= len(module1_layers) or (layer_idx - 1 > 0 and layer_idx < num_layers - 1):  # fmt: skip
                 prev_layer, next_layer = module0_layers[layer_idx - 1], module0_layers[layer_idx]
                 with deferred_dispatch():
                     stage5_args, stage1_outs, dispatch_tokens, residual, routing = stage5_stage1_f(
@@ -890,7 +892,7 @@ def overlapped_forward_backward(
     chunk_record0.layers[layer_idx0].stage5.outs = record.outs
     layer_idx0 += 1
 
-    if len(module0.layers) == len(module1.layers) + 1:
+    if len(module0_layers) == len(module1_layers) + 1:
         hidden_states = layer_forward(
             module0_layers[-1],
             hidden_states,
@@ -899,14 +901,14 @@ def overlapped_forward_backward(
             cu_seqlens,
         )
         layer_idx0 += 1
-    elif len(module0.layers) + 1 == len(module1.layers):
+    elif len(module0_layers) + 1 == len(module1_layers):
         hidden_states_grad = layer_backward(
             module1_layers[0],
             (hidden_states_grad,),
             chunk_record1.layers[-num_layers - 1],
         )
     else:
-        assert len(module0.layers) == len(module1.layers)
+        assert len(module0_layers) == len(module1_layers)
 
     final_grads = (hidden_states_grad,)
     if module1.stage_index == 0:
@@ -915,9 +917,9 @@ def overlapped_forward_backward(
         final_grads = (None,)
         record.outs = None
     if module0.stage_index == module0.stage_count - 1:
-        hidden_states = epilog_f(module0, hidden_states, chunk_record0.epilog)
+        hidden_states = epilog_f(module0, hidden_states, chunk_record0.epilog, epilog_inputs0, rotary_posemb, cu_seqlens)  # fmt: skip
 
-    outputs0 = [hidden_states]
+    outputs0 = [hidden_states] if isinstance(hidden_states, torch.Tensor) else list(hidden_states)
     if objective0 is not None:
         nvtx.range_push("objective0(model_outputs0, objective_inputs0)")
         loss0, objective_output0 = objective0(tuple(outputs0), objective_inputs0)

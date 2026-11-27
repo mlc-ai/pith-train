@@ -397,6 +397,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 
 class Qwen3MoeModel(nn.Module):
+    mtp_layer = None
+
     def __init__(self, config: Qwen3MoeConfig, phase: int):
         super().__init__()
         match phase:

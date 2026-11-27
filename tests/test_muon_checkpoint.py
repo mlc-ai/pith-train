@@ -11,7 +11,7 @@ Run (needs >=2 GPUs; ep-size must divide the world)::
 The six-rank Qwen3 case checks a 22/22/20 expert split. The eight-rank HSDP case checks
 replicated expert shards (two replicas of two shards).
 
-Builds a real model (``--model``: deepseek-v2-lite, qwen3-30b-a3b, gpt-oss-20b;
+Builds a real model (``--model``: glm-4.7-flash, qwen3-30b-a3b, gpt-oss-20b;
 reduced to a few layers) with FSDP2 + DualPipeV, steps the composed
 ``[Muon, AdamW]`` on synthetic grads to populate state, then
 save_checkpoint -> fresh optimizers -> find_checkpoint + load_checkpoint and asserts the optimizer
@@ -45,7 +45,7 @@ from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 NUM_LAYERS = 4  # a few MoE layers; small enough to build quickly
 
 MODELS = {
-    "deepseek-v2-lite": "examples/pretrain_lm/deepseek-v2-lite/config.json",  # MLA, GroupedLinear experts
+    "glm-4.7-flash": "examples/pretrain_lm/glm-4.7-flash/config.json",  # MLA, GroupedLinear experts
     "qwen3-30b-a3b": "examples/pretrain_lm/qwen3-30b-a3b/config.json",  # GQA + q/k_norm
     "gpt-oss-20b": "examples/pretrain_lm/gpt-oss-20b/config.json",  # sinks, fused gate_up, expert biases
 }
@@ -143,7 +143,7 @@ def _entry():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep-size", type=int, default=2)
     parser.add_argument("--hsdp-replica", type=int, default=1)
-    parser.add_argument("--model", choices=list(MODELS), default="deepseek-v2-lite")
+    parser.add_argument("--model", choices=list(MODELS), default="glm-4.7-flash")
     parsed = parser.parse_args()
 
     cfg = PretrainLMCfg()

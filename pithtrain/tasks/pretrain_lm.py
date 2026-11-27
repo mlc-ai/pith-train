@@ -1,11 +1,13 @@
 import gc
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import List, Tuple
 
 import torch
 import torch.cuda
+import torch.nn.functional as F
 import wandb
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig
@@ -53,6 +55,21 @@ class PretrainLMCfg(SlottedDefault):
     The root directory hosting the tokenized corpus, globbed for *.bin shards.
     """
 
+    mtp_loss_coef: float = 0.2
+    """
+    Weight of the multi-token-prediction loss in the training loss, for a model with an MTP layer
+    (GLM-4.7-Flash). The MTP loss trains only the MTP layer.
+    """
+
+
+def has_mtp_layer() -> bool:
+    """
+    Whether this rank's last stage holds a multi-token-prediction layer: the first pipeline rank
+    with GLM-4.7-Flash. Only that rank reads the values of the micro-batches; the others size
+    their buffers from the model inputs.
+    """
+    return training.model.module[1].mtp_layer is not None
+
 
 def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
     if cfg.training.benchmark:
@@ -89,47 +106,64 @@ def get_global_batch(
     block = len(front)
     local_seq_len = 2 * block
 
+    # With an MTP layer the model also takes the next tokens (the labels) and predicts the tokens
+    # after them; the last sample of a shard has no such token at its end (label -100).
+    mtp = has_mtp_layer()
     local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
     local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+    local_mtp_labels = torch.empty_like(local_labels) if mtp else None
 
     for row in range(local_batch_size):
         microbatch_idx, row_in_microbatch = divmod(row, micro_batch_size)
         index = start0 + microbatch_idx * effective_batch_size + row_in_microbatch
-        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
-        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
-        local_tokens[row, :block] = tokens_a
-        local_tokens[row, block:] = tokens_b
-        local_labels[row, :block] = labels_a
-        local_labels[row, block:] = labels_b
+        for span, columns in ((front, slice(0, block)), (back, slice(block, local_seq_len))):
+            tokens, labels = dataset.get_chunk(index, span.start, block)
+            local_tokens[row, columns] = tokens
+            local_labels[row, columns] = labels
+            if mtp:
+                _, mtp_labels = dataset.get_chunk(index, span.start + 1, block)
+                local_mtp_labels[row, columns] = F.pad(mtp_labels, (0, block - len(mtp_labels)), value=-100)  # fmt: skip
 
     local_tokens = local_tokens.to(device, non_blocking=True)
     local_labels = local_labels.to(device, non_blocking=True)
+    if mtp:
+        local_mtp_labels = local_mtp_labels.to(device, non_blocking=True)
 
-    return [
-        Microbatch(
-            model_inputs=(local_tokens[i : i + micro_batch_size],),
-            cu_seqlens=None,
-            objective_inputs=(local_labels[i : i + micro_batch_size],),
-        )
-        for i in range(0, local_batch_size, micro_batch_size)
-    ]
+    microbatches = []
+    for i in range(0, local_batch_size, micro_batch_size):
+        tokens, labels = local_tokens[i : i + micro_batch_size], local_labels[i : i + micro_batch_size]  # fmt: skip
+        microbatch = Microbatch(model_inputs=(tokens,), cu_seqlens=None, objective_inputs=(labels,))
+        if mtp:
+            microbatch.objective_inputs = (labels, local_mtp_labels[i : i + micro_batch_size])
+            microbatch.epilog_inputs = (labels,)
+        microbatches.append(microbatch)
+    return microbatches
+
+
+def token_sum_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    logits = logits.view(-1, logits.size(-1))
+    labels = labels.view(-1)
+    num_tokens = (labels != -100).sum().clamp_min(1)
+    return cross_entropy(logits, labels, ignore_index=-100) * num_tokens
 
 
 def objective(
     model_outputs: Tuple[torch.Tensor, ...],
     objective_inputs: Tuple[torch.Tensor, ...],
+    mtp_loss_coef: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     The loss is summed over the micro-batch's tokens, not averaged: train_step divides by the
-    global token count.
+    global token count. With an MTP layer the model outputs its logits too, the loss adds
+    mtp_loss_coef times their cross-entropy, and the objective output stacks both sums.
     """
-    (logits,) = model_outputs
-    (labels,) = objective_inputs
-    logits = logits.view(-1, logits.size(-1))
-    labels = labels.view(-1)
-    num_tokens = (labels != -100).sum().clamp_min(1)
-    loss = cross_entropy(logits, labels, ignore_index=-100) * num_tokens
-    return loss, loss.detach()
+    logits, *mtp_logits = model_outputs
+    labels, *mtp_labels = objective_inputs
+    loss = token_sum_cross_entropy(logits, labels)
+    if not mtp_logits:
+        return loss, loss.detach()
+    mtp_loss = token_sum_cross_entropy(*mtp_logits, *mtp_labels)
+    return loss + mtp_loss_coef * mtp_loss, torch.stack([loss.detach(), mtp_loss.detach()])
 
 
 def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
@@ -166,18 +200,20 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     microbatches = get_global_batch(cfg, dataset, step, device)
 
     # One detached loss per micro-batch on pipeline rank 0, an empty list on the other ranks.
-    objective_outputs = model.step(microbatches, objective)
+    step_objective = partial(objective, mtp_loss_coef=cfg.mtp_loss_coef)
+    objective_outputs = model.step(microbatches, step_objective)
 
     # Every pipeline rank holds the same labels, so all stages count the same total for the scale.
     counted = 0
     for microbatch in microbatches:
-        (labels,) = microbatch.objective_inputs
+        labels, *_ = microbatch.objective_inputs
         counted = counted + (labels != -100).sum()
     num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
 
     cp_size = distributed.cp_size
     if distributed.pp_rank == 0:
-        loss = torch.stack(objective_outputs).sum() / num_tokens
+        # The cross-entropy sum, or with an MTP layer [cross-entropy sum, MTP cross-entropy sum].
+        loss = torch.stack(objective_outputs).sum(dim=0) / num_tokens
         if cp_size > 1:
             torch.distributed.all_reduce(loss, group=distributed.cp_group)
             loss /= cp_size
@@ -224,12 +260,18 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
     logger = logging.stdout
     if distributed.rank == 0:
         max_steps = cfg.training.max_steps
-        loss, lr = loss.item(), schedulers[0].get_last_lr()[0]
+        if loss.ndim == 0:
+            loss, mtp_loss = loss.item(), None
+        else:
+            loss, mtp_loss = loss.tolist()
+        lr = schedulers[0].get_last_lr()[0]
         tokens_per_second = global_batch_size * cfg.training.sequence_length / elapsed
         statements = []
         statements.append("step %08d/%08d" % (step + 1, max_steps))
         statements.append("step-time %.3f sec" % elapsed)
         statements.append("cross-entropy-loss %.4f" % loss)
+        if mtp_loss is not None:
+            statements.append("mtp-loss %.4f" % mtp_loss)
         if moe_load_balance_coef > 0:
             statements.append("load-balance-loss %.6f" % lb_loss)
         statements.append("learning-rate %.6e" % lr)
@@ -242,6 +284,8 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
             metrics = dict()
             metrics["train/step"] = step
             metrics["train/cross-entropy-loss"] = loss
+            if mtp_loss is not None:
+                metrics["train/mtp-loss"] = mtp_loss
             if moe_load_balance_coef > 0:
                 metrics["train/load-balance-loss"] = lb_loss
             metrics["train/learning-rate"] = lr
