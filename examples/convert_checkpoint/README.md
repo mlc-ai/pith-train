@@ -6,7 +6,6 @@ Download a released HuggingFace checkpoint, and export trained PyTorch Distribut
 
 ```bash
 bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b
-bash examples/convert_checkpoint/launch.sh deepseek-v2-lite
 ```
 
 ## Available Models
@@ -14,7 +13,7 @@ bash examples/convert_checkpoint/launch.sh deepseek-v2-lite
 | Model | Download | Export |
 |---|---|---|
 | [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | yes | yes |
-| [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | yes | yes |
+| [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) | yes | yes |
 
 Each model directory contains a `script.py` that downloads the model and exports the newest checkpoint. Edit `script.py` to customize.
 

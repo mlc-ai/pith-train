@@ -40,9 +40,8 @@ def model_config(name: str):
 
 
 def family(config) -> str:
-    return {"deepseek_v2": "deepseek_v2", "qwen3_moe": "qwen3_moe", "gpt_oss": "gpt_oss"}.get(
-        config.model_type, "qwen35"
-    )
+    families = {"glm4_moe_lite": "glm4_moe_lite", "qwen3_moe": "qwen3_moe", "gpt_oss": "gpt_oss"}
+    return families.get(config.model_type, "qwen35")
 
 
 def compiled(fn):
@@ -146,7 +145,7 @@ def test_rmsnorm(case: dict) -> None:
         D = config.head_dim
         check_norm(case["id"], "q_norm", config, scaled_rows((B, S, axes["Hq"], D), gen), gen)
         check_norm(case["id"], "k_norm", config, scaled_rows((B, S, axes["Hkv"], D), gen), gen)
-    elif family(config) == "deepseek_v2":
+    elif family(config) == "glm4_moe_lite":
         check_norm(case["id"], "kv_a", config, scaled_rows((B, S, config.kv_lora_rank), gen), gen)
 
 
@@ -155,9 +154,9 @@ def rope_parts(config, Hq: int, Hkv: int):
     (apply_rotary_posemb, rotary embedding module, q heads x dims, k heads x dims) of the model.
     """
     match family(config):
-        case "deepseek_v2":
-            from pithtrain.models.deepseek_v2 import DeepSeekV2Attention as Attention
-            from pithtrain.models.deepseek_v2 import DeepSeekV2RotaryEmbedding as Rotary
+        case "glm4_moe_lite":
+            from pithtrain.models.glm4_moe_lite import Glm4MoeLiteAttention as Attention
+            from pithtrain.models.glm4_moe_lite import Glm4MoeLiteRotaryEmbedding as Rotary
 
             dim = config.qk_rope_head_dim
             return Attention.apply_rotary_posemb, Rotary(config), (Hq, dim), (1, dim)
@@ -215,8 +214,8 @@ def test_rope(case: dict) -> None:
 
 def make_gate(config) -> nn.Module:
     match family(config):
-        case "deepseek_v2":
-            from pithtrain.models.deepseek_v2 import DeepSeekV2MoEGate as Gate
+        case "glm4_moe_lite":
+            from pithtrain.models.glm4_moe_lite import Glm4MoeLiteTopkRouter as Gate
         case "qwen3_moe":
             from pithtrain.models.qwen3_moe import Qwen3MoeGate as Gate
         case "gpt_oss":
@@ -230,7 +229,7 @@ def model_logits(config, gate: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """
     The gate's logits as its forward computes them, eagerly.
     """
-    if family(config) == "deepseek_v2":
+    if family(config) == "glm4_moe_lite":
         return F.linear(x.float(), gate.weight.float())
     return F.linear(x, gate.weight, getattr(gate, "bias", None))
 
@@ -242,9 +241,13 @@ def weights_of(config, logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     match family(config):
         case "gpt_oss":
             return logits.gather(-1, idx).softmax(-1)
-        case "deepseek_v2":
-            assert config.topk_method == "greedy"
-            return logits.softmax(-1).gather(-1, idx) * config.routed_scaling_factor
+        case "glm4_moe_lite":
+            # The correction bias (zero here) steers the choice only; the weights are the sigmoid
+            # scores of the chosen experts, normalized.
+            weights = logits.sigmoid().gather(-1, idx)
+            if config.norm_topk_prob:
+                weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+            return weights * config.routed_scaling_factor
         case name:
             weights = logits.softmax(-1).gather(-1, idx)
             if name == "qwen35" or config.norm_topk_prob:

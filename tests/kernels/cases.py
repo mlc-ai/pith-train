@@ -118,7 +118,7 @@ def count(layer_types: list[str], kind: str) -> int:
     return sum(1 for layer_type in layer_types if layer_type == kind)
 
 
-def deepseek_v2(cfg: dict) -> dict:
+def glm4_moe_lite(cfg: dict) -> dict:
     H, heads = cfg["hidden_size"], cfg["num_attention_heads"]
     nope, rope, vdim, lora = (
         cfg["qk_nope_head_dim"],
@@ -128,9 +128,15 @@ def deepseek_v2(cfg: dict) -> dict:
     )
     L, dense = cfg["num_hidden_layers"], cfg["first_k_dense_replace"]
     shared = cfg["n_shared_experts"] * cfg["moe_intermediate_size"]
-    assert cfg.get("q_lora_rank") is None, "q_lora_rank adds q_a / q_b projections"
-    projections = (
-        Projection("q_proj", heads * (nope + rope), H, L),
+    q_lora = cfg.get("q_lora_rank")
+    if q_lora is None:
+        q_projections = (Projection("q_proj", heads * (nope + rope), H, L),)
+    else:  # the query through a low-rank pair
+        q_projections = (
+            Projection("q_a_proj", q_lora, H, L),
+            Projection("q_b_proj", heads * (nope + rope), q_lora, L),
+        )
+    projections = q_projections + (
         Projection("kv_a_proj_with_mqa", lora + rope, H, L),
         Projection("kv_b_proj", heads * (nope + vdim), lora, L),
         Projection("o_proj", H, heads * vdim, L),
@@ -292,7 +298,7 @@ def qwen3_5(cfg: dict, moe: bool) -> dict:
 
 
 EXTRACTORS = {
-    "deepseek_v2": deepseek_v2,
+    "glm4_moe_lite": glm4_moe_lite,
     "qwen3_moe": qwen3_moe,
     "gpt_oss": gpt_oss,
     "qwen3_5_moe_text": lambda cfg: qwen3_5(cfg, moe=True),
@@ -601,7 +607,10 @@ def weight_quant_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
 
 def attention_heads(model: Model) -> dict:
     att = model.attention
-    return dict(Hq=att.num_heads, Hkv=att.num_kv_heads, D=att.head_dim, Dv=att.v_head_dim, mla=att.mla_kv_lora_rank is not None)  # fmt: skip
+    heads = dict(Hq=att.num_heads, Hkv=att.num_kv_heads, D=att.head_dim, Dv=att.v_head_dim, mla=att.mla_kv_lora_rank is not None)  # fmt: skip
+    if heads["mla"]:
+        heads.update(lora=att.mla_kv_lora_rank, rope=att.mla_rope_dim)
+    return heads
 
 
 def attention_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
@@ -689,8 +698,8 @@ def swiglu_cases(model: Model, meshes: list[Mesh]) -> OrderedDict:
             continue
         for mesh in meshes:
             T = mesh.tokens_per_gpu
-            # DeepSeekV2MLP runs the fused FP8 operator
-            make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type == "deepseek_v2"), weight=dict(layers=layers))  # fmt: skip
+            # Glm4MoeLiteMLP runs the fused FP8 operator
+            make = lambda T=T, name=name, inter=inter, layers=layers: dict(axes=dict(mlp=name, M=T, inter=inter, hidden=model.hidden, fp8_swiglu_mlp=model.model_type == "glm4_moe_lite"), weight=dict(layers=layers))  # fmt: skip
             collect.add(f"{name}-M{k(T)}", mesh, make)
     return collect.cases
 

@@ -3,7 +3,6 @@
 #
 # Usage:
 #   bash examples/convert_checkpoint/launch.sh qwen3-30b-a3b
-#   bash examples/convert_checkpoint/launch.sh deepseek-v2-lite
 
 set -euo pipefail
 export PYTHONUNBUFFERED=1

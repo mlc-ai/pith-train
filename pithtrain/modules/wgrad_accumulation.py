@@ -176,6 +176,9 @@ def attach_side_grads(group: FSDPParamGroup) -> None:
         # same objects across steps, so each is hooked once (again if FSDP2 ever replaces it).
         for index, fsdp_param in enumerate(group.fsdp_params):
             param = fsdp_param.unsharded_param
+            # A frozen parameter (GLM-4.7's router bias) gets no gradient and takes no hook.
+            if not param.requires_grad:
+                continue
             if hooked.get(index) is not param:
                 param.register_post_accumulate_grad_hook(make_hook(index))
                 hooked[index] = param

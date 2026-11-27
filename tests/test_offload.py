@@ -42,7 +42,7 @@ NUM_LAYERS, NUM_EXPERTS, VOCAB_SIZE = 4, 16, 8192
 CYCLES = 3
 
 MODELS = {
-    "deepseek-v2-lite": "examples/pretrain_lm/deepseek-v2-lite/config.json",
+    "glm-4.7-flash": "examples/pretrain_lm/glm-4.7-flash/config.json",
     "qwen3-30b-a3b": "examples/pretrain_lm/qwen3-30b-a3b/config.json",
     "gpt-oss-20b": "examples/pretrain_lm/gpt-oss-20b/config.json",  # expert biases go to AdamW
     "qwen3.5-35b-a3b": "examples/pretrain_lm/qwen3.5-35b-a3b/config.json",

@@ -78,7 +78,7 @@ PithTrain is structured in three layers:
 
 - **Application:** Training loop for pretraining (native) and RL post-training (slime).
 - **Engine:** The bulk of PithTrain, composed of five modules:
-  - *Model:* Protocol interface with implementations for Qwen, DeepSeek, and GPT-OSS architectures.
+  - *Model:* Protocol interface with implementations for Qwen, GLM, and GPT-OSS architectures.
   - *Pipeline Engine:* DualPipeV scheduler with 5-stage overlapped forward-backward execution.
   - *Distributed Training:* Pipeline, data, context, and expert parallelism (PP x DP x CP x EP) with MoE parallel folding.
   - *Building Blocks:* FP8 quantization, fused expert MLP, expert dispatch and deduplication, token scatter, ring attention, FP8 parameter all-gather, fused cross-entropy, and load-balancing loss.

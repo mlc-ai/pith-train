@@ -1,5 +1,13 @@
 """
-deepseek-ai/DeepSeek-V2 and deepseek-ai/DeepSeek-V2-Lite.
+zai-org/GLM-4.7-Flash (Glm4MoeLiteForCausalLM).
+
+Multi-head latent attention with a low-rank query and an interleaved rotary embedding, a dense
+first layer, shared experts next to the routed ones, and DeepSeek-V3's aux-loss-free router
+("noaux_tc"): sigmoid scores, a per-expert correction bias that steers the choice but not the
+weights, top-k weights renormalized then scaled.
+
+The checkpoint also holds one multi-token-prediction layer, model.layers.47, which this model does
+not instantiate; its keys are expected unmapped on import.
 """
 
 import math
@@ -7,7 +15,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
+from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.kernels import (
@@ -39,11 +47,11 @@ from pithtrain.operators.token_scatter import (
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["DeepSeekV2MoEGate", "DeepSeekV2Model"]
+__all__ = ["Glm4MoeLiteDecoderLayer", "Glm4MoeLiteMoE", "Glm4MoeLiteModel", "Glm4MoeLiteTopkRouter"]
 
 
-class DeepSeekV2RotaryEmbedding(nn.Module):
-    def __init__(self, config: DeepseekV2Config) -> None:
+class Glm4MoeLiteRotaryEmbedding(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig) -> None:
         super().__init__()
         inv_freq, attn_scale = self.compute_rope_params(config)
         self.set_cos_sin(config, inv_freq, attn_scale)
@@ -71,7 +79,7 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
         linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
         return torch.clamp(linear_func, 0, 1)
 
-    def compute_rope_params(self, config: DeepseekV2Config) -> tuple[torch.Tensor, float]:
+    def compute_rope_params(self, config: Glm4MoeLiteConfig) -> tuple[torch.Tensor, float]:
         rope_scaling = config.rope_scaling
         base, dim = rope_scaling["rope_theta"], config.qk_rope_head_dim
         match rope_scaling["rope_type"]:
@@ -93,7 +101,7 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
                 raise ValueError(f"unsupported rope_type: {other!r}")
 
     def set_cos_sin(
-        self, config: DeepseekV2Config, inv_freq: torch.Tensor, attn_scale: float
+        self, config: Glm4MoeLiteConfig, inv_freq: torch.Tensor, attn_scale: float
     ) -> None:
         positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
@@ -107,8 +115,8 @@ class DeepSeekV2RotaryEmbedding(nn.Module):
         return self.cos[:S], self.sin[:S]
 
 
-class DeepSeekV2MLP(nn.Module):
-    def __init__(self, config: DeepseekV2Config, intermediate_size: int | None = None):
+class Glm4MoeLiteMLP(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, intermediate_size: int | None = None):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
@@ -128,8 +136,8 @@ class DeepSeekV2MLP(nn.Module):
         return self.forward(x)
 
 
-class DeepSeekV2Experts(nn.Module):
-    def __init__(self, config: DeepseekV2Config, num_experts: int):
+class Glm4MoeLiteExperts(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, num_experts: int):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.moe_intermediate_size
@@ -183,60 +191,73 @@ class DeepSeekV2Experts(nn.Module):
         return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=quantized_input), reverse_shuffle_idxs  # fmt: skip
 
 
-class DeepSeekV2MoEGate(nn.Module):
-    def __init__(self, config: DeepseekV2Config):
+class Glm4MoeLiteTopkRouter(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig):
         super().__init__()
+        # config.json names the formula; Glm4MoeLiteConfig keeps the field only when read from it.
+        topk_method = getattr(config, "topk_method", "noaux_tc")
+        if topk_method != "noaux_tc":
+            raise ValueError(f"Unsupported GLM-4.7 topk_method: {topk_method}")
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.num_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.topk_method = config.topk_method
         self.num_group = config.n_group
         self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
         self.load_balance_loss_fn = None
         self.router_replay = None
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)), requires_grad=True)  # fmt: skip
+        # A buffer in HF, updated there by its own bias schedule and frozen at inference. A
+        # parameter here, so the checkpoint and the HF import carry it; frozen, as there is no
+        # bias schedule here (slime's GLM recipes set Megatron's update rate to 0), and read in
+        # fp32 like HF's (apply_fsdp keeps a frozen parameter in its stored dtype).
+        self.e_score_correction_bias = nn.Parameter(torch.zeros(self.n_routed_experts), requires_grad=False)  # fmt: skip
 
     def forward(
         self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)  # fmt: skip
-        scores = logits.softmax(dim=-1, dtype=torch.float32)
-        unmasked_scores = scores
-        if self.topk_method == "group_limited_greedy":
+        scores = logits.sigmoid()
+        if replay_idx is not None:
+            topk_idx = replay_idx
+        else:
+            # The bias only steers the choice; the two best experts of each group rank the groups.
+            scores_for_choice = scores + self.e_score_correction_bias.type(torch.float32)
             num_tokens = scores.shape[0]
-            group_scores = scores.view(num_tokens, self.num_group, -1).max(dim=-1).values
+            group_scores = scores_for_choice.view(num_tokens, self.num_group, -1).topk(2, dim=-1)[0].sum(dim=-1)  # fmt: skip
             group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
             group_mask = torch.zeros_like(group_scores)
             group_mask.scatter_(1, group_idx, 1)
             score_mask = group_mask.unsqueeze(-1).expand(num_tokens, self.num_group, self.num_experts // self.num_group).reshape(num_tokens, -1)  # fmt: skip
-            scores = scores.masked_fill(~score_mask.bool(), 0.0)
-        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-        if replay_idx is not None:
-            # Replayed experts outside the live groups retain their unmasked probabilities.
-            topk_idx = replay_idx
-            topk_weight = unmasked_scores.gather(-1, topk_idx)
+            scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+            topk_idx = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weight = scores.gather(-1, topk_idx)
+        if self.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
         topk_weight = topk_weight * self.routed_scaling_factor
         if self.load_balance_loss_fn is None:
             return topk_idx, topk_weight, None
-        lb_loss = self.load_balance_loss_fn(scores, topk_idx, self.n_routed_experts, self.top_k)
+        # The balance loss reads the scores as a distribution over the experts.
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        lb_loss = self.load_balance_loss_fn(probs, topk_idx, self.n_routed_experts, self.top_k)
         # Token-weight the injected lb gradient so train_step's 1/num_tokens grad scale leaves it
         # correctly normalized (it bypasses the token-weighted objective). lb_loss stays unscaled.
         topk_weight = MoELoadBalanceLossInjector.apply(topk_weight, lb_loss * topk_weight.shape[0])
         return topk_idx, topk_weight, lb_loss
 
 
-class DeepSeekV2MoE(nn.Module):
-    def __init__(self, config: DeepseekV2Config):
+class Glm4MoeLiteMoE(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig):
         super().__init__()
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts_per_rank = config.n_routed_experts // distributed.ep_size
         self.n_routed_experts = config.n_routed_experts
-        self.experts = DeepSeekV2Experts(config, self.experts_per_rank)
-        self.gate = DeepSeekV2MoEGate(config)
+        self.experts = Glm4MoeLiteExperts(config, self.experts_per_rank)
+        self.gate = Glm4MoeLiteTopkRouter(config)
         intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-        self.shared_experts = DeepSeekV2MLP(config=config, intermediate_size=intermediate_size)
+        self.shared_experts = Glm4MoeLiteMLP(config=config, intermediate_size=intermediate_size)
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
@@ -256,8 +277,8 @@ class DeepSeekV2MoE(nn.Module):
         return y
 
 
-class DeepSeekV2Attention(nn.Module):
-    def __init__(self, config: DeepseekV2Config):
+class Glm4MoeLiteAttention(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig):
         super().__init__()
         hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -280,7 +301,7 @@ class DeepSeekV2Attention(nn.Module):
         self.softmax_scale = self.q_head_dim ** (-0.5)
         rope_scaling = config.rope_scaling
         if rope_scaling is not None and rope_scaling.get("mscale_all_dim", 0):
-            mscale = DeepSeekV2RotaryEmbedding.yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])  # fmt: skip
+            mscale = Glm4MoeLiteRotaryEmbedding.yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])  # fmt: skip
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
     @staticmethod
@@ -299,8 +320,8 @@ class DeepSeekV2Attention(nn.Module):
         q = q.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
         B, S, H, D = k.shape
         k = k.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
-        q_embed = (q * cos) + (DeepSeekV2Attention.rotate_half(q) * sin)
-        k_embed = (k * cos) + (DeepSeekV2Attention.rotate_half(k) * sin)
+        q_embed = (q * cos) + (Glm4MoeLiteAttention.rotate_half(q) * sin)
+        k_embed = (k * cos) + (Glm4MoeLiteAttention.rotate_half(k) * sin)
         return q_embed, k_embed
 
     def forward(
@@ -339,13 +360,13 @@ class DeepSeekV2Attention(nn.Module):
         return attn_output
 
 
-class DeepSeekV2DecoderLayer(nn.Module):
-    def __init__(self, config: DeepseekV2Config, layer_id: int):
+class Glm4MoeLiteDecoderLayer(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, layer_id: int):
         super().__init__()
         self.idx = layer_id
-        self.self_attn = DeepSeekV2Attention(config=config)
+        self.self_attn = Glm4MoeLiteAttention(config=config)
         has_experts = layer_id >= config.first_k_dense_replace
-        self.mlp = DeepSeekV2MoE(config) if has_experts else DeepSeekV2MLP(config)
+        self.mlp = Glm4MoeLiteMoE(config) if has_experts else Glm4MoeLiteMLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -363,7 +384,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, DeepSeekV2MLP):
+        if isinstance(self.mlp, Glm4MoeLiteMLP):
             return hidden_states, residual, None, None, None
         residual = residual + self.mlp.shared_experts(hidden_states)
         topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
@@ -376,10 +397,10 @@ class DeepSeekV2DecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         replay_idx = None
-        if isinstance(self.mlp, DeepSeekV2MoE):
+        if isinstance(self.mlp, Glm4MoeLiteMoE):
             replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
         hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
-        if isinstance(self.mlp, DeepSeekV2MLP):
+        if isinstance(self.mlp, Glm4MoeLiteMLP):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
@@ -402,7 +423,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         expand_idx: torch.Tensor | None = None,
         expert_counts: list[int] | None = None,
     ) -> torch.Tensor:
-        if isinstance(self.mlp, DeepSeekV2MLP):
+        if isinstance(self.mlp, Glm4MoeLiteMLP):
             return self.mlp(gathered_tokens)
         if training.fp8 and fp8_fused_experts_supported():
             expand = expand_idx if distributed.ep_size > 1 else None
@@ -429,7 +450,7 @@ class DeepSeekV2DecoderLayer(nn.Module):
         topk_weight: torch.Tensor | None,
         residual: torch.Tensor,
     ):
-        if not isinstance(self.mlp, DeepSeekV2MoE):
+        if not isinstance(self.mlp, Glm4MoeLiteMoE):
             return residual + moe_outs
         if distributed.ep_size == 1:
             weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
@@ -458,9 +479,12 @@ class DeepSeekV2DecoderLayer(nn.Module):
         return hidden_states
 
 
-class DeepSeekV2Model(nn.Module):
-    def __init__(self, config: DeepseekV2Config, phase: int):
+class Glm4MoeLiteModel(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, phase: int):
         super().__init__()
+        # Glm4MoeLiteAttention pairs the rotary dims as HF's interleaved variant does.
+        if not getattr(config, "rope_interleave", True):
+            raise ValueError("GLM-4.7 without rope_interleave is not supported")
         match phase:
             case 0:
                 stage_count = distributed.pp_size * 2
@@ -477,7 +501,7 @@ class DeepSeekV2Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.chunk_record: ChunkRecord | None = None
 
-        self.rotary_emb = DeepSeekV2RotaryEmbedding(config)
+        self.rotary_emb = Glm4MoeLiteRotaryEmbedding(config)
         self.embed_tokens, self.norm, self.lm_head = None, None, None
         if stage_index == 0:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -486,7 +510,7 @@ class DeepSeekV2Model(nn.Module):
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(i): DeepSeekV2DecoderLayer(config, i)
+                str(i): Glm4MoeLiteDecoderLayer(config, i)
                 for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
             }
         )

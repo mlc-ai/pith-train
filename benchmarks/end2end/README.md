@@ -19,9 +19,7 @@ per token from Megatron's `num_floating_point_operations`.
 
 | Model | Nodes | Case | Micro-batch | Throughput (tok/s/gpu) | MFU | Memory (GiB) |
 |---|---|---|---|---|---|---|
-| deepseek-v2-lite | 1 | `pp4-dp2-cp1-ep1` | 4 | 24,165 | 40.1% | 114.8 |
-| deepseek-v2-lite | 2 | `pp2-dp8-cp1-ep2` | 4 | 24,256 | 40.3% | 94.8 |
-| deepseek-v2-lite | 4 | `pp2-dp16-cp1-ep8` | 4 | 22,870 | 38.0% | 92.4 |
+| glm-4.7-flash | 1 | `pp2-dp4-cp1-ep4` | 2 | 12,826 | 35.5% | 108.9 |
 | gpt-oss-20b | 1 | `pp1-dp8-cp1-ep2` | 2 | 18,038 | 41.8% | 110.5 |
 | gpt-oss-20b | 2 | `pp1-dp16-cp1-ep8` | 4 | 18,054 | 41.8% | 102.5 |
 | gpt-oss-20b | 4 | `pp1-dp32-cp1-ep8` | 4 | 18,043 | 41.8% | 97.5 |
@@ -37,9 +35,7 @@ per token from Megatron's `num_floating_point_operations`.
 
 | Model | Nodes | Case | Micro-batch | Throughput (tok/s/gpu) | MFU | Memory (GiB) |
 |---|---|---|---|---|---|---|
-| deepseek-v2-lite | 1 | `pp4-dp1-cp2-ep1` | 1 | 13,028 | 37.2% | 111.2 |
-| deepseek-v2-lite | 2 | `pp2-dp4-cp2-ep2` | 1 | 13,096 | 37.5% | 92.0 |
-| deepseek-v2-lite | 4 | `pp4-dp4-cp2-ep1` | 1 | 13,112 | 37.5% | 99.8 |
+| glm-4.7-flash | 1 | `pp2-dp1-cp4-ep4` | 1 | 3,895 | 27.1% | 103.8 |
 | qwen3-30b-a3b | 1 | `pp2-dp1-cp4-ep4` | 1 | 6,841 | 39.3% | 100.4 |
 | qwen3-30b-a3b | 2 | `pp2-dp2-cp4-ep4` | 1 | 6,810 | 39.2% | 85.6 |
 | qwen3-30b-a3b | 4 | `pp1-dp8-cp4-ep8` | 1 | 6,797 | 39.0% | 90.7 |

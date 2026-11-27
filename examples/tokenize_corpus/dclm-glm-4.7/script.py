@@ -1,4 +1,4 @@
-"""Download one shard of the DCLM corpus and tokenize with the DeepSeek-V2 model."""
+"""Download one shard of the DCLM corpus and tokenize with the GLM-4.7-Flash tokenizer."""
 
 from pathlib import Path
 
@@ -15,7 +15,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     cfg = TokenizeCorpusCfg()
-    cfg.tokenizer_name = "deepseek-ai/DeepSeek-V2-Lite"
+    cfg.tokenizer_name = "zai-org/GLM-4.7-Flash"
     cfg.source_path = Path("workspace/datasets/dclm-baseline/rawtxt")
-    cfg.output_path = Path("workspace/datasets/dclm-baseline/toktxt/deepseek-v2")
+    cfg.output_path = Path("workspace/datasets/dclm-baseline/toktxt/glm-4.7")
     launch(cfg)

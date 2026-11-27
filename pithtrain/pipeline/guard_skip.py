@@ -15,7 +15,7 @@ sizes, training.fp8 and every micro-batch's input metadata, including cu_seqlens
 compiles during a skipped step, every signature loses its trust.
 
 Skipping is off when decoder layers differ in module structure (qwen3.5 linear vs full attention,
-deepseek-v2 dense vs MoE): guards copied from one variant look up submodules the other lacks, and
+glm-4.7-flash dense vs MoE): guards copied from one variant look up submodules the other lacks, and
 Dynamo raises instead of trying the next entry. It is also off on torch releases other than the
 one it was validated on.
 """
