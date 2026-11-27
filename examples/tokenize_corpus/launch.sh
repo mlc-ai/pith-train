@@ -3,7 +3,6 @@
 #
 # Usage:
 #   bash examples/tokenize_corpus/launch.sh dclm-qwen3
-#   bash examples/tokenize_corpus/launch.sh dclm-deepseek-v2
 #
 # For multi-node tokenization with SLURM:
 #   srun -W 0 examples/tokenize_corpus/launch.sh dclm-qwen3

@@ -1,7 +1,7 @@
 """GLM-4.7-Flash checkpoint converter.
 
-The decoder keys are DeepSeek-V2's, per-expert and untransposed, so the generic import and export
-handle them. The checkpoint also holds a multi-token-prediction layer under
+The decoder keys are per-expert and untransposed, so the generic import and export handle them.
+The checkpoint also holds a multi-token-prediction layer under
 ``model.layers.<num_hidden_layers>`` (its ``eh_proj``, ``enorm``, ``hnorm``, ``shared_head``, a
 copy of the embedding and of the head, and one more decoder layer), which the model does not
 instantiate: those keys are expected to stay unmapped on import.

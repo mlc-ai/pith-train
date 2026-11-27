@@ -6,7 +6,6 @@ Download and tokenize a training corpus. This is a one-time data preparation ste
 
 ```bash
 bash examples/tokenize_corpus/launch.sh dclm-qwen3
-bash examples/tokenize_corpus/launch.sh dclm-deepseek-v2
 bash examples/tokenize_corpus/launch.sh dclm-glm-4.7
 ```
 

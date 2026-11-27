@@ -237,21 +237,15 @@ class TestScheduleSimulation:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: DeepSeek-V2-Lite smoke test
+# Test 5: GLM-4.7-Flash smoke test
 # ---------------------------------------------------------------------------
 
 
-class TestDeepSeekV2Lite:
+class TestGlm47Flash:
     def test_smoke(self):
         """
-        Verify the estimator runs end-to-end on DeepSeek-V2-Lite without errors.
-
-        Known limitation: DeepSeek-V2-Lite config uses ``n_routed_experts``
-        instead of ``num_experts``. The current ``ModelConfig.from_json`` only
-        reads ``num_experts``, so ``n_routed_experts`` is silently ignored and
-        ``num_experts`` defaults to 0 (treated as a dense model). If
-        ``from_json`` is updated to handle ``n_routed_experts``, this test
-        should still pass since we only assert ``peak_bytes > 0``.
+        Verify the estimator runs end-to-end on GLM-4.7-Flash (MLA, ``n_routed_experts``)
+        without errors.
         """
         from tools.memory_estimator.__main__ import estimate_non_pytorch_bytes
         from tools.memory_estimator.activation_profile import (
@@ -265,7 +259,7 @@ class TestDeepSeekV2Lite:
         )
         from tools.memory_estimator.schedule_simulator import ScheduleSimulator
 
-        config_path = REPO_ROOT / "examples" / "pretrain_lm" / "deepseek-v2-lite" / "config.json"
+        config_path = REPO_ROOT / "examples" / "pretrain_lm" / "glm-4.7-flash" / "config.json"
         model_cfg = ModelConfig.from_json(config_path)
 
         parallel_cfg = ParallelismConfig(

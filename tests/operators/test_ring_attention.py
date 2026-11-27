@@ -190,10 +190,10 @@ class MLARequest:
     B: int
     S: int
     H: int
-    kv_lora_rank: int = 512
-    qk_nope_head_dim: int = 128
+    kv_lora_rank: int = 512  # GLM-4.7-Flash's MLA dims
+    qk_nope_head_dim: int = 192
     qk_rope_head_dim: int = 64
-    v_head_dim: int = 128
+    v_head_dim: int = 256
     atol: float = 1e-3
     atol_weight: float = 1e-2
     # Relative L2 tolerance for the kv_b weight gradient. Cosine is scale-invariant and would hide a
@@ -438,7 +438,6 @@ BOUNDS = {
     "dk_pe": 1.25e-2,  # measured 4.06e-3
     "dkv_b": 8e-3,  # measured 2.56e-3
 }
-NOPE, ROPE, VDIM, LORA = 128, 64, 128, 512  # DeepSeek-V2-Lite's MLA dims
 
 
 def zigzag_rows(rank: int, cp: int, seq: int, device) -> torch.Tensor:
@@ -504,18 +503,19 @@ def mla_worker(case: dict) -> None:
     group = distributed.cp_group
     rank, cp = group.rank(), group.size()
     B, seq, H = a["B"], a["seq"], a["Hq"]
-    assert (a["D"], a["Dv"]) == (NOPE + ROPE, VDIM)
+    rope, vdim, lora = a["rope"], a["Dv"], a["lora"]
+    nope = a["D"] - rope
     scale = a["D"] ** -0.5
     gen = torch.Generator(device=f"cuda:{torch.cuda.current_device()}").manual_seed(seed_of(case))
-    q_nope, q_pe = randn(gen, B, seq, H, NOPE), randn(gen, B, seq, H, ROPE)
-    normed_kv, k_pe = randn(gen, B, seq, LORA), randn(gen, B, seq, 1, ROPE)
-    weight = randn(gen, H * (NOPE + VDIM), LORA, scale=LORA**-0.5)
-    dout = randn(gen, B, seq, H, VDIM)
+    q_nope, q_pe = randn(gen, B, seq, H, nope), randn(gen, B, seq, H, rope)
+    normed_kv, k_pe = randn(gen, B, seq, lora), randn(gen, B, seq, 1, rope)
+    weight = randn(gen, H * (nope + vdim), lora, scale=lora**-0.5)
+    dout = randn(gen, B, seq, H, vdim)
     rows = zigzag_rows(rank, cp, seq, q_nope.device)
 
     leaves = [x[:, rows].contiguous().requires_grad_(True) for x in (q_nope, q_pe, normed_kv, k_pe)]  # fmt: skip
     w = weight.clone().requires_grad_(True)
-    out = mla_ring_attention_func(*leaves, w, sm_scale=scale, qk_nope_head_dim=NOPE, v_head_dim=VDIM, cp_group=group)  # fmt: skip
+    out = mla_ring_attention_func(*leaves, w, sm_scale=scale, qk_nope_head_dim=nope, v_head_dim=vdim, cp_group=group)  # fmt: skip
     out.backward(dout[:, rows])
     dw = w.grad.float()
     dist.all_reduce(dw, group=group)
@@ -525,20 +525,20 @@ def mla_worker(case: dict) -> None:
     want = {name: [] for name in got if name != "dkv_b"}
     dw_ref = torch.zeros_like(w32)
     for b in range(B):
-        kv = (normed_kv[b].float() @ w32.T).view(seq, H, NOPE + VDIM)
-        k_full = torch.cat([kv[..., :NOPE], k_pe[b].float().expand(seq, H, ROPE)], dim=-1)
+        kv = (normed_kv[b].float() @ w32.T).view(seq, H, nope + vdim)
+        k_full = torch.cat([kv[..., :nope], k_pe[b].float().expand(seq, H, rope)], dim=-1)
         q_rows = torch.cat([q_nope[b, rows], q_pe[b, rows]], dim=-1)
-        ref = flash_attn_memoize_reference(q_rows, k_full, kv[..., NOPE:], scale, True, dout=dout[b, rows], q_positions=rows)  # fmt: skip
+        ref = flash_attn_memoize_reference(q_rows, k_full, kv[..., nope:], scale, True, dout=dout[b, rows], q_positions=rows)  # fmt: skip
         del kv, k_full
         dk, dv = ref["dk"].contiguous(), ref["dv"].contiguous()
         dist.all_reduce(dk, group=group)
         dist.all_reduce(dv, group=group)
-        dkv = torch.cat([dk[..., :NOPE], dv], dim=-1).view(seq, H * (NOPE + VDIM))
+        dkv = torch.cat([dk[..., :nope], dv], dim=-1).view(seq, H * (nope + vdim))
         want["out"].append(ref["out"])
-        want["dq_nope"].append(ref["dq"][..., :NOPE])
-        want["dq_pe"].append(ref["dq"][..., NOPE:])
+        want["dq_nope"].append(ref["dq"][..., :nope])
+        want["dq_pe"].append(ref["dq"][..., nope:])
         want["dnormed_kv"].append((dkv[rows] @ w32))
-        want["dk_pe"].append(dk[rows, :, NOPE:].sum(1, keepdim=True))
+        want["dk_pe"].append(dk[rows, :, nope:].sum(1, keepdim=True))
         dw_ref += dkv.T @ normed_kv[b].float()
         del ref, dk, dv, dkv
     want = {name: torch.stack(value) for name, value in want.items()}

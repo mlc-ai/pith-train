@@ -18,7 +18,6 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig
 
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.glm4_moe_lite import Glm4MoeLiteModel, Glm4MoeLiteTopkRouter
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
@@ -49,9 +48,7 @@ def fill_weights(module: nn.Module):
         # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
-    elif isinstance(
-        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
-    ):
+    elif isinstance(module, (Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
@@ -93,7 +90,7 @@ def records_empty(model: DualPipeV) -> bool:
     return all(getattr(record, field.name) is None for record in records if record is not None for field in fields(record))  # fmt: skip
 
 
-def reference_step(chunks, model: DeepSeekV2Model):
+def reference_step(chunks, model: nn.Module):
     outputs, losses = [], []
     for i, (micro_x, micro_labels, cu_seqlens) in enumerate(chunks):
         training.current_microbatch = i
@@ -317,10 +314,7 @@ def main(model_name: str):
     if config.model_type in ("qwen3_5", "qwen3_5_moe"):
         config = config.text_config
 
-    if config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
-        config.num_hidden_layers = min(config.num_hidden_layers, 8)
-    elif config.model_type == "qwen3_moe":
+    if config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
@@ -590,18 +584,17 @@ def main(model_name: str):
             # BF16 noise on every dense weight.
             if param_name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 param_eps = 0.3
-        # DeepSeek-V2 under FP8: with so few rows per expert on this small fixture, a 1-ulp BF16
-        # perturbation of the embedding alone moves the FP8 gradients by up to 0.11 on dense
-        # weights and 0.29 on experts, also on one GPU with pp=ep=cp=1. A broken dense layer or
-        # accumulation reads about 1.
-        if training.fp8 and config.model_type == "deepseek_v2":
+        # GLM-4.7 under FP8: with so few rows per expert on this small fixture, the FP8 rounding of
+        # the operands moves the gradients far past the BF16 noise, also on one GPU with
+        # pp=ep=cp=1. A broken dense layer or accumulation reads about 1.
+        if training.fp8 and config.model_type == "glm4_moe_lite":
             param_eps = max(param_eps, 0.6 if ".experts." in param_name else 0.05)
         # GLM-4.7: the eager reference and the staged copy round differently and send a few percent
         # of the tokens to another expert set, as in every model here; the diff weighs a flipped
         # token by its routing weight squared, and the sigmoid router's top-k normalization gives
         # the expert that flips the weight of any other (softmax: half), so the flips read about
-        # 0.02 on the routed experts (behind DeepSeek-V2's softmax gate 0.005, with replayed routes
-        # 7e-4, the noise floor). A broken expert path reads about 1.
+        # 0.02 on the routed experts (with replayed routes 7e-4, the noise floor). A broken expert
+        # path reads about 1.
         if config.model_type == "glm4_moe_lite" and ".experts." in param_name:
             param_eps = max(param_eps, 3e-2)
         if diff > param_eps:
@@ -655,7 +648,6 @@ def main(model_name: str):
 @record
 def entry() -> None:
     models = []
-    models.append("examples/pretrain_lm/deepseek-v2-lite/config.json")
     models.append("examples/pretrain_lm/qwen3-30b-a3b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")

@@ -10,7 +10,7 @@ TORCHRUN_ARGS=()
 TORCHRUN_ARGS+=(--nnodes=1 --nproc-per-node=8)
 TORCHRUN_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=localhost:15213)
 
-MODEL="${1:-examples/pretrain_lm/deepseek-v2-lite/config.json}"
+MODEL="${1:-examples/pretrain_lm/glm-4.7-flash/config.json}"
 
 # Mesh degrees, overridable from the environment. The default 8-GPU mesh is pp=2 ep=2 cp=1,
 # which leaves attn dp=4 and expt dp=2. Set CP_SIZE=2 to exercise the folded layout, where cp

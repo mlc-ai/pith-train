@@ -1,28 +1,194 @@
 """
 zai-org/GLM-4.7-Flash (Glm4MoeLiteForCausalLM).
 
-The decoder is DeepSeek-V2's: multi-head latent attention with a low-rank query, interleaved rotary
-embedding, a dense first layer and shared experts next to the routed ones. Only the router differs:
-sigmoid scores, a per-expert correction bias that steers the choice but not the weights
-(DeepSeek-V3's aux-loss-free "noaux_tc"), top-k weights renormalized then scaled.
+Multi-head latent attention with a low-rank query and an interleaved rotary embedding, a dense
+first layer, shared experts next to the routed ones, and DeepSeek-V3's aux-loss-free router
+("noaux_tc"): sigmoid scores, a per-expert correction bias that steers the choice but not the
+weights, top-k weights renormalized then scaled.
 
 The checkpoint also holds one multi-token-prediction layer, model.layers.47, which this model does
 not instantiate; its keys are expected unmapped on import.
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
 
-from pithtrain.models.deepseek_v2 import (
-    DeepSeekV2DecoderLayer,
-    DeepSeekV2Model,
-    DeepSeekV2MoE,
+from pithtrain.contexts import distributed, training
+from pithtrain.kernels import (
+    bf16_experts_supported,
+    fp8_fused_experts_supported,
+    fp8_quant_grouped,
+    stage_compile_options,
 )
-from pithtrain.modules.load_balance import MoELoadBalanceLossInjector
+from pithtrain.models.interface import RoutingInfo
+from pithtrain.modules.load_balance import (
+    MoELoadBalanceLossInjector,
+    MoELoadBalanceLossTracker,
+    replay_indices,
+)
+from pithtrain.operators.cp_sequence import zigzag_spans
+from pithtrain.operators.ep_dispatch import prepare_dispatch
+from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
+from pithtrain.operators.fp8_experts import fp8_scatter_quant, fp8_swiglu_experts
+from pithtrain.operators.fp8_swiglu_mlp import fp8_swiglu_mlp
+from pithtrain.operators.fp8_swiglu_mlp import fusable as fp8_mlp_fusable
+from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.ring_attention import mla_ring_attention_func
+from pithtrain.operators.silu_mul import silu_mul
+from pithtrain.operators.token_scatter import (
+    padded_index_gather,
+    precompute_group_indices,
+    scatter_for_grouped_gemm,
+)
+from pithtrain.pipeline.dualpipev import layer_partition
+from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
-__all__ = ["Glm4MoeLiteModel", "Glm4MoeLiteTopkRouter"]
+__all__ = ["Glm4MoeLiteDecoderLayer", "Glm4MoeLiteMoE", "Glm4MoeLiteModel", "Glm4MoeLiteTopkRouter"]
+
+
+class Glm4MoeLiteRotaryEmbedding(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig) -> None:
+        super().__init__()
+        inv_freq, attn_scale = self.compute_rope_params(config)
+        self.set_cos_sin(config, inv_freq, attn_scale)
+
+    @staticmethod
+    def yarn_find_correction_range(
+        beta_fast: float, beta_slow: float, dim: int, base: float, max_position_embeddings: int
+    ) -> tuple[int, int]:
+        def correction_dim(num_rotations: float) -> float:
+            log_num = math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+            log_den = math.log(base)
+            return dim * log_num / (2 * log_den)
+
+        low = math.floor(correction_dim(beta_fast))
+        high = math.ceil(correction_dim(beta_slow))
+        return max(low, 0), min(high, dim - 1)
+
+    @staticmethod
+    def yarn_get_mscale(factor: float, mscale: float) -> float:
+        return 1.0 if factor <= 1 else 0.1 * mscale * math.log(factor) + 1.0
+
+    @staticmethod
+    def yarn_linear_ramp_mask(low: float, high: float, dim: int) -> torch.Tensor:
+        high = high + 0.001 if low == high else high
+        linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
+        return torch.clamp(linear_func, 0, 1)
+
+    def compute_rope_params(self, config: Glm4MoeLiteConfig) -> tuple[torch.Tensor, float]:
+        rope_scaling = config.rope_scaling
+        base, dim = rope_scaling["rope_theta"], config.qk_rope_head_dim
+        match rope_scaling["rope_type"]:
+            case "yarn":
+                factor = rope_scaling["factor"]
+                original_max_position_embeddings = rope_scaling["original_max_position_embeddings"]
+                beta_fast, beta_slow = rope_scaling["beta_fast"], rope_scaling["beta_slow"]
+                mscale, mscale_all_dim = rope_scaling["mscale"], rope_scaling["mscale_all_dim"]
+                freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                freq_inter = 1.0 / (factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))  # fmt: skip
+                low, high = self.yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings)  # fmt: skip
+                inv_freq_mask = 1.0 - self.yarn_linear_ramp_mask(low, high, dim // 2).to(torch.float32)  # fmt: skip
+                inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+                attn_scale = float(self.yarn_get_mscale(factor, mscale) / self.yarn_get_mscale(factor, mscale_all_dim))  # fmt: skip
+                return inv_freq, attn_scale
+            case "default":
+                return 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)), 1.0
+            case other:
+                raise ValueError(f"unsupported rope_type: {other!r}")
+
+    def set_cos_sin(
+        self, config: Glm4MoeLiteConfig, inv_freq: torch.Tensor, attn_scale: float
+    ) -> None:
+        positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = (emb.cos() * attn_scale).to(torch.bfloat16)
+        sin = (emb.sin() * attn_scale).to(torch.bfloat16)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, S: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos[:S], self.sin[:S]
+
+
+class Glm4MoeLiteMLP(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, intermediate_size: int | None = None):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = training.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = training.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = training.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if training.fp8 and fp8_fused_experts_supported() and fp8_mlp_fusable(x):
+            return fp8_swiglu_mlp(self.gate_proj, self.up_proj, self.down_proj, x)
+        quantized_x = training.Linear.quantize_input(x)
+        gate = self.gate_proj(x, quantized_x)
+        up = self.up_proj(x, quantized_x)
+        return self.down_proj(silu_mul(gate, up))
+
+    def reference_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)
+
+
+class Glm4MoeLiteExperts(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, num_experts: int):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.moe_intermediate_size
+        self.top_k = getattr(config, "num_experts_per_tok", num_experts)
+        self.gate_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
+        self.up_proj = training.GroupedLinear(num_experts, hidden_size, intermediate_size)
+        self.down_proj = training.GroupedLinear(num_experts, intermediate_size, hidden_size)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grouped_mm_offs: torch.Tensor,
+        ks: list | None = None,
+        ks_tensor: torch.Tensor | None = None,
+        quantized_input: tuple[torch.Tensor, ...] | None = None,
+    ) -> torch.Tensor:
+        group_indices = precompute_group_indices(grouped_mm_offs, x.shape[0])
+        if training.fp8 and fp8_fused_experts_supported() and x.shape[0]:
+            args = (x, grouped_mm_offs, ks, ks_tensor, group_indices, quantized_input)
+            return fp8_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args)
+        kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=group_indices)  # fmt: skip
+        use_shared_quant = training.fp8 and x.shape[0]
+        quantized_x = fp8_quant_grouped(x.detach(), grouped_mm_offs) if use_shared_quant else None  # fmt: skip
+        gate = self.gate_proj(x, **kwargs, quantized_input=quantized_x)
+        up = self.up_proj(x, **kwargs, quantized_input=quantized_x)
+        return self.down_proj(silu_mul(gate, up), **kwargs)
+
+    def uses_bf16_cute(self) -> bool:
+        return not training.fp8 and bf16_experts_supported(self.gate_proj.num_groups)
+
+    def forward_from_tokens(
+        self,
+        gathered: torch.Tensor,
+        expert_idxs: torch.Tensor,
+        expand_idx: torch.Tensor | None,
+        expert_counts: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Stage 3 from the received tokens on Hopper: returns (expert outputs, reverse_shuffle_idxs),
+        or the outputs in slot order with None for the BF16 CuTe experts. A method of its own,
+        registered with FSDP, so the FP8 input never meets FSDP's bf16 input cast.
+        """
+        if not training.fp8:
+            from pithtrain.operators.bf16_experts import bf16_swiglu_experts
+
+            args = (gathered, expert_idxs, expand_idx, self.top_k)
+            return bf16_swiglu_experts(self.gate_proj, self.up_proj, self.down_proj, *args), None
+        G = self.gate_proj.num_groups
+        x, reverse_shuffle_idxs, offs, ks, ks_tensor, quantized_input = fp8_scatter_quant(gathered, expert_idxs, G, expand_idx, expert_counts)  # fmt: skip
+        # self.forward, not self(...): calling the module re-enters FSDP's input cast.
+        return self.forward(x, offs, ks=ks, ks_tensor=ks_tensor, quantized_input=quantized_input), reverse_shuffle_idxs  # fmt: skip
 
 
 class Glm4MoeLiteTopkRouter(nn.Module):
@@ -82,19 +248,310 @@ class Glm4MoeLiteTopkRouter(nn.Module):
         return topk_idx, topk_weight, lb_loss
 
 
-class Glm4MoeLiteMoE(DeepSeekV2MoE):
-    gate_class = Glm4MoeLiteTopkRouter
+class Glm4MoeLiteMoE(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig):
+        super().__init__()
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.experts_per_rank = config.n_routed_experts // distributed.ep_size
+        self.n_routed_experts = config.n_routed_experts
+        self.experts = Glm4MoeLiteExperts(config, self.experts_per_rank)
+        self.gate = Glm4MoeLiteTopkRouter(config)
+        intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+        self.shared_experts = Glm4MoeLiteMLP(config=config, intermediate_size=intermediate_size)
+
+    def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
+        topk_idx, topk_weight, lb_loss = self.gate(hidden_states, replay_idx)
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        expert_idxs = topk_idx.view(-1)
+        replicated_tokens = hidden_states.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, hidden_states.shape[-1])  # fmt: skip
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(replicated_tokens, expert_idxs, self.experts_per_rank)  # fmt: skip
+        outs = self.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
+        outs = outs[reverse_shuffle_idxs]
+        y = (outs.view(*topk_idx.shape, -1) * topk_weight.unsqueeze(dim=-1)).sum(dim=1).to(outs.dtype)  # fmt: skip
+        y = y.view(*orig_shape) + self.shared_experts(identity)
+        return y
 
 
-class Glm4MoeLiteDecoderLayer(DeepSeekV2DecoderLayer):
-    moe_class = Glm4MoeLiteMoE
+class Glm4MoeLiteAttention(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.q_lora_rank = config.q_lora_rank
+        if self.q_lora_rank is None:
+            self.q_proj = training.Linear(hidden_size, self.num_heads * self.q_head_dim, bias=False)
+        else:
+            self.q_a_proj = training.Linear(hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = training.Linear(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)  # fmt: skip
+        self.kv_a_proj_with_mqa = training.Linear(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)  # fmt: skip
+        self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_b_proj = training.Linear(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), bias=False)  # fmt: skip
+        self.o_proj = training.Linear(self.num_heads * self.v_head_dim, hidden_size, bias=False)
+        self.softmax_scale = self.q_head_dim ** (-0.5)
+        rope_scaling = config.rope_scaling
+        if rope_scaling is not None and rope_scaling.get("mscale_all_dim", 0):
+            mscale = Glm4MoeLiteRotaryEmbedding.yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])  # fmt: skip
+            self.softmax_scale = self.softmax_scale * mscale * mscale
+
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @staticmethod
+    def apply_rotary_posemb(
+        q: torch.Tensor, k: torch.Tensor, rotary_posemb: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = rotary_posemb
+        cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
+        B, S, H, D = q.shape
+        q = q.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
+        B, S, H, D = k.shape
+        k = k.view(B, S, H, D // 2, 2).transpose(4, 3).reshape(B, S, H, D)
+        q_embed = (q * cos) + (Glm4MoeLiteAttention.rotate_half(q) * sin)
+        k_embed = (k * cos) + (Glm4MoeLiteAttention.rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, S, _ = hidden_states.size()
+        q_in_proj = self.q_proj if self.q_lora_rank is None else self.q_a_proj
+        quantized_hidden = training.Linear.quantize_input(hidden_states)
+        q = q_in_proj(hidden_states, quantized_hidden)
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states, quantized_hidden)
+        if self.q_lora_rank is not None:
+            q = self.q_b_proj(self.q_a_layernorm(q))
+        q = q.view(B, S, self.num_heads, self.q_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)  # fmt: skip
+        compressed_kv, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)  # fmt: skip
+        k_pe = k_pe.view(B, S, 1, self.qk_rope_head_dim)
+        normed_kv = self.kv_a_layernorm(compressed_kv)
+        q_pe, k_pe = self.apply_rotary_posemb(q_pe, k_pe, rotary_posemb)
+        if distributed.cp_size > 1:
+            kv_b_quant = self.kv_b_proj.get_quantized_weight() if training.fp8 else None
+            attn_output = mla_ring_attention_func(q_nope, q_pe, normed_kv.contiguous(), k_pe.contiguous(), self.kv_b_proj.weight, sm_scale=self.softmax_scale, qk_nope_head_dim=self.qk_nope_head_dim, v_head_dim=self.v_head_dim, cp_group=distributed.cp_group, kv_b_quant=kv_b_quant)  # fmt: skip
+        else:
+            kv = self.kv_b_proj(normed_kv).view(B, S, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)  # fmt: skip
+            k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+            if cu_seqlens is not None:
+                attn_output = flash_attn_varlen_func(q.squeeze(0), k.squeeze(0), value_states.squeeze(0).contiguous(), cu_seqlens, S, softmax_scale=self.softmax_scale, causal=True).unsqueeze(0)  # fmt: skip
+            else:
+                attn_output = flash_attn_func(q, k, value_states.contiguous(), softmax_scale=self.softmax_scale, causal=True)  # fmt: skip
+        attn_output = attn_output.reshape(B, S, self.num_heads * self.v_head_dim)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
 
 
-class Glm4MoeLiteModel(DeepSeekV2Model):
-    decoder_layer_class = Glm4MoeLiteDecoderLayer
+class Glm4MoeLiteDecoderLayer(nn.Module):
+    def __init__(self, config: Glm4MoeLiteConfig, layer_id: int):
+        super().__init__()
+        self.idx = layer_id
+        self.self_attn = Glm4MoeLiteAttention(config=config)
+        has_experts = layer_id >= config.first_k_dense_replace
+        self.mlp = Glm4MoeLiteMoE(config) if has_experts else Glm4MoeLiteMLP(config)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
+    def forward_stage1_compute(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+        replay_idx: torch.Tensor | None = None,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if isinstance(self.mlp, Glm4MoeLiteMLP):
+            return hidden_states, residual, None, None, None
+        residual = residual + self.mlp.shared_experts(hidden_states)
+        topk_idx, topk_weight, lb_loss = self.mlp.gate(hidden_states, replay_idx)
+        return hidden_states, residual, topk_idx, topk_weight, lb_loss
+
+    def forward_stage1(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+        replay_idx = None
+        if isinstance(self.mlp, Glm4MoeLiteMoE):
+            replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
+        if isinstance(self.mlp, Glm4MoeLiteMLP):
+            return hidden_states, residual, None
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
+        dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.n_routed_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
+        return dispatch_tokens, residual, routing
+
+    def keeps_stage3_input(self) -> bool:
+        """
+        The BF16 CuTe experts read gathered_tokens again in their weight gradient, so the pipeline
+        must not free them.
+        """
+        return (
+            not training.fp8 and hasattr(self.mlp, "experts") and self.mlp.experts.uses_bf16_cute()
+        )
+
+    def forward_stage3(
+        self,
+        gathered_tokens: torch.Tensor,
+        expert_idxs: torch.Tensor | None = None,
+        expand_idx: torch.Tensor | None = None,
+        expert_counts: list[int] | None = None,
+    ) -> torch.Tensor:
+        if isinstance(self.mlp, Glm4MoeLiteMLP):
+            return self.mlp(gathered_tokens)
+        if training.fp8 and fp8_fused_experts_supported():
+            expand = expand_idx if distributed.ep_size > 1 else None
+            outs, reverse_shuffle_idxs = self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, expert_counts)  # fmt: skip
+            del gathered_tokens
+            return padded_index_gather(outs, reverse_shuffle_idxs)
+        if self.keeps_stage3_input():
+            expand = expand_idx if distributed.ep_size > 1 else None
+            return self.mlp.experts.forward_from_tokens(gathered_tokens, expert_idxs, expand, None)[0]  # fmt: skip
+        if distributed.ep_size > 1:
+            gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
+        output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank, group_counts=expert_counts)  # fmt: skip
+        del gathered_tokens
+        outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
+        return padded_index_gather(outs, reverse_shuffle_idxs)
+
+    # Not fused with the next layer's forward_stage1 into one compiled region as qwen3_moe does:
+    # for this model the fused region changes the forward bits at its layer boundaries.
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
+    def forward_stage5(
+        self,
+        moe_outs: torch.Tensor,
+        moe_local_idxs: torch.Tensor | None,
+        topk_weight: torch.Tensor | None,
+        residual: torch.Tensor,
+    ):
+        if not isinstance(self.mlp, Glm4MoeLiteMoE):
+            return residual + moe_outs
+        if distributed.ep_size == 1:
+            weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
+            return residual + weighted.sum(dim=1).to(moe_outs.dtype).view(*residual.shape)
+        permuted_probs = topk_weight.view(-1)[moe_local_idxs]
+        token_indices = moe_local_idxs // topk_weight.shape[1]
+        weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
+        aggregated = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
+        aggregated.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
+        return residual + aggregated.view(*residual.shape)
+
+    def reference_forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_posemb: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, rotary_posemb, cu_seqlens)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp.reference_forward(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class Glm4MoeLiteModel(nn.Module):
     def __init__(self, config: Glm4MoeLiteConfig, phase: int):
-        # DeepSeekV2Attention pairs the rotary dims as HF's interleaved variant does.
+        super().__init__()
+        # Glm4MoeLiteAttention pairs the rotary dims as HF's interleaved variant does.
         if not getattr(config, "rope_interleave", True):
             raise ValueError("GLM-4.7 without rope_interleave is not supported")
-        super().__init__(config, phase)
+        match phase:
+            case 0:
+                stage_count = distributed.pp_size * 2
+                stage_index = distributed.pp_rank
+            case 1:
+                stage_count = distributed.pp_size * 2
+                stage_index = stage_count - 1 - distributed.pp_rank
+            case -1:
+                stage_count = 1
+                stage_index = 0
+            case _:
+                raise ValueError("phase must be 0, 1, or -1, got %d" % phase)
+        self.stage_index, self.stage_count = stage_index, stage_count
+        self.hidden_size = config.hidden_size
+        self.chunk_record: ChunkRecord | None = None
+
+        self.rotary_emb = Glm4MoeLiteRotaryEmbedding(config)
+        self.embed_tokens, self.norm, self.lm_head = None, None, None
+        if stage_index == 0:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if stage_index == stage_count - 1:
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.layers = nn.ModuleDict(
+            {
+                str(i): Glm4MoeLiteDecoderLayer(config, i)
+                for i in layer_partition(config.num_hidden_layers, stage_count, stage_index)
+            }
+        )
+
+    def forward_posemb(
+        self, S: int, cu_seqlens: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = distributed.device
+        assert cu_seqlens is None or distributed.cp_size == 1
+        if cu_seqlens is not None:
+            starts, ends = cu_seqlens[:-1], cu_seqlens[1:]
+            lengths = ends - starts
+            position_ids = torch.arange(S, device=device) - torch.repeat_interleave(starts, lengths)
+            cos, sin = self.rotary_emb(S)
+            return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
+        cp_size = distributed.cp_size
+        spans = zigzag_spans(distributed.cp_rank, cp_size, S * cp_size)
+        position_ids = torch.cat([torch.arange(span.start, span.stop, device=device) for span in spans])  # fmt: skip
+        cos, sin = self.rotary_emb(S * cp_size)
+        return cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0)
+
+    def forward_prolog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(hidden_states)
+
+    def forward_epilog(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.norm(hidden_states)
+        return self.lm_head(hidden_states)
+
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return model_forward(self, hidden_states, self.chunk_record, cu_seqlens)
+
+    def reference_forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.stage_index == 0:
+            hidden_states = self.forward_prolog(hidden_states)
+        rotary_posemb = self.forward_posemb(hidden_states.shape[1], cu_seqlens)
+        for _, layer in self.layers.items():
+            hidden_states = layer.reference_forward(hidden_states, rotary_posemb, cu_seqlens)
+        if self.stage_index == self.stage_count - 1:
+            hidden_states = self.forward_epilog(hidden_states)
+        return hidden_states

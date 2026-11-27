@@ -2,7 +2,7 @@
 FP8 routed experts as single autograd nodes, with the activation fused into the FP8 quantization
 of its neighbours, and the fused expert input that feeds them.
 
-- fp8_swiglu_experts: separate gate, up and down weights (DeepSeek-V2-Lite, Qwen3).
+- fp8_swiglu_experts: separate gate, up and down weights (GLM-4.7-Flash, Qwen3).
 - fp8_swiglu_gate_up_experts: one fused (G, 2I, H) gate_up weight (Qwen3.5).
 - fp8_clamped_swiglu_experts: gpt-oss's raw biased, interleaved gate_up and down parameters and
   its clamped SwiGLU.

@@ -19,7 +19,6 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, training
-from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.glm4_moe_lite import Glm4MoeLiteModel
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
@@ -59,7 +58,7 @@ __all__ = [
     "setup_training",
 ]
 
-PIPELINE_STAGE_MODELS = (DeepSeekV2Model, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
+PIPELINE_STAGE_MODELS = (Glm4MoeLiteModel, GptOssModel, Qwen3MoeModel, Qwen35MoeModel, Qwen35Model)
 
 
 def is_muon_param(name: str, param: torch.Tensor) -> bool:
@@ -180,8 +179,8 @@ class TrainingCfg(SlottedDefault):
     hf_import_path: Optional[Path] = None
     """
     A HuggingFace safetensors directory to stream the initial weights from. Used only when
-    save_location holds no checkpoint. Supports Qwen3, DeepSeek-V2, GPT-OSS (MXFP4), Qwen3.5
-    dense/MoE and GLM-4.7-Flash.
+    save_location holds no checkpoint. Supports Qwen3, GPT-OSS (MXFP4), Qwen3.5 dense/MoE and
+    GLM-4.7-Flash.
     """
 
     save_interval: Optional[int] = None
@@ -396,9 +395,7 @@ def setup_model(
             f"splits the sequence into 2*cp_size equal chunks"
         )
 
-    if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepSeekV2Model
-    elif module_config.model_type == "qwen3_moe":
+    if module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
     elif module_config.model_type == "gpt_oss":
         ModelClass = GptOssModel
