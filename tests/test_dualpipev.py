@@ -585,10 +585,11 @@ def main(model_name: str):
             if param_name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 param_eps = 0.3
         # GLM-4.7 under FP8: with so few rows per expert on this small fixture, the FP8 rounding of
-        # the operands moves the gradients far past the BF16 noise, also on one GPU with
-        # pp=ep=cp=1. A broken dense layer or accumulation reads about 1.
+        # the operands moves the routed experts' gradients far past the BF16 noise, 0.14-0.16 at
+        # pp1/ep1, pp2/ep1, pp1/ep2 and pp2/ep2 alike (about 3x below). A broken dense layer or
+        # accumulation reads about 1.
         if training.fp8 and config.model_type == "glm4_moe_lite":
-            param_eps = max(param_eps, 0.6 if ".experts." in param_name else 0.05)
+            param_eps = max(param_eps, 0.5 if ".experts." in param_name else 0.05)
         # GLM-4.7: the eager reference and the staged copy round differently and send a few percent
         # of the tokens to another expert set, as in every model here; the diff weighs a flipped
         # token by its routing weight squared, and the sigmoid router's top-k normalization gives
